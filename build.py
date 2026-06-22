@@ -178,9 +178,15 @@ def main():
         e_hex = '5'
         n_hex = 'unknown'
     
-    vl2_path = 'base/t2csri_rc3.vl2'
+    vl2_path = 'base/t2csri_linux.vl2'
     patch_vl2(vl2_path, args.username, cert, decrypted_hex, n_hex, e_hex)
-    print("Done! Commit the changes and run with: ./docker/asgard-run tribes2 . -online")
+    
+    # Copy patched VL2 to ~/t2-linux/base
+    import shutil
+    dest = os.path.expanduser('~/t2-linux/base/t2csri_linux.vl2')
+    shutil.copy2(vl2_path, dest)
+    print(f"Done! Copied to {dest}")
+    print("Run with: ./docker/asgard-run tribes2 ~/t2-linux -online")
 
 if __name__ == '__main__':
     main()
