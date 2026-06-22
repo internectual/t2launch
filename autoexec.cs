@@ -1,1 +1,0 @@
-$winConsoleEnabled = "1";
