@@ -42,56 +42,35 @@ def rc4(key_bytes, data_bytes):
         result.append(byte ^ k)
     return bytes(result)
 
-def decrypt_store_key(encrypted_hex, password):
+def decrypt_store_key(key_b64, password):
     """Decrypt the private key from a TribesNext private.store entry.
     
-    Format of stored entry: nonce:encryptedHex
+    Input: base64-decoded string of "nonce:encryptedHex"
     Key derivation: RC4 key = SHA1(password + nonce) as ASCII HEX string (40 bytes)
     Verification: SHA1(decrypted_hex) == nonce
     """
-    # Parse the encrypted hex
+    # key_b64 is already base64-decoded: "nonce:encryptedHex"
+    key_str = key_b64 if isinstance(key_b64, str) else key_b64.decode('ascii')
+    
+    if ':' not in key_str:
+        print("ERROR: Expected nonce:encryptedHex format")
+        return None, None
+    
+    nonce, encrypted_hex = key_str.split(':', 1)
     encrypted_bytes = bytes.fromhex(encrypted_hex)
     
-    # We need the nonce — it's the SHA1 of the original plaintext
-    # But we need the nonce from the store file
-    # For now, we try the hex-string-as-key approach
-    # This requires knowing the nonce, which is stored in the store file
-    # 
-    # Usage: we expect the encrypted_hex to be the nonce:encryptedHex format
-    if ':' in encrypted_hex:
-        nonce, enc = encrypted_hex.split(':', 1)
-        enc_bytes = bytes.fromhex(enc)
-    else:
-        # Just the encrypted hex, nonce must be provided separately
-        nonce = None
-        enc_bytes = bytes.fromhex(encrypted_hex)
+    # RC4 key = SHA1(password + nonce) as ASCII HEX string (40 bytes, NOT 20-byte binary)
+    rc4_key = hashlib.sha1((password + nonce).encode('ascii')).hexdigest().encode('ascii')
     
-    # Try different RC4 key approaches
-    if nonce:
-        # Approach 1: RC4 key = hex string of SHA1(password + nonce)
-        rc4_key = hashlib.sha1((password + nonce).encode('ascii')).hexdigest().encode('ascii')
-        decrypted = rc4(rc4_key, enc_bytes)
-        decrypted_hex = decrypted.hex()
-        verify = hashlib.sha1(decrypted_hex.encode('ascii')).hexdigest()
-        if verify == nonce:
-            return nonce, decrypted_hex
-        
-        # Approach 2: RC4 key = raw bytes of SHA1(password + nonce)
-        rc4_key = hashlib.sha1((password + nonce).encode('ascii')).digest()
-        decrypted = rc4(rc4_key, enc_bytes)
-        decrypted_hex = decrypted.hex()
-        verify = hashlib.sha1(decrypted_hex.encode('ascii')).hexdigest()
-        if verify == nonce:
-            return nonce, decrypted_hex
-        
-        # Approach 3: password bytes as RC4 key
-        rc4_key = password.encode('ascii')
-        decrypted = rc4(rc4_key, enc_bytes)
-        decrypted_hex = decrypted.hex()
-        verify = hashlib.sha1(decrypted_hex.encode('ascii')).hexdigest()
-        if verify == nonce:
-            return nonce, decrypted_hex
+    decrypted = rc4(rc4_key, encrypted_bytes)
+    decrypted_hex = decrypted.hex()
     
+    # Verify
+    verify = hashlib.sha1(decrypted_hex.encode('ascii')).hexdigest()
+    if verify == nonce:
+        return nonce, decrypted_hex
+    
+    print(f"SHA1 mismatch: expected {nonce}, got {verify}")
     return None, None
 
 def download_credentials(username, password):
@@ -109,11 +88,8 @@ def download_credentials(username, password):
 
 def patch_vl2(vl2_path, username, cert, decrypted_key, n_hex, e_hex='5'):
     """Patch the VL2 archive with user-specific credentials"""
-    with open(vl2_path, 'rb') as f:
-        content = f.read()
-    
     files = {}
-    with zipfile.ZipFile(content, 'r') as zf:
+    with zipfile.ZipFile(vl2_path, 'r') as zf:
         for name in zf.namelist():
             files[name] = zf.read(name)
     

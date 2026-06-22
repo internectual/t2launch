@@ -366,6 +366,21 @@ add_mount /media/cdrom /cdrom rw
 AUDIO_GID=$(getent group audio | cut -d: -f3)
 if [[ -n "$AUDIO_GID" ]]; then DOCKER_EXTRA_ARGS+=(--group-add "$AUDIO_GID"); fi
 
+# Start RSA proxy for fast decryption (needed for TribesNext auth)
+RSA_PROXY_PORT=18765
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "WARNING: python3 not found — RSA proxy will not start"
+else
+    # Kill any existing proxy
+    pkill -f "rsa_proxy.py" 2>/dev/null || true
+    # Start proxy in background
+    python3 "$ROOT_DIR/rsa_proxy.py" "$RSA_PROXY_PORT" &
+    RSA_PROXY_PID=$!
+    echo "RSA proxy started (PID: $RSA_PROXY_PID) on port $RSA_PROXY_PORT"
+    # Give it a moment to bind
+    sleep 0.5
+fi
+
 $GAMESCOPE_CMD $HOST_WRAPPER docker run \
     --rm \
     --privileged \
@@ -383,3 +398,9 @@ $GAMESCOPE_CMD $HOST_WRAPPER docker run \
     $GAME_NAME \
     bash --norc -c 'cd /home/loki/game && export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH && [ -n "$PRE_LAUNCH" ] && eval "$PRE_LAUNCH"; STRACE="" && [ "$USE_STRACE" = "1" ] && STRACE="strace -e trace=none -o /dev/null -f"; PADSP="" && [ "$USE_PADSP" = "1" ] && PADSP="padsp"; CMD=""; if [ -n "$LAUNCH_CMD" ]; then CMD="$LAUNCH_CMD"; elif [ -e "${GAME_NAME}.sh" ]; then CMD="./${GAME_NAME}.sh"; elif [ -e "${GAME_NAME}" ]; then CMD="./${GAME_NAME}"; elif [ -e "${GAME_NAME}.dynamic" ]; then CMD="./${GAME_NAME}.dynamic"; else CMD="./${GAME_NAME}"; fi; exec $STRACE $PADSP $CMD "$@"' \
     _ "${GAME_ARGS[@]}"
+
+# Cleanup RSA proxy on exit
+if [[ -n "$RSA_PROXY_PID" ]]; then
+    kill $RSA_PROXY_PID 2>/dev/null || true
+    echo "RSA proxy stopped"
+fi

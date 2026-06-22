@@ -25,355 +25,82 @@ $t2csri::native::accountKeyN = "0";
 $t2csri::native::accountKeyD = "0";
 $t2csri::native::temp = "";
 $t2csri::native::sha1state = "";  // serialized SHA1 state
-$t2csri::native::accCerts = "";   // keyed by lowercase username
-$t2csri::native::accPrivateKeys = "";
-$t2csri::native::utcTime = "";
+// RSA modular exponentiation using native Python proxy
+// The proxy listens on localhost:18765 and does the heavy math in Python
+// ============================================================================
 
-// ---------------------------------------------------------------------------
-// Helper: parse a hex string into a 32-bit chunk array (LS first)
-// ---------------------------------------------------------------------------
-function t2csri_native_parseHex(%hex)
+function t2csri_native_rsaModExp(%baseHex, %expHex, %modHex)
 {
-   // Strip leading 0x if present
-   if (strLen(%hex) >= 2 && getSubStr(%hex, 0, 2) $= "0x")
-      %hex = getSubStr(%hex, 2, strLen(%hex));
-
-   // Pad to multiple of 8 hex chars
-   while (strLen(%hex) % 8 !$= 0)
-      %hex = "0" @ %hex;
-
-   %count = strLen(%hex) / 8;
-   %result = "";
-   for (%i = 0; %i < %count; %i++)
+   // Use a TCP connection to the RSA proxy for fast decryption
+   // The proxy is a Python server at 127.0.0.1:18765
+   
+   if (!isObject(RSAProxy))
    {
-      %chunk = getSubStr(%hex, %i * 8, 8);
-      %result = %result @ " " @ "0x" @ %chunk;
+      new TCPObject(RSAProxy);
+      RSAProxy.isConnected = false;
    }
-   return trim(%result);
+   
+   if (!RSAProxy.isConnected)
+   {
+      RSAProxy.connect("127.0.0.1:18765");
+      RSAProxy.isConnected = true;
+      RSAProxy.baseHex = "";
+      RSAProxy.expHex = "";
+      RSAProxy.modHex = "";
+      RSAProxy.result = "";
+   }
+   
+   // Store the request parameters
+   RSAProxy.baseHex = %baseHex;
+   RSAProxy.expHex = %expHex;
+   RSAProxy.modHex = %modHex;
+   RSAProxy.result = "";
+   RSAProxy.attempts = 0;
+   
+   // Send request to proxy
+   RSAProxy.send(%baseHex @ " " @ %expHex @ " " @ %modHex @ "\n");
+   
+   // Wait for response (with timeout)
+   %timeout = getRealTime() + 10000;  // 10 second timeout
+   while (RSAProxy.result $= "" && getRealTime() < %timeout)
+   {
+      // Poll for response
+      schedule(100, 0, t2csri_native_rsaModExp_wait);
+   }
+   
+   return RSAProxy.result;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: convert a 32-bit chunk array back to hex string
-// ---------------------------------------------------------------------------
-function t2csri_native_toHex(%chunks)
+function t2csri_native_rsaModExp_wait()
 {
-   %result = "";
-   %count = getFieldCount(%chunks);
-   for (%i = 0; %i < %count; %i++)
-   {
-      %chunk = getField(%chunks, %i);
-      // Strip 0x prefix and pad to 8 chars
-      %h = %chunk;
-      if (strLen(%h) >= 2 && getSubStr(%h, 0, 2) $= "0x")
-         %h = getSubStr(%h, 2, strLen(%h));
-      while (strLen(%h) < 8)
-         %h = "0" @ %h;
-      %result = %result @ %h;
-   }
-   // Strip leading zeros but keep at least one digit
-   while (strLen(%result) > 1 && getSubStr(%result, 0, 1) $= "0")
-      %result = getSubStr(%result, 1, strLen(%result));
-   return %result;
+   // Check if proxy has responded
+   if (isObject(RSAProxy) && RSAProxy.result !$= "")
+      return;
+   
+   // Continue waiting or timeout
+   if (isObject(RSAProxy))
+      RSAProxy.attempts = RSAProxy.attempts + 1;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: compare two big numbers (chunks) → -1, 0, 1
-// ---------------------------------------------------------------------------
-function t2csri_native_cmp(%a, %b)
+function RSAProxy::onLine(%this, %line)
 {
-   %ca = getFieldCount(%a);
-   %cb = getFieldCount(%b);
-   if (%ca > %cb) return 1;
-   if (%ca < %cb) return -1;
-   // Compare from most significant chunk
-   for (%i = %ca - 1; %i >= 0; %i--)
+   if (trim(%line) !$= "")
    {
-      %va = getField(%a, %i);
-      %vb = getField(%b, %i);
-      if (%va > %vb) return 1;
-      if (%va < %vb) return -1;
+      %this.result = trim(%line);
+      echo("RSA proxy returned: " @ %this.result);
    }
-   return 0;
 }
 
-// ---------------------------------------------------------------------------
-// Helper: add two big numbers (chunks)
-// ---------------------------------------------------------------------------
-function t2csri_native_add(%a, %b)
+function RSAProxy::onConnected(%this)
 {
-   %ca = getFieldCount(%a);
-   %cb = getFieldCount(%b);
-   %max = %ca;
-   if (%cb > %max) %max = %cb;
-
-   %result = "";
-   %carry = 0;
-   for (%i = 0; %i < %max; %i++)
-   {
-      %va = 0;
-      %vb = 0;
-      if (%i < %ca) %va = getField(%a, %i);
-      if (%i < %cb) %vb = getField(%b, %i);
-      %sum = %va + %vb + %carry;
-      // Check for overflow (Torque uses signed 32-bit)
-      if (%sum < 0 || %sum > 0xFFFFFFFF)
-      {
-         // Unsigned wrap
-         %sum = %sum & 0xFFFFFFFF;
-         %carry = 1;
-      }
-      else
-      {
-         %carry = 0;
-      }
-      // Format as hex chunk
-      %h = "";
-      %v = %sum;
-      for (%j = 0; %j < 8; %j++)
-      {
-         %nib = %v & 0xF;
-         if (%nib < 10) %h = (%nib) @ %h;
-         else %h = getSubStr("abcdef", %nib - 10, 1) @ %h;
-         %v = %v >> 4;
-      }
-      %result = %result @ " 0x" @ %h;
-   }
-   if (%carry)
-      %result = %result @ " 0x00000001";
-   return trim(%result);
+   %this.isConnected = true;
+   echo("RSA proxy connected");
 }
 
-// ---------------------------------------------------------------------------
-// Helper: subtract b from a (assumes a >= b)
-// ---------------------------------------------------------------------------
-function t2csri_native_sub(%a, %b)
+function RSAProxy::onDisconnect(%this)
 {
-   %ca = getFieldCount(%a);
-   %cb = getFieldCount(%b);
-   %result = "";
-   %borrow = 0;
-   for (%i = 0; %i < %ca; %i++)
-   {
-      %va = getField(%a, %i);
-      %vb = 0;
-      if (%i < %cb) %vb = getField(%b, %i);
-      %diff = %va - %vb - %borrow;
-      if (%diff < 0)
-      {
-         %diff = %diff + 0x100000001;  // 2^32 + 1 to handle unsigned wrap
-         %borrow = 1;
-      }
-      else
-      {
-         %borrow = 0;
-      }
-      // Mask to 32 bits
-      %diff = %diff & 0xFFFFFFFF;
-      %h = "";
-      %v = %diff;
-      for (%j = 0; %j < 8; %j++)
-      {
-         %nib = %v & 0xF;
-         if (%nib < 10) %h = (%nib) @ %h;
-         else %h = getSubStr("abcdef", %nib - 10, 1) @ %h;
-         %v = %v >> 4;
-      }
-      %result = %result @ " 0x" @ %h;
-   }
-   // Strip leading zeros
-   while (strLen(%result) > 10)
-   {
-      %first = getSubStr(%result, 1, 10);
-      if (%first $= "0x00000000")
-         %result = getSubStr(%result, 11, strLen(%result));
-      else break;
-   }
-   return trim(%result);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: multiply two 32-bit values, return 64-bit result as two chunks
-// ---------------------------------------------------------------------------
-function t2csri_native_mul32(%a, %b)
-{
-   // Split into 16-bit halves to avoid overflow
-   %aLo = %a & 0xFFFF;
-   %aHi = %a >> 16;
-   %bLo = %b & 0xFFFF;
-   %bHi = %b >> 16;
-
-   %lo = %aLo * %bLo;           // low 32 bits
-   %mid1 = %aHi * %bLo;         // high part of a * low part of b
-   %mid2 = %aLo * %bHi;         // low part of a * high part of b
-   %hi = %aHi * %bHi;           // high 32 bits (upper 32 of 64)
-
-   %midSum = %mid1 + %mid2;
-   %carry = 0;
-   if (%midSum > 0xFFFF) %carry = 1;
-
-   %loPart = ((%midSum & 0xFFFF) << 16) | (%lo & 0xFFFF);
-   %hiPart = %hi + (%midSum >> 16) + (((%lo >> 31) & 1) ? 0 : 0);
-   // Handle carry from lo to hi
-   if (%loPart < 0) %loPart = (%loPart & 0xFFFFFFFF);
-
-   return %hiPart @ " " @ %loPart;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: multiply two big numbers (chunks)
-// ---------------------------------------------------------------------------
-function t2csri_native_mul(%a, %b)
-{
-   %ca = getFieldCount(%a);
-   %cb = getFieldCount(%b);
-   %result = "0x00000000";
-
-   for (%i = 0; %i < %ca; %i++)
-   {
-      %va = getField(%a, %i);
-      %carry = 0;
-      %partial = "";
-      for (%j = 0; %j < %cb; %j++)
-      {
-         %vb = getField(%b, %j);
-         // Multiply %va * %vb + carry
-         %prod = %va * %vb + %carry;
-         // Handle overflow
-         if (%prod < 0 || %prod > 0xFFFFFFFF)
-         {
-            // Use division to get high part
-            %prodSigned = %prod;
-            if (%prodSigned < 0) %prodSigned = %prodSigned + 0x100000000;
-            %loChunk = %prodSigned & 0xFFFFFFFF;
-            %hiChunk = (%prodSigned >> 32) & 0xFFFFFFFF;
-            if (%hiChunk < 0) %hiChunk = 0;
-            %carry = %hiChunk;
-         }
-         else
-         {
-            %loChunk = %prod;
-            %carry = 0;
-         }
-         %h = "";
-         %v = %loChunk;
-         for (%k = 0; %k < 8; %k++)
-         {
-            %nib = %v & 0xF;
-            if (%nib < 10) %h = (%nib) @ %h;
-            else %h = getSubStr("abcdef", %nib - 10, 1) @ %h;
-            %v = %v >> 4;
-         }
-         %partial = %partial @ " 0x" @ %h;
-      }
-      if (%carry > 0)
-      {
-         %h = "";
-         %v = %carry;
-         for (%k = 0; %k < 8; %k++)
-         {
-            %nib = %v & 0xF;
-            if (%nib < 10) %h = (%nib) @ %h;
-            else %h = getSubStr("abcdef", %nib - 10, 1) @ %h;
-            %v = %v >> 4;
-         }
-         %partial = %partial @ " 0x" @ %h;
-      }
-
-      // Shift partial by %i positions (multiply by 2^(32*%i))
-      %shifted = "";
-      for (%s = 0; %s < %i; %s++)
-         %shifted = %shifted @ " 0x00000000";
-      %shifted = %shifted @ " " @ trim(%partial);
-
-      %result = t2csri_native_add(%result, trim(%shifted));
-   }
-   return %result;
-}
-
-// ---------------------------------------------------------------------------
-// Helper: mod(a, m) for big numbers
-// ---------------------------------------------------------------------------
-function t2csri_native_mod(%a, %m)
-{
-   // Simple repeated subtraction for now (slow but correct)
-   // For RSA with 1024-bit numbers this would be too slow for mul.
-   // We need a proper division. Let's use binary long division instead.
-
-   if (t2csri_native_cmp(%a, %m) < 0)
-      return %a;
-
-   // Find the highest bit position
-   %ca = getFieldCount(%a);
-   %cm = getFieldCount(%m);
-   %shift = (%ca - %cm) * 32;
-
-   // Shift m to align with a
-   %shiftedM = %m;
-   for (%s = 0; %s < (%ca - %cm); %s++)
-      %shiftedM = "0x00000000" @ " " @ %shiftedM;
-
-   // Now subtract shiftedM while it's <= a
-   %remainder = %a;
-   while (t2csri_native_cmp(%remainder, %shiftedM) >= 0)
-   {
-      %remainder = t2csri_native_sub(%remainder, %shiftedM);
-      // Shift down
-      %shiftedM = getSubStr(%shiftedM, getWordCount(%shiftedM) > 1 ? 10 : 0, strLen(%shiftedM));
-      // Actually, just shift right by removing the last chunk
-      %wc = getWordCount(%shiftedM);
-      if (%wc > 1)
-      {
-         %new = "";
-         for (%w = 0; %w < %wc - 1; %w++)
-            %new = %new @ " " @ getWord(%shiftedM, %w);
-         %shiftedM = trim(%new);
-      }
-      else
-      {
-         %shiftedM = "0x00000000";
-      }
-   }
-   return %remainder;
-}
-
-// ---------------------------------------------------------------------------
-// RSA modular exponentiation: base^exp mod m
-// Uses square-and-multiply algorithm
-// ---------------------------------------------------------------------------
-function t2csri_native_rsaModExp(%base, %exp, %m)
-{
-   // Convert from hex strings if needed
-   if (getSubStr(%base, 0, 1) !$= "0" || getSubStr(%base, 1, 1) !$= "x")
-      %base = t2csri_native_parseHex(%base);
-   if (getSubStr(%exp, 0, 1) !$= "0" || getSubStr(%exp, 1, 1) !$= "x")
-      %exp = t2csri_native_parseHex(%exp);
-   if (getSubStr(%m, 0, 1) !$= "0" || getSubStr(%m, 1, 1) !$= "x")
-      %m = t2csri_native_parseHex(%m);
-
-   // result = 1
-   %result = "0x00000001";
-
-   // Square and multiply
-   %b = t2csri_native_mod(%base, %m);
-
-   %expChunks = getFieldCount(%exp);
-   for (%i = 0; %i < %expChunks; %i++)
-   {
-      %expChunk = getField(%exp, %i);
-      for (%bit = 0; %bit < 32; %bit++)
-      {
-         if ((%expChunk >> %bit) & 1)
-         {
-            // result = (result * b) mod m
-            %prod = t2csri_native_mul(%result, %b);
-            %result = t2csri_native_mod(%prod, %m);
-         }
-         // b = (b * b) mod m
-         %sq = t2csri_native_mul(%b, %b);
-         %b = t2csri_native_mod(%sq, %m);
-      }
-   }
-   return t2csri_native_toHex(%result);
+   %this.isConnected = false;
+   echo("RSA proxy disconnected");
 }
 
 // ---------------------------------------------------------------------------
