@@ -1,0 +1,187 @@
+INSIDE TEAM RABBIT 2
+By Yogi
+Provided by TribalWar
+http://www.tribalwar.com
+
+ 
+A little less than a year ago a new game type hit the Tribes scene with a lot of hype and a fresh following. The hype lived for a while during which teams formed around the game and it even spawned a ladder of its own. Even though it was a solid concept, a lack of depth hurt its longevity. I am, of course, describing the original Team Rabbit. A new twist put on the Rabbit game type originally created by Eric "RatedZ" Lanz of Dynamix, Team Rabbit 2 is a team based, high speed, flag passing bonanza. By holding the flag and performing tricky mid air passes, each team racked up points. This was the extent of the gameplay, thus leading to its shortened lifespan.
+
+Team Rabbit is back in a new way for Tribes 2. Those familiar with Team Rabbit will feel right at home. Those who are not are in for a quite a ride. Let's take a look at the classic elements of Team Rabbit and the brand new elements that make this incarnation a winner.
+
+
+GAMEPLAY
+
+Just what makes Team Rabbit 2, Team Rabbit 2? The simple answer is it is a high speed, high flying, adrenaline rushing flag passing fest. However menial this may seem, don't you worry kids because that's just the beginning. The more creative the pass or series of passes, the more points it is worth. You also now have the ability to determine how far you wish to throw the flag. By holding down your "Throw Flag" button, a hud will pop up showing your power meter. This allows you to determine the force at which you want to throw the flag.
+
+Skiing and jetting are not the only ways to move around the map. On most maps there are platforms on the ground, or tubes that a player can enter that will apply an impulse to your body. This allows you to either cross the map quickly to get into the play, or to propel yourself to new heights to make a spectacular one.
+
+You will also notice that the mission boundaries are very tight. This was done to keep the play confined to a small "arena" of sorts. When you or the flag happen to be recklessly hurtling towards the mission boundary never fear, Team Rabbit 2 will keep everyone and everything in play. When you or the flag come in contact with it, the boundary will bounce you or the flag back into the playing field. This can add another twist to moving around and making incredible "off the wall" passes.
+
+
+ROLES
+
+
+Before diving further into how the game is played, let's pause to look at the players on the field. Team Rabbit 2 offers three different classes that loosely match up with the Tribes 2 armors. They are simply named (just as in any sport): Offense, Defense, and Goalie. Roles are automatically determined for the player based on where they are on the field. For example, when you enter the goal crease you will automatically be switched to the goalie armor (only if someone else on your team is not already a goalie of course). 
+
+Offense   
+
+ - Numbers vary depending on team size.
+
+ - The basic role for any team. Offense plays a vital role in 
+   moving the flag across the field and increasing the jackpot.
+ 
+Defense
+
+ - 2 per team.
+
+ - Determined by distance from your goal. If you are within range 
+   and there are less than 2 defenders, you will become one.
+
+ - This is an oversized medium armor which makes it easier to grab 
+   or intercept a pass.
+
+ - Same physics as offense with a small increase to health.
+
+ - Armed with a modified shocklance. This lance applies a massive 
+   impulse to the player which sends them flying out of position. 
+   Good for dealing with cherry pickers in front of your goal. 
+   Loosely equated to body checking.
+
+Goalie   
+
+ - 1 per team.
+
+ - Immensely oversized heavy armor better for blocking the goal with.
+
+ - Armed with a shocklance that behaves like the defense's.
+
+ - Armed with an unlimited number of mortars that can clear a field 
+   of enemies. The impulse applied by an exploding mortar is high 
+   while damage dealt is rather low.
+
+ - The goalie has lots of health and energy for hovering because 
+   the goals are elevated.
+ 
+
+GAMEPLAY CONTINUED...
+
+Team Rabbit 2 offers two new huds to your heads up display. In the top center is a hud that shows the current jackpot value (more on that in a second). On the left, just below the chat hud is a new scoring hud. It pops up when a successful scoring sequence was completed. It displays the people involved, the name of the scoring sequence (based on the moves you made, Team Rabbit 2 has a name for just about anything you can try), and the point value of the maneuver. The hud makes only a brief appearance, then hides itself to not obstruct your view.
+
+Another highlight of Team Rabbit 2 is the atmosphere. The game is enhanced with an all new sound pack. These sounds don't replace the Tribes 2 sounds; they are in addition to them. Passes and passing sequences have a name associated with them and also have matching sounds to liven up the game (more on this in a second). When you attempt a goal and hit the cross bar the crowd moans in disappointment. On the other hand on a successful goal, the crowd cheers with enthusiasm! Thus giving the feeling of playing a real spectator sport rather than an online game. 
+
+In Team Rabbit 2 there are no "Kills" or "Deaths." When a player's life is taken down to zero they do not die, they become "Knocked Down" for a few seconds once your body stops moving. When a player comes out of the knocked down state, they respawn in the spot where the knock down occurred. This throws an interesting twist when it comes to ammunition management. You cannot scavenge a knocked down player's body for ammo. You are only re-equipped when you respawn. In order to knock yourself out and respawn in your spawn hutch you must do a full suicide (CTRL+K). If you kill yourself with your own disc, for example, you will have essentially knocked yourself down and will continue in play.
+
+SCORING
+
+
+The scoring system in Team Rabbit 2 is very complex. We're going to take an in-depth look at it here. One thing to keep in mind though, as you play don't try to think too hard about how to build a good scoring pass. Don't print this out and sit it next to your monitor in an attempt to find out how to perform every scoring maneuver. You will never be successful at it. As you play you will learn what moves you need to make in order to score well.
+
+
+
+What is the Matrix?
+Each pass is evaluated according to a 10-dimensional matrix: passer speed, receiver speed, receiver height, horizontal flag speed, vertical flag speed, flag hang-time, passer direction (horizontal or vertical), passer orientation relative to the direction of the flag throw, flag direction relative to the receiver's direction, and lastly the receiver's orientation relative to the flag. Each part of this matrix has levels (as few as two, as many as four). So, for example, there are four levels of passer speed depending on how fast the passer was going when he dropped the flag.
+
+So, with a 10-dimensional matrix of values, each of which has multiple levels, there are actually hundreds of thousands of possible bonus combinations. In order to manage this complexity, four categories were designed that sit on top of the 10-dimensional matrix. These categories allow the game to construct a very simple bonus that is based on all that underlying complexity.
+
+
+
+Categories
+The categories are Prefix, Noun, Qualifier and Description. Each of these corresponds to particular values in the 10-dimensional matrix as follows: 
+
+Prefix - Receiver's orientation relative to the flag. This is for catching the flag backwards (or partly backwards).
+
+Noun - Passer speed, receiver speed, receiver height. This is for high-speed, mid-air flag passing in the style of TR1.
+
+Qualifier - Horizontal flag speed, vertical flag speed, flag hang-time. This for differentiating between outward passes that were common in Team Rabbit, and upward/downward passes. It also measures the length of time the flag was in the air.
+
+Description - Basically this measures various angles. Crazy perpendicular passes that are thrown in strange ways are worth more than Team Rabbit style passes where the flag is thrown face-to-face.
+
+
+Composite Bonus
+Each category represents part of what is called a composite bonus. A composite bonus is just a way of managing all of the underlying complexity. A particular type of words is assigned for each category, which are then assembled together and displayed as a coherent object. Here are some examples of words for each category:
+
+  Prefix - Angled, Twisted
+  Noun - Cougar's, Mosquito's, Astronaut's (all objects, mostly animals, 
+         that suggest how fast and high the pass was)
+  Qualifier - Bursting, Hanging, Frozen
+  Description - Grab, Back Breaker, Deliverance, Glass Smash
+
+A composite bonus will always have a Noun and a Description, but it won't necessarily have a Prefix or a Qualifier. The simplest composite bonus is a Llama's Grab, worth 0 points. A more significant composite bonus would be Twisted Cougar's Bursting Back Breaker. In all, there are 3 Prefixes, 64 Nouns, 24 Qualifiers, and 27 Descriptions. Each of these has its own point value and sound effect. The total value of the bonus is the sum of the values in each category. When the bonus plays, up to 4 sound effects play as well, but they're intelligently designed so that they blend well together. Nouns have animal sounds that play immediately, Qualifiers are lingering pad-type sounds that play underneath, and Descriptions are very distinctive, quick sounds that play a second or two after the pass is completed. 
+
+Jackpot and Team Scores
+When a pass is completed, its point value goes into the Jackpot. Both teams build up the same Jackpot. The first team to score a goal with a built up Jackpot will "cash in" these points. A Jackpot must have at least 40 points in it before a goal can be scored, and it maxes out at 250 points. 
+
+There is another scoring mechanism called Creativity. If your team makes a sequence of passes, each pass different from the next, you'll get an instant Creativity bonus that goes directly into your team's score. There are three levels of Creativity bonuses. If you keep making creative sequences of passes without allowing an interception, you'll get more instant points that go directly to your team.
+
+
+TEAM RABBIT 2 MAPS
+
+Crater 71  
+
+- Desert Map with small water deposits.
+- Very ski friendly terrain.
+- Low rolling hills lead to good visibility and easy passes.
+
+--------------------------------------------------------------------------------
+ 
+Frozen Fury 
+
+- Ice map with a volcano.
+- Hilly terrain allows for high speeds and high flight.
+- Flag on a stand in the middle of the map over the lava crater.
+- Large hills make passes tricky but rewarding due to high speeds and altitudes capable.
+
+--------------------------------------------------------------------------------
+God's Rift  
+
+- Desert like map with rivers causing eroded ravines.
+- Deep gorges cause action to happen in small confined areas of the map.
+- Long tosses difficult due to deep canyons.
+
+--------------------------------------------------------------------------------
+ 
+Haven 
+
+- Desert map with a center oasis.
+- Good visibility and good skiing allow for great passing.
+- Nice rolling terrain.
+
+--------------------------------------------------------------------------------
+Mount Olympus  
+
+- Large lush map.
+- Wide open rolling terrain ideal for big passes.
+- Very ski friendly.
+
+--------------------------------------------------------------------------------
+ 
+Phasma Dust 
+
+- A "dry" lush map with scattered lakes.
+- There's a quick ski path down the center of the map that allows for quick counter attacks.
+- Excellent terrain for high speed skiing.
+- Good visibility for long range passes.
+
+--------------------------------------------------------------------------------
+Skinny Dip  
+
+- Lush map with a large center lake.
+- Small map, watch for quick counter attacks.
+- Good rolling terrain allows for easy passing.
+
+--------------------------------------------------------------------------------
+ 
+Sol's Descent 
+
+- Arid map with moderately hilly terrain.
+- Both goals hover over two small lakes.
+- Goals up on a hill but surrounded by a ridge, great for cherry picking.
+- Easy to ski and pass.
+
+--------------------------------------------------------------------------------
+Treasure Island  
+
+- Lush map with a central very shallow river.
+- Small map leads to fast paced action.
+- Goals high in the air.
+

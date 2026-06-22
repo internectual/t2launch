@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Usage: asgard-run [GAME] [HOST_GAME_PATH] [GAME_ARGS...]
+#
+# Any flag-like argument (starting with "-") and everything after it is passed
+# straight through to the game. The game folder is remembered between runs, so
+# after the first time you can just do:
+#   ./asgard-run tribes2 -nologin -mod Classic
+#   ./asgard-run tribes2 -window
+# First time / to set the folder explicitly, give the path before the flags:
+#   ./asgard-run tribes2 /path/to/t2 -window
+# You can also force the boundary with "--", or set GAME_ARGS in the env:
+#   ./asgard-run tribes2 -- -window
+#   GAME_ARGS="-window -mod Classic" ./asgard-run
+# Re-pick the folder any time:  ASGARD_PICK=1 ./asgard-run
+# Note: no flags are forced. For offline play pass -nologin yourself, e.g.
+#   ./asgard-run tribes2 -nologin
+GAME_ARGS=(${GAME_ARGS:-})          # seed from the environment if provided
+POSITIONAL=()
+_collect=0
+for _a in "$@"; do
+    if [[ $_collect -eq 1 ]]; then
+        GAME_ARGS+=("$_a")
+    elif [[ "$_a" == "--" ]]; then
+        _collect=1                       # explicit boundary (the -- is dropped)
+    elif [[ "$_a" == -* ]]; then
+        _collect=1; GAME_ARGS+=("$_a")   # first flag: it and the rest are game args
+    else
+        POSITIONAL+=("$_a")              # bare words: game name, then host folder
+    fi
+done
+GAME_NAME="${POSITIONAL[0]:-}"
+# Optional: path to the game folder on the host (bind-mounted into container).
+# If not provided, you'll be prompted (or it falls back to the baked-in copy).
+HOST_GAME_PATH="${POSITIONAL[1]:-}"
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GAMES_DIR="$ROOT_DIR/games"
+
+# Preflight: Docker is the only hard requirement.
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: Docker is not installed (or not on PATH)."
+    echo "  Arch/CachyOS:  sudo pacman -S docker && sudo systemctl enable --now docker"
+    echo "  Debian/Ubuntu: sudo apt install docker.io && sudo systemctl enable --now docker"
+    echo "  Then add yourself to the docker group: sudo usermod -aG docker \$USER  (log out/in)"
+    exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: Docker is installed but not usable by this user."
+    echo "  Start it:           sudo systemctl enable --now docker"
+    echo "  Fix permissions:    sudo usermod -aG docker \$USER   (then log out and back in)"
+    exit 1
+fi
+
+# Pick the game automatically — the user's only job is to point at the game
+# folder, so don't bother them with this when there's only one game.
+if [[ -z "$GAME_NAME" ]]; then
+    mapfile -t _games < <(ls -1 "$GAMES_DIR" 2>/dev/null)
+    if [[ ${#_games[@]} -eq 1 ]]; then
+        GAME_NAME="${_games[0]}"
+    elif [[ ${#_games[@]} -gt 1 ]] && command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+        _menu=(); for g in "${_games[@]}"; do _menu+=("$g" ""); done
+        GAME_NAME=$(whiptail --title "Tribes 2 Docker — Select Game" \
+            --menu "Which game do you want to run?" 18 60 8 "${_menu[@]}" \
+            3>&1 1>&2 2>&3) || { echo "Cancelled."; exit 1; }
+    else
+        echo "Available games in $GAMES_DIR/:"
+        ls -1 "$GAMES_DIR/" 2>/dev/null || echo "  (none found)"
+        read -rp "Enter game name (e.g. tribes2): " GAME_NAME
+    fi
+fi
+
+# --- Interactive game-folder selection ---------------------------------------
+
+# Print any auto-detected Tribes 2 install directories, one per line.
+detect_game_candidates() {
+    local guess
+    for guess in \
+        "$HOME/t2-linux" \
+        "$HOME/Downloads/t2-linux" \
+        "$HOME/tribes2/asgard/games/tribes2" \
+        "$HOME/tribes2/asgard" \
+        "$HOME/Tribes2/Linux" \
+        "$HOME/tribes2" \
+        "$HOME/Games/Tribes2" \
+        "/media/cdrom/Tribes2/Linux" \
+        "/mnt/cdrom/Tribes2/Linux" \
+        "/opt/tribes2" \
+        "/usr/local/games/tribes2"; do
+        if [[ -d "$guess" ]] && [[ -f "$guess/tribes2.dynamic" || -f "$guess/tribes2" ]]; then
+            printf '%s\n' "$guess"
+        fi
+    done
+}
+
+# Arrow-key folder browser (whiptail). Prints the chosen directory to stdout.
+#   [up/down]            highlight a sub-folder
+#   Enter / "Open"       go inside the highlighted folder
+#   Tab -> "Choose ..."  select the folder you are currently in
+#   Esc                  cancel
+browse_for_folder() {
+    local cur
+    cur="$(cd "${1:-$HOME}" 2>/dev/null && pwd)" || cur="$HOME"
+    while true; do
+        local menu=() d note=""
+        [[ "$cur" != "/" ]] && menu+=(".." ".. (go up a level)")
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && menu+=("$d" "[folder] $d")
+        done < <(find "$cur" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort -f)
+        [[ ${#menu[@]} -eq 0 ]] && menu+=(" " "(no sub-folders here)")
+        if [[ -f "$cur/tribes2.dynamic" || -f "$cur/tribes2" ]]; then
+            note="\n\n  *** Tribes 2 detected in THIS folder! ***"
+        fi
+
+        local choice rc
+        if choice=$(whiptail --title "Browse for your Tribes 2 game folder" \
+                --menu "Now in:  $cur$note\n\n[up/down] highlight a folder, then [Open] to go inside it.\n[Tab] over to [Choose THIS folder] to pick where you are." \
+                22 78 12 "${menu[@]}" \
+                --ok-button "Open" --cancel-button "Choose THIS folder" \
+                3>&1 1>&2 2>&3); then
+            rc=0
+        else
+            rc=$?
+        fi
+
+        if [[ $rc -eq 0 ]]; then            # "Open" the highlighted folder
+            case "$choice" in
+                " ")  : ;;
+                "..") cur="$(cd "$cur/.." && pwd)" ;;
+                *)    cur="$(cd "$cur/$choice" 2>/dev/null && pwd)" || true ;;
+            esac
+        elif [[ $rc -eq 1 ]]; then          # "Choose THIS folder"
+            printf '%s\n' "$cur"
+            return 0
+        else                                # Esc -> cancel
+            return 1
+        fi
+    done
+}
+
+# Top-level picker: list detected installs + a "Browse..." option.
+# Prints the chosen path (empty = use the copy baked into the image).
+# Returns non-zero if the user quits.
+select_game_folder() {
+    local cands=() c menu=()
+    while IFS= read -r c; do [[ -n "$c" ]] && cands+=("$c"); done < <(detect_game_candidates)
+    for c in "${cands[@]}"; do menu+=("$c" "use this: $c"); done
+    menu+=("__browse__"  "Browse for a folder...")
+    menu+=("__builtin__" "Use the copy baked into the image")
+
+    local sel
+    sel=$(whiptail --title "Tribes 2 - Select Game Folder" \
+        --menu "Where is your Tribes 2 game folder?\n(the one containing tribes2.dynamic, base/, ...)\n\nUse the arrow keys, then Enter." \
+        20 78 10 "${menu[@]}" \
+        --ok-button "Select" --cancel-button "Quit" \
+        3>&1 1>&2 2>&3) || return 1
+
+    case "$sel" in
+        __browse__)  browse_for_folder "${cands[0]:-$HOME}" ;;
+        __builtin__) printf '' ;;
+        *)           printf '%s\n' "$sel" ;;
+    esac
+}
+
+# Remember the chosen game folder between runs (saved per game).
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/asgard"
+SAVED_PATH_FILE="$STATE_DIR/${GAME_NAME}.path"
+
+# No folder on the command line? Reuse the last one we saved, unless ASGARD_PICK=1
+# forces the picker.
+if [[ -z "$HOST_GAME_PATH" && -z "${ASGARD_PICK:-}" && -f "$SAVED_PATH_FILE" ]]; then
+    _saved="$(cat "$SAVED_PATH_FILE" 2>/dev/null || true)"
+    if [[ -n "$_saved" && -d "$_saved" ]]; then
+        HOST_GAME_PATH="$_saved"
+        echo "Using saved game folder: $HOST_GAME_PATH"
+        echo "(choose a different one with:  ASGARD_PICK=1 ./asgard-run )"
+        echo ""
+    fi
+fi
+
+# If still no host game path, ask — graphical arrow-key menu when possible.
+if [[ -z "$HOST_GAME_PATH" ]]; then
+    if command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
+        if ! HOST_GAME_PATH="$(select_game_folder)"; then
+            echo "No folder selected. Aborting."
+            exit 1
+        fi
+    else
+        # Plain-text fallback (no whiptail, or non-interactive terminal)
+        echo "Enter the path to your Tribes 2 game directory."
+        echo "(folder containing tribes2.dynamic, base/, etc.; empty = built-in copy)"
+        mapfile -t CANDIDATES < <(detect_game_candidates)
+        if [[ ${#CANDIDATES[@]} -gt 0 ]]; then
+            echo "Detected:"
+            for i in "${!CANDIDATES[@]}"; do echo "  $((i+1)). ${CANDIDATES[$i]}"; done
+            read -rp "Enter a path, or a number [1-${#CANDIDATES[@]}] (default: 1): " INPUT
+            INPUT="${INPUT:-1}"
+            if [[ "$INPUT" =~ ^[0-9]+$ ]] && [[ "$INPUT" -ge 1 ]] && [[ "$INPUT" -le ${#CANDIDATES[@]} ]]; then
+                HOST_GAME_PATH="${CANDIDATES[$((INPUT-1))]}"
+            else
+                HOST_GAME_PATH="$INPUT"
+            fi
+        else
+            read -rp "Enter path (or empty for built-in): " HOST_GAME_PATH
+        fi
+    fi
+
+    # Expand ~
+    HOST_GAME_PATH="${HOST_GAME_PATH/#\~/$HOME}"
+    echo ""
+fi
+
+# Remember a valid choice for next time (skips the picker on future runs).
+if [[ -n "$HOST_GAME_PATH" && -d "$HOST_GAME_PATH" ]]; then
+    HOST_GAME_PATH="$(cd "$HOST_GAME_PATH" && pwd)"   # normalize to absolute
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$HOST_GAME_PATH" > "$SAVED_PATH_FILE" 2>/dev/null || true
+fi
+
+# Defaults (can be overridden by per-game asgard.cfg)
+GAMESCOPE_WIDTH=${GAMESCOPE_WIDTH:-1280}
+GAMESCOPE_HEIGHT=${GAMESCOPE_HEIGHT:-1024}
+USE_GAMESCOPE=${USE_GAMESCOPE:-1}
+USE_PADSP=${USE_PADSP:-1}
+SOFTWARE_GL=${SOFTWARE_GL:-1}
+MESA_YEAR=${MESA_YEAR:-}
+SAVE_DIRS=()
+LAUNCH_CMD=""
+PRE_LAUNCH=""
+USE_STRACE=${USE_STRACE:-1}
+GAMESCOPE_ARGS=""
+HOST_WRAPPER=""
+EXTRA_ENV=""
+
+# Source per-game config if it exists
+if [[ -f "$ROOT_DIR/config/$GAME_NAME.cfg" ]]; then
+    source "$ROOT_DIR/config/$GAME_NAME.cfg"
+fi
+
+# First run: build the Docker image automatically if it doesn't exist yet, so
+# the only thing the user ever has to do is pick the game folder above.
+if ! docker image inspect "$GAME_NAME" >/dev/null 2>&1; then
+    echo ""
+    echo "Docker image '$GAME_NAME' not found — building it now (one-time setup)."
+    echo "This can take a few minutes the first time..."
+    echo ""
+    "$ROOT_DIR/asgard-build" "$GAME_NAME"
+    echo ""
+fi
+
+DOCKER_EXTRA_ARGS=()
+if [[ "$SOFTWARE_GL" == "1" ]]; then
+    DOCKER_EXTRA_ARGS+=(-e LIBGL_ALWAYS_SOFTWARE=1)
+fi
+if [[ -n "$MESA_YEAR" ]]; then
+    DOCKER_EXTRA_ARGS+=(-e "MESA_EXTENSION_MAX_YEAR=$MESA_YEAR")
+fi
+
+# If a host game path is provided, bind-mount it over the container's /home/loki/game
+# This avoids copying game files into the image at build time.
+if [[ -n "$HOST_GAME_PATH" ]]; then
+    if [[ ! -d "$HOST_GAME_PATH" ]]; then
+        echo "ERROR: Host game path '$HOST_GAME_PATH' does not exist or is not a directory."
+        exit 2
+    fi
+    HOST_GAME_PATH="$(cd "$HOST_GAME_PATH" && pwd)"  # resolve to absolute path
+    # Mount read-write so the engine can write console.log / prefs / screenshots
+    # into the game tree, matching how a normal local install behaves.
+    DOCKER_EXTRA_ARGS+=(-v "$HOST_GAME_PATH:/home/loki/game:rw")
+    echo "Bind-mounting host game: $HOST_GAME_PATH -> /home/loki/game"
+
+    # The user's game folder only contains the original game files. The launcher
+    # script and the bundled replacement fonts live in THIS repo (games/$GAME_NAME)
+    # and would be hidden by the bind-mount above, so layer them back on top.
+    # Docker applies mounts ordered by destination depth, so these nested mounts
+    # correctly overlay onto the game mount.
+    HELPER_DIR="$GAMES_DIR/$GAME_NAME"
+    if [[ -f "$HELPER_DIR/run_t2.sh" ]]; then
+        DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/run_t2.sh:/home/loki/game/run_t2.sh:ro")
+        echo "  + overlay launcher: run_t2.sh"
+    fi
+    if [[ -d "$HELPER_DIR/base/fonts" ]]; then
+        DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/base/fonts:/home/loki/game/base/fonts:ro")
+        echo "  + overlay fonts:    base/fonts"
+    fi
+fi
+
+for save_dir in "${SAVE_DIRS[@]}"; do
+    host_dir="${save_dir%%:*}"
+    container_dir="${save_dir#*:}"
+    mkdir -p "$host_dir"
+    DOCKER_EXTRA_ARGS+=(-v "$host_dir:$container_dir:rw")
+done
+
+# Pass /dev/dsp if available (OSS emulation via snd-pcm-oss kernel module)
+if [[ -e /dev/dsp ]]; then
+    DOCKER_EXTRA_ARGS+=(--device /dev/dsp)
+fi
+
+if [[ -n "$EXTRA_ENV" ]]; then
+    DOCKER_EXTRA_ARGS+=(-e "$EXTRA_ENV")
+fi
+
+# Grant the container access to the X server. 'xhost' lives in 'xorg-xhost' on
+# Arch/Fedora and 'x11-xserver-utils' on Debian/Ubuntu. A missing or failing
+# xhost must NOT abort the run (set -e) — warn and continue.
+if command -v xhost >/dev/null 2>&1; then
+    if [ -n "$SUDO_USER" ]; then
+        sudo -u "$SUDO_USER" DISPLAY=$DISPLAY xhost +local:docker >/dev/null 2>&1 || true
+    else
+        xhost +local:docker >/dev/null 2>&1 || true
+    fi
+else
+    echo "NOTE: 'xhost' is not installed — the game window may fail to open."
+    echo "      Install it, then re-run:"
+    echo "        Arch/CachyOS:   sudo pacman -S --needed xorg-xhost"
+    echo "        Debian/Ubuntu:  sudo apt install x11-xserver-utils"
+    echo "        Fedora:         sudo dnf install xorg-x11-server-utils"
+fi
+
+GAMESCOPE_CMD=""
+if [[ "$USE_GAMESCOPE" == "1" ]]; then
+    if command -v gamescope >/dev/null 2>&1; then
+        GAMESCOPE_CMD="gamescope -w $GAMESCOPE_WIDTH -h $GAMESCOPE_HEIGHT $GAMESCOPE_ARGS --"
+    else
+        echo "NOTE: gamescope not installed — running without it."
+    fi
+fi
+
+uid=${SUDO_UID:-$(id -u)}
+if [ -n "$SUDO_USER" ]; then
+    HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    XDG_RUNTIME_DIR="/run/user/$uid"
+fi
+
+# The game is an X11 app. On Wayland it draws via XWayland; if DISPLAY is unset,
+# fall back to :0 so it still has somewhere to connect.
+if [[ -z "$DISPLAY" ]]; then
+    echo "NOTE: \$DISPLAY was empty; defaulting to :0 (XWayland)."
+    DISPLAY=":0"
+fi
+
+# Add host-integration mounts/devices only when the source actually exists, so
+# the same command works across X11/Wayland, PulseAudio/PipeWire and distros.
+# A missing bind-mount source otherwise makes Docker create a junk root-owned
+# dir (which is what broke audio/display on non-Ubuntu hosts).
+add_mount()  { if [[ -e "$1" ]]; then DOCKER_EXTRA_ARGS+=(-v "$1:$2:${3:-rw}"); fi; return 0; }
+add_device() { if [[ -e "$1" ]]; then DOCKER_EXTRA_ARGS+=(--device "$1"); fi; return 0; }
+
+mkdir -p "${HOME}/.loki"   # game writes prefs/saves here; ensure it's user-owned
+
+add_device /dev/snd
+add_device /dev/dri
+add_mount /etc/machine-id /etc/machine-id ro
+add_mount /var/lib/dbus   /var/lib/dbus   rw
+add_mount "${XDG_RUNTIME_DIR}/pulse/native"  "${XDG_RUNTIME_DIR}/pulse/native"  rw
+add_mount "${HOME}/.config/pulse/cookie"     /home/loki/.config/pulse/cookie    ro
+add_mount "${HOME}/.Xauthority"              /home/loki/.Xauthority             rw
+add_mount /tmp/.X11-unix  /tmp/.X11-unix  rw
+add_mount "${HOME}/.loki" /home/loki/.loki rw
+add_mount "${XDG_RUNTIME_DIR}" "/run/loki/$uid" rw
+add_mount /media/cdrom /cdrom rw
+
+# Host 'audio' group GID, so the container user can access /dev/snd (if present).
+AUDIO_GID=$(getent group audio | cut -d: -f3)
+if [[ -n "$AUDIO_GID" ]]; then DOCKER_EXTRA_ARGS+=(--group-add "$AUDIO_GID"); fi
+
+$GAMESCOPE_CMD $HOST_WRAPPER docker run \
+    --rm \
+    --privileged \
+    --network host \
+    --group-add=audio \
+    -e PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native \
+    --env=DISPLAY=$DISPLAY \
+    --env=XDG_RUNTIME_DIR=/run/user/$uid \
+    "${DOCKER_EXTRA_ARGS[@]}" \
+    -e GAME_NAME="$GAME_NAME" \
+    -e LAUNCH_CMD="$LAUNCH_CMD" \
+    -e PRE_LAUNCH="$PRE_LAUNCH" \
+    -e USE_STRACE="$USE_STRACE" \
+    -e USE_PADSP="$USE_PADSP" \
+    $GAME_NAME \
+    bash --norc -c 'cd /home/loki/game && export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH && [ -n "$PRE_LAUNCH" ] && eval "$PRE_LAUNCH"; STRACE="" && [ "$USE_STRACE" = "1" ] && STRACE="strace -e trace=none -o /dev/null -f"; PADSP="" && [ "$USE_PADSP" = "1" ] && PADSP="padsp"; CMD=""; if [ -n "$LAUNCH_CMD" ]; then CMD="$LAUNCH_CMD"; elif [ -e "${GAME_NAME}.sh" ]; then CMD="./${GAME_NAME}.sh"; elif [ -e "${GAME_NAME}" ]; then CMD="./${GAME_NAME}"; elif [ -e "${GAME_NAME}.dynamic" ]; then CMD="./${GAME_NAME}.dynamic"; else CMD="./${GAME_NAME}"; fi; exec $STRACE $PADSP $CMD "$@"' \
+    _ "${GAME_ARGS[@]}"

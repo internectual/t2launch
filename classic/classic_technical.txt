@@ -1,0 +1,940 @@
+10/31/02 v1.1
+
+===============================================================================
+=                                  ADMIN                                      =
+===============================================================================
+ - SuperAdmins can now kick admins.
+   (admin.cs)
+
+ - SuperAdmins can remove admin power.
+   (server.cs)
+
+ - Admins can issue warnings to players.
+   (defaultGame.cs)
+   (server.cs)
+
+ - Admins can send players bottomprint or centerprint messages.
+   (adminHud.cs)
+   (clientOverloads.cs)
+   (server.cs)
+
+ - Admins can send private messages to players.
+   (defaultGame.cs)
+   (support.cs)
+
+ - Added a Random Teams feature.
+   (defaultGame.cs)
+   (GameGui.cs)
+   (hud.cs)
+   (server.cs)
+   (serverDefaults.cs)
+
+ - Added 'Auto-Server-Restart' and a SuperAdmin 'Server Restart' feature.
+   (server.cs)
+
+ - Rewrote SAD function to allow more flexibility.
+   (server.cs)
+
+ - Fixed the 'Ban Player' lobby option.
+   (admin.cs)
+   
+ - Added these remote SuperAdmin features:
+     Set super password
+     Set admin password
+     Set Join password
+     Set Maximum number of players
+     Force server to restart
+     Turn Random Teams on/off
+     Turn Fair teams on/off
+   (server.cs)
+ 
+ - Added Auto-setting join password feature. The server sets the join password
+   at x number of players.
+
+ - New ServerPrefs.cs variables. 
+         $Host::AdminPassword
+            Password to gain Admin status on server. The default value of
+            "changethis" is ignored.
+         $Host::ClassicAutoPWEnabled
+            Automatic locking of server after $Host::LockServerPlayerCount 
+            number of players on the server is reached.
+         $Host::ClassicAutoPWPassword:
+            $Host::Password is changed to this when automatic password is 
+            triggered.
+         $Host::ClassicAutoPWPlayerCount
+            When server reaches this number of players, and 
+            $Host::ClassicAutoPWEnabled is set to 1, the server join password is
+            set to $Host::ClassicAutoPWPassword.
+         $Host::ClassicAutoRestartServer
+            Sets automatic server restart on and off. 1 is enabled, 0 is 
+            disabled. If on, server will reload every $Host::ClassicRestartTime
+            hours.
+         $Host::ClassicEchoChat
+            Echoes global chat to remote telnet console. 1 is enabled, 0 is 
+            disabled.
+         $Host::ClassicFairTeams
+            Disallow players from making teams uneven. 1 is enabled, 0 is 
+            disabled.
+         $Host::ClassicLogEchoEnabled
+            Echoes special messages to console. 1 is enabled, 0 is disabled.
+         $Host::ClassicMaxTelepads
+            Maximum numbers of practice CTF teleport pads each player can 
+            deploy.
+         $Host::ClassicRandomizeTeams
+            Randomly picks a team to place players on. 1 is enabled, 0 is 
+            disabled.
+         $Host::ClassicRandomMissions
+            Randomly load missions of the same type instead of in reverse 
+            alphabetical order. 1 is enabled, 0 is disabled.
+         $Host::ClassicRestartTime
+            Time in hours until server will automatically restart, but only
+            if $Host::ClassicAutoRestartServer is set to 1.
+         $Host::ClassicSuperAdminPassword
+            Password to gain Super Admin status on server. The default value
+            of "changeme" is ignored.
+         $Host::ClassicTelnet:
+            Allow remote telnet access? 1 is enabled, 0 is disabled.
+         $Host::ClassicTelnetListenPass
+            Read only telnet access password, for admins.
+         $Host::ClassicTelnetPassword
+            Full access telnet password, for super admins.
+         $Host::ClassicTelnetPort
+            Server port for remote telnet applications can connect to.
+   (serverDefaults.cs)
+
+ - Added a admin HUD to control server settings.
+   (adminHud.cs)
+
+ - Added new mission list management system that gives admins better control over
+   mission rotation.
+   (GameGui.cs)
+
+ - Added Random mission loading feature.
+   (server.cs)
+
+ - Anyone trying to guess the SAD PW by spamming values will be banned.
+   (server.cs)
+ 
+ - Added working "Add Bot" to function DefaultGame::sendGameVoteMenu.
+   (defaultGame.cs)
+
+ - Allow Super admins to admin players even when $Host::allowAdminPlayerVotes 
+   is false.
+   (admin.cs)
+
+ - Added logging function to support file.
+   (support.cs)
+
+ - CRC checking is now off by default, instead of on.
+   (serverDefaults.cs)
+   
+
+===============================================================================
+=                              PLAYER ARMORS                                  =
+===============================================================================
+[ALL]
+ - Completely new physics model.
+ - Player speeds are tweaked when going too fast when ejecting from vehicles.
+   (player.cs)
+
+ - Added more gravity.
+   (server.cs)
+
+ - Delay from using suicide key bind changed from 10 seconds to 2.
+   (defaultGame.cs)
+
+ - Players no longer spawn invisible.
+   (defaultGame.cs)
+   
+ - Reduced time between being able to mount vehicles.
+   (player.cs)
+   
+ - More clearance when ejecting from vehicles.
+   (player.cs)
+
+ - Fixed a energy allocation bug when leaving inventory stations.
+   (station.cs)
+
+ - Players don't spin around when using remove inventories.
+   (station.cs)
+
+ - The screen doesn't shake as much when skiing.
+   (player.cs)
+    
+[HEAVY]
+ - Slight increase to heavy walk speed.
+   (player.cs)   
+
+[MEDIUM]
+ - Default grenade launcher ammo for medium armor changed from 12 to 15.
+   (player.cs)
+ 
+   
+===============================================================================
+=                             CODE OPTIMIZATIONS                              =
+===============================================================================
+- Buying favorites.
+  (inventoryHud.cs)
+
+- Assigning beacons when purchasing favorites.
+  (inventoryHud.cs)
+  
+- Buying deployable favorites.
+  (inventoryHud.cs)
+
+- Rewrote getAmmoStationLovin()
+  (inventoryHud.cs)
+
+- Projectile spread code.
+  (projectiles.cs)
+
+- Optimized weapon buying favorites code.
+  (inventory.cs)
+
+- ShapeBase::hasAmmo().
+  (inventory.cs)
+  
+  
+===============================================================================
+=                               HAND GRENADES                                 =
+===============================================================================
+[ALL]
+ - Inherit more velocity from player.
+ - Higher arc when tossed.
+ - Players lose spawn invulnerability and uncloak when they throw grenades.
+   (weapon.cs)
+   (items.cs)
+
+ - Hand grenades are always thrown at maximum force. Variable throwing power
+   was removed.
+   (inventory.cs)
+
+ - Added a bind to throw grenade ammo.
+   (inventory.cs)
+
+ - Fixed a unlimited grenade ammo exploit.
+   (weapTurretCode.cs)
+
+ - Added a key-bind for "Max Throw Grenade" which will throw a grenade at 
+   maximum throwing range.
+   (clientOverloads.cs)
+   (inventory.cs)
+
+[CAMERA]
+ - Detects enemies using Sensor Jammer Pack.
+ - Field of view was tweaked to remove fisheye effect.
+ - Camera eye can now be controlled through Command Screen.
+ - Cameras can no longer be viewed from third person Command Screen.
+   (cameraGrenade.cs)
+   (weapTurretCode.cs)
+
+ - Fixed a camera ammo pickup bug.
+   (weapons.cs)
+
+[CONCUSSION]
+ - Removed a duplicate datablock entry.
+   (concussionGrenade.cs)
+
+[WHITEOUT]
+ - Lowered the maximum time a player can be blinded.
+   (flashGrenade.cs)   
+
+
+===============================================================================
+=                                  HUDS                                       =
+===============================================================================
+- Fixed a message that was sending the wrong variable to the objective HUD.
+  (CTFGame.cs)
+
+- Fixed a problem with the mine HUD.
+  (inventoryHud.cs)
+
+- Added new reticle code.
+  (hud.cs)
+
+- Vehicle Station HUD doesn't close after making a selection.
+  (clientOverloads.cs)
+  
+- Vehicle Station HUD pops up as soon as player steps on vehicle pad.
+  (station.cs)
+
+- Vehicle Station quickeys are always mapped to the same keys, regardless of 
+  which are available in the map.
+  (serverVehicleHud.cs)
+
+- Fixed a problem with objective HUD not working properly.
+  (clientOverloads.cs)
+
+
+===============================================================================
+=                                  OTHER                                      =
+===============================================================================
+[CONSOLE SPAM FIXES]
+ - Various fixes.
+   (support.cs)
+
+ - MPB console spam fix.
+   (vehicle.cs)
+
+ - Added TSStatic to Flag::objectiveInit().
+   (CTFGame.cs)
+
+ - Projectile console spam fix.
+   (projectiles.cs)
+
+ - Suicide console spam fix.
+   (server.cs)
+
+ - Animation play console spam fix.
+   (server.cs)
+
+ - Added DefaultGame::countFlips().
+   (deafultGame.cs)
+
+[FLAG]
+ - Flag now follows movement vector of corpse instead of a random vector.
+ - More tossing power when throwing flag.
+   (inventory.cs)  
+
+ - Added mass to the flag to prevent it from flying across the map.
+   (item.cs)
+
+ - Increased the pick up radius of the flag from 3m to 3.5m. This helps
+   fix the problem of players passing through the flag.
+   (items.cs)
+
+ - Flags on stands no longer rise and hover over players standing on them.
+   (CTFGame.cs)
+   (inventory.cs)
+
+ - Added fix to keep flag from sticking to OOB grid. Flag now bounces back in
+   bounds.
+   (CTFGame.cs)
+
+ - Player loses spawn invulnerability when they pick up flag.
+   (item.cs)
+
+ - Added code to give the clients a more accurate representation of where
+   a drop flagged is. This should keep players from passing through flags 
+   when they are out in the field. Thanks for this goes to Kinetic Poet for
+   a single flag solution created for TeamRabbit2.
+ - Fixed a bug that wasn't deleting vehicle flag-camping threads at the end
+   of maps. Fixed added to base.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+
+ - Players have to wait 1 second to pick up a flag after they drop/throw it.
+   This fixes the problem where players would instantly pick up the flag
+   when trying to throw it some angles.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+   (inventory.cs)
+   (player.cs)
+
+ - Made some changes that may help the problem of fast players passing
+   through flags. This container search also fixes the bug that wasn't allowing
+   players to make contact with a flag when the player was on the flagstand
+   when the flag was returned.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+   (inventory.cs)
+
+
+[VARIOUS]
+ - Added a Defend and Destroy game type to BASE. To make a DnD, mappers
+   only need to include "DnD" in the MissionTypes list at the top of the
+   .mis file.
+   (aiDnD.cs)
+   (DnDGame.cs)
+
+ - Committing suicide no longer lowers a players score.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+   (DnDGame.cs)
+
+ - Fixed a motion sensor sound bug that had "effect = 
+   MotionSensorDeployEffect" in AudioProfile(SensorDeploySound), when it
+   belongs in AudioProfile(MotionSensorDeploySound).
+   (deployables.cs)
+
+ - Fixed a spelling error in that wasn't causing any problems but resulted
+   in inaccurate text searches on the file.
+   (station.cs)
+
+ - Fixed the bug that was sending multiple repair messages to a players chat
+   HUD when a teammate repaired a object.
+   (message.cs)
+
+ - Added a waiting period when changing teams to prevent team change exploit
+   to crash servers. Added admin variable so admins can team-change whoever 
+   they want.
+   (server.cs)
+
+ - Only the "Storm" and "Inferno" default team names are used.
+   (CTFGame.cs)
+   (DnDGame.cs)
+
+ - More information is displayed when observing a player. Rewrote 
+   displayObserverHud.
+   (hud.cs)
+   (deafultGame.cs)
+   
+ - Observer camera is faster.
+   (server.cs)
+   (clientOverloads.cs)
+
+ - Every 20 seconds, players can switch spawn spots during tournament mode 
+   waiting period by suiciding.
+   (inventory.cs)  
+   (player.cs)
+   (server.cs)
+   (deafultGame.cs)
+
+ - Echo chat to console for remote telnet apps.
+   (message.cs)
+
+ - Send a global chat message to alert players that a remote telnet connection
+   has been established to the server.
+   (server.cs)
+
+ - Added a mod information load screen.
+   (loadingGui.cs)
+ 
+ - Fixed a setArmThread error in serverCmdPlayAnim()
+   (server.cs)
+
+ - Fixed a tournament mode bug that allowed players to start on the other teams
+   side of the map. Code supplied by FSB-AO.
+   (server.cs)
+
+ - Fixed a beacon ammo pickup bug.
+   (weapons.cs)
+   
+ - Tournament mode, pick-team bug fix.
+   (server.cs)
+
+ - Functions add player to admin and super admin list were not functioning 
+   properly. Added command to activate admin HUD.
+   (server.cs)
+   
+ - Removed duplicate function serverCmdResetControlObject(%client).
+ - Added show name of turret controller.
+   (serverCommanderMap.cs)
+
+ - Add and restore game type feature and streamlined a little.
+   (server.cs)
+
+ - Added Mod HUD, so server side modders can have some client-side support.
+   (modHud.cs)
+
+ - Allow observer global chat to be seen by all, not just admins and other 
+   observers.
+   (message.cs)
+
+ - Added new global array for reticles and visibility.
+   (weapons.cs)
+
+ - A .wav sound will play every time you do damage to a enemy player, or vehicle,
+   with any of the weapons listed at end of this entry. The 
+   $pref::Classic::playerHitSound and $pref::Classic::vehicleHitSound entries
+   in clientPrefs.cs can be set to 0 to disable these. 
+   The $pref::Classic::playerHitWav and $pref::Classic::vehicleHitWav entries in 
+   clientPrefs.cs are used to specify the wav files played. The wav file must be
+   under the 'audio' directory in your 'base' directory. You'll need to create
+   the audio directory if it isn't there and you want to use a wav file that 
+   isn't included with T2. The value for these entries have to be in quotes, have
+   to begin with the two characters: ~w, and must contain a valid path to the 
+   wav files. 
+   
+   For example, the default value of:
+   $pref::Classic::playerHitWav = "~wfx/weapons/cg_hard4.wav";
+   looks for the cg_hard4.wav file in ...\Tribes2\GameData\base\audio\fx\weapons\
+   This directory is part of the T2 directory structure found in the audio.vl2
+   file. There are hundreds of sound effects in the audio.vl2 you can use.
+   
+   To use your own wav file you would create a "audio" directory under the "base"
+   directory if it's not already there. This would be the path:
+   ...\Tribes2\GameData\base\audio\fx\weapons\
+   Lets say your wav file has a filename of "guns.wav". Place the guns.wav file 
+   in this audio directory and change the $pref::Classic::playerHitWav entry 
+   in clientPrefs.cs to this:
+   $pref::Classic::playerHitWav = "~wguns.wav";
+      
+   The .wav file is played when damage is done with these weapons;
+   Blaster, Plasma Gun, Chaingun, Disc, Grenades (GL and hand), Laser, Mortar,
+   Missile, ShockLance, Impact (object to object, AKA ramming), Controlled Plasma
+   Turret, Controlled  AA Turret, Controlled ELF Turret, Controlled Mortar Turret,
+   Controlled Missile Turret, Controlled Indoor Deployable Turret, Controlled 
+   Outdoor Deployable Turret, Controlled Sentry Turret, Shrike Blaster, Bomber
+   Plasma, Bomber Bomb, Tank Chaingun, Tank Mortar, Satchel.
+   (vehicle.cs)
+   (server.cs)
+   (defaultGame.cs)
+
+ - Added Client side option to allow you to use your repair kit even if your health
+   is at maximum. This is controlled with the "$pref::Classic::wasteRepairKit" 
+   variable in your ClientPrefs.cs file.
+   (items.cs)
+
+ - Added chat messages that inform players when their teammates destroy enemy
+   objects. This feature can be turned on and off by editing the 
+   $pref::Classic::ignoreTeamDestroyMessages option in the file 
+   ...\Tribes2\GameData\classic\prefs\ClientPrefs.cs
+   Set this to 1 to suppress the messages from being shown in your chat HUD,
+   or 0 to view them.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+   (message.cs)
+   (clientOverloads.cs)
+
+ - Added material sound and walk puff properties file for new terrain textures
+   (classicPropMap.cs)
+
+ - Cleaned up deployable's triggers.
+   (SiegeGame.cs)
+   (server.cs)
+
+ - Some admin features now display the name of admin issuing the command.
+   (server.cs)
+
+ - Fixed a variable error in teamRepairMessage().
+   (message.cs)
+
+ - %name was never defined in ShapeBaseData::onDestroyed()
+   (CTFGame.cs)
+
+ - Added isNumber function to server.cs. Thanks goes to Writer.
+   (server.cs)
+
+ - Remove client's direct requests to start animations. Prevents players from
+   switching the animation frame for their player/model.
+   (chatMenuHud.cs)
+
+ - Commented out code that sent client repair messages which would spam 
+   messages. Replaced it with a new system for sending teammates repair and 
+   destroy messages. This is for both information purposes and for stat 
+   tracking.
+   (CTFGame.cs)
+   (PracticeCTFGame.cs)
+
+ - Added a function for client-side scripters that returns a string that
+   contains the mod name the server is running. See the setCameraSpeed()
+   function in clientOverloads.cs for an example of how this works.
+   (server.cs)
+   (clientOverloads.cs)
+
+ - Generators shield can withstand a bit more damage.
+   (staticShape.cs) 
+
+ - Removed all of the code for the trial demo. This lowers the memory 
+   requirement and speeds up processing a bit.
+   (CTFGame.cs)
+   (admin.cs)
+   (defaultGame.cs)
+   (GameGui.cs)
+   (loadingGui.cs)
+   (PracticeCTFGame.cs)
+   (server.cs)
+   (serverDefaults.cs)
+   (cloakingpack.cs)
+   (repairpack.cs)
+   (sensorjammerpack.cs)
+
+ - Beacons can only be markers now, not targeting devices.
+   (item.cs)
+
+ - Fixed an old base bug that was trying to load a mission name instead of
+   file.
+   (server.cs)
+
+ - Change the sound that's triggered when a team loses control of a 
+   FlipFlop. The old one was the same as when your teams flag is taken.
+   (defaultGame.cs)
+   
+
+===============================================================================
+=                                  PACKS                                      =
+===============================================================================
+[CLOAK]
+ - Lower energy consumption rate.
+   (cloakingpack.cs)
+
+ - Players are now completely invisible when cloaked.
+   (support.cs)
+
+[DEPLOYABLE PULSE SENSOR]
+ - Increased detection radius from 150 to 175.
+   (deployables.cs)
+
+[SATCHEL]
+ - Fixed Satchel bug. Prior to fix, clients couldn't pick up packs when satchel
+   was destroyed from damage.
+ - Satchel packs now stick when making contact with buildings and terrain.
+ - Slight increase to satchel damage, explosion radius, and kickback.
+   (satchelCharge.cs)
+
+ - The time a satchel explodes after pressing fire was changed from 8/10th
+   of a second to 6/10ths.
+   (inventory.cs)
+
+[REPAIR]
+ - Slight increase to repair rate for non-player objects
+ - Fixed lingering repair projectile bug (?).
+   (repairpack.cs)
+
+[SENSOR JAMMER]
+ - When off, the user can only be detected (seen in enemy sensor net) if 
+   exposed by a camera. If not detected, the player will not project a red 
+   triangle over his head, and will not be targeted by sensor controlled turrets
+   (all but sentry). When the SJP is on, it has the same affect as above for all
+   friendly players over a 30m radius centered on the jamming player. It will
+   also expose cloaked enemies.
+ - Fixed a SJP bug that allowed players to retain jammed status after dropping
+   this pack.
+   (sensorjammerpack.cs)   
+
+[SHIELD PACK]
+ - Shield pack energy of heavy armor absorbs more damage.
+   (player.cs)
+
+[REMOTE INVENTORY]
+ - Tweaked mass for new armor physics.
+ - The range deployable inventories can be placed near each other was
+   slightly reduced.
+   (deployables.cs)
+
+
+===============================================================================
+=                             PRACTICE MODE                                   =
+===============================================================================
+- Added a practice mode. This mode contains a variety of practice related 
+  features.
+  (practiceHud.cs)
+  (aiPracticeCtf.cs)
+  (GameGui.cs)
+  (inventory.cs)  
+  (loadingGui.cs)
+  (PracticeCTFGame.cs)
+  (practice.cs)      
+  (server.cs)
+
+
+===============================================================================
+=          CHANGES NEEDED FOR TR2 + CLASSIC, SEARCH FILES WITH: tr2           =
+===============================================================================
+  (inventory.cs)
+  (weapons.cs)
+  (hud.cs)
+  (player.cs)
+  (inventoryhud.cs)
+  (server.cs)
+
+
+===============================================================================
+=                                 TURRETS                                     =
+===============================================================================
+[ALL]
+ - All turret barrel "item" references in image datablocks were mislabeled.
+   (aaBarrelLarge.cs)
+   (ELFBarrelLarge.cs)
+   (indoorDeployableBarrel.cs)
+   (missileBarrelLarge.cs)
+   (mortarBarrelLarge.cs)
+   (outdoorDeployableBarrel.cs)
+   (plasmaBarrelLarge.cs)
+
+ - The name of a turret will be changed to the name of the player controlling it.
+   (serverCommanderMap.cs)
+
+ - Added check to see if a turret has a valid owner, if not clear the variable.
+   (player.cs)
+
+[AA BARREL]
+ - Slight decrease to wake up and unfold time.
+   (aaBarrelLarge.cs)
+
+[ELF BARREL]
+ - Slight decrease to wake up and unfold time.
+ - Projectile datablock was missing a emitter parameter, which spammed console.
+   (ELFBarrelLarge.cs)
+
+[MISSILE BARREL]
+ - Slight decrease to time projectile detonates.
+ - Corrected labels for sound datablocks.
+ - Projectile sped up.
+   (missileBarrelLarge.cs)
+
+ - Prevent missile barrels from being controlled, which prevents long range 
+   missile fire on enemy targets that can't be distracted by flares.
+   (serverCommanderMap.cs)
+
+[MORTAR BARREL]
+ - Slight decrease to time projectile detonates.
+ - Projectile velocity and max range increased to match hand mortar.
+ - Projectile doesn't float in the air as much.
+ - Explosion radius slightly reduced.
+ - Slight decrease to wake up and unfold time.
+ - Increased targeting radius from 160m to 400m.
+   (mortarBarrelLarge.cs)
+
+[PLASMA BARREL]
+ - Increased damage.
+   (plasmaBarrelLarge.cs)
+   (damageTypes.cs)  
+
+ - Increased projectile velocity.
+ - Decreased time projectile exists.
+ - Reduced targeting radius from 150m to 120m.
+ - Slight decrease to wake up and unfold time.
+   (plasmaBarrelLarge.cs)
+
+[DEPLOYABLE TURRETS]
+ - Slight decrease to wake up and unfold time.
+   (outdoorDeployableBarrel.cs)
+   (indoorDeployableBarrel.cs)
+
+ - The number of turrets that can be deployed within an area was increased by
+   one.
+ - The range deployable turrets can be placed near each other was slightly
+   reduced.
+   (deployables.cs)
+
+ - Fixed turret ownership issues when player switches teams or leaves the game.
+   (player.cs)  
+
+
+===============================================================================
+=                                 VEHICLES                                    =
+===============================================================================
+[ALL]
+ - Changed display of Vehicle Station HUD and how quick-key purchase operates.
+   The Vehicle purchase HUD will remain up until the player leaves the station, 
+   allowing them to make another selection.
+ - Added a check to see if a player is in a inventory station when teleporting 
+   to a vehicle. This prevents boarding a vehicle with an illegal armor type, 
+   such as heavy armors piloting Grav Bikes.
+   (serverVehicleHud.cs)
+   (station.cs)
+
+ - Players in a multi-player vehicle will receive a message when someone enters
+   that vehicle.
+   (player.cs)
+   (serverVehicleHud.cs)
+
+ - Fixed vehicle ghosting bug from stopping players.
+   (player.cs)
+
+ - Lingering time for destroyed vehicles reduced from 2 to 1/2 a second.
+ - Console spam fixes.
+   (vehicle.cs)
+
+ - Sensors from all vehicles are shown on Command Screen, not just the shrike.
+   (vehicle_bomber.cs)
+   (vehicle_havoc.cs)  
+   (vehicle_mpb.cs)
+   (vehicle_tank.cs)
+   (vehicle_wildcat.cs)
+
+ - Fixed reticle problems.
+   (serverCommanderMap.cs)
+
+ - Fixed a target naming bug for vehicle stations.
+   (station.cs)
+
+ - Rewrote vehicles station code to fix a energy bug that would show
+   the station being powered when it wasn't.
+   (station.cs)
+
+[BOMBER]
+ - The Bomber turret barrels state references in image datablocks were
+   mislabeled and caused console spam (fixed) and possibly screwed up rate of
+   fire.
+ - Kickback from bomb explosion is stronger.
+ - Added gravityMod to bomb projectile to compensate for gravity change since
+   engine bomber HUD drawing code wasn't changed, as it should have been.
+ - Turbo thruster is slightly stronger.
+ - Maximum speed is slightly higher.
+ - Vertical thruster is slightly stronger.
+   (vehicle_bomber.cs)
+
+ - Bombers no longer do back flips when damaged.
+   (projectiles.cs)
+
+ - Added bombing reticle to pilot seat of bomber
+   (clientOverloads.cs)
+
+[GRAV BIKE]
+ - Shield is weaker vs. weapon fire.
+ - Maneuvering thruster is stronger.
+ - Turbo thruster is stronger, resulting in higher speeds.
+   (vehicle_wildcat.cs)
+
+ - Added a Chaingun to nose.
+   (vehicle_wildcat.cs)
+   (defaultGame.cs)
+
+[HAVOK]
+ - Maneuvering thruster is stronger.
+ - Turbo thruster is stronger, resulting in higher speeds.
+ - Max speed increased.
+   (vehicle_havoc.cs)
+
+[MPB]
+ - Spawns a bit higher on vehicle pad to prevent it from being dry docked.
+ - Turbo thruster is stronger, resulting in higher speeds.
+   (vehicle_mpb.cs)
+
+ - Fixed exploit that allowed concussion grenades to propel the MPB into the
+   sky.
+   (projectiles.cs)
+
+ - Fixed bug that was displaying MPB sensor in middle of map on the command 
+   screen instead of origin of MPB.
+   (weapTurretCode.cs)
+
+ - The minimum range the MPB can be deployed from buildings and turrets was
+   significantly reduced.
+   (vehicle.cs)
+
+ - Added MPB teleporter.
+   (serverVehicleHud.cs)
+   (vehicle.cs)
+   (CTFGame.cs)
+   (defaultGame.cs)
+   (mpbTeleporter.cs)
+   (SiegeGame.cs)
+   (station.cs)
+
+ - MPB Turret is modular.
+   (vehicle.cs)
+   (turret.cs)
+
+[SHRIKE]
+ - Vertical thruster is slightly stronger.
+   (vehicle_shrike.cs)
+
+[TANK]
+ - Stronger air cushion.
+ - Slightly higher speed before tank takes ground collision damage.
+ - Maneuvering thruster is stronger.
+ - Turbo thruster is stronger, resulting in higher speeds.
+ - Projectile velocity sped up a bit due to higher gravity. Maximum range
+   is approximately 450 meters.
+   (vehicle_tank.cs)
+
+
+===============================================================================
+=                            VEHICLE STATION                                  =
+===============================================================================
+- Updated version of Zear's ministation.cs. That script allowed vehicle 
+  stations to be scaled and moved. We updated it to accommodate the changes we
+  made to the vehicle station code.
+  (minivstationx.cs)
+
+- Added targetTypeTag to StaticShapeData(StationVehiclePad) datablock,
+  which should be there.
+  (station.cs)
+
+
+===============================================================================
+=                                 WEAPONS                                     =
+===============================================================================
+[CHAINGUN]
+ - Bullet spread is slightly tighter.
+ - Does a tiny bit more damage.
+ - Bullets travel a bit faster.
+   (chaingun.cs)
+
+[DISC]
+ - Projectile speed is slightly faster in and out of water.
+ - Disc inherits more velocity from the firing player.
+ - Discs skip off of water at angles of 20 degrees or less.
+ - Disc spread removed.
+ - Discs do slightly more damage to heavy armors.
+   (disc.cs)
+
+ - Increased explosion kickback. The kick is greater increase when damaging 
+   self, which allows for stronger disc jumps.
+   (disc.cs)
+   (projectile.cs)
+
+[ELF]
+ - Increased range from 37 to 38.
+   (ELFGun.cs)
+
+[GRENADE LAUNCHER]
+ - Projectile inherits more velocity from firing player.
+ - Projectile is slightly faster.
+ - Projectile doesn't float in the air as much.
+ - Slight decrease to the projectile detonation time.
+   (grenadeLauncher.cs)
+
+[MINE]
+ - Inherits more velocity from the throwing player.
+ - More arc when throwing mine ammo.
+ - More power when throwing mine ammo.
+   (weapon.cs)
+
+ - More arc when thrown.
+ - Mine are always thrown at maximum force. Variable throwing power was
+   removed.
+   (inventory.cs)
+
+ - Fixed a check to see if mines are banned.
+   (inventoryHud.cs)
+
+ - Mines can be detonated as soon as they're thrown, AKA "mine discing".
+ - Fixed a bug that would forget to decrement the mine count for each team.
+   This would eventually prevent a team from deploying any mines, even if
+   they didn't have any deployed.
+   (weapTurretCode.cs)
+
+ - Raised mine limit to from 20 to 25.
+ - Tiny increase to damage.
+ - Small decrease to kickback. 
+ - Slight increase to detonation range.
+ - Mines do slightly less damage to static shapes.
+   (mine.cs)
+   
+ - Added a key-bind for "Max Throw Mine" which will throw a mine at 
+   maximum throwing range.
+   (clientOverloads.cs)
+   (inventory.cs)
+
+[MISSILE LAUNCHER]
+ - Missile duration is slightly longer.
+ - Maximum missile projectile velocity increased.
+ - Minimum heat to lock onto a target changed to match Missile Barrel.
+   (missileLauncher.cs)
+ 
+ - Players can no longer rapid-fire missiles.
+   (projectiles.cs)
+   (defaultGame.cs)
+
+[MORTAR]
+ - Slight decrease to time mortar projectile detonates.
+ - Explosion radius slightly reduced.
+ - Projectile velocity sped up a bit due to higher gravity, but still has same max range.
+ - Projectile doesn't float in the air as much.
+   (mortar.cs)
+
+ - Players can no longer rapid-fire mortars.
+   (projectiles.cs)
+   (defaultGame.cs)
+
+[PLASMA]
+ - Slightly faster plasma projectile.
+   (plasma.cs)
+
+[SHOCKLANCE]
+ - Increased kickback.
+ - Increased maximum hit range to 16m.
+ - Minimum energy required to fire changed from 15 to 3.
+   (shockLance.cs)
+
+ - Added chat messages for rear ShockLance hits.
+   (deathMessages.cs)
+   (projectiles.cs)
+   (CTFGame.cs)
+   (defaultGame.cs)
+   (PracticeCTFGame.cs)

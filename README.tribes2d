@@ -1,0 +1,108 @@
+
+                             Tribes 2
+                        Linux Dedicated Server
+                           March 16, 2001
+
+
+       TABLE OF CONTENTS
+
+       1 System Security
+       2 System Requirements
+       3 Starting the server
+       4 Troubleshooting
+       5 Contacting Loki Software, Inc.
+
+This dedicated server for Tribes 2 has been brought to you by
+Loki Software, Inc.
+
+The Linux client for Tribes 2 is available as a separate product
+from Loki Software, Inc., and can be obtained from your local software
+reseller or online at: http://www.lokigames.com/
+
+
+-------------------
+(1) SYSTEM SECURITY
+-------------------
+
+As with any other internet service, it is possible that the Tribes 2
+dedicated server contains security weaknesses.  For this reason we
+recommend that you never run this software on a system that contains
+sensitive data or behind a firewall that protects a secure network.
+
+
+-----------------------
+(2) SYSTEM REQUIREMENTS
+-----------------------
+
+  Linux kernel version 2.2.X or 2.4.X
+  Pentium 300 or faster
+  32 MB RAM required (64 MB recommended)
+  Hard disk drive with 500 MB of available space
+
+
+-----------------------
+(3) STARTING THE SERVER
+-----------------------
+
+The Linux version of the game includes a dedicated server which does not
+require you to log in or even use a graphical display.  The binary is called
+"tribes2d" and resides in your TRIBES 2 installation directory.  To run the
+standalone dedicated server, pass it the "-dedicated" command line option,
+followed by the name of the first map, and the type of game to run.
+
+For example, to start a game of Capture The Flag on the Katabatic map, you
+would do the following:
+
+	Log in as the user you created to run Tribes 2
+	cd /path/to/installed/game
+	./tribes2d -dedicated Katabatic CTF
+
+The first time the dedicated server runs, it will create the directory
+~/.loki/tribes2 and place default configuration files there.  You can
+customize the advanced server settings by editing the file
+~/.loki/tribes2/base/prefs/ServerPrefs.cs
+
+You can specify the number of bots to run on the command line by using
+the -bot N command line option.
+
+For example, to use the default map and game type with 10 bots, you 
+would do the following:
+
+	cd /path/to/installed/game
+	./tribes2d -dedicated -bot 10
+
+If for some reason the server is crashing frequently, you can use the
+script "tribes2d-restart.sh" to automatically restart the dedicated
+server.  This script will also look for updates on the internet when
+it starts, to keep your server up to date.
+
+
+-------------------    
+(4) TROUBLESHOOTING    
+-------------------    
+The following are some of the more common problems you might have, and
+recommended solutions:
+
+A) I logged in to the account for the Tribes 2 server, but I can't
+   update the game!
+
+   You probably installed the game as root.  Make sure that you are
+   logged in as the user you installed the game with to run loki_update.
+
+
+----------------------------------
+(5) CONTACTING LOKI SOFTWARE, INC.
+----------------------------------
+
+For information about this and other products, visit our website at:
+http://www.lokigames.com/
+
+Technical support is available from Loki Software, Inc. at:
+
+    FAQ:      http://faqs.lokigames.com/
+    Website:  http://fenris.lokigames.com/
+    Email:    support@lokigames.com
+    Telephone support is available for the Linux client.
+
+You can also communicate with other Tribes 2 enthusiasts at:
+Usenet:   news://news.lokigames.com/loki.games.tribes2

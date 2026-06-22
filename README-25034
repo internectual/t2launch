@@ -1,0 +1,747 @@
+
+This is the Tribes 2 Linux 25034 update.
+
+This update features content from the Tribes 2 Re-Release Update,
+adding two original game types, new maps, and updates to address
+numerous performance issues.
+
+The first new game type, Team Rabbit 2, focuses on acrobatic maneuvers
+and sports-style action.  For more information on Team Rabbit 2, take
+a look at Inside_Team_Rabbit_2.txt
+
+The second new game type, Tribes 2 Classic, adds increased speed and
+intensity to the classic Tribes gametypes.  For more information on
+Tribes 2 Classic, take a look at classic/classic_readme.txt
+
+
+Changes for 25034:
+========================
+
+Fixed AMD Win32 Dual CPU timing bug
+Added gravity to demo recordings
+Fixed CPU control state in a couple more places for deterministic simulation
+Merged many script fixes
+
+
+Changes for 25026:
+========================
+
+Mission Editing Tools
+===================================
+The Torque Game Engine mission editor has been back-ported to Tribes 2.  The new editor offers numerous interface enhancements and improved functionality.  For more information on how to use the new mission editor, press <F1> in the editor.
+The Interior inspect apply has been fixed to properly update position and scale of interiors.
+
+Gameplay-related Changes
+===================================
+Team repair message spam fix
+Fixed static shape crediting bug in CTF
+Added script hooks for death types
+Added crew name position for other players on vehicle
+Fixed adminlist bugs
+Fixed periodic camera jerks
+Added export/import named selections to Mission Editor
+Fixed bug where vehicle station was saving in mission improperly
+Added MissionCleanup to the mission group in the mission editor for viewing dynamic objects
+Fixed underwater color bug
+Object builder now drops objects correctly in the world
+Flags no longer stick to mission area boundaries
+Deploy object check better for organics
+Hard editor bind to F11 removed
+Players no longer damaged by destroyed vehicles (thanks script folks!)
+NetConnection now reports netgraph properly when simulated ping and packet loss are set
+Terraformer bitmap export working properly
+Options dialog no longer has News or Forums load screen selections
+Fixed bug where players would stop receiving updates from server
+Triggers now export properly
+Fixed up selection sync'ing between object list and world editor view
+Added delete group ability
+Changed netConnection's update to reflect old method of packet send timing
+Tweaked the ELF back up a bit per request from ChrisM
+Fix for telnetConsole crash
+Fix to get time console function
+Fixed state for math copro during update loops for proper object synch
+Flag hovering over friendly players fixed (z & Z)
+Fixed lingering repair projectile
+Incorrect image datablock parameter value fixed for ELFBarrelLarge (z & Z)
+Fixed FPS slowdown from multiple damage/flash overlays 
+<NULL> string bug fixed
+Tank lighning kill UE fixed
+disc spread removed, discs now fire to center of reticle
+ELF has been significantly nerfed
+Trigger delay on weapon fire gone
+Players and vehicles should no longer get randomly yanked around during play (net hitches)
+ELF projectile now properly removed when target is destroyed (z & Z)
+Added QueryPerformanceCounter high resolution timer to fix FPS slowdown bug
+Fixed console spam in CTF games (z & Z)
+Fixed objective HUD updating in CTF (z & Z)
+Fixed deploy objects inside other shapes exploit (z & Z)
+Mines are now checked for mission ban list in inventory (z & Z)
+Turret owner now properly reset on client drop or team change (z & Z)
+Vehicle reticle disappearance bug fixed (z & Z)
+Multiple station bugs fixed (z & Z)
+Fixed missing ammo globals (z & Z)
+Fixed unlimited grenade exploit (z & Z)
+Fixed satchel charge pack bug (z & Z)
+Fixed incorrect image datablock parameters in turrets and bomber (z & Z)
+
+Scripting-related Fixes and Additions
+===================================
+Added package script fix for Parent chaining on package deactivate (z & Z)
+Added formatTimeString() script command (Thanks Bryan Ross!) 
+Fixed controlDefaults trigger bugs (thanks z0dd!) 
+Fixed message.cs to allow clients to do ~w voice binds 
+setGravity() and getGravity() functions for setting gravity from script added
+Added noFrictionOnSki parameter to player datablock for T1-like skiing
+Moved the execution call to message.cs to an earlier spot in console_end.cs for scriptors (z & Z)
+
+Admin-related Fixes
+===================================
+Added script notification when a telnet client is added (z & Z)
+Fixed remote eval security hole in admin.cs 
+SAD, Admin and Super Admin lists now export (z & Z)
+Tourney mode team pick bug fixed (z & Z)
+
+T2TV-related Fixes
+===================================
+Fix for T2TV shared read/write
+Fixed zipSubStream to properly write out final blocks on demo streams (for T2TV) 
+
+Misc. Changes and Fixes
+===================================
+News and Forums shell pages removed
+Added GG splash screen logo 
+IRC client crash UE fixed (with improper tags)
+
+
+Changes for 24834:
+========================
+
+Linux Changes
+===================================
+The network status window will display the net stats now.
+
+Map Editor
+===================================
+Several editor crashes have been resolved and this tool should be more stable for the MOD community now.
+
+
+VCR Mode
+===================================
+The VCR Mode has been implemented.
+
+F3 starts recording.  F4 stops the current recording.  Multiple recordings can be made from the same mission.
+
+Other controls can be used while playing back a recording. They include:
+
+   -- ESCAPE will stop the playback
+   -- TAB will pop up the playback controls window in the upper part of the screen
+   -- SPACEBAR will pause/unpause the playback
+   -- Numpad + will increase the time step so that the playback accelerates (maximum of 16X speed)
+   -- Numpad - will decrease the time step so that the playback slows down (minimum of 1/16X speed)
+
+Satchel Charge Icon Glow
+===================================
+When the satchel charge is deployed and ready to explode, the icon now glows. The icon disappears completely when the satchel is destroyed (either through activation or destruction). This allows players to more readily keep track of satchel charge status.
+
+"Visibility" option for Server Admins
+=====================================
+Allows an Advanced Server option to indicate whether the server will use the "Speed" or "Distance" versions of the maps when hosting games. The "Distance" setting will use world versions with much less fog and more visible distance. The "Speed" setting will use the current foggier map settings. These settings will be displayed as a new column on the Master Server List titled "VISIBILITY" and the settings will be "Speed" or "Distance".
+
+NOTE: This visibility change won't be apparent on all maps. A map you can use as a test to show the differences is "Dessicator".
+
+World Skins Default to Main Tribes
+==========================================
+The missions are now set up so they have default skins other than "Storm" vs. "Inferno". This occurs whenever a player has "Show Individual Skins" toggled OFF. In otherwords, some maps will have "Diamond Skin" vs. "StarWolf", while others will have different combinations. (NOTE: If a player has "Show Individual Skins" toggled ON, then he will see the regular individual skins for players.) New voice samples have been added to allow Victory messages indicate these new team skins. Also note: Bioderms are bioderms, regardless of the team they are on...we're not changing models or voice packages.
+
+Teams now use skins for CTF games relative to the planet - as follows:
+Terrain 	Team 1 		Team 2
+Ice  		Starwolf 	Blood Eagle
+Lush  		Blood Eagle 	Diamond Sword
+Badlands 	Starwolf 	Diamond Sword
+Desert  	Phoenix 	Blood Eagle
+Lava  		Diamond Sword 	Phoenix
+
+If the server admin wishes to specify team skins, set the variable
+$host:: useCustomSkins = true;  in serverPrefs.cs
+
+if this variable is set true the skins and names used are
+$Host::TeamName1 and $Host::TeamName2  and 
+$Host::TeamSkin1 and $Host::TeamSkin2  also set in serverPrefs.cs.
+These team and skin names are always used for non-CTF games.
+
+NOTE: In "Tournament" mode games, the skins will always default to Storm and Inferno rather than world-specific skins. This is to make it easier for League and Ladder players to assign teams to sides.
+
+Cheat Fixes
+===================================
+Significant cheat prevention code has been implemented to eliminate known cheats, as well as to make it much more difficult for future cheating of a similar nature to occur.
+
+NOTE: If you have any troubles running a server now, you may have altered or removed something from the build on your server. The code is checking almost everything now (shapes, textures, etc.), so you should ensure that you have all files present from a normal build on your server. (Additional files, like MODs and extra art files won't be a problem...but all original files must be there as well.)
+
+Siege Halftime Improved
+===================================
+The Siege halftime now gets a screen listing the winning team instead of simply "Switching Sides".
+
+CTF Individual Scoring
+===================================
+No change was made whatsoever to the team CTF scoring. But the individual scoring now takes into account vehicle kills, more repair/destroy stuff, and makes it nice and robust for statistical tracking later. NOTE: The scores are dramatically inflated compared to previous individual scores so that we had more "granularity" in the system and didn't have to use decimal points. Thus, you will appear to be racking up a huge amount of points, but it's all relative when compared to other players in the game.
+Scoring Details
+----------------------
+Kill: 10 pts
+Flag Capture: 30 pts
+Flag Grab (if subsequently captured): 20  [A one player grab-and-cap you get both for a total of 50]
+Carrier Escort: 3
+Sniper Headshot: 1
+Turret kill:  manned: 10  automated: 3
+Flag Defend: 5
+Flag Carrier Kill: 5
+Flag Return: 0 - 10 pts [Points are scaled by distance: no points for a short return. 10 pts if the flag carrier gets all the way to the flag. 1 point per 10% (Halfway is 5 pts.)]  15 points if the return breaks a stalemate (both teams have had each others flags for 60 seconds or longer.)
+Generator Defend: 5 pts
+Object			Destroy				Repair
+Generator		10				8
+Sensor			4				1
+Base Turret		5				4
+Inv Station		2				2
+Vehicle Station		5				4
+Solar Panel		5				4
+Sentry Turret		4				2
+Deployed sensor		1				0
+Deployed inv station	2				0
+Deployed turret		3				3
+Shrike			5
+Bomber			8
+Havoc			5
+Wildcat			5
+Tank			8
+MPB			12
+*vehicles destroyed by mines are double points, vehicles destroyed by the Shrike are triple points
+**vehicles destroyed also score 2 points per passenger (after any multiplier)
+***points accumulated in a vehicle are earned by everyone in the vehicle
+
+
+Heat Lock vs. Target Laser Lock
+===================================
+Heat Locking now supercedes Targeting Laser Locking so that heat locks can be attained on objects that are being lazed by friends. Keep in mind that when the target is out of range for the ML, it will still lock onto the targeting laser giving the appearance that its locking onto the laser first. If the target is in range the ML will always look for heated targets first.
+
+Objective HUD Visible on Vehicles
+===================================
+The objective HUD is now visible while flying/driving vehicles.
+
+Client-Side Toggle on Vehicle Tport
+===================================
+The player now has the ability to toggle Vehicle Tport ability on/off (defaults to ON) as a client-side option in SETTINGS/GAME.
+
+EAX Sound Improvements
+===================================
+EAX environmental sound reverbs have been included for underwater and interiors. Those sounds will only be heard when using EAX or EAX2 drivers. (We recommend EAX for best results.)
+
+Vehicles Parking on Flags
+===================================
+"Anti-Parking" code has been added to flags similar to the "anti-camping" code around a Nexus in Hunters. This results in vehicles taking damage over time when they are parked near a flag, eventually resulting in their destruction if left there too long.
+
+Aiming Up and Down
+===================================
+The restrictions on aiming up and down have been virtually removed for all armors. NOTE: This will result in situations where your weapon can clip through the leg of your armor when looking straight down. If this bothers you, then change your graphics setting to "Items Only" so that your body is not drawn when in first-person perspective. 
+
+Jetpower for Suits
+===================================
+Scout jetpower (power of thrust) was reduced to previous levels, but their maximum speed velocity was increased somewhat. This removes the "butterfly" effect, but allows slightly faster skiing than previously allowed. Additionally, air resistance was reduced by 33% on all armors to further reduce the "floaty" feel. This also allows slightly faster speeds across the board.
+
+Splash Damage
+===================================
+Splash damage on shots was reduced slightly. It is still much more powerful than when the game was released, but this change makes mortars and grenades more playable.
+
+Shrike Speed
+===================================
+The Shrike thrust was returned to normal, making the Shrike very responsive again. A new maximum speed cap has been added to prevent it from going too fast, but the performance improvement on this vehicle is significant.
+
+Mine Damage
+===================================
+Mine damage was reduced slightly to prevent Lights from being one-shotted by stepping on a mine. They will still be severely harmed, but won't go from 100% health to dead in one shot.
+
+Missile Launcher
+===================================
+The Missile Launcher range had been inadvertently reduced during the reticule improvements a few patches back. It has now been increased back to its original design. Range is now 400m.
+
+Heat Signature Fall Off
+===================================
+Heat reduces *very slightly* slower than it did previously. Players can still easily manage their heat signatures, but must be a bit more paranoid of missile launchers now (thus making it a bit easier for high-ping players to use this weapon).
+
+Suit Mortars vs. Tanks
+===================================
+The strength of hand-held mortars versus Tanks was incorrectly weak. It has now been increased so that it is much more useful.
+
+Shrike Gun Changes
+===================================
+The Shrike blasters have been moved out to the wing joints to allow easier strafing of objects. Additionally, there is some (very minor...one degree of spread) projectile spread on the blasters now to make strafing easier. (For comparison purposes, the chaingun has eight degrees of spread.)The range of the blasters was incorrectly enormous and has been reduced to a balanced distance (slightly outside the range of hand-held missile launchers).
+
+Water Movement
+===================================
+Speeds in water have been greatly increased so as to make water a more viable playing environment.
+
+Whiteout Grenades
+===================================
+A maximum saturation has been defined for the Whiteout grenades to keep your "whiteout" time to no more than two seconds.
+
+OOB Grid
+===================================
+The mission boundary is now visually defined. As you approach a mission boundary, and "out of bounds grid" will fade into existence. If you go past the boundary, the grid will not fade out until you return inside the mission area. This is done to make it easier to avoid getting a flag stripped or getting damaged due to OOB damage. This visual option can be toggled OFF in your Game Settings area (option button is called "Show Out of Bounds Grid").
+
+Wildcat Grav Bike
+===================================
+"Suspension" has been added to the Wildcat making it easier to control over rough terrain.
+
+Air Drag
+===================================
+Air Drag has been reduced making the game feel "faster".
+
+Flight Ceiling limited for Shrike
+===================================
+If you fly past the flight ceiling then you will lose your jetting and thrusting ability. Angle your nose down (when you are above the flight ceiling) and thrust will function normally.
+
+"Unassigned" Team
+===================================
+This bug allowed a person to join as "unassigned" and view all friend/foe triangles as grey. It has been fixed.
+
+<Null> and random string issues
+===================================
+There is a finite number of network strings available, the single quote strings. This problem occurs when all strings have been allocated. This is particularly common with mod servers, which appear to be allocating too many net strings. Mod and script developers need to be cautious when creating new strings. Don't create dynamic net strings unless you have a firm understanding of the implications. If a string is added using "AddTaggedString" make sure that there is a corresponding "RemoveTaggedSting" call when the string is no longer needed. Also be sure to limit the number of imbedded strings in your scripts. 
+
+
+Changes for 23669:
+========================
+
+- (bug fix) Linux servers now load preferences from the specified $serverprefs instead of prefs/ServerPrefs.cs
+
+- (bug fix) Flying vehicles now float to the ground normally on Linux servers.
+
+- (bug fix) Vehicles and deployables now properly explode if they are destroyed while someone is repairing them.
+
+- (bug fix) Sniper laser shots no longer create water splash effects if hitting ground near the water.
+
+- (bug fix) The "flag jumping" bug is now fixed. When a flag lands after being dropped, it will stay put when it slides to rest.
+
+- (bug fix) Fixed a situation where closing tribe or player tags on the Browser out of order would cause a disconnect with the database server.
+
+- (bug fix) Players can no longer fire, place mines, place grenades, or place beacons when inside a force field.
+
+- (bug fix) Fixed bug where modifier keys (specifically SHIFT) bound to actions in the game would still cause those actions when typing in a text edit control in-game (such as the chat entry)
+
+- (bug fix) Fixed a bug that could cause a player to drop to desktop when attempting to join a game which was in the process of cycling missions.
+
+- (bug fix) Fixed a Radeon video card issue which could occur if the desktop color bit-depth was different than the color bit-depth that the player was using in the game.
+
+- (bug fix) You won't try to fade into a vehicle that was destroyed after you purchased it, but before you had actually tported to the seat.
+
+- (bug fix) Minor change in the MPB explosion so that the turret part of the MPB doesn't seem to hover in place for a split-second during the explosion.
+
+- (bug fix) Bomber bombs now tumble properly and won't seem to disappear when falling.
+
+- (bug fix) Fixed a rare problem that could cause a client crash while the server is resetting.
+
+- (bug fix) Fixed a problem with the ELF gun effect that was causing hangs.
+
+- (bug fix) Telnet can now be used to set passwords for PURE servers so that they can be used for match games. (command line option...see the post in T2FAQs called "How do I TELNET INTO A PURE SERVER?" for more information on how to use this ability.)
+
+- (bug fix) The "cloning" issue (where players could clone themselves by dying, going to the CC with the CC camera showing themselves, spawn, and flicker back and forth to the CC) is now fixed and no longer occurs.
+
+- (bug fix) Another "cloning" issue which occurred when the Tourney Admin would switch teams for players is fixed and no longer occurs.
+
+- (bug fix) Fixed a bug where, when a client joins a server where the client does not have the map being run on the server, the client hangs while loading. This now elegantly exits instead of hanging.
+
+- (bug fix) Fixed an issue where the last few characters of the Server Info dialog would be cut off.
+
+- (bug fix) Fixed a situation where a blank error box could occur if CD key not entered properly when creating an account.
+
+- (bug fix) Sensor rings will no longer show up on the Command Circuit if the generators are not powered.
+
+- (bug fix) There was a rare bug where, if a player was standing in a force field's position when that force field went from a depowered to powered state (in otherwords, if the gens were repaired while he stood in the FF position), then the player would be stuck forever. If this case occurs, that player will now be destroyed.
+
+- (improvement) The "redjack" icon has been removed and new network throughput graphs have been implemented to better help players troubleshoot their net settings. Additionally, a more accurate and complete set of network presets is available. (See the section "NETWORK SETTINGS" in the file "README.network" for more information.)
+
+- (improvement) The pure server concept is now implemented. Pure servers only allow regulation scripts and maps to be run on the server (no restrictions yet on the client), thus ensuring that anyone that joins a "base" server is playing the game as it was designed by Dynamix. MODs are still easily joined, but players can be assured that a "Base" game is really a "Base" game now. (Any game with server or rules mods that is not actually named as a new MOD will be described as "variant" instead of "base" on the master server list.) NOTE: See the section "PURE SERVER" in the file "README.network" for more information on this.
+
+- (improvement) Old Password is now required in order to enter a New Password when editing your account.
+
+- (improvement) Password handling is different now in order to make it more difficult for people to casually find a password on a hard drive.
+
+- (improvement) Made more room for player names to display on the Server Info box.
+
+- (improvement) Bomber and Tank now have separate energy capacitors for their turret weapons. This energy pool is completely separate from the energy pool that the thrusters and force shields use. (Gunner energy is displayed as a second bar below the regular vehicle energy and is orangish in color.)
+
+- (improvement) Vertical thrusters on air vehicles are now more efficient to enable better takeoffs from ground level.
+
+- (improvement) Changed team damage OFF to include friendly turret fire and vehicle fire. (In otherwords, if Team Damage is OFF, then turrets fire and vehicle fire will not affect friendly units.)
+
+- (improvement) Splash damage no longer falls off so dramatically with distance. You will find that area effect (explosion) weapons now are more effective within their damage area.
+
+- (improvement) While in Tournament mode, and while in observer mode at the beginning of a match (before teams have been selected), players will now be able to chat with one another.
+
+- (improvement) Added observer points to Tombstone (it previously had none).
+
+- (improvement) Grenades tossing is slightly improved. The grenades will throw farther with less time spent pressing the grenade key. (They still have the exact same minimum and maximum throwing distances, it's just easier to throw it out to max range now.)
+
+- (community) Player histories are now accurate.
+
+- (community) Preferences in the FORUMs should be fixed now so that they stay in existence. The sort is the only exception. That will reformat each time you enter the FORUM and you will need to select whichever sort your prefer at that time.
+
+
+Changes for 23115:
+========================
+
+- (bug fix) The ALT key no longer sticks when toggling fullscreen mode under Linux.
+
+- (bug fix) Fixed an authentication hole that allowed arbitrary IP connections to a LAN server.  The policy now is: LAN servers will disallow any connections from IP addresses that do not match the Class B network address of the server (or match one of them, in a multihomed server).  So if your server's address is 12.13.14.15, clients from 12.13.*.* will be considered, but clients from 12.12.*.* will be immediately rejected.  In addition, a LAN server will only allow 4 unique Class C ids at any one time.  This should be sufficiently lenient for even the largest LAN parties, but should eliminate the auth hole.
+
+- (bug fix) Fixed a server crash on mission change when the last human player leaves the game in mid cycle.
+
+- (bug fix) Fixed a bug that could reset your Shape Detail setting to max
+
+- (bug fix) Client join message name correction
+
+- (bug fix) All known in-game Chat HUD bugs are fixed (partial lines from paging up/down and resize issues, etc.).
+
+- (bug fix) Infinite missile lock-on sound bug is fixed. Dead. Finito. No more. Pushing up the daisies.
+
+- (bug fix) Stitched up a hole associated with one of the base shapes. Small fry compared to the memory leaks.
+
+- (bug fix) Found a particle crash issue and plugged it up good.
+
+- (bug fix) Fixed a shield impact internal compile error that was crunching frame rate.
+
+- (bug fix) Turns out we tweaked it so inventory stations were counting as turrets for turret placement purposes. D'oh. Fixed.
+
+- (bug fix) A rare crash that occurred with the Radeon VE card has been resolved.
+
+- (bug fix) Fixed a crash that could occur when a flare grenade was released when inside a force field.
+
+- (bug fix) Deployable turrets (spider and spike) and Deployable inv stations now do damage in their explosion when they are destroyed.
+
+- (optimization) The following missions were refined in order to optimize framerate:
+	Alcatraz
+	Caldera
+	Flashpoint
+	Gauntlet
+	IceBound
+	Insalubria
+	Overreach
+	Respite
+	Sirocco
+
+- (optimization) Adjusted the LOD of the logo projectors found in CnH missions.
+
+- (optimization) Changed object shield shapes from the form-fitting forcefields into a less poly-intensive dome effect. Also gave shields a lower memory profile.
+
+- (optimization) Changed the way the clouds' planes are clipped. Sky's the limit, right?
+
+- (optimization) Missile sound script calls moved from script into code for faster processing.
+
+- (memory leak) Fixed a large memory leak. This plus the other leaks mentioned here should finally put the nail in the coffin on the "degrading server performance" issue.
+
+- (memory leak) Fixed a memory leak associated with the pretty lightning effects on maps like Casern Cavite.memory leaks:
+	
+- (memory leak) Fixed a memory leak in our fancy text list control and the gui text list.
+	
+- (memory leak) Fixed a memory leak involving memory use and resource allocation.
+
+- (improvement) Targeting laser prediction should be better now.
+
+- (improvement) You can specify a server's IP address manually at the join screen
+
+- (improvement) You can now specify "-password <pw>" on the command line to join a server that requires a password.
+
+- (improvement) Heavy armors are tougher against snipers. You now require four headshots or five body shots to kill a Juggernaut with a laser rifle.
+
+- (improvement) Footspeed of all armors increased slightly, as well as a minor boost to jetpack performance. Some improvements made to air resistance for mediums and heavy armors (very subtle).
+
+- (improvement) The jetpack effect was reverted back to the old effect (by popular demand).
+
+- (improvement) A Chat HUD message has been added that is displayed whenever you try to deploy a mine, but your team's maximum number of mines has already been deployed. Previously, the mine would just blow up and not explain why it detonated. Now, it still blows up, but tells you why it happened.
+
+- (improvement) Polished up the health meter on the HUD so when you're still alive, it displays a visible sliver of positive health.
+
+- (improvement) Made framerate and gameplay changes to Caldera. The attackers' base has been moved farther from the defenders, and the switch has been put in one of the upper chambers, while the stations are located separately from the generators. The changes should fix a serious defensive advantage.
+
+- (improvement) After you buy a vehicle, you now fade into the driver's seat if your armor and pack make you an eligible pilot/driver.
+
+- (improvement) Added a "rogue" mine message so that if you are killed by a mine laid by someone who has left the building, the death message is more accurate.
+
+- (improvement) Increased speed of belly turret projectiles so that it is more effective in general (especially for air defense).
+
+- (improvement) Modified name tags of vehicles when you place your reticle over them. Names are now more consistent and descriptive.
+
+- (improvement) Missile and AA turrets now have a longer maximum range (you'll still need to deploy sensors to get this added range, but they can fire farther if you do). They also react more quickly to available targets.
+
+- (community) The "compose email", "forum post", and "news submission" windows are now resizable and movable.
+
+
+Changes for 22755:
+========================
+
+- (optimization) Damage Decal toggle applies to ALL damage decals now. This improves performance on video cards with lower VRAM. Those cards should turn this feature OFF for best gameplay.
+
+- (optimization) Dynamic lighting now fades with distance so that systems do less calculations on lights that make little or no difference anyway.
+
+- (optimization) The following missions were edited/revised in order to achieve much higher framerates in-game. They are:
+        Death Birds Fly
+        Dust to Dust
+        Recalascence
+        Reversion
+        Riverdance
+
+- (optimization) There is now a PARTICLE DENSITY slider on the GRAPHICS menu that allows you to turn down the number of particles used in explosions and weapon effects. Systems with low VRAM should turn this down as low as possible. The effects will still look good, but will use many less polygons and alpha translucencies.
+
+- (optimization) The force shield effect on players and objects has been greatly simplified. The old effect was hammering the frame rates on older video cards when played. This new effect greatly speeds gameplay on all cards, and particularly on Voodoo cards.
+
+- (memory leak) Memory leaks were located and eradicated. This most likely was the cause of the "degradation over time" that folks were experiencing on their servers.
+
+- (bug fix) "Vote Spamming" has been prevented in-game.
+
+- (bug fix) Moved some of the CD check from script into code, where it should be.
+
+- (bug fix) The "sticking" mouse button problem is now fixed.
+
+- (bug fix) Deployables are now easier to place on walls and other surfaces. There were some inconsistencies on which surfaces could be placed upon and those are now resolved.
+
+- (bug fix) There was a bug that prevented users from deleting some Server Filters. That is resolved now.
+
+- (bug fix) There was a Siege bug where a base item (like a turret) could be destroyed, and then repaired, but it would no longer receive power after being repaired. That is now fixed. The items will receive power correctly after being repaired.
+
+- (bug fix) Resolved the Team Damage OFF situation where friendly troops could destroy permanent "base" objects.
+
+- (bug fix) Removed a packet overrun in the net code that *could* have allowed hackers to bring down servers. This had not occurred to date and is now prevented.
+
+- (bug fix) Deployable inventory stations can no longer be deployed directly next to each other. They must be at least 20 meters apart in order to be deployed properly.
+
+- (bug fix) Ejection speed increased slightly to more easily accomodate jumping out of moving vehicles.
+
+- (bug fix) Many team damage fixes occurred. When Team Damage is OFF the following are now true: Friendly teammates are no longer prevented from destroying deployables. The ELF will no longer drain energy from friendly players. If a friendly player blinds another friendly player with Whiteout grenades, then a message is displayed in the Chat HUD so that the blinded person knows who did it. (There are more Team Damage changes coming in the next patch.)
+
+- (bug fix) Medium now has a standard loadout of 12 grenades in the grenade launcher instead of 10. Light: 10; Medium: 12; Heavy: 15.
+
+- (bug fix) Deployable pulse sensors now have a range of 150m instead of 120m to make them a more attractive option to deploy.
+
+- (bug fix) Fixed an indoor turret proximity bug introduced in the last patch.
+
+- (improvement) Flag captures are now worth 100 points (for the team), instead of 1 point. Additionally, each time someone grabs the flag *from the enemy flag stand* they will gain 1 point (for the team), regardless of whether they actually capture it or not. You will ONLY get this single point if the flag was actually on the flagstand. You will NOT get the point by touching the flag anywhere else on the field. This change will help prevent tie situations and will reward aggressive offensive play.
+NOTE: The "touch" point can only be gained once every 20 seconds...so a "scrum" around the flag base will not result in a large group of points being gained.
+
+- (improvement) Siege: Alcatraz. The generators have been moved around a bit. There are two entrances to that base. One is the "front door" and the other is the "back door". (The back door is the one that has a team-pass-only force field blocking enemies from the switch room.) There is now an upper generator down the chute from the "front door" that powers the "back door" force field. Additionally, there is a solar panel outside that powers the base turrets and sentry turrets. None of these generators have to be destroyed to get to the switch, but their destruction makes it MUCH easier to do so. There are four generators total on this map (all are waypointed now), and the destruction of all four is necessary before the base power will go down.
+
+- (improvement) Siege: Caldera. The generator has been moved out of the switch room and into the very big main room that has the inventory stations in it. It is no longer necessary to destroy the generators in a particular sequence. Destroying the two main generators (Primary and Secondary) will drop the force field that protects the switch. Both gens must be down in order for the switch force field to drop.
+
+- (improvement) Added "quickbuy" keyboard shortcuts to use at vehicle station. (Default keys are the 1-6 number keys. 1 is the top vehicle on the list, 6 is the bottom vehicle on the list).
+NOTE: These key bindings are not currently editable. However, since you are on the vehicle purchase pad when they are in effect, they cannot interfere with any custom keys you've created, so you should have no problems.
+
+- (improvement) Team Damage ON/OFF can be changed by Admins/SuperAdmins as well as being voted on by players. If you are an Admin or SuperAdmin, then just go to Lobby and look up where the "Vote" options are listed. There are options there to toggle the Team Damage flag. Regular players can also Vote to Enable/Disable Team Damage in the same spot.
+
+- (improvement) Default server prefs have been changed so that the default time limit is now 30 minutes (instead of 20) and Team Damage is OFF.
+
+- (improvement) Fixed buddy filter. You can now use the Filter option on the JOIN screen to find games that have players in them that are listed on your buddy list. (Use the Email or Warrior Browser functions to add/remove people from your buddy list.)
+NOTE: We feel that there is an issue that may be related to NAT (Network Address Translation). Sierra QA uses public IP addresses on it's internal network that are not routable on the Internet.  They experience a problem that occurs when anyone inside their firewall uses the Internet for anything, their internal address is "changed" to a legal external address. In their case, they use "many to one" NAT, so everyone appears to be the same address outside our walls. This issue prevents Sierra QA from seeing "buddies" that are on systems *inside* their firewall (they can see "buddies" on external servers just fine). We are hypothesizing that it is NAT that is causing the buddy list lookup to fail internally. We are continuing to work on this.
+ALSO NOTE: This feature works correctly for everyone else.
+
+- (improvement) You can now add a player to your server admin lists (so that server admins can auto-admin players when they join a server, if desired). How this is done: If you are a SuperAdmin (owner of the server), you can go into the lobby and right-click on a player's name. You will then have the ability to add them to your Admin or SuperAdmin lists.
+
+- (improvement) Master Server list no longer insists on keeping your current game highlighted while refreshing a query. This allows you to page up and down more easily on the list while it is refreshing.
+
+- (improvement) Added "Team Damage ON/OFF" and "Windows/Linux" as options for creating new Server Filters.
+
+- (improvement) Missile reticle is improved aesthetically. This is part 1 of 2 of the missile reticle changes. The second part will be in the next patch.
+
+- (community) Made changes to Tribe Forums to make posting new topics work better with the current cache architecture.
+
+- (community) Fixed buttons on Tribe/Warrior Browser to reflect visitors membership in tribe
+
+- (community) Changed NEWS button on Tribe page to OPTIONS, added links to Tribe Forum, Tribe Public Chat and Tribe Private Chat.
+
+- (community) Added "EMail" and "Add To Buddylist" options into the right click menu in the Chat Channel member list.
+
+- (community) Changed layout of right click menu's in the Community for easier understandability.
+
+- (community) Added Moderator functions to the T2 Community - allows post removal, ability to send warnings and execute ban's to the perp.
+
+- (community) Added confirmation box to the News page on Submit News - explains purpose and requires yes/no.
+
+- (community) Upgraded Forum Cache version
+
+- (community) Added ability to Lock Topic for Moderators
+
+- (community) Added locking for posts where Topic is already in cache.
+
+- (community) Implemented a ban structure on the Database
+
+- (community) Fixed DBProxy thread disconnections - removed blank error boxes.
+
+- (community) Fixed bug in Blocking Email Senders
+
+
+Changes for 22460:
+========================
+
+- **GAMEPLAY CHANGE** Spider clamp turrets need more surface area for legal deploy space now
+
+- Minor tweak to improve long-term server stability.
+
+- A new voice codec, 'GSM' was added to allow voice communication between Linux and Windows users.
+
+- Minor sound system tweaks and fixes.
+
+- Minor BOT navigation and seeking improvements.
+
+- Fix removing BOTs counting toward the Vote Meter representation.
+
+- Improvement for vehicle physics, particularly instances when vehicles would get stuck on their edge.
+
+- Fix for BOT's skins not dynamically updating to correct team skin, when Admin team changed them.
+
+- Fixed bug where certain cases would cause cursor to vanish when it should not.
+
+- Minor server query improvements.
+
+- Fix players can be added to the 'Admin List'.
+
+- No more voting to BAN, only Super ADMIN may now BAN.
+
+- Various GUI improvements, notably the Voice Com. elements in the Lobby, and some minor pointer icon improvements for certain cases.
+
+- Linux 'Penguin' symbol added for Server List Screen when joining, so users may identify Windows and Linux servers at a glance.
+
+
+Changes for 22337:
+========================
+
+- Added a default Arial font so that missing fonts in the community forums don't crash the client.
+
+- OpenAL is now dynamically loaded, reducing CPU usage when sound is turned off. This also fixes the problem where once sound is disabled on the command line, the client prefs had to be edited to re-enable it.
+
+- **SIEGE GAMEPLAY CHANGE**: When attacking a base, you will see red waypoints on the generators. When those generators are destroyed, the waypoints will change to green. If the generators are repaired thereafter, they will return to red. If you are on the defender team, these colors are reversed (green normally, red if destroyed, green if repaired again). This will help teams coordinate attack and defense more easily.
+
+- **FLARE GREANDE GAMEPLAY CHANGE**: Each flare will only attract ONE missile now. When the missile hits the flare, the flare will be destroyed. Only the first missile fired after the flare is thrown will be fooled by that flare. Other missiles must be attracted by other flares in order to be avoided.
+
+- There was a problem where emails were getting cloned multiple times for some folks. This is fixed now and no longer occurs.
+
+- There was an issue where the single player game type was not being properly cleared for folks when they left single player and went to other games. This is fixed now.
+
+- A stray underground generator was removed from Caldera.
+
+- The name column will no longer jump to the top when folks leave and join a room, thus making it easier to stay focused on a particular player's name.
+
+- If you steal a vehicle, the vehicle's sensor radius will not switch to the stealing player's team. In otherwords, the sensor of the vehicle will still report to the original team's sensor net...not the team that stole the vehicle. That's as design and is one of the drawbacks of using a stolen vehicle.
+
+- Bounty & Hunter: The player icons on the command maps are now the correct colors.
+
+- More items have correct names and tags on the command map and in the HUD. There were instances like "East Generator Generator". Those have been eliminated.
+
+- The last patch accidentally eliminated the "PlayerXXX joined YYYY game. Click here to join." links from the CHAT. This has been resolved and is now available again.
+
+- Players are no longer able to squeeze in under the tires of vehicles and play Superman by lifting them off the ground. ; )
+
+- Bots were getting stuck in Riverdance when the fell in the water near the bridge. This has been fixed.
+
+- Added more filtering options so that the filters for the server query (JOIN) screen are more powerful and flexible.
+
+- Added a platform indicator so users can tell whether they are joining a Win32 or Linux server. (Shouldn't make any difference to game play, but we felt you'd like to know.)
+
+- Fixed a small texture leak on 3Space objects.
+
+- Added an underwater satchel charge effect. Slightly increased the delay time between activating the satchel and the time that it actually explodes (this was as designed...a minor bug was causing it to explode too soon).
+
+
+Changes for 22228:
+========================
+
+- Fixed a problem that could have caused texture leaking in the interiors
+
+- Fixed an AI problem in Training 2
+
+- A bug where infinite ammo could be gained by tossing the ammo was prevented.
+
+- Fixed a problem in Training 2 where a waypoint wouldn't update properly.
+
+- Thundersword and Havoc hold steady now when players try to jump in so they don't invert and detonate.
+
+- Scoring has been fixed so that it isn't blanked any longer if the admin changes the time limit during a game.
+
+- Active server queries will be cancelled now when you join a game (loads game faster now).
+
+- If standing in an inventory station when it is destroyed you no longer permanently lose weapons.
+
+- Fixed a problem where the bombardier could create a permanent targeting laser.
+
+- Cleaned up Chat text to remove programming characters.
+
+- Fixed "highlight text with my nick" option so it saves preference to file correctly.
+
+- Made MPB able to climb hills more easily and reduced damage from impact with the ground.
+
+- Added button to stop server queries in progress on "JOIN" screen.
+
+- Observers can now only chat with other observers (no one else can hear them).
+
+- Made deployable inv stations have smaller trigger so they don't "suck you in" from so far away.
+
+- Bots will now claim switches in CnH more accurately.
+
+- Added a "max distance" ring for sensors on the commander map so players can more accurately assess how well they placed the sensor in relation to how much area it is actually sensing.
+
+- Added a "ding" sound when you have filled up a text buffer so that you know why your text isn't showing up.
+
+- Fixed Chat HUD so that page up/page down works better.
+
+- Fixed a situation where Heavies could end up being permanently cloaked.
+
+- The MPBs on the "Alcatraz" map now deploy correctly (Siege map).
+
+- The "edited post" date stamp now works correctly.
+
+- If you jump into a vehicle while zoomed in, the zoom will reset correctly therafter now.
+
+- The Score Screen (F2) is now available while in a vehicle.
+
+- You can now vote to kick observers, if desired.
+
+- The ELF turret is fixed so it no longer fires at players when destroyed (an intermittent bug)
+
+- Some console spam associated with the Wildcat has been removed.
+
+- There was a situation where a player could die twice if he fell out of bounds. That has been resolved.
+
+- Screen resolution information should update properly now when restarting the application.
+
+- The camera should no longer be able to dip below terrain when in third person mode.
+
+
+Changes for 22075:
+========================
+
+- Voice over IP support has been temporarily disabled
+
+
+Changes for 22002:
+========================
+
+- Fixed ambient sound angle attenuation
+
+- Added preliminary voice over IP support (Linux <-> Linux only)
+
+- Fixed lots of crash bugs
+
+- No longer minimize the window when launching a URL in windowed mode
+
+- NVidia 0.9-769 drivers rock!  Definitely upgrade your drivers! :)
+
+
+Known issues:
+============
+
+- NVidia OpenGL 0.9-769 driver issues:
+
+  Single-processor and Multi-processor:
+  * Some versions of agpgart lock up under heavy load.
+
+- Matrox OpenGL driver issues:
+  * The Tribes 2 rendering hits a software path
+
+
+======
+Please report all bugs to Fenris: http://fenris.lokigames.com/

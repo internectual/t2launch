@@ -1,0 +1,10 @@
+$PJScheme::DeathHudGui = "Normal";
+$PJScheme::EndStatsGui = "Normal";
+$PJScheme::GlobalHudGui = "Normal";
+$PJScheme::KillerGui = "Normal";
+$PJScheme::LastKillGui = "Normal";
+$PJscheme::SpeedGui = "Normal";
+$PJScheme::SystemHudGui = "Normal";
+$PJScheme::TeamHudGui = "Normal";
+$PJscheme::VictimGui = "Normal";
+$PJScheme::WarningGui = "Normal";

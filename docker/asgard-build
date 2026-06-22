@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+set -e
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT_DIR"   # so build/, start.sh and the docker build context resolve here
+GAMES_DIR="$ROOT_DIR/games"
+GAME_NAME=$1
+
+# If no game name provided, ask
+if [[ -z "$GAME_NAME" ]]; then
+    echo "=== Tribes 2 Docker — Build Container ==="
+    echo ""
+    echo "Available games in $GAMES_DIR/:"
+    ls -1 "$GAMES_DIR/" 2>/dev/null || echo "  (none found)"
+    echo ""
+    read -rp "Enter game name (e.g. tribes2): " GAME_NAME
+    echo ""
+fi
+
+if [[ ! -d "$GAMES_DIR/$GAME_NAME" ]]; then
+    echo "WARNING: '$GAME_NAME' is not present in the games folder."
+    echo "The container will be built without built-in game files."
+    echo "You can still bind-mount a game directory at runtime with asgard-run."
+    echo ""
+    read -rp "Continue anyway? [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy] ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+fi
+
+if [[ -d "build" ]]; then
+    echo "A build may still be in progress. Please make sure no build is running then delete the 'build' folder."
+    exit 2
+fi
+
+# The Dockerfile bakes the compatibility libraries from lib/ into the image
+# (COPY lib/libstdc++* ... etc). An empty lib/ makes the build fail partway
+# through, so make sure the libs are present first — offering to fetch them.
+LIB_DIR="$ROOT_DIR/lib"
+have_libs() { ls "$LIB_DIR"/libstdc++* "$LIB_DIR"/libSDL* "$LIB_DIR"/libsmpeg* &>/dev/null; }
+if ! have_libs; then
+    echo "No compatibility libraries found in lib/."
+    echo "These get baked into the Docker image and are required to build."
+    echo ""
+    if [[ -x "$ROOT_DIR/bundle-libs.sh" ]]; then
+        read -rp "Run bundle-libs.sh now to copy them from your game install? [Y/n]: " ANS
+        if [[ ! "$ANS" =~ ^[Nn] ]]; then
+            echo ""
+            "$ROOT_DIR/bundle-libs.sh"
+            echo ""
+        fi
+    else
+        echo "(bundle-libs.sh not found — run it manually to populate lib/.)"
+    fi
+    if ! have_libs; then
+        echo "WARNING: lib/ still has no compatibility libraries."
+        echo "The Docker build will likely fail at the 'COPY lib/...' steps."
+        read -rp "Try to build anyway? [y/N]: " CONFIRM_LIBS
+        if [[ ! "$CONFIRM_LIBS" =~ ^[Yy] ]]; then
+            echo "Aborted."
+            exit 1
+        fi
+    fi
+fi
+
+if [[ -d "$GAMES_DIR/$GAME_NAME" ]]; then
+    cp -r "$GAMES_DIR/$GAME_NAME" "$ROOT_DIR/build"
+    if file "build/$GAME_NAME" | grep -q "text"; then
+        sed -i -e 's/^DetectARCH()/DetectARCH()\n{\n\techo \"x86\"\n}\nIntoTheVOID()/' "build/$GAME_NAME"
+    fi
+fi
+
+echo "cd game" > start.sh
+echo "if [ -e ${GAME_NAME}.sh ]; then ./${GAME_NAME}.sh; else ./${GAME_NAME}; fi" >> start.sh
+echo "exit" >> start.sh
+
+USER_UID=${SUDO_UID:-$(id -u)}
+USER_GID=${SUDO_GID:-$(id -g)}
+docker build \
+    --build-arg USER_UID="$USER_UID" \
+    --build-arg USER_GID="$USER_GID" \
+    -t "$GAME_NAME" .
+
+rm -rf build
+rm start.sh

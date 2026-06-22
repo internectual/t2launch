@@ -1,0 +1,58 @@
+----------------------------
+NETWORK SETTINGS
+----------------------------
+
+Settings:
+    The packet rate and packet size sliders have been removed.  More connection choices have been added to the preset list. NOTE: Your connection has been forced to 56K modem for now. If you would like to change those settings, you should go to SETTINGS/NETWORK and try one of the other presets.
+
+*** NOTE *** You should go to your Network Settings and choose the Preset that you want to use. Please do this EVEN if you have a 56K Modem, just to be sure that the settings are recorded in your prefs file correctly.
+
+    When connected to a server a new graph display will be shown in the network settings dialog.  Each metric can be toggled on/off by clicking on the text whose color corresponds to the line in the graph.  The user will want to maximize throughput while minimizing packet latency.  The 'send packets' metric corresponds to the 'Client Update Rate' slider.
+
+    The user needs to be careful not to set network settings too high.  When connected to a small game with little action, a modem user could probably get away with setting their network preset to 'Cable' or 'T1/Lan'.  But, when connected to a game with many players and vehicles and lots of action, the user could experience stutters and high latency with that setting.
+ 
+Hud:
+    The user can activate the network hud by pressing 'ctrl-n'.  This hud has two states, the first being identical to the graph in the Network Settings dialog.  Pressing 'ctrl-n' a second time will toggle the hud into it's other state.  This hud shows the ping (ms) and packet loss (%) on the top and has two progress bars to display packet throughput.  The top bar measures the percentage of maximum packet send throughput given the settings you have selected.  The bottom bar measures the maximum packet receive throughput.  These bars will not necessarily reach peak, since the server may be capping the number of packets the user receives per second.  They will indicate, however, when there is a problem with the network connection.  If these bars become erratic or drop to their minimum position, then the user is probably experience connection problems with the server.
+
+----------------------------
+PURE SERVERS
+----------------------------
+
+Q:  What is a PURE server?
+A:  A PURE ("base") server is a dedicated Tribes2 server which is running only the scripts and missions that are part of the most recent version of Tribes2 - the authorized version distributed by Dynamix. NOTE: A server MUST be a DEDICATED SERVER in order to qualify as a "pure" server.
+
+Q:  Why would we care whether a server is a PURE ("base") server?
+A:  There are two reasons.  Because of the versatility of the Tribes2 scripting language, a server can be customized to a great extent.  Some servers have been set up with modifications such as discs that shoot twice as fast, or sniper rifles that can kill a heavy in one shot.  Some servers are playing brand new game types with different rules.  We created the PURE server so that before joining a server, a player will know whether they're playing Tribes2 as it was originally designed by Dynamix, or if they may encounter some (really fun, but) unexpected features.
+The other reason is to ensure the integrity of a tournament match.  On a PURE server, no custom scripts or changes to missions are permitted on the server.  Even commands entered directly into the server console are filtered to prevent a "biased" server operator from influencing the match.
+
+Q:  Is a PURE server "better" than a modified one?
+A:  Absolutely not.  There have been many different modifications made by people hosting their own servers which have been incredibly fun to play.  This is just a way of identifying which servers have been modified.  For beginners, it is recommended that they first join a PURE ("base") server in order to first see Tribes2 as the designers at Dynamix created it.
+
+Q:  How can I tell if a server is a PURE ("base") server?
+A:  After you log in to Tribes2 and switch to the "Join Server List", PURE ("base") servers are the ones that are listed in blue.  If the server has a different version number than you, the server may show up in grey, however, the "Rules Set" column will still say "base".  If you are hosting a PURE server, the console prompt will be "PURE%" instead of just a "%".
+
+Q:  Will joining a PURE server stop me from using my own client scripts?
+No, PURE servers only change how the server is hosted.  You don't have to download anything to join a PURE server, and all your custom client scripts will work as before.
+
+Q:  How do I Host a PURE Server?
+There are two ways of hosting a PURE server.  From the "Host Game" screen, press the "Advanced Options" button. A new "PURE Server" switch has been added beside the "Dedicated" switch.  Make sure it is on, press the "Save" button to close the options dialog, and then press the "Start Game" button, and you will launch a PURE server.
+The second method is if you start a server from the command line.  In the latest version, when executing "Tribes2.exe -dedicated", PURE mode is on by default, unless you also include a "-mod ..." argument.  If you want to host a non-pure dedicated server, you have to include a "-nonpure" argument.
+
+Q:  What happens to my server scripts when hosting a PURE server?
+A:  Any scripts which are not distributed by Dynamix, and are not part of the official Tribes2 release (ie. are not found in scripts.vl2), will be filtered when executed.  Only statements assigning variables beginning with "$Host::" will have any effect.  All other statments will be ignored.  This includes all function calls, function definitions, datablock definitions, and any access to game objects or fields of game objects.
+
+Q:  I can't type "quit();" anymore.  How do I shut down my PURE server?
+A: To re-emphasize, on a PURE server, there are no function calls permitted.  Since functions can be redefined, and can have compromising results, they have all been prevented.  To shut down a PURE server you have to close the console window, or hit Ctrl-C.
+
+Q:  I tried creating a dedicated server, but it didn't show up as PURE , and my console prompt isn't "PURE%". What happened?
+A:  In order to create a PURE server, we must first verify that your installation of Tribes2 has not been compromised.  The things that can prevent a server from being PURE are:
+  1.  If you launched the server from the shell, but the PURE SERVER switch wasn't set to "on".
+  2.  If your copy of console_start.cs has been modified in any way.
+  3.  If your copy of scripts.vl2 has been modified in any way.
+  4.  If your copy of missions.vl2 has been modified in any way.
+  5.  If you have added or downloaded any "missions/*.mis" files.  PURE servers only run the missions distributed by Dynamix. 
+If any of these things are true, the server will not show up as PURE, but will still function fully as a dedicated server.
+
+Q:  I want to create a PURE server, but I have an admin script with which I need to manage it.  Is there any way I can execute this script?
+A:  Unfortunately not - it is impossible to determine the intent of a function.  We can only guarantee our own functions against results that could compromise a server.
+
