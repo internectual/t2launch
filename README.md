@@ -87,6 +87,11 @@ Or with the quick script:
 - [x] SHA1 implemented natively in TorqueScript
 - [x] RC4 key derivation uses hex-string key (matching TribesNext behavior)
 - [x] Private key pre-decrypted at build time
+- [x] LD_PRELOAD hook loads successfully (t2_hook.so)
+- [x] Hook can read game memory (mConsoleConstructor at 0x8487434)
+- [x] Hook finds Con::printf at 0x080E61E4 via dlsym
+- [ ] Con::printf callable from hook (engine not ready during constructor)
+- [ ] Console command registration from hook
 - [ ] RSA key setup completes but game hangs at post-login (main menu loading)
 - [ ] Full online play tested
 
@@ -102,6 +107,32 @@ rc4_key = SHA1(password + nonce)  # Returns hex string
 
 This is critical — using the 20-byte binary hash instead of the 40-byte hex string produces garbage output. The t2-mapper `auth.ts` code documents this:
 > "RC4 key = SHA1(password + nonce) as ASCII hex string (not hex-decoded)"
+
+### LD_PRELOAD Hook (t2_hook.so)
+
+The hook is loaded via `t2_hook.so` listed in the binary's `NEEDED` entries. It uses `__attribute__((constructor))` to run during static initialization.
+
+**What works:**
+- Reading game memory at known addresses
+- Calling `dlsym` to find engine functions
+- Writing to stdout via `write()` syscall
+
+**Limitations:**
+- `Con::printf` (at 0x080E61E4) cannot be called from the constructor — the console system isn't initialized yet
+- `mConsoleConstructor` (at 0x8487434) linked list isn't built during static init
+- `Con::addCommand` requires `__thiscall` with the correct `this` pointer
+
+**Key addresses (from stripped binary):**
+- `Con::printf`: `0x080E61E4`
+- `mConsoleConstructor`: `0x08487434`
+- `Con::addCommand_4`: `0x080E74B0`
+- `Con::addCommand_5`: `0x080E7560`
+- `Con::addCommand_6`: `0x080E7610`
+- `Con::addCommand`: `0x080E774C`
+
+### TorqueScript Compiler Stack Overflow
+
+The TorqueScript compiler in the V12 engine has a stack overflow bug for `.cs` files >100 lines. The original `t2csri_native.cs` (708 lines) was split into multiple smaller files to work around this.
 
 ### Cached DSO Files
 
@@ -128,7 +159,9 @@ with zipfile.ZipFile('/path/to/base/t2csri_rc3.vl2', 'w', zipfile.ZIP_DEFLATED) 
 
 ## Future Plans
 
-- [ ] Move crypto to a native C shared library (loaded via `dlopen`) for performance
+- [ ] Call engine functions from hook (need to defer past static init)
+- [ ] Register console commands from hook (need mConsoleConstructor ready)
+- [ ] Move crypto to native C in the hook for performance
 - [ ] Implement full TribesNext protocol in a standalone proxy (no TorqueScript modifications needed)
 - [ ] Support for TribesNext clans, browser, and community features
 - [ ] Automated credential refresh (currently credentials expire)
