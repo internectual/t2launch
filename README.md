@@ -10,32 +10,38 @@ Run the Tribes 2 Linux client (Loki native port, 2001) and connect to the Tribes
 
 Tribes 2 used GameSpy for online play, which shut down in 2004. The TribesNext community patch replaced GameSpy with a custom authentication system that uses RSA challenge-response for login. The TribesNext RC2a patch was only released as a Windows `.exe` modifier, which means Linux users had to run the entire game under Wine.
 
-This project replaces the Ruby-based crypto layer (which the Windows patch depends on) with native TorqueScript implementations, allowing the Loki Linux binary to authenticate directly with TribesNext servers.
+This project replaces the Ruby-based crypto layer (which the Windows patch depends on) with native implementations, allowing the Loki Linux binary to authenticate directly with TribesNext servers.
 
 ## Architecture
 
 ```
 t2launch/
-├── console_start.cs          # Patched startup (loads native crypto before VL2)
-├── t2csri_native.cs           # Native TorqueScript crypto (SHA1, RSA, RC4)
-├── base/t2csri_rc3.vl2        # Patched TribesNext scripts (native login flow)
-├── public.store               # Your TribesNext certificate
-├── private.store              # Your encrypted private key
-├── tribes2.dynamic            # Loki Linux binary (not included, use your own)
 ├── docker/                    # Docker compatibility wrapper
 │   ├── Dockerfile             # 32-bit Ubuntu 16.04 container
 │   ├── asgard-run             # Launch script
-│   └── asgard-build           # Image builder
-└── run_t2.sh                  # Quick start script
+│   ├── config/tribes2.cfg     # Per-game config (LD_PRELOAD, etc.)
+│   └── run_t2.sh              # In-container launcher
+├── t2csri_native.cs           # Native TorqueScript crypto (SHA1, RSA, RC4)
+└── README.md
+```
+
+Game files (not included) go in `~/t2-linux/`:
+```
+~/t2-linux/
+├── tribes2.dynamic            # Loki Linux binary (#25034)
+├── t2_hook.so                 # LD_PRELOAD hook (crypto commands)
+├── console_start.cs           # Game startup (loads t2csri_native splits)
+├── autoexec.cs / base/        # Game scripts
+├── *.vl2                      # Script archives
+└── public.store/private.store # TribesNext credentials
 ```
 
 ## How It Works
 
-1. **Native SHA1**: Implements SHA1 hash in TorqueScript (32-bit word operations)
-2. **Native RSA**: Implements modular exponentiation for big numbers using 32-bit chunk arrays
-3. **Native RC4**: Implements RC4 stream cipher with 2048-byte discard
-4. **Pre-decrypted Key**: The private key is decrypted at build time using Python (fast), avoiding the slow RC4-in-TorqueScript path at runtime
-5. **Patched Login Flow**: `t2csri_doLogin()` bypasses Ruby's `rubyEval()` entirely
+1. **LD_PRELOAD Hook**: `t2_hook.so` is loaded at game startup, registers console commands (`sha1sum`, etc.) via `Con::addCommand`
+2. **Native TorqueScript Crypto**: `t2csri_native.cs` split into <100-line chunks provides `rubyEval` stub and auth flow
+3. **Package Wrapping**: `t2launch_package.cs` wraps `DispatchLaunchMode` to detect engine readiness
+4. **Credentials**: Store files (`public.store`, `private.store`) provide TribesNext certificate/key
 
 ## Quick Start
 
@@ -45,134 +51,112 @@ t2launch/
 - Your own Tribes 2 Linux game files (from Loki Software release)
 - TribesNext account credentials
 
-### Setup
-
-1. **Get your credentials** using the t2-mapper login script:
-   ```bash
-   git clone https://github.com/exogen/t2-mapper.git
-   cd t2-mapper
-   npm install
-   npm run login
-   ```
-   Copy the `T2_ACCOUNT_CERTIFICATE` and `T2_ACCOUNT_ENCRYPTED_KEY` values.
-
-2. **Generate store files**:
-   ```bash
-   python3 scripts/gen_store.py --cert "$CERT" --key "$KEY" --username YourUsername
-   ```
-
-3. **Decrypt the private key** (for the hardcoded key in `loginScreens.cs`):
-   ```bash
-   python3 scripts/decrypt_key.py --key "$KEY" --password YourPassword
-   ```
-
-4. **Update the hardcoded values** in `base/t2csri_rc3.vl2` (via extract → modify → repack)
-
 ### Run
 
+```bash
+./docker/asgard-run tribes2 /path/to/your/t2-linux -nologin
+```
+
+Or to attempt online play:
 ```bash
 ./docker/asgard-run tribes2 /path/to/your/t2-linux -online
 ```
 
-Or with the quick script:
+### Verify Hook Loading
+
 ```bash
-./run_t2.sh
+./docker/asgard-run tribes2 /path/to/your/t2-linux -nologin 2>&1 | grep HOOK_LOADED
 ```
 
 ## Current Status
 
-- [x] `$RubyEnabled` check bypassed
-- [x] Account credentials loaded from store files
-- [x] Login flow bypasses server credential download
-- [x] SHA1 implemented natively in TorqueScript
-- [x] RC4 key derivation uses hex-string key (matching TribesNext behavior)
-- [x] Private key pre-decrypted at build time
-- [x] LD_PRELOAD hook loads successfully (t2_hook.so)
-- [x] Hook can read game memory (mConsoleConstructor at 0x8487434)
-- [x] Hook finds Con::printf at 0x080E61E4 via dlsym
-- [ ] Con::printf callable from hook (engine not ready during constructor)
-- [ ] Console command registration from hook
-- [ ] RSA key setup completes but game hangs at post-login (main menu loading)
+- [x] Game boots to lobby in `-nologin` mode (159 DSOs compiled)
+- [x] Original game binary works via Docker (no hook needed for basic boot)
+- [x] t2_hook.so builds successfully (pure C, no C++ dependencies)
+- [x] LD_PRELOAD mechanism works via `config/tribes2.cfg` EXTRA_ENV
+- [x] Hook constructor runs (confirmed with stderr output)
+- [x] t2csri_native.cs split into 10 files compiles without errors
+- [x] Console commands from hook (sha1sum, rsa_mod_exp) — IN PROGRESS
+- [ ] Game server connection (RSA challenge-response)
 - [ ] Full online play tested
 
-## Technical Notes
+## Technical Findings
 
-### The RC4 Key Format Issue
+### What Does NOT Cause Compiler Crashes
 
-The TribesNext Ruby code derives the RC4 key as:
-```ruby
-rc4_key = SHA1(password + nonce)  # Returns hex string
-# Then uses the 40-CHAR HEX STRING as the RC4 key, not the 20-byte binary hash
+Large `.cs` files are **NOT** the problem. The original game has a 2592-line `console_start.cs` and compiles fine. The TorqueScript compiler crash at `0x80f1467` is caused by **SYNTAX ERRORS** (mismatched braces, bad split points in scripts).
+
+Use `-prepbuild -nologin` to identify which file has syntax errors — the compiler will show `Line N - Syntax error.` for each failing file.
+
+### LD_PRELOAD Configuration
+
+The hook is loaded via `EXTRA_ENV` in `docker/config/tribes2.cfg`:
+```bash
+EXTRA_ENV="LD_PRELOAD=/usr/lib/libSDL-1.2.so.0 /home/loki/game/t2_hook.so"
 ```
 
-This is critical — using the 20-byte binary hash instead of the 40-byte hex string produces garbage output. The t2-mapper `auth.ts` code documents this:
-> "RC4 key = SHA1(password + nonce) as ASCII hex string (not hex-decoded)"
+This is the **only** reliable way to set LD_PRELOAD — setting it via `docker run -e` gets overridden by the `EXTRA_ENV` variable.
 
-### LD_PRELOAD Hook (t2_hook.so)
+### Hook Requirements
 
-The hook is loaded via `t2_hook.so` listed in the binary's `NEEDED` entries. It uses `__attribute__((constructor))` to run during static initialization.
+The hook MUST be compiled as pure C (not C++) to avoid symbol conflicts:
+```bash
+gcc -m32 -shared -fPIC -o t2_hook.so t2_hook.c -lc -O2 -std=c99
+```
 
-**What works:**
-- Reading game memory at known addresses
-- Calling `dlsym` to find engine functions
-- Writing to stdout via `write()` syscall
+Using C++ or linking against `libstdc++` causes `undefined symbol: __ti9exception` crashes.
 
-**Limitations:**
-- `Con::printf` (at 0x080E61E4) cannot be called from the constructor — the console system isn't initialized yet
-- `mConsoleConstructor` (at 0x8487434) linked list isn't built during static init
-- `Con::addCommand` requires `__thiscall` with the correct `this` pointer
+### t2csri_native.cs Splitting
 
-**Key addresses (from stripped binary):**
-- `Con::printf`: `0x080E61E4`
-- `mConsoleConstructor`: `0x08487434`
-- `Con::addCommand_4`: `0x080E74B0`
-- `Con::addCommand_5`: `0x080E7560`
-- `Con::addCommand_6`: `0x080E7610`
-- `Con::addCommand`: `0x080E774C`
+The 708-line `t2csri_native.cs` must be split into 78-line chunks to avoid hitting syntax errors at split points:
+```
+t2csri_native_0.cs through t2csri_native_9.cs
+```
 
-### TorqueScript Compiler Stack Overflow
+Update `console_start.cs` to exec all splits:
+```
+exec("t2csri_native_0.cs");
+exec("t2csri_native_1.cs");
+...
+exec("t2csri_native_9.cs");
+```
 
-The TorqueScript compiler in the V12 engine has a stack overflow bug for `.cs` files >100 lines. The original `t2csri_native.cs` (708 lines) was split into multiple smaller files to work around this.
+### Key Binary Addresses (from Tribes 2 Linux #25034)
+
+- `Con::addCommand`: `0x080E85C0` (same function at 0x80E85C0, 0x80E8618, 0x80E8670, 0x80E86C8)
+- `telnetSetParameters` command: registered at game startup (for remote debugging)
+- Game binary MD5: `14d168effa1d854f95b18d959c9fd009`
 
 ### Cached DSO Files
 
-The game compiles `.cs` files to `.dso` bytecode and caches them in `~/.loki/tribes2/base/`. After modifying scripts, delete the cached `.dso` files:
+The game compiles `.cs` files to `.dso` bytecode and caches them in `~/.loki/tribes2/base/`. After modifying scripts, delete cached `.dso` files:
 ```bash
 find ~/.loki/tribes2 -name "*.dso" -delete
 ```
 
-### VL2 Archive Modification
+### Docker Game Directory Mapping
 
-The game's scripts are packed in `.vl2` archives (which are just ZIP files). To modify them:
-```bash
-cd /tmp && mkdir vl2_extract && cd vl2_extract
-unzip /path/to/base/t2csri_rc3.vl2
-# Edit files...
-python3 -c "
-import zipfile
-with zipfile.ZipFile('/path/to/base/t2csri_rc3.vl2', 'w', zipfile.ZIP_DEFLATED) as zf:
-    for root, dirs, files in os.walk('.'):
-        for f in files:
-            zf.write(os.path.join(root, f))
-"
-```
+The game directory is bind-mounted: `~/t2-linux` → `/home/loki/game` inside the container. Hook and script files are accessible at `/home/loki/game/`.
 
-## Future Plans
+## Known Issues
 
-- [ ] Call engine functions from hook (need to defer past static init)
-- [ ] Register console commands from hook (need mConsoleConstructor ready)
-- [ ] Move crypto to native C in the hook for performance
-- [ ] Implement full TribesNext protocol in a standalone proxy (no TorqueScript modifications needed)
-- [ ] Support for TribesNext clans, browser, and community features
-- [ ] Automated credential refresh (currently credentials expire)
-- [ ] GUI launcher for server browsing and connection
-- [ ] Integration with TacoServer for custom game servers
+1. **Login GUI missing**: `LoginDlg` control not loading — need to exec `gui/LoginDlg.gui` from autoexec.cs or console_start.cs
+2. **t2csri_native_4.cs duplicated**: `console_start.cs` has duplicate exec lines causing double-load
+3. **Hook file locked**: Cannot overwrite `t2_hook.so` while game is running (even zombie processes hold the lock)
+4. **Process accumulation**: Multiple game processes accumulate if not killed properly — always `pkill -9 -f tribes2` before testing
+
+## Todo
+
+- [ ] Fix LoginDlg loading (add exec to autoexec.cs)
+- [ ] Get hook to register sha1sum/sha1sum commands via Con::addMethodS
+- [ ) Implement RSA decrypt in hook (big number modular exponentiation)
+- [ ] Test full auth flow: login → lobby → game server
+- [ ] Clean up duplicate t2csri_native exec lines in console_start.cs
 
 ## Credits
 
 - **TribesNext** (tribesnext.com) — community authentication system
 - **t2-mapper** (exogen/t2-mapper) — protocol reference implementation
-- **tribes-2-docker** (CodeMasterCody3D) — Docker compatibility wrapper
 - **Loki Software** — Linux port of Tribes 2
 
 ## License
