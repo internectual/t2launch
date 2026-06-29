@@ -83,11 +83,22 @@ echo("SHA1: " @ %result);
 - [x] Game boots to lobby in `-nologin` mode (158 DSOs compiled)
 - [x] LD_PRELOAD hook mechanism works
 - [x] Hook registers console commands via `Con::addMethodS`
-- [x] `hook_sha1()` — SHA1 hash (verified: correct output for "abc")
 - [x] `hook_test()` — basic command test (returns "ok_from_c")
-- [ ] `hook_rsa_mod_exp()` — RSA modular exponentiation (2048-bit)
-- [ ] `hook_rand64()` — random 64-bit hex generation
-- [ ] TribesNext script integration (official t2-scripts run unmodified)
+- [x] `hook_sha1()` — SHA1 hash (verified: correct for "abc")
+- [x] `hook_rsa_mod_exp()` — RSA modular exponentiation (verified: 2^10 mod 101 = 0e)
+- [x] `hook_rand64()` — random 64-bit hex from /dev/urandom
+- [ ] TribesNext script integration (official t2-scripts)
+- [ ] Full auth flow: login → lobby → game server
+- [ ] Full online play tested
+
+## Hook Console Commands
+
+| Command | Args | Description |
+|---------|------|-------------|
+| `hook_test` | none | Returns "ok_from_c" |
+| `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
+| `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
+| `hook_rand64` | none | Random 16-char hex |
 - [ ] Full auth flow: login → lobby → game server connection
 - [ ] Full online play tested
 
