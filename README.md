@@ -87,9 +87,21 @@ echo("SHA1: " @ %result);
 - [x] `hook_sha1()` — SHA1 hash (verified: correct for "abc")
 - [x] `hook_rsa_mod_exp()` — RSA modular exponentiation (verified: 2^10 mod 101 = 0e)
 - [x] `hook_rand64()` — random 64-bit hex from /dev/urandom
-- [ ] TribesNext script integration (official t2-scripts)
+- [x] TribesNext script integration (modified t2-scripts with native crypto)
 - [ ] Full auth flow: login → lobby → game server
 - [ ] Full online play tested
+
+## TribesNext Script Integration
+
+The official t2-scripts are loaded from `~/t2-linux/base/t2csri/` with the following modifications:
+- `sha1sum()` → calls `hook_sha1()` instead of Ruby SHA1Pure
+- `rsa_mod_exp()` → calls `hook_rsa_mod_exp()` instead of Ruby
+- `t2csri_verify_auth/deleg/update_signature()` → direct RSA with hardcoded keys
+- `$accountKey.decrypt()` → `hook_rsa_mod_exp(challenge, d, n)`
+- `rand()` → `hook_rand64()`
+- `rubyEval()` / `rubyGetValue()` / `rubyExec()` → no-op stubs
+
+All RSA public keys (1024-bit, public exponent 3) are embedded from the Windows DLL.
 
 ## Hook Console Commands
 
