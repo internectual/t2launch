@@ -92,204 +92,30 @@ static const char* hook_sha1_cb(void *obj, S32 argc, const char **argv) {
 }
 
 static const char* hook_rsa_mod_exp_cb(void *obj, S32 argc, const char **argv) {
+    static char result[2048];
     (void)obj;
     if (argc < 4) return "usage";
-    fprintf(stderr, "[t2_hook] rsa_mod_exp argc=%d b=%s e=%s m=%s\n", argc,
-        argc>1?argv[1]:"(null)", argc>2?argv[2]:"(null)", argc>3?argv[3]:"(null)");
-    /* All bignum state on heap to avoid stack overflow.
-     * Using 32-bit words, little-endian byte order per word. */
-    typedef struct { uint32_t w[64]; int nw; } bn;
-    #define BN_MAX 64
-    bn *ba = calloc(1, sizeof(bn));
-    bn *be = calloc(1, sizeof(bn));
-    bn *bm = calloc(1, sizeof(bn));
-    bn *br = calloc(1, sizeof(bn));
-    if (!ba||!be||!bm||!br) { free(ba);free(be);free(bm);free(br); return "oom"; }
-
-    /* Parse hex to bn (little-endian bytes into little-endian words) */
-    for (int p = 1; p <= 3; p++) {
-        const char *hex = argv[p];
-        bn *bnn = (p==1)?ba:(p==2)?be:bm;
-        int hlen = strlen(hex);
-        if (hlen % 2) hlen++; /* pad */
-        int nbytes = hlen / 2;
-        bnn->nw = (nbytes + 3) / 4;
-        if (bnn->nw > BN_MAX) bnn->nw = BN_MAX;
-        for (int i = 0; i < nbytes && i < BN_MAX*4; i++) {
-            int hi = (hlen % 2) ? (hlen-1-i*2) : (hlen-2-i*2);
-            if (hi < 0) break;
-            char h[3] = {hex[hi], hex[hi+1], 0};
-            unsigned int b; sscanf(h, "%02x", &b);
-            bnn->w[i/4] |= b << ((i%4)*8);
-        }
-        while (bnn->nw > 1 && bnn->w[bnn->nw-1] == 0) bnn->nw--;
+    fprintf(stderr, "[t2_hook] rsa_mod_exp b=%.20s... e=%.20s... m=%.20s...\n",
+        argv[1], argv[2], argv[3]);
+    /* Use precompiled GMP helper for fast modexp */
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd), "/usr/lib/rsa_helper %s %s %s 2>/dev/null",
+             argv[1], argv[2], argv[3]);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) { strcpy(result, "ERR:popen"); return result; }
+    if (!fgets(result, sizeof(result), fp)) {
+        pclose(fp);
+        strcpy(result, "ERR:no_output");
+        return result;
     }
-
-    /* bn helpers as macros using heap temp */
-    #define BNCPY(dst, src) memcpy((dst), (src), sizeof(bn))
-    #define BNCMP(a, b) ({ int _m=(a)->nw>(b)->nw?(a)->nw:(b)->nw,_r=0; for(int _i=_m-1;_i>=0;_i--){uint32_t _a=(_i<(a)->nw)?(a)->w[_i]:0,_b=(_i<(b)->nw)?(b)->w[_i]:0;if(_a<_b){_r=-1;break;}if(_a>_b){_r=1;break;}} _r; })
-
-    /* ba = ba mod bm */
-    while (BNCMP(ba, bm) >= 0) {
-        bn *sh = calloc(1, sizeof(bn));
-        BNCPY(sh, bm);
-        while (BNCMP(sh, ba) <= 0 && sh->nw < BN_MAX) {
-            uint32_t c = 0;
-            for (int i = 0; i < sh->nw; i++) {
-                uint32_t nc = sh->w[i] >> 31;
-                sh->w[i] = (sh->w[i] << 1) | c;
-                c = nc;
-            }
-            if (c && sh->nw < BN_MAX) sh->w[sh->nw++] = c;
-        }
-        /* shift right 1 */
-        uint32_t c = 0;
-        for (int i = sh->nw-1; i >= 0; i--) {
-            uint32_t nc = sh->w[i] & 1;
-            sh->w[i] = (sh->w[i] >> 1) | (c << 31);
-            c = nc;
-        }
-        while (sh->nw > 1 && sh->w[sh->nw-1] == 0) sh->nw--;
-        /* ba -= sh */
-        int64_t borrow = 0;
-        for (int i = 0; i < ba->nw; i++) {
-            int64_t diff = (int64_t)ba->w[i] - (i < sh->nw ? sh->w[i] : 0) - borrow;
-            if (diff < 0) { diff += 0x100000000LL; borrow = 1; } else borrow = 0;
-            ba->w[i] = (uint32_t)diff;
-        }
-        while (ba->nw > 1 && ba->w[ba->nw-1] == 0) ba->nw--;
-        free(sh);
-    }
-
-    /* br = ba^be mod bm (square-and-multiply) */
-    br->w[0] = 1; br->nw = 1;
-    for (int i = be->nw-1; i >= 0; i--) {
-        for (int bit = 31; bit >= 0; bit--) {
-            /* br = br*br mod bm */
-            bn *tmp = calloc(1, sizeof(bn));
-            for (int j = 0; j < br->nw; j++) {
-                uint64_t carry = 0;
-                for (int k = 0; k < br->nw; k++) {
-                    if (j+k >= BN_MAX) break;
-                    uint64_t prod = (uint64_t)br->w[j]*br->w[k]+tmp->w[j+k]+carry;
-                    tmp->w[j+k] = (uint32_t)prod;
-                    carry = prod >> 32;
-                }
-                int kk = j+br->nw;
-                while (carry && kk < BN_MAX) {
-                    uint64_t s = tmp->w[kk]+carry;
-                    tmp->w[kk] = (uint32_t)s; carry = s>>32; kk++;
-                }
-            }
-            tmp->nw = br->nw*2; if (tmp->nw > BN_MAX) tmp->nw = BN_MAX;
-            while (tmp->nw > 1 && tmp->w[tmp->nw-1] == 0) tmp->nw--;
-            /* tmp = tmp mod bm */
-            while (BNCMP(tmp, bm) >= 0) {
-                bn *sh2 = calloc(1, sizeof(bn));
-                BNCPY(sh2, bm);
-                while (BNCMP(sh2, tmp) <= 0 && sh2->nw < BN_MAX) {
-                    uint32_t c2 = 0;
-                    for (int ii = 0; ii < sh2->nw; ii++) {
-                        uint32_t nc2 = sh2->w[ii] >> 31;
-                        sh2->w[ii] = (sh2->w[ii] << 1) | c2;
-                        c2 = nc2;
-                    }
-                    if (c2 && sh2->nw < BN_MAX) sh2->w[sh2->nw++] = c2;
-                }
-                uint32_t c2 = 0;
-                for (int ii = sh2->nw-1; ii >= 0; ii--) {
-                    uint32_t nc2 = sh2->w[ii] & 1;
-                    sh2->w[ii] = (sh2->w[ii] >> 1) | (c2 << 31);
-                    c2 = nc2;
-                }
-                while (sh2->nw > 1 && sh2->w[sh2->nw-1] == 0) sh2->nw--;
-                int64_t bor = 0;
-                for (int ii = 0; ii < tmp->nw; ii++) {
-                    int64_t dif = (int64_t)tmp->w[ii]-(ii<sh2->nw?sh2->w[ii]:0)-bor;
-                    if (dif < 0) { dif += 0x100000000LL; bor = 1; } else bor = 0;
-                    tmp->w[ii] = (uint32_t)dif;
-                }
-                while (tmp->nw > 1 && tmp->w[tmp->nw-1] == 0) tmp->nw--;
-                free(sh2);
-            }
-            BNCPY(br, tmp);
-            free(tmp);
-
-            if ((be->w[i] >> bit) & 1) {
-                /* br = br * ba mod bm */
-                tmp = calloc(1, sizeof(bn));
-                for (int j = 0; j < br->nw; j++) {
-                    uint64_t carry = 0;
-                    for (int k = 0; k < ba->nw; k++) {
-                        if (j+k >= BN_MAX) break;
-                        uint64_t prod = (uint64_t)br->w[j]*ba->w[k]+tmp->w[j+k]+carry;
-                        tmp->w[j+k] = (uint32_t)prod;
-                        carry = prod >> 32;
-                    }
-                    int kk = j+ba->nw;
-                    while (carry && kk < BN_MAX) {
-                        uint64_t s = tmp->w[kk]+carry;
-                        tmp->w[kk] = (uint32_t)s; carry = s>>32; kk++;
-                    }
-                }
-                tmp->nw = br->nw+ba->nw; if (tmp->nw > BN_MAX) tmp->nw = BN_MAX;
-                while (tmp->nw > 1 && tmp->w[tmp->nw-1] == 0) tmp->nw--;
-                while (BNCMP(tmp, bm) >= 0) {
-                    bn *sh3 = calloc(1, sizeof(bn));
-                    BNCPY(sh3, bm);
-                    while (BNCMP(sh3, tmp) <= 0 && sh3->nw < BN_MAX) {
-                        uint32_t c3 = 0;
-                        for (int ii = 0; ii < sh3->nw; ii++) {
-                            uint32_t nc3 = sh3->w[ii] >> 31;
-                            sh3->w[ii] = (sh3->w[ii] << 1) | c3;
-                            c3 = nc3;
-                        }
-                        if (c3 && sh3->nw < BN_MAX) sh3->w[sh3->nw++] = c3;
-                    }
-                    uint32_t c3 = 0;
-                    for (int ii = sh3->nw-1; ii >= 0; ii--) {
-                        uint32_t nc3 = sh3->w[ii] & 1;
-                        sh3->w[ii] = (sh3->w[ii] >> 1) | (c3 << 31);
-                        c3 = nc3;
-                    }
-                    while (sh3->nw > 1 && sh3->w[sh3->nw-1] == 0) sh3->nw--;
-                    int64_t bor2 = 0;
-                    for (int ii = 0; ii < tmp->nw; ii++) {
-                        int64_t dif2 = (int64_t)tmp->w[ii]-(ii<sh3->nw?sh3->w[ii]:0)-bor2;
-                        if (dif2 < 0) { dif2 += 0x100000000LL; bor2 = 1; } else bor2 = 0;
-                        tmp->w[ii] = (uint32_t)dif2;
-                    }
-                    while (tmp->nw > 1 && tmp->w[tmp->nw-1] == 0) tmp->nw--;
-                    free(sh3);
-                }
-                BNCPY(br, tmp);
-                free(tmp);
-            }
-        }
-    }
-
-    static char result[1024];
-    int pos = 0, started = 0;
-    for (int i = br->nw-1; i >= 0; i--) {
-        for (int byte = 3; byte >= 0; byte--) {
-            uint8_t b = (br->w[i] >> (byte*8)) & 0xFF;
-            if (!started && b == 0 && (i > 0 || byte > 0)) continue;
-            started = 1;
-            sprintf(result+pos, "%02x", b);
-            pos += 2;
-        }
-    }
-    result[pos] = '\0';
-    if (pos == 0) strcpy(result, "00");
-    fprintf(stderr, "[t2_hook] rsa_mod_exp result=%s (b_len=%d e_len=%d m_len=%d)\n",
-        result,
-        argc>1?strlen(argv[1]):0,
-        argc>2?strlen(argv[2]):0,
-        argc>3?strlen(argv[3]):0);
-
-    free(ba); free(be); free(bm); free(br);
-    #undef BNCPY
-    #undef BNCMP
+    pclose(fp);
+    /* strip newline */
+    result[strcspn(result, "\r\n")] = 0;
+    /* lowercase */
+    for (int i = 0; result[i]; i++)
+        if (result[i] >= 'A' && result[i] <= 'F')
+            result[i] += 32;
+    fprintf(stderr, "[t2_hook] rsa_mod_exp result=%.40s...\n", result);
     return result;
 }
 
@@ -312,6 +138,158 @@ static const char* hook_rand64_cb(void *obj, S32 argc, const char **argv) {
     return buf;
 }
 
+/* ── RC4 implementation in C (correct, no TS──────── */
+
+static void rc4_ksa(uint8_t *S, const uint8_t *key, int keylen) {
+    for (int i = 0; i < 256; i++) S[i] = i;
+    int j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = (j + S[i] + key[i % keylen]) & 0xFF;
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+}
+
+static void rc4_drop(uint8_t *S, int n) {
+    int i = 0, j = 0;
+    for (int k = 0; k < n; k++) {
+        i = (i + 1) & 0xFF;
+        j = (j + S[i]) & 0xFF;
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+}
+
+static void rc4_crypt(uint8_t *S, const uint8_t *in, uint8_t *out, int len) {
+    int i = 0, j = 0;
+    for (int k = 0; k < len; k++) {
+        i = (i + 1) & 0xFF;
+        j = (j + S[i]) & 0xFF;
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+        out[k] = in[k] ^ S[(S[i] + S[j]) & 0xFF];
+    }
+}
+
+static int hex2nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int hex_to_bytes(const char *hex, uint8_t *out, int max_out) {
+    int len = 0;
+    for (int i = 0; hex[i] && hex[i+1] && len < max_out; i += 2) {
+        int hi = hex2nibble(hex[i]);
+        int lo = hex2nibble(hex[i+1]);
+        if (hi < 0 || lo < 0) return -1;
+        out[len++] = (hi << 4) | lo;
+    }
+    return len;
+}
+
+static void bytes_to_hex(const uint8_t *data, int len, char *out) {
+    for (int i = 0; i < len; i++)
+        sprintf(out + i*2, "%02x", data[i]);
+    out[len*2] = '\0';
+}
+
+static const char* hook_login_cb(void *obj, S32 argc, const char **argv) {
+    static char result[2048];
+    (void)obj; (void)argc;
+
+    const char *username = "LouCypher";
+    if (argc >= 2) username = argv[1];
+
+    /* ── Read password from file ── */
+    char password[256] = {0};
+    FILE *fp = fopen("/home/loki/.loki/tribes2/password", "r");
+    if (!fp) { snprintf(result, sizeof(result), "ERR:no_pw_file"); return result; }
+    if (!fgets(password, sizeof(password), fp)) { fclose(fp); snprintf(result, sizeof(result), "ERR:empty_pw"); return result; }
+    fclose(fp);
+    password[strcspn(password, "\r\n")] = 0;
+    fprintf(stderr, "[t2_hook] login: pw=%s (len=%zu)\n", password, strlen(password));
+
+    /* ── Read private.store ── */
+    char store_path[512];
+    snprintf(store_path, sizeof(store_path), "/home/loki/game/base/private.store");
+    FILE *fs = fopen(store_path, "r");
+    if (!fs) { snprintf(result, sizeof(result), "ERR:no_store"); return result; }
+    char line[2048], enc_data[2048] = {0};
+    while (fgets(line, sizeof(line), fs)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        if (strcmp(line, username) == 0) {
+            strncpy(enc_data, tab + 1, sizeof(enc_data) - 1);
+            break;
+        }
+    }
+    fclose(fs);
+    if (!enc_data[0]) { snprintf(result, sizeof(result), "ERR:no_user"); return result; }
+
+    /* ── Parse nonce:ciphertext ── */
+    char *colon = strchr(enc_data, ':');
+    if (!colon) { snprintf(result, sizeof(result), "ERR:bad_fmt"); return result; }
+    *colon = 0;
+    char *nonce_hex = enc_data;
+    char *ct_hex = colon + 1;
+
+    /* ── Compute RC4 key = SHA1(password + nonce) ── */
+    char pw_nonce[512];
+    snprintf(pw_nonce, sizeof(pw_nonce), "%s%s", password, nonce_hex);
+    char key_hex[41];
+    sha1((const uint8_t *)pw_nonce, strlen(pw_nonce), key_hex);
+
+    uint8_t key_bytes[20];
+    for (int i = 0; i < 20; i++) {
+        unsigned int b;
+        sscanf(key_hex + i*2, "%02x", &b);
+        key_bytes[i] = (uint8_t)b;
+    }
+
+    /* ── Decode ciphertext hex ── */
+    int ct_len = strlen(ct_hex) / 2;
+    uint8_t ct[1024], pt[1024];
+    if (ct_len > sizeof(ct)) { snprintf(result, sizeof(result), "ERR:ct_too_long"); return result; }
+    for (int i = 0; i < ct_len; i++) {
+        unsigned int b;
+        sscanf(ct_hex + i*2, "%02x", &b);
+        ct[i] = (uint8_t)b;
+    }
+
+    /* ── RC4 KSA ── */
+    uint8_t S[256];
+    for (int i = 0; i < 256; i++) S[i] = i;
+    int j = 0;
+    for (int i = 0; i < 256; i++) {
+        j = (j + S[i] + key_bytes[i % 20]) & 0xFF;
+        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
+    }
+
+    /* ── RC4 drop 2048 ── */
+    int ii = 0, jj = 0;
+    for (int k = 0; k < 2048; k++) {
+        ii = (ii + 1) & 0xFF;
+        jj = (jj + S[ii]) & 0xFF;
+        uint8_t tmp = S[ii]; S[ii] = S[jj]; S[jj] = tmp;
+    }
+
+    /* ── RC4 PRGA + decrypt ── */
+    for (int k = 0; k < ct_len; k++) {
+        ii = (ii + 1) & 0xFF;
+        jj = (jj + S[ii]) & 0xFF;
+        uint8_t tmp = S[ii]; S[ii] = S[jj]; S[jj] = tmp;
+        pt[k] = ct[k] ^ S[(S[ii] + S[jj]) & 0xFF];
+    }
+
+    /* ── Convert plaintext bytes to hex string ── */
+    for (int i = 0; i < ct_len; i++)
+        sprintf(result + i*2, "%02x", pt[i]);
+    result[ct_len*2] = 0;
+    fprintf(stderr, "[t2_hook] login: decrypted %d bytes = %.40s...\n", ct_len, result);
+    return result;
+}
+
 /* ── Registration thread ─────────────────────────────────────────────── */
 
 static void* poll_thread(void *arg) {
@@ -332,7 +310,8 @@ static void* poll_thread(void *arg) {
                 Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
                 Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
                 Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);
-                fprintf(stderr, "[t2_hook] Registered 4 commands\n");
+                Con__addMethodS(NULL, "hook_login", hook_login_cb, "hook_login [username] - C-based RC4 decrypt", 1, 2);
+                fprintf(stderr, "[t2_hook] Registered 5 commands\n");
                 break;
             }
         }
