@@ -90,9 +90,11 @@ echo("SHA1: " @ %result);
 - [x] TribesNext script integration (modified t2-scripts with native crypto)
 - [x] Cert store reader (public.store / private.store)
 - [x] `t2csri_getAccount()` login flow (cert + RC4 decrypt + RSA key setup)
-- [x] Game boots to login screen in `-online` mode (EXIT=0)
-- [ ] Full auth end-to-end with live TribesNext server
-- [ ] loginScreens.cs GUI wrapper (account creation, community features)
+- [x] loginScreens.cs GUI wrapper (TribesNext login dialog, no Ruby dependency)
+- [x] Game boots to TribesNext login screen in `-online` mode (EXIT=0, no errors)
+- [ ] Full auth end-to-end with live TribesNext server (needs interactive input)
+- [ ] Account creation (needs RSA keygen in C)
+- [ ] Persisting downloaded accounts to store files
 
 ## TribesNext Script Integration
 
