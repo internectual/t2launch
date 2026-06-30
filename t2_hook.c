@@ -94,6 +94,8 @@ static const char* hook_sha1_cb(void *obj, S32 argc, const char **argv) {
 static const char* hook_rsa_mod_exp_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     if (argc < 4) return "usage";
+    fprintf(stderr, "[t2_hook] rsa_mod_exp argc=%d b=%s e=%s m=%s\n", argc,
+        argc>1?argv[1]:"(null)", argc>2?argv[2]:"(null)", argc>3?argv[3]:"(null)");
     /* All bignum state on heap to avoid stack overflow.
      * Using 32-bit words, little-endian byte order per word. */
     typedef struct { uint32_t w[64]; int nw; } bn;
@@ -279,6 +281,11 @@ static const char* hook_rsa_mod_exp_cb(void *obj, S32 argc, const char **argv) {
     }
     result[pos] = '\0';
     if (pos == 0) strcpy(result, "00");
+    fprintf(stderr, "[t2_hook] rsa_mod_exp result=%s (b_len=%d e_len=%d m_len=%d)\n",
+        result,
+        argc>1?strlen(argv[1]):0,
+        argc>2?strlen(argv[2]):0,
+        argc>3?strlen(argv[3]):0);
 
     free(ba); free(be); free(bm); free(br);
     #undef BNCPY
