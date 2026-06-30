@@ -39,8 +39,9 @@ Game files (not included) go in `~/t2-linux/`:
 
 1. **LD_PRELOAD Hook**: `t2_hook.so` is loaded at game startup, spawns a thread that waits for the console hash table to initialize, then registers console commands via `Con::addMethodS`
 2. **Native SHA1**: `hook_sha1()` — SHA1 hash computation in C, callable from TorqueScript
-3. **Native RSA** (TODO): `hook_rsa_mod_exp()` — modular exponentiation for 2048-bit RSA
-4. **Credentials** (TODO): Store files (`public.store`, `private.store`) for TribesNext certificate/key
+3. **Native RSA**: `hook_rsa_mod_exp()` — modular exponentiation for 2048-bit RSA
+4. **Credentials**: Store files (`public.store`, `private.store`) for TribesNext certificate/key
+5. **Modified t2-scripts**: Replaces all Ruby crypto calls with native hook commands
 
 ## Quick Start
 
@@ -60,7 +61,7 @@ docker run --rm -v /path/to/t2_hook.c:/build/t2_hook.c -v ~/t2-linux:/output tri
 ### Run
 
 ```bash
-./docker/asgard-run tribes2 /path/to/your/t2-linux -nologin
+./docker/asgard-run tribes2 /path/to/your/t2-linux -online
 ```
 
 ### Verify Hook Loading
@@ -92,7 +93,9 @@ echo("SHA1: " @ %result);
 - [x] `t2csri_getAccount()` login flow (cert + RC4 decrypt + RSA key setup)
 - [x] loginScreens.cs GUI wrapper (TribesNext login dialog, no Ruby dependency)
 - [x] Game boots to TribesNext login screen in `-online` mode (EXIT=0, no errors)
-- [ ] Full auth end-to-end with live TribesNext server (needs interactive input)
+- [x] **Login SUCCEEDED** — correct password accepted, RC4 decrypt verified, cert loaded
+- [x] Auth server connection established (tribesnext.thyth.com:60659)
+- [ ] Challenge-response decryption working (server rejecting RSA decrypt result)
 - [ ] Account creation (needs RSA keygen in C)
 - [ ] Persisting downloaded accounts to store files
 
@@ -118,8 +121,6 @@ All RSA public keys (1024-bit, public exponent 3) are embedded from the Windows 
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
 | `hook_rand64` | none | Random 16-char hex |
-- [ ] Full auth flow: login → lobby → game server connection
-- [ ] Full online play tested
 
 ## Technical Findings
 
@@ -134,7 +135,7 @@ The hook CANNOT register commands from its constructor — the console hash tabl
 ### LD_PRELOAD Configuration
 
 The hook is loaded via `EXTRA_ENV` in `docker/config/tribes2.cfg`:
-```bash
+```
 EXTRA_ENV="LD_PRELOAD=/usr/lib/libSDL-1.2.so.0 /home/loki/game/t2_hook.so"
 ```
 
@@ -159,11 +160,9 @@ Compiling in the `tribes2:hook` container ensures glibc 2.23 compatibility.
 | `Con::addMethodB` | `0x080E8720` | `__cdecl` |
 | `Con::evaluate` | `0x080E88F4` | `__cdecl` |
 | `Con::execute` | `0x080E7560` | `__cdecl` |
-| `Con::getVariable` | `0x080E7388` | `__cdecl` |
+| `Con::getReturnBuffer` | IFC22:0x08122490 | `__cdecl` |
 | Console global ptr | `0x08493DEC` | — |
-| `Sim::findObject` | `0x080FE454` | `__cdecl` |
-| `dAtoi` | `0x081CF68C` | `__cdecl` |
-| `dAtob` | `0x081CF6E8` | `__cdecl` |
+| `Sim::postEvent` | `0x080FE128` | `__cdecl` |
 
 ### Game Console Settings
 
@@ -189,10 +188,22 @@ rm -f ~/.loki/tribes2/console.log ~/.loki/tribes2/stack-trace.txt
 
 CRITICAL: Also `pkill -9 -f tribes2.dynamic` before testing — stale processes cause stale output.
 
+### Game Config
+
+The default config (`docker/config/tribes2.cfg`) runs in `-online` mode for TribesNext play:
+```
+USE_GAMESCOPE=0
+SOFTWARE_GL=1
+USE_STRACE=0
+USE_PADSP=0
+LAUNCH_CMD="./tribes2.dynamic -online"
+EXTRA_ENV="LD_PRELOAD=/usr/lib/libSDL-1.2.so.0 /home/loki/game/t2_hook.so"
+```
+
 ## Credits
 
 - **TribesNext** (tribesnext.com) — community authentication system
-- **t2-mapper** (exogen/t2-mapper) — protocol reference implementation
+- **t2-mapper** (exogen/t2-mapper) — protocol and crypto reference implementation
 - **IFC22** — binary address reference and API documentation
 - **Loki Software** — Linux port of Tribes 2
 
