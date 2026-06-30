@@ -88,8 +88,11 @@ echo("SHA1: " @ %result);
 - [x] `hook_rsa_mod_exp()` — RSA modular exponentiation (verified: 2^10 mod 101 = 0e)
 - [x] `hook_rand64()` — random 64-bit hex from /dev/urandom
 - [x] TribesNext script integration (modified t2-scripts with native crypto)
-- [ ] Full auth flow: login → lobby → game server
-- [ ] Full online play tested
+- [x] Cert store reader (public.store / private.store)
+- [x] `t2csri_getAccount()` login flow (cert + RC4 decrypt + RSA key setup)
+- [x] Game boots to login screen in `-online` mode (EXIT=0)
+- [ ] Full auth end-to-end with live TribesNext server
+- [ ] loginScreens.cs GUI wrapper (account creation, community features)
 
 ## TribesNext Script Integration
 
@@ -99,6 +102,8 @@ The official t2-scripts are loaded from `~/t2-linux/base/t2csri/` with the follo
 - `t2csri_verify_auth/deleg/update_signature()` → direct RSA with hardcoded keys
 - `$accountKey.decrypt()` → `hook_rsa_mod_exp(challenge, d, n)`
 - `rand()` → `hook_rand64()`
+- `t2csri_getAccountCertificate()` → reads public.store
+- `t2csri_getEncryptedAccountKey()` → reads private.store
 - `rubyEval()` / `rubyGetValue()` / `rubyExec()` → no-op stubs
 
 All RSA public keys (1024-bit, public exponent 3) are embedded from the Windows DLL.
