@@ -6,6 +6,8 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
 typedef int S32;
 
@@ -97,18 +99,29 @@ static const char* hook_rsa_mod_exp_cb(void *obj, S32 argc, const char **argv) {
     if (argc < 4) return "usage";
     fprintf(stderr, "[t2_hook] rsa_mod_exp b=%.20s... e=%.20s... m=%.20s...\n",
         argv[1], argv[2], argv[3]);
-    /* Use precompiled GMP helper for fast modexp */
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd), "/usr/lib/rsa_helper %s %s %s 2>/dev/null",
-             argv[1], argv[2], argv[3]);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) { strcpy(result, "ERR:popen"); return result; }
-    if (!fgets(result, sizeof(result), fp)) {
-        pclose(fp);
-        strcpy(result, "ERR:no_output");
+    /* Use precompiled GMP helper for fast modexp via fork+exec */
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { strcpy(result, "ERR:pipe"); return result; }
+    pid_t cpid = fork();
+    if (cpid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        char *args[] = {"/home/loki/game/rsa_helper", (char*)argv[1], (char*)argv[2], (char*)argv[3], NULL};
+        execv("/home/loki/game/rsa_helper", args);
+        _exit(1);
+    } else if (cpid > 0) {
+        close(pipefd[1]);
+        ssize_t n = read(pipefd[0], result, sizeof(result)-1);
+        close(pipefd[0]);
+        waitpid(cpid, NULL, 0);
+        if (n <= 0) { strcpy(result, "ERR:no_output"); return result; }
+        result[n] = 0;
+    } else {
+        strcpy(result, "ERR:fork");
+        close(pipefd[0]); close(pipefd[1]);
         return result;
     }
-    pclose(fp);
     /* strip newline */
     result[strcspn(result, "\r\n")] = 0;
     /* lowercase */
