@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=T2Launch
+Comment=Launch Tribes 2 with configurable profiles
+Exec=t2launch
+Icon=applications-games
+Terminal=false
+Categories=Game;

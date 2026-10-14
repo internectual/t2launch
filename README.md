@@ -37,13 +37,185 @@ Game files (not included) go in `~/t2-linux/`:
 
 ## How It Works
 
-1. **LD_PRELOAD Hook**: `t2_hook.so` is loaded at game startup, spawns a thread that waits for the console hash table to initialize, then registers console commands via `Con::addMethodS`
+1. **LD_PRELOAD Hook**: `t2_hook.so` registers native console helpers and defers TorqueScript work to the game thread through the SDL event loop.
 2. **Native SHA1**: `hook_sha1()` — SHA1 hash computation in C, callable from TorqueScript
 3. **Native RSA**: `hook_rsa_mod_exp()` — modular exponentiation for 2048-bit RSA
 4. **Credentials**: Store files (`public.store`, `private.store`) for TribesNext certificate/key
 5. **Modified t2-scripts**: Replaces all Ruby crypto calls with native hook commands
 
+For the #25034 profile browser, the hook also replaces the local player's broken
+TRIBES-tab callback at runtime with a `DatabaseQueryArray(13, ...)` request. This
+prefetches tribe memberships for the first browser wake, adds those tribes to the
+browser tabs and membership checks, and repaints the member list when rows arrive.
+It also falls back to the saved login name for an empty AuthInfo display name and
+disables IRC nickname filtering on the tribe creation fields. These are in-memory
+GUI/script changes; no `.cs` files or archives on disk are modified.
+
 ## Quick Start
+
+### Desktop launcher
+
+T2Launch provides a system-tray desktop app for running the native client with
+saved profiles. It builds and runs the Docker image from this checkout; no files
+are downloaded from the original `tribes-2-docker` project.
+
+Install the desktop app and start it:
+
+```bash
+./install.sh
+~/.local/bin/t2launch
+```
+
+Open **Settings** from the tray menu to choose the game directory, create/edit
+profiles, choose the fullscreen display, toggle the hook, configure autolaunch,
+or use **Build / Rebuild image**. The tray menu lists profiles alphabetically;
+click a profile to launch it. Hovering the tray icon shows running profiles.
+The hook is enabled by default and its library/helper are overlaid into an
+external game directory when available. Settings are stored in
+`~/.config/t2launch/settings.json` with private permissions.
+Launcher and crash-stage diagnostics are written, with login arguments redacted,
+to `~/.local/state/t2launch/launch-diagnostics.log`.
+
+The underlying command-line image build remains available:
+
+```bash
+./docker/asgard-build tribes2
+```
+
+The launcher automatically builds the image if it is missing. Its build
+context stages the local `games/tribes2` support files, installs the image's
+runtime dependencies, and includes the legacy Loki compatibility libraries in
+`docker/compat-libs`; it does not fetch code or libraries from the upstream
+project.
+
+### Local WON emulator and master proxy
+
+Enable **Use local WON emulator** in a profile and leave **Load t2_hook.so**
+enabled. The launcher starts or reuses `wonemu.py` and checks readiness before
+starting the game. Readiness includes an implementation fingerprint, so an
+existing daemon is restarted when the emulator code changes. It binds only to
+localhost:
+
+| Port | Handler |
+|------|---------|
+| TCP 15104 | WON GetDir requests and service discovery |
+| TCP 15105 | Signed public-key block and local-account Auth1 login |
+| TCP 15106 | DBProxy account-name lookup; other operations are captured |
+| TCP 15107 | Native IRC certificate/challenge login and basic IRC commands |
+| UDP 15108 | Native Torque master protocol and TribesNext discovery proxy |
+
+The hook replaces the three Sierra bootstrap strings with `127.0.0.1:15104`
+in the running client's memory before WON initialization. It checks the original
+strings and restores page permissions afterward. The executable on disk is
+unchanged. The option is off by default; enabling it on an unsupported executable
+fails instead of attempting the patch.
+
+The directory serves `/TitanServers/Auth`, `/Tribes2`, and
+`/TitanServers/DBProxy`, advertising the local endpoints. Directory discovery has
+been verified against the actual #25034 client. The auth listener serves a
+generated auth key block signed with a per-install emulator root key, which the
+client verifies against an in-memory replacement for its embedded WON verifier.
+Emulator accounts are stored separately in `community.sqlite3` as salted PBKDF2
+password hashes; they do not depend on Sierra/WON signing keys or `private.store`.
+Reserve a login with `python3 wonemu.py --reserve-local-account NAME`, then enter
+that name and its chosen password in T2's online login screen. The first login
+enrolls the password hash. Existing `private.store` accounts remain accepted as
+a legacy fallback.
+The default `compat` auth key profile uses a compact safe-prime group to avoid a
+legacy-client overflow/truncation in its 2048-bit ElGamal output. Message 3 is
+decoded through the ElGamal wrapper and Blowfish login-data transform. The
+decrypted payload is represented in logs only by its length and SHA-256; key and
+credential contents are not logged. A valid local account completes the
+encrypted message-4/message-5 challenge and receives a signed Auth1/Auth2
+certificate reply with an encrypted session-key confirmation. The #25034 client
+accepts the local success reply. Unknown accounts and invalid passwords receive
+a native AuthComplete failure. Use `--auth-key-profile native` to experiment
+with the client's embedded 2048-bit group. The legacy private-store fallback
+defaults to `base/private.store` beside the game binary and can be overridden
+with `--private-store`. DBProxy account-name lookup accepts both local accounts
+and legacy `private.store` entries; unsupported DBProxy
+requests are recorded by operation and payload hash. Successful Auth1 sessions are
+cached in memory for the IRC listener. Its native `CERT`/`CHALLENGE`/`CHALRESP`
+exchange encrypts CB33/CB35 with the client's Auth1 key and includes the signed Auth2
+certificate context. It validates the known CB34 proof encoding and has a
+loopback-only compatibility path for legacy CB34 layouts bound to a verified
+Auth1 session. The IRC service supports
+the login handshake, PING/PONG, basic channel joins, player profile response
+(query 23), and player search from `private.store` (query 3). It reassembles chunked
+`DBQA` requests and emits `DBMSG` continuations for long results. Other DBProxy
+support includes tribe search (query 4), local mail send/inbox polling/read/delete and deleted-mail
+listing (queries 5, 1, 7, 6, and array query 14), forum list/topics/posts and local
+post create/reply/edit/delete (queries 7–9 and 12–14), tribal topic moderation
+(queries 62 and 66–68), news article
+listing/post/edit/delete (array queries 0 and 100; scalar queries 1–3), local MOTD
+and classic web-link rows (scalar query 0 and array query 15), local profile history
+(array query 12), and online presence for authenticated IRC sessions (query 69).
+Player descriptions, graphics, URLs, and display names are persisted in a local
+SQLite community store at `community.sqlite3` under the log directory; override
+its path with `--community-db`. Tribes and memberships are persisted there as
+well. The current DBProxy subset includes player search/profile and profile
+updates, live IRC presence, tribe search/profile/roster, tribe creation and settings,
+membership roles, primary-tribe selection, invitations, and persistent buddy lists.
+Mail supports sending
+to local accounts, inbox polling, and read/delete status. Forums provide a local
+General board with topic and post persistence; post mutations are limited to the
+authenticated author, while tribe moderators can manage their forum topics. News
+articles use the recovered T2 category IDs and are editable/deletable by their author.
+The stock #25034 online shell has no Forums tab; its forum backend is retained for
+existing forum-link flows, without modifying the game's scripts or other assets.
+Deferred idea: expose a Forums tab through hook-based runtime script registration,
+while leaving the on-disk `.cs` files untouched. This is not implemented yet.
+Mail sender block lists support listing,
+adding, and removing blocked accounts and prevent delivery from blocked senders.
+Deleted-mail views are supported. Existing tribe memberships grant access to the
+corresponding negative-ID tribe forums. MOTD administration and other DBProxy
+query families remain unsupported.
+
+The master proxy handles native Torque game-type queries, server-list filters,
+game-server heartbeats, and server-info replies. Its default `hybrid` backend
+translates TribesNext `/list`, `/listtypes`, and heartbeat requests while merging
+in locally observed native servers. Select `local` for LAN/alternative-auth
+discovery or `tribesnext` for TribesNext-only listings with
+`--master-backend`; `--tribesnext-master-url` can point to another compatible
+HTTP backend. These can also be selected through `T2LAUNCH_MASTER_BACKEND` and
+`T2LAUNCH_TRIBESNEXT_MASTER_URL` when the launcher auto-starts the service. The
+existing T2 scripts remain untouched.
+
+For command-line launches:
+
+```bash
+T2LAUNCH_WONEMU=1 ./docker/asgard-run tribes2 ~/t2-linux
+```
+
+The directory is contacted when the **native WON login flow** runs. `-nologin`
+skips that flow, and TribesNext replacement scripts may bypass it. A diagnostic
+probe in the game console can explicitly start native discovery:
+
+```cs
+WONInit();
+WONStartLogin("wonemu_probe", "probe_not_a_real_password", false);
+echo(WONLoginResult());
+```
+
+Logs are in `${XDG_STATE_HOME:-~/.local/state}/t2launch/wonemu/`:
+`traffic.jsonl` records decoded directory queries, authentication message
+metadata, raw encrypted bytes, response hashes and connections; `wonemu.log`
+captures stdout/stderr when auto-started. The generated private root/auth keys
+live in `keys.json` in this private-permission state directory. The service
+remains available across game instances. Start it interactively or stop it with:
+
+```bash
+python3 wonemu.py
+python3 wonemu.py --stop
+```
+
+`--empty-directory` allows zero-entity response experiments; individual listener
+ports can be configured with `--auth-port`, `--dbproxy-port`, etc. The hook's
+bootstrap destination remains fixed at 15104. Auto-start uses the default ports
+and verifies the running service's identity/settings, rather than reusing an
+arbitrary process on that port.
+
+Protocol checks: `python3 -m unittest discover -s tests -v`.
 
 ### Prerequisites
 
@@ -134,12 +306,17 @@ The hook CANNOT register commands from its constructor — the console hash tabl
 
 ### LD_PRELOAD Configuration
 
-The hook is loaded via `EXTRA_ENV` in `docker/config/tribes2.cfg`:
+The launcher composes `LD_PRELOAD` in `docker/asgard-run` when the hook option
+is enabled. The hook must precede SDL so its main-thread `SDL_PollEvent`
+interposer can defer runtime TorqueScript work safely. The Xenial container
+also needs `libpthread` preloaded explicitly:
 ```
-EXTRA_ENV="LD_PRELOAD=/usr/lib/libSDL-1.2.so.0 /home/loki/game/t2_hook.so"
+LD_PRELOAD=/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:/usr/lib/libSDL-1.2.so.0
 ```
 
-This is the **only** reliable way to set LD_PRELOAD — setting it via `docker run -e` gets overridden by the `EXTRA_ENV` variable.
+The hook toggle removes only `t2_hook.so`; `libpthread` and SDL remain available
+for the legacy game runtime. It registers five native commands and installs the
+Player TRIBES-tab override at runtime after the Community Browser control exists.
 
 ### Hook Build Requirements
 
@@ -190,14 +367,15 @@ CRITICAL: Also `pkill -9 -f tribes2.dynamic` before testing — stale processes 
 
 ### Game Config
 
-The default config (`docker/config/tribes2.cfg`) runs in `-online` mode for TribesNext play:
+The default config (`docker/config/tribes2.cfg`) sets the game binary and
+enables the hook. The desktop profile supplies `-online` or `-nologin`:
 ```
 USE_GAMESCOPE=0
 SOFTWARE_GL=1
 USE_STRACE=0
 USE_PADSP=0
-LAUNCH_CMD="./tribes2.dynamic -online"
-EXTRA_ENV="LD_PRELOAD=/usr/lib/libSDL-1.2.so.0 /home/loki/game/t2_hook.so"
+GAME_BINARY="./tribes2.dynamic"
+LOAD_HOOK=1
 ```
 
 ## Credits

@@ -36,7 +36,8 @@ GAME_NAME="${POSITIONAL[0]:-}"
 # If not provided, you'll be prompted (or it falls back to the baked-in copy).
 HOST_GAME_PATH="${POSITIONAL[1]:-}"
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GAMES_DIR="$ROOT_DIR/games"
+REPO_DIR="$(cd "$ROOT_DIR/.." && pwd)"
+GAMES_DIR="$REPO_DIR/games"
 
 # Preflight: Docker is the only hard requirement.
 if ! command -v docker >/dev/null 2>&1; then
@@ -227,15 +228,25 @@ SOFTWARE_GL=${SOFTWARE_GL:-1}
 MESA_YEAR=${MESA_YEAR:-}
 SAVE_DIRS=()
 LAUNCH_CMD=""
+GAME_BINARY="./${GAME_NAME:-tribes2}.dynamic"
 PRE_LAUNCH=""
 USE_STRACE=${USE_STRACE:-1}
 GAMESCOPE_ARGS=""
 HOST_WRAPPER=""
 EXTRA_ENV=""
+LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-1}"
+T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
 
 # Source per-game config if it exists
 if [[ -f "$ROOT_DIR/config/$GAME_NAME.cfg" ]]; then
     source "$ROOT_DIR/config/$GAME_NAME.cfg"
+fi
+LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
+T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
+WONEMU="${T2LAUNCH_WONEMU:-0}"
+if [[ "$WONEMU" == "1" && "$LOAD_HOOK" != "1" ]]; then
+    echo "ERROR: local WON emulation requires the hook to be enabled." >&2
+    exit 2
 fi
 
 # First run: build the Docker image automatically if it doesn't exist yet, so
@@ -280,6 +291,24 @@ if [[ -n "$HOST_GAME_PATH" ]]; then
         DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/run_t2.sh:/home/loki/game/run_t2.sh:ro")
         echo "  + overlay launcher: run_t2.sh"
     fi
+    HOOK_FILE="$HELPER_DIR/t2_hook.so"
+    [[ -f "$HOOK_FILE" ]] || HOOK_FILE="$REPO_DIR/t2_hook.so"
+    if [[ -f "$HOOK_FILE" ]]; then
+        DOCKER_EXTRA_ARGS+=(-v "$HOOK_FILE:/home/loki/game/t2_hook.so:ro")
+        echo "  + overlay hook:     t2_hook.so"
+    elif [[ "$LOAD_HOOK" == "1" ]]; then
+        echo "WARNING: hook requested but no t2_hook.so was found in $HELPER_DIR or $REPO_DIR."
+    fi
+    if [[ "$LOAD_HOOK" == "1" ]]; then
+        RSA_HELPER_FILE="$HELPER_DIR/rsa_helper"
+        [[ -f "$RSA_HELPER_FILE" ]] || RSA_HELPER_FILE="$REPO_DIR/rsa_helper"
+        if [[ -f "$RSA_HELPER_FILE" ]]; then
+            DOCKER_EXTRA_ARGS+=(-v "$RSA_HELPER_FILE:/home/loki/game/rsa_helper:ro")
+            echo "  + overlay RSA helper"
+        else
+            echo "WARNING: hook RSA helper not found; RSA challenge commands may fail."
+        fi
+    fi
     if [[ -d "$HELPER_DIR/base/fonts" ]]; then
         DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/base/fonts:/home/loki/game/base/fonts:ro")
         echo "  + overlay fonts:    base/fonts"
@@ -302,6 +331,16 @@ if [[ -n "$EXTRA_ENV" ]]; then
     DOCKER_EXTRA_ARGS+=(-e "$EXTRA_ENV")
 fi
 
+PRELOAD="/usr/lib/libSDL-1.2.so.0"
+if [[ "$LOAD_HOOK" == "1" ]]; then
+    PRELOAD="/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:$PRELOAD"
+fi
+# The hook uses game-specific addresses; do not preload it into the shell.
+DOCKER_EXTRA_ARGS+=(-e "LD_PRELOAD=" -e "T2_GAME_PRELOAD=$PRELOAD" -e "T2LAUNCH_WONEMU=$WONEMU")
+if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" ]] && ! command -v gamescope >/dev/null 2>&1; then
+    DOCKER_EXTRA_ARGS+=(-e "SDL_VIDEO_FULLSCREEN_HEAD=$T2LAUNCH_MONITOR_INDEX")
+fi
+
 # Grant the container access to the X server. 'xhost' lives in 'xorg-xhost' on
 # Arch/Fedora and 'x11-xserver-utils' on Debian/Ubuntu. A missing or failing
 # xhost must NOT abort the run (set -e) — warn and continue.
@@ -319,12 +358,16 @@ else
     echo "        Fedora:         sudo dnf install xorg-x11-server-utils"
 fi
 
-GAMESCOPE_CMD=""
-if [[ "$USE_GAMESCOPE" == "1" ]]; then
+GAMESCOPE_CMD=()
+if [[ "$USE_GAMESCOPE" == "1" || -n "$T2LAUNCH_MONITOR" || -n "${T2LAUNCH_MONITOR_INDEX:-}" ]]; then
     if command -v gamescope >/dev/null 2>&1; then
-        GAMESCOPE_CMD="gamescope -w $GAMESCOPE_WIDTH -h $GAMESCOPE_HEIGHT $GAMESCOPE_ARGS --"
+        GAMESCOPE_CMD=(gamescope -w "$GAMESCOPE_WIDTH" -h "$GAMESCOPE_HEIGHT")
+        if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" ]]; then
+            GAMESCOPE_CMD+=(--display-index "$T2LAUNCH_MONITOR_INDEX")
+        fi
+        GAMESCOPE_CMD+=(--)
     else
-        echo "NOTE: gamescope not installed — running without it."
+        echo "NOTE: gamescope not installed — using SDL monitor selection where supported."
     fi
 fi
 
@@ -340,6 +383,7 @@ if [[ -z "$DISPLAY" ]]; then
     echo "NOTE: \$DISPLAY was empty; defaulting to :0 (XWayland)."
     DISPLAY=":0"
 fi
+export DISPLAY
 
 # Add host-integration mounts/devices only when the source actually exists, so
 # the same command works across X11/Wayland, PulseAudio/PipeWire and distros.
@@ -366,37 +410,47 @@ add_mount /media/cdrom /cdrom rw
 AUDIO_GID=$(getent group audio | cut -d: -f3)
 if [[ -n "$AUDIO_GID" ]]; then DOCKER_EXTRA_ARGS+=(--group-add "$AUDIO_GID"); fi
 
-# Start RSA proxy for fast decryption (needed for TribesNext auth)
+# Start/reuse RSA proxy for fast decryption (needed for TribesNext auth).
+if [[ "$WONEMU" == "1" ]]; then
+    python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/tribes2.dynamic"
+    WONEMU_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/wonemu"
+    DOCKER_EXTRA_ARGS+=(-v "$WONEMU_STATE_DIR/verifier.der:/home/loki/wonemu-verifier.der:ro" \
+        -e "T2LAUNCH_WON_VERIFIER=/home/loki/wonemu-verifier.der")
+fi
+
 RSA_PROXY_PORT=18765
 if ! command -v python3 >/dev/null 2>&1; then
     echo "WARNING: python3 not found — RSA proxy will not start"
 else
-    # Kill any existing proxy
-    pkill -f "rsa_proxy.py" 2>/dev/null || true
-    # Start proxy in background
-    python3 "$ROOT_DIR/rsa_proxy.py" "$RSA_PROXY_PORT" &
-    RSA_PROXY_PID=$!
-    echo "RSA proxy started (PID: $RSA_PROXY_PID) on port $RSA_PROXY_PORT"
-    # Give it a moment to bind
-    sleep 0.5
+    if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",18765),0.2); s.close()' >/dev/null 2>&1; then
+        echo "Reusing RSA proxy on 127.0.0.1:$RSA_PROXY_PORT"
+    else
+        python3 "$ROOT_DIR/rsa_proxy.py" "$RSA_PROXY_PORT" &
+        RSA_PROXY_PID=$!
+        sleep 0.5
+        if ! kill -0 "$RSA_PROXY_PID" 2>/dev/null; then
+            echo "ERROR: RSA proxy failed to start" >&2
+            exit 1
+        fi
+        echo "RSA proxy started (PID: $RSA_PROXY_PID) on port $RSA_PROXY_PORT"
+    fi
 fi
 
-$GAMESCOPE_CMD $HOST_WRAPPER docker run \
+"${GAMESCOPE_CMD[@]}" $HOST_WRAPPER docker run \
     --rm \
-    --privileged \
     --network host \
     --group-add=audio \
     -e PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native \
-    --env=DISPLAY=$DISPLAY \
+    --env=DISPLAY \
     --env=XDG_RUNTIME_DIR=/run/user/$uid \
     "${DOCKER_EXTRA_ARGS[@]}" \
     -e GAME_NAME="$GAME_NAME" \
-    -e LAUNCH_CMD="$LAUNCH_CMD" \
+    -e GAME_BINARY="$GAME_BINARY" \
     -e PRE_LAUNCH="$PRE_LAUNCH" \
     -e USE_STRACE="$USE_STRACE" \
     -e USE_PADSP="$USE_PADSP" \
     $GAME_NAME \
-    bash --norc -c 'cd /home/loki/game && export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH && [ -n "$PRE_LAUNCH" ] && eval "$PRE_LAUNCH"; STRACE="" && [ "$USE_STRACE" = "1" ] && STRACE="strace -e trace=none -o /dev/null -f"; PADSP="" && [ "$USE_PADSP" = "1" ] && PADSP="padsp"; CMD=""; if [ -n "$LAUNCH_CMD" ]; then CMD="$LAUNCH_CMD"; elif [ -e "${GAME_NAME}.sh" ]; then CMD="./${GAME_NAME}.sh"; elif [ -e "${GAME_NAME}" ]; then CMD="./${GAME_NAME}"; elif [ -e "${GAME_NAME}.dynamic" ]; then CMD="./${GAME_NAME}.dynamic"; else CMD="./${GAME_NAME}"; fi; exec $STRACE $PADSP $CMD "$@"' \
+    bash --norc -c 'cd /home/loki/game; export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH; if [ -n "$PRE_LAUNCH" ]; then eval "$PRE_LAUNCH"; fi; STRACE=(); if [ "$USE_STRACE" = "1" ]; then STRACE=(strace -e trace=none -o /dev/null -f); fi; PADSP=(); if [ "$USE_PADSP" = "1" ]; then PADSP=(padsp); fi; exec "${STRACE[@]}" "${PADSP[@]}" env LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"' \
     _ "${GAME_ARGS[@]}"
 
 # Cleanup RSA proxy on exit

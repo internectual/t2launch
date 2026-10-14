@@ -1,5 +1,12 @@
 # Docker image used to run old Linux games such as the ones released by Loki or
 # Linux Game Publishing.
+FROM i386/ubuntu:16.04 AS hook-build
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+COPY ./build/t2_hook.c /tmp/t2_hook.c
+RUN gcc -m32 -shared -fPIC -o /tmp/t2_hook.so /tmp/t2_hook.c -O2 -std=c99 -pthread -ldl
+
 FROM i386/ubuntu:16.04
 
 # Install system dependencies needed by old games.
@@ -48,17 +55,9 @@ RUN ln -s /usr/lib/i386-linux-gnu/mesa/libGL.so.1 /usr/lib/libGL.so && \
 # Symlink libaudiofile.so to a known location for Heavy Gear 2.
 RUN ln -s /usr/lib/i386-linux-gnu/libaudiofile.so.1 /usr/lib/libaudiofile.so.0
 
-# Copy old GCC 2.95 / era-specific compat libs from the host's lib/ directory.
-# These are needed for binaries compiled with egcs/GCC 2.95 (e.g. Tribes 2).
-COPY lib/libstdc++* /usr/lib/
-COPY lib/libSDL* /usr/lib/
-COPY lib/libsmpeg* /usr/lib/
-COPY lib/libsmjpeg* /usr/lib/
-COPY lib/libttf* /usr/lib/
-
-# Copy a subset of the "Loki compat libs" to a standard location.
-# This has only been useful for Civ:CTP so far.
-COPY lib/* /usr/lib/
+# Keep the legacy Loki-era SDL and GCC runtimes alongside Xenial's libraries.
+# Tribes 2's binary requires symbols that are not exported by libstdc++6.
+COPY compat-libs/ /usr/lib/
 
 # Run as a regular user
 ARG USER_UID
@@ -68,8 +67,8 @@ RUN useradd -ms /bin/bash $USER
 RUN usermod --uid $USER_UID "$USER"
 RUN groupmod --gid $USER_GID "$USER"
 WORKDIR /home/loki
-COPY ./build /home/loki/game
-COPY ./start.sh /home/loki/start.sh
+COPY ./build/ /home/loki/game/
+COPY --from=hook-build /tmp/t2_hook.so /home/loki/game/t2_hook.so
 RUN chown $USER_UID:$USER_GID -R /home/loki/
 USER $USER
 
