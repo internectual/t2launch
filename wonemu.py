@@ -29,6 +29,7 @@ import urllib.parse
 import urllib.request
 
 import community_store
+import tribesnext
 import woncrypto
 
 HOST = "127.0.0.1"
@@ -46,7 +47,7 @@ TORQUE_MASTER_MAX_SERVERS = (TORQUE_MASTER_PACKET_MAX - 12) // TORQUE_MASTER_SER
 
 def implementation_fingerprint():
     digest = hashlib.sha256()
-    for module in (__import__(__name__), community_store, woncrypto):
+    for module in (__import__(__name__), community_store, tribesnext, woncrypto):
         path = Path(module.__file__).resolve()
         digest.update(path.name.encode("utf-8"))
         digest.update(path.read_bytes())
@@ -260,7 +261,8 @@ def parse_login_payload(payload, session_key):
             "extension_bytes": extension_bytes}
 
 
-def decode_login_envelope(payload, keys, private_store=None, account_store=None):
+def decode_login_envelope(payload, keys, private_store=None, account_store=None,
+                          refresh_tribesnext=None):
     reader = Reader(payload)
     if reader.take(5) != bytes.fromhex("05 0c 00 03 00"):
         raise ValueError("Not a native login request")
@@ -287,21 +289,48 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None)
         result["login_data_error"] = str(exc)
     else:
         account_enrolled = False
+        tribesnext_validation = "store_missing"
         if account_store is not None and account_store.local_account_exists(fields["username"]):
             account_validation, account_enrolled = account_store.verify_local_account(
                 fields["username"], fields["password"])
+            credential_source = "local"
+            # The same game login screen is used for WON and TribesNext. If the
+            # local profile password differs from the user's TribesNext password,
+            # accept the latter only when it unlocks that account's installed
+            # TribesNext private key.
+            if account_validation != "valid" and private_store:
+                tribesnext_validation = woncrypto.verify_private_store_password(
+                    private_store, fields["username"], fields["password"])
+                if tribesnext_validation == "valid":
+                    account_validation = "valid"
+                    credential_source = "tribesnext"
+            elif private_store:
+                tribesnext_validation = woncrypto.verify_private_store_password(
+                    private_store, fields["username"], fields["password"])
         else:
-            account_validation = woncrypto.verify_private_store_password(
+            tribesnext_validation = woncrypto.verify_private_store_password(
                 private_store, fields["username"], fields["password"])
+            account_validation = tribesnext_validation
+            credential_source = "tribesnext" if account_validation == "valid" else "unknown"
+        recovery_status = "not_configured"
+        if tribesnext_validation != "valid":
+            recovery_status = "not_used"
+        elif refresh_tribesnext is not None:
+            try:
+                recovery_status = refresh_tribesnext(fields["username"], fields["password"])
+            except (OSError, ValueError, UnicodeError):
+                recovery_status = "failed"
         result.update(login_data_decryption="decoded", symmetric_key_bytes=len(symmetric_key),
                       login_plaintext_bytes=len(login_data),
                       login_plaintext_sha256=hashlib.sha256(login_data).hexdigest(),
                       login_request_kind=fields["request_kind"],
                        username_utf16_bytes=len(fields["username"].encode("utf-16le")),
                        password_utf16_bytes=len(fields["password"].encode("utf-16le")),
-                       client_identifier=fields["client"], login_flags=list(fields["flags"]),
-                       login_extension_bytes=fields["extension_bytes"],
+                      client_identifier=fields["client"], login_flags=list(fields["flags"]),
+                      login_extension_bytes=fields["extension_bytes"],
                       account_validation=account_validation,
+                      credential_source=credential_source,
+                      tribesnext_recovery=recovery_status,
                       account_enrolled=account_enrolled)
     return result
 
@@ -1518,85 +1547,86 @@ class AuthHandler(socketserver.BaseRequestHandler):
                     emulator.log.event("sent", service="auth", connection=connection, message=2,
                                        frame_hex=reply.hex(), key_block_id=1)
                     print("[wonemu] auth: sent signed public-key block", flush=True)
-                else:
-                    # Preserve encrypted bytes and decode only known message-3
-                    # framing; successful replies require a verified local account.
+                    continue
+
+                if (header, service, message) == (5, 12, 3):
                     emulator.log.event("capture_only", service="auth", connection=connection,
                                        bytes=len(payload) + 4, data_hex=frame(payload).hex(), message=message)
-                    if (header, service, message) == (5, 12, 3):
-                        login = None
-                        encrypted_key = None
-                        encrypted_data = None
+                    login = None
+                    encrypted_key = None
+                    encrypted_data = None
+                    try:
+                        login = decode_login_envelope(
+                            payload, emulator.keys, emulator.private_store, emulator.community,
+                            emulator.refresh_tribesnext_account if emulator.refresh_tribesnext else None)
+                        reader = Reader(payload)
+                        reader.take(5)
+                        reader.take(2)
+                        encrypted_key = reader.take(reader.number("<H"))
+                        encrypted_data = reader.take(reader.number("<H"))
+                        emulator.log.event("login_envelope", connection=connection, **login)
+                        state = (f"decrypted login payload ({login['login_plaintext_bytes']} bytes)"
+                                 if login["login_data_decryption"] == "decoded"
+                                 else "login payload remains encrypted")
+                        print(f"[wonemu] auth: parsed message 3 envelope ({login['elgamal_plaintext_bytes']} ElGamal bytes, "
+                              f"{login['encrypted_login_data_bytes']} login bytes); {state}", flush=True)
+                    except (OSError, ValueError) as exc:
+                        emulator.log.event("login_decode_error", connection=connection, error=str(exc))
+                    if login and login.get("account_validation") == "valid" and encrypted_key:
                         try:
-                            login = decode_login_envelope(payload, emulator.keys,
-                                                          emulator.private_store, emulator.community)
-                            reader = Reader(payload)
-                            reader.take(5)
-                            reader.take(2)
-                            encrypted_key = reader.take(reader.number("<H"))
-                            encrypted_data = reader.take(reader.number("<H"))
-                            emulator.log.event("login_envelope", connection=connection, **login)
-                            state = (f"decrypted login payload ({login['login_plaintext_bytes']} bytes)"
-                                     if login["login_data_decryption"] == "decoded"
-                                     else "login payload remains encrypted")
-                            print(f"[wonemu] auth: parsed message 3 envelope ({login['elgamal_plaintext_bytes']} ElGamal bytes, "
-                                  f"{login['encrypted_login_data_bytes']} login bytes); {state}", flush=True)
-                        except ValueError as exc:
-                            emulator.log.event("login_decode_error", connection=connection, error=str(exc))
-                        if login and login.get("account_validation") == "valid" and encrypted_key:
-                            try:
-                                session_key, login_data = woncrypto.decrypt_won_login_data(
-                                    emulator.keys["auth"], encrypted_key, encrypted_data)
-                                login_username = parse_login_payload(login_data, session_key)["username"]
-                            except (OSError, ValueError) as exc:
-                                emulator.log.event("auth_challenge_error", connection=connection, error=str(exc))
-                            else:
-                                challenge = secrets.token_bytes(16)
-                                cipher = woncrypto.encrypt_won_crypt_transform(session_key, challenge)
-                                reply = frame(struct.pack("<BHHH", 5, 12, 4, len(cipher)) + cipher)
-                                self.request.sendall(reply)
-                                emulator.log.event("sent", service="auth", connection=connection, message=4,
-                                                   encrypted_challenge_bytes=len(cipher), frame_hex=reply.hex())
-                                print("[wonemu] auth: sent encrypted challenge for local account", flush=True)
-                                continue
-                        # Malformed or non-local credentials receive a native
-                        # AuthComplete failure; only a verified account reaches
-                        # the encrypted challenge and signed success response.
+                            session_key, login_data = woncrypto.decrypt_won_login_data(
+                                emulator.keys["auth"], encrypted_key, encrypted_data)
+                            login_username = parse_login_payload(login_data, session_key)["username"]
+                        except (OSError, ValueError) as exc:
+                            emulator.log.event("auth_challenge_error", connection=connection, error=str(exc))
+                        else:
+                            challenge = secrets.token_bytes(16)
+                            cipher = woncrypto.encrypt_won_crypt_transform(session_key, challenge)
+                            reply = frame(struct.pack("<BHHH", 5, 12, 4, len(cipher)) + cipher)
+                            self.request.sendall(reply)
+                            emulator.log.event("sent", service="auth", connection=connection, message=4,
+                                               encrypted_challenge_bytes=len(cipher), frame_hex=reply.hex())
+                            print("[wonemu] auth: sent encrypted challenge for local account", flush=True)
+                            continue
+                    rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
+                    self.request.sendall(rejection)
+                    emulator.log.event("sent", service="auth", connection=connection,
+                                       message=6, status=-1, frame_hex=rejection.hex())
+                    outcome = login.get("account_validation", "not_decoded") if login else "not_decoded"
+                    print(f"[wonemu] auth: explicit rejection; account validation={outcome}", flush=True)
+                    break
+
+                if (header, service, message) == (5, 12, 5) and session_key:
+                    reader = Reader(payload)
+                    reader.take(5)
+                    cipher = reader.take(reader.number("<H"))
+                    if reader.offset != len(payload):
+                        raise ValueError("Trailing bytes in auth challenge response")
+                    response = woncrypto.decrypt_won_crypt_transform(session_key, cipher)
+                    expected_response = response == b"\0"
+                    emulator.log.event("auth_challenge_response", connection=connection,
+                                       plaintext_bytes=len(response), expected_response=expected_response)
+                    if expected_response and login_username:
+                        reply, client_key = woncrypto.auth1_login_reply(
+                            emulator.keys, session_key, login_username, return_client_key=True)
+                        emulator.register_auth_session(self.client_address[0], login_username,
+                                                       session_key, reply, client_key)
+                        self.request.sendall(frame(reply))
+                        emulator.log.event("sent", service="auth", connection=connection,
+                                           message=6, status=0, response_bytes=len(reply))
+                        print("[wonemu] auth: completed local Auth1 login", flush=True)
+                    else:
                         rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
                         self.request.sendall(rejection)
                         emulator.log.event("sent", service="auth", connection=connection,
                                            message=6, status=-1, frame_hex=rejection.hex())
-                        outcome = login.get("account_validation", "not_decoded") if login else "not_decoded"
-                        print(f"[wonemu] auth: explicit rejection; account validation={outcome}", flush=True)
-                    elif (header, service, message) == (5, 12, 5) and session_key:
-                        reader = Reader(payload)
-                        reader.take(5)
-                        cipher = reader.take(reader.number("<H"))
-                        if reader.offset != len(payload):
-                            raise ValueError("Trailing bytes in auth challenge response")
-                        response = woncrypto.decrypt_won_crypt_transform(session_key, cipher)
-                        expected_response = response == b"\0"
-                        emulator.log.event("auth_challenge_response", connection=connection,
-                                           plaintext_bytes=len(response), expected_response=expected_response)
-                        if expected_response and login_username:
-                            reply, client_key = woncrypto.auth1_login_reply(
-                                emulator.keys, session_key, login_username,
-                                return_client_key=True)
-                            emulator.register_auth_session(self.client_address[0], login_username,
-                                                           session_key, reply, client_key)
-                            self.request.sendall(frame(reply))
-                            emulator.log.event("sent", service="auth", connection=connection,
-                                               message=6, status=0, response_bytes=len(reply))
-                            print("[wonemu] auth: completed local Auth1 login", flush=True)
-                        else:
-                            rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
-                            self.request.sendall(rejection)
-                            emulator.log.event("sent", service="auth", connection=connection,
-                                               message=6, status=-1, frame_hex=rejection.hex())
-                            print("[wonemu] auth: challenge response rejected", flush=True)
-                    if message != 3 and not (message == 5 and session_key):
-                        print(f"[wonemu] auth: captured message {message} ({len(payload) + 4} bytes); handler not implemented", flush=True)
+                        print("[wonemu] auth: challenge response rejected", flush=True)
                     break
+
+                emulator.log.event("capture_only", service="auth", connection=connection,
+                                   bytes=len(payload) + 4, data_hex=frame(payload).hex(), message=message)
+                print(f"[wonemu] auth: captured message {message} ({len(payload) + 4} bytes); handler not implemented", flush=True)
+                break
         except (OSError, ValueError) as exc:
             emulator.log.event("connection_error", service="auth", connection=connection, error=str(exc))
 
@@ -1610,12 +1640,13 @@ class MasterDatagramHandler(socketserver.BaseRequestHandler):
 class Emulator:
     def __init__(self, ports=None, log_dir=LOG_DIR, empty=False, keys=None, private_store=None,
                  master_backend="local", tribesnext_master_url=TRIBESNEXT_MASTER_URL,
-                 community_db=None):
+                 community_db=None, refresh_tribesnext=False):
         self.ports = dict(ports or PORTS)
         self.records = {path: [] for path in directory_records(self.ports)} if empty else directory_records(self.ports)
         self.empty = empty
         self.keys = keys
         self.private_store = Path(private_store) if private_store is not None else None
+        self.refresh_tribesnext = bool(refresh_tribesnext)
         self.community = community_store.CommunityStore(
             community_db or (Path(log_dir) / "community.sqlite3"))
         self.community_db_path = self.community.path
@@ -1668,6 +1699,22 @@ class Emulator:
                 if not connections:
                     self.irc_presence.pop(int(user_id), None)
 
+    def refresh_tribesnext_account(self, username, password):
+        if not self.private_store:
+            self.log.event("tribesnext_recovery", result="store_missing")
+            return "store_missing"
+        public_store = self.private_store.with_name("public.store")
+        try:
+            tribesnext.recover_account(
+                username, password, public_store, self.private_store, timeout=8.0)
+        except (OSError, ValueError, UnicodeError) as exc:
+            result = "failed"
+            self.log.event("tribesnext_recovery", result=result,
+                           error_type=type(exc).__name__)
+            return result
+        self.log.event("tribesnext_recovery", result="refreshed")
+        return "refreshed"
+
     def online_user_ids(self):
         with self.irc_presence_lock:
             return {user_id for user_id, connections in self.irc_presence.items() if connections}
@@ -1678,6 +1725,7 @@ class Emulator:
                 "stage": AUTH_STAGE if self.keys else "directory + DBProxy + Torque master proxy",
                 "implementation_sha256": IMPLEMENTATION_SHA256,
                 "master_backend": self.master_backend,
+                "refresh_tribesnext": self.refresh_tribesnext,
                 "master_url_sha256": hashlib.sha256(self.tribesnext_master_url.encode()).hexdigest(),
                 "verifier_sha256": hashlib.sha256(woncrypto.public_key(self.keys["root"])).hexdigest() if self.keys else None,
                 "auth_key_sha256": hashlib.sha256(woncrypto.public_key(self.keys["auth"])).hexdigest() if self.keys else None,
@@ -1882,6 +1930,8 @@ class Emulator:
                         reply += address + struct.pack("<H", port)
                     udp_socket.sendto(reply, peer)
                 self.log.event("master_server_list", peer=list(peer), entities=len(servers),
+                               server_endpoints=[f"{socket.inet_ntoa(address)}:{port}"
+                                                 for address, port in servers],
                                packets=packet_count, backend=self.master_backend)
             elif packet_type == 2:  # Game-type request
                 game_types, mission_types = self.master_game_types()
@@ -1985,6 +2035,7 @@ def ensure(args):
                 ready.get("verifier_sha256") == fingerprint and
                 ready.get("auth_key_sha256") == auth_fingerprint and ready.get("stage") == AUTH_STAGE and
                 ready.get("implementation_sha256") == implementation_fingerprint and
+                ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
                 ready.get("private_store_path_sha256") == private_store_fingerprint and
                 ready.get("community_db_path_sha256") == community_db_fingerprint and
                 ready.get("master_backend") == args.master_backend and
@@ -2007,13 +2058,16 @@ def ensure(args):
     args.log_dir.chmod(0o700)
     fd = os.open(args.log_dir / "wonemu.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as log:
-        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--log-dir", str(args.log_dir),
+        child_args = [sys.executable, str(Path(__file__).resolve()), "--log-dir", str(args.log_dir),
                                     "--client-binary", str(args.client_binary),
                                     "--auth-key-profile", args.auth_key_profile,
                                     "--private-store", str(private_store),
                                     "--community-db", str(community_db),
                                     "--master-backend", args.master_backend,
-                                    "--tribesnext-master-url", args.tribesnext_master_url],
+                                    "--tribesnext-master-url", args.tribesnext_master_url]
+        if args.refresh_tribesnext:
+            child_args.append("--refresh-tribesnext")
+        process = subprocess.Popen(child_args,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     for _ in range(50):
         ready = health()
@@ -2021,6 +2075,7 @@ def ensure(args):
                 ready.get("verifier_sha256") == fingerprint and ready.get("auth_key_sha256") == auth_fingerprint and
                 ready.get("stage") == AUTH_STAGE and
                 ready.get("implementation_sha256") == implementation_fingerprint and
+                ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
                 ready.get("private_store_path_sha256") == private_store_fingerprint and
                 ready.get("community_db_path_sha256") == community_db_fingerprint and
                 ready.get("master_backend") == args.master_backend and
@@ -2034,6 +2089,7 @@ def ensure(args):
                     ready.get("verifier_sha256") == fingerprint and ready.get("auth_key_sha256") == auth_fingerprint and
                     ready.get("stage") == AUTH_STAGE and
                     ready.get("implementation_sha256") == implementation_fingerprint and
+                    ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
                     ready.get("private_store_path_sha256") == private_store_fingerprint and
                     ready.get("community_db_path_sha256") == community_db_fingerprint and
                     ready.get("master_backend") == args.master_backend and
@@ -2068,6 +2124,9 @@ def main():
     parser.add_argument("--tribesnext-master-url",
                         default=os.environ.get("T2LAUNCH_TRIBESNEXT_MASTER_URL", TRIBESNEXT_MASTER_URL),
                         help="HTTP base URL for the TribesNext master service")
+    parser.add_argument("--refresh-tribesnext", action="store_true",
+                        default=os.environ.get("T2LAUNCH_REFRESH_TRIBESNEXT", "1") == "1",
+                        help="refresh existing TribesNext certificate/key from the official account server on login")
     parser.add_argument("--empty-directory", action="store_true", help="serve successful queries with no entities")
     for service, port in PORTS.items():
         parser.add_argument(f"--{service}-port", type=int, default=port)
@@ -2099,7 +2158,8 @@ def main():
         keys = woncrypto.provision(args.log_dir, args.client_binary, args.auth_key_profile)
         private_store = args.private_store or args.client_binary.expanduser().resolve().parent / "base/private.store"
         emulator = Emulator(args.ports, args.log_dir, args.empty_directory, keys, private_store,
-                            args.master_backend, args.tribesnext_master_url, args.community_db)
+                            args.master_backend, args.tribesnext_master_url, args.community_db,
+                            args.refresh_tribesnext)
         def stop(_signum, _frame):
             emulator.stopped.set()
         signal.signal(signal.SIGTERM, stop)

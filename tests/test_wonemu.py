@@ -624,6 +624,19 @@ class ProtocolTests(unittest.TestCase):
                 payload, {"auth": key}, private_store, account_store)
             existing_local_result = wonemu.decode_login_envelope(
                 payload, {"auth": key}, private_store, account_store)
+            recovery_requests = []
+            recovery_result = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, account_store,
+                refresh_tribesnext=lambda name, password: (
+                    recovery_requests.append((name, password)) or "refreshed"))
+            separate_password_store = community_store.CommunityStore(
+                Path(directory) / "separate-password.sqlite3")
+            separate_password_store.reserve_local_account(
+                "WONEMUXPROBE", woncrypto.local_auth_user_id("WONEMUXPROBE"))
+            local_seed_status, local_seeded = separate_password_store.verify_local_account(
+                "WONEMUXPROBE", "distinct-local-password")
+            tribesnext_password_result = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, separate_password_store)
         session_key, login_data = woncrypto.decrypt_won_login_data(key, encrypted_key, encrypted_data)
         fields = wonemu.parse_login_payload(login_data, session_key)
         self.assertEqual(woncrypto.encrypt_won_crypt_transform(session_key, login_data), encrypted_data)
@@ -641,6 +654,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(local_result["account_enrolled"])
         self.assertEqual(existing_local_result["account_validation"], "valid")
         self.assertFalse(existing_local_result["account_enrolled"])
+        self.assertEqual(recovery_result["tribesnext_recovery"], "refreshed")
+        self.assertEqual(len(recovery_requests), 1)
         self.assertEqual(local_result["account_validation"], "valid")
         self.assertTrue(local_result["account_enrolled"])
         self.assertEqual(existing_local_result["account_validation"], "valid")
@@ -648,6 +663,11 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(fields["username"], "WONEMUXPROBE")
         self.assertEqual(fields["password"], "probe_not_a_real_password")
         self.assertFalse({"username", "password", "plaintext"} & result.keys())
+        self.assertEqual(local_seed_status, "valid")
+        self.assertTrue(local_seeded)
+        self.assertEqual(tribesnext_password_result["account_validation"], "valid")
+        self.assertEqual(tribesnext_password_result["credential_source"], "tribesnext")
+        self.assertFalse(tribesnext_password_result["account_enrolled"])
 
     def test_valid_private_store_login_gets_signed_auth1_success_reply(self):
         from build import rc4
@@ -1374,6 +1394,11 @@ class NetworkTests(unittest.TestCase):
             with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
                 emulator.tribesnext_servers(default_query)
             fetch.assert_called_once_with("/list")
+
+            with patch.object(emulator, "fetch_tribesnext",
+                              return_value="66.42.121.64:28001\n"):
+                fission = emulator.tribesnext_servers(default_query)
+            self.assertEqual(fission, [(bytes((66, 42, 121, 64)), 28001)])
 
             with patch.object(emulator, "fetch_tribesnext",
                               return_value="0 CLASSIC\n0 TRIBES2\n1 CTF\n"):

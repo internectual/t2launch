@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <arpa/inet.h>
 
 typedef int S32;
 
@@ -19,22 +20,107 @@ typedef void (*con_addMethodS_t)(const char *nsName, const char *name,
     const char *usage, S32 minArgs, S32 maxArgs);
 typedef const char *(*con_evaluate_t)(const char *code, unsigned char echo,
     const char *fileName, unsigned char noCalls);
-typedef int (*sdl_poll_event_t)(void *event);
 typedef void (*sdl_gl_swap_buffers_t)(void);
 
 static con_addMethodS_t Con__addMethodS = NULL;
 static con_evaluate_t Con__evaluate = (con_evaluate_t)0x080E88F4;
-static sdl_poll_event_t real_sdl_poll_event = NULL;
 static sdl_gl_swap_buffers_t real_sdl_gl_swap_buffers = NULL;
 static pthread_t game_main_thread;
 static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
+static volatile int profile_browser_wake_seen = 0;
+static volatile int tribesnext_runtime_installed = 0;
+static volatile int player_pane_override_installed = 0;
+static char tribesnext_certificate[20001];
+static char tribesnext_modulus[2049];
+static char tribesnext_exponent[2049];
+static char tribesnext_private_exponent[4097];
+static char tribesnext_username[128];
+static char tribesnext_password[512];
 static int won_redirected = 0;
 static char won_endpoint[28] = "127.0.0.1:15104";
 static time_t hook_started_at = 0;
 static time_t last_player_pane_override = 0;
-static int sdl_poll_hook_reported = 0;
 static int sdl_gl_swap_hook_reported = 0;
+
+static const char tribesnext_runtime_script[] =
+    "function t2launch_tnUnlockPoll() {"
+    " if ($T2Launch::TNReady && trim($LoginName) !$= \"\" && stricmp($T2Launch::TNUsername, $LoginName) != 0) {"
+    "  hook_tn_clear(); $T2Launch::TNReady = 0; $T2Launch::TNLastAttempt = \"\";"
+    " }"
+    " if (!$T2Launch::TNReady && trim($LoginName) !$= \"\" && $LoginPassword !$= \"\") {"
+    "  %fingerprint = hook_sha1($LoginName @ \"\\t\" @ $LoginPassword);"
+    "  if (%fingerprint !$= $T2Launch::TNLastAttempt) {"
+    "   $T2Launch::TNLastAttempt = %fingerprint;"
+    "   schedule(350, 0, \"t2launch_tnTryUnlock\", %fingerprint);"
+    "  }"
+    " }"
+    " schedule(100, 0, \"t2launch_tnUnlockPoll\");"
+    "}"
+    "function t2launch_tnTryUnlock(%fingerprint) {"
+    " if ($T2Launch::TNReady || %fingerprint !$= hook_sha1($LoginName @ \"\\t\" @ $LoginPassword)) return;"
+    " if (hook_tn_unlock($LoginName, $LoginPassword) $= \"ok\") {"
+    "  $T2Launch::TNReady = 1; $T2Launch::TNUsername = $LoginName;"
+    " }"
+    "}"
+    "function t2launch_tnReject(%message) {"
+    " error(%message); schedule(1000, 0, \"disconnect\");"
+    "}"
+    "function clientCmdt2csri_pokeClient(%version) {"
+    " hook_tn_trace(\"poke\");"
+    " if (!$T2Launch::TNReady) { t2launch_tnReject(\"T2CSRI: use your TribesNext account password in the login screen to unlock the stored key\"); return; }"
+    " $T2Launch::TNEncryptedChallenge = \"\";"
+    " %certLength = hook_tn_certificate_length();"
+    " if (%certLength <= 0 || %certLength > 20000) { t2launch_tnReject(\"T2CSRI: no account certificate is loaded\"); return; }"
+    " echo(\"T2CSRI: sending existing account certificate\");"
+    " for (%i = 0; %i < %certLength; %i += 200) {"
+    "  %certChunk = hook_tn_certificate_chunk(%i);"
+    "  if (strLen(%certChunk) == 0) { t2launch_tnReject(\"T2CSRI: certificate chunk was empty\"); return; }"
+    "  commandToServer('t2csri_sendCertChunk', %certChunk);"
+    " } hook_tn_trace(\"certificate_sent\");"
+    " %address = $T2Launch::TNJoinAddress;"
+    " if (trim(%address) $= \"\") %address = ServerConnection.getAddress();"
+    " %firstColon = strstr(%address, \":\");"
+    " if (%firstColon < 0) { t2launch_tnReject(\"T2CSRI: invalid game-server address\"); return; }"
+    " %afterFirst = getSubStr(%address, %firstColon + 1, strLen(%address));"
+    " %secondColon = strstr(%afterFirst, \":\");"
+    " if (%secondColon >= 0) %serverIP = getSubStr(%afterFirst, 0, %secondColon);"
+    " else %serverIP = getSubStr(%address, 0, %firstColon);"
+    " echo(\"T2CSRI: challenge target IP \" @ %serverIP);"
+    " %serverIPHex = hook_tn_ipv4_hex(%serverIP);"
+    " if (strLen(%serverIPHex) != 8) { t2launch_tnReject(\"T2CSRI: could not encode game-server IPv4 address\"); return; }"
+    " hook_tn_ip_trace(%serverIP, %serverIPHex);"
+    " $T2Launch::TNClientChallenge = hook_rand64() @ %serverIPHex;"
+    " schedule(1000, 0, \"t2launch_tnSendChallenge\");"
+    "}"
+    "function t2launch_tnSendChallenge() {"
+    " if ($T2Launch::TNClientChallenge !$= \"\") {"
+    "  commandToServer('t2csri_sendChallenge', $T2Launch::TNClientChallenge);"
+    "  hook_tn_trace(\"client_challenge_sent\");"
+    "  echo(\"T2CSRI: client challenge sent\");"
+    " }"
+    "}"
+    "function clientCmdt2csri_getChallengeChunk(%chunk) {"
+    " if (strLen($T2Launch::TNEncryptedChallenge) + strLen(%chunk) > 8192) { t2launch_tnReject(\"T2CSRI: server challenge exceeded the size limit\"); return; }"
+    " if ($T2Launch::TNEncryptedChallenge $= \"\") echo(\"T2CSRI: received encrypted server challenge\");"
+    " hook_tn_trace(\"challenge_chunk\");"
+    " $T2Launch::TNEncryptedChallenge = $T2Launch::TNEncryptedChallenge @ strLwr(%chunk);"
+    "}"
+    "function clientCmdt2csri_decryptChallenge() {"
+    " hook_tn_trace(\"decrypt_challenge\");"
+    " %decrypted = hook_tn_decrypt($T2Launch::TNEncryptedChallenge);"
+    " %clientLen = strLen($T2Launch::TNClientChallenge);"
+    " if (strLwr(getSubStr(%decrypted, 0, %clientLen)) !$= strLwr($T2Launch::TNClientChallenge)) { t2launch_tnReject(\"T2CSRI: server challenge did not echo client nonce\"); return; }"
+    " %serverChallenge = getSubStr(%decrypted, %clientLen, strLen(%decrypted));"
+    " if (trim(%serverChallenge) $= \"\") { t2launch_tnReject(\"T2CSRI: server challenge was empty\"); return; }"
+    " schedule(getRandom(128, 512), 0, \"t2launch_tnRespond\", %serverChallenge);"
+    " $T2Launch::TNEncryptedChallenge = \"\";"
+    "}"
+    "function t2launch_tnRespond(%challenge) {"
+    " commandToServer('t2csri_challengeResponse', %challenge);"
+    " hook_tn_trace(\"response_sent\");"
+    "}"
+    "t2launch_tnUnlockPoll();";
 
 #define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
@@ -151,6 +237,7 @@ static const char player_pane_button_click_override[] =
     "  schedule(500, 0, DatabaseQueryArray, 13, 0, %warrior,"
     "   T2LaunchTribeCache, T2LaunchTribeCache.key, true);"
     " }"
+    " hook_profile_browser_wake();"
     "}"
     "function T2LaunchTribeCache::onDatabaseQueryResult(%this, %status, %result, %key) {"
     " if (%this.key != %key) return;"
@@ -221,7 +308,13 @@ static const char player_pane_button_click_override[] =
     "   if (getField(%authRow, 3) == 1401 && getField(%authRow, 4) >= 2) TProfileHdr.twa = 1;"
     "  }"
     "  W_Profile.setVisible(1); W_History.setVisible(1); W_Tribes.setVisible(1);"
-    "  %isMe = getField(getRecord(%info, 0), 0) $= TWBTitle.name; TProfileHdr.isMe = %isMe;"
+    "  %localName = $pref::LastLoginName;"
+    "  if (trim(%localName) $= \"\") %localName = getField(getRecord(%info, 0), 0);"
+    "  %isMe = (stricmp(TProfileHdr.playerName, %localName) == 0) ||"
+    "   (stricmp(getField(getRecord(%info, 0), 0), TWBTitle.name) == 0);"
+    "  %authID = getField(getRecord(%info, 0), 3);"
+    "  if (trim(%authID) !$= \"\" && %authID == TProfileHdr.playerID) %isMe = 1;"
+    "  TProfileHdr.isMe = %isMe;"
     "  TProfileHdr.twa = TProfileHdr.isMe;"
     "  if (TProfileHdr.twa) {"
     "   W_BuddyList.setText(\"BUDDYLIST\"); W_BuddyList.setVisible(1);"
@@ -270,7 +363,14 @@ static const char player_pane_button_click_override[] =
     "  MessageBoxOK(\"ERROR\", \"There was an error processing your request, please wait a few moments and try again.\");"
     " } else { %this.state = \"error\"; MessageBoxOK(\"WARNING\", getField(%status, 1)); }"
     " Canvas.setCursor(DefaultCursor);"
-    "}";
+    "}"
+    "package T2LaunchJoinTrace {"
+    " function JoinGame(%address) {"
+    "  $T2Launch::TNJoinAddress = %address;"
+    "  hook_tn_join_trace(%address, $T2Launch::TNReady);"
+    "  Parent::JoinGame(%address);"
+    " }"
+    "}; activatePackage(T2LaunchJoinTrace);";
 
 /* Only the Loki #25034 client has the fixed addresses used by this hook. */
 static int readable_range(uintptr_t address, size_t length, int *protection) {
@@ -395,23 +495,7 @@ static int is_supported_game(void) {
         readable_range(CONSOLE_GLOBAL, sizeof(uint32_t), &protection);
 }
 
-/* SDL_PollEvent is interposed as a diagnostic that the hook is first in the
- * executable's dynamic lookup order. */
-int SDL_PollEvent(void *event) {
-    if (!real_sdl_poll_event)
-        real_sdl_poll_event = (sdl_poll_event_t)dlsym(RTLD_NEXT, "SDL_PollEvent");
-    if (!real_sdl_poll_event) return 0;
-    if (!sdl_poll_hook_reported) {
-        sdl_poll_hook_reported = 1;
-        fprintf(stderr, "[t2_hook] SDL_PollEvent main-loop hook active\n");
-    }
-
-    return real_sdl_poll_event(event);
-}
-
-/* Run deferred TorqueScript changes after the game's rendered frame, on the
- * SDL/OpenGL thread. The event-poll hook may only run during startup on some
- * builds, whereas SDL_GL_SwapBuffers is called continuously by the main loop. */
+/* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
         real_sdl_gl_swap_buffers = (sdl_gl_swap_buffers_t)dlsym(
@@ -430,13 +514,23 @@ void SDL_GL_SwapBuffers(void) {
         !pthread_equal(pthread_self(), game_main_thread))
         return;
 
+    if (!tribesnext_runtime_installed) {
+        Con__evaluate(tribesnext_runtime_script, 0, NULL, 0);
+        tribesnext_runtime_installed = 1;
+        fprintf(stderr, "[t2_hook] Installed runtime TribesNext authentication handlers\n");
+    }
+
     time_t now = time(NULL);
-    if (now != (time_t)-1 && hook_started_at && now - hook_started_at >= 10 &&
-        (!last_player_pane_override || now - last_player_pane_override >= 15)) {
-        Con__evaluate(player_pane_button_click_override, 0, NULL, 0);
-        if (!last_player_pane_override)
-            fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
+    if (now != (time_t)-1 && hook_started_at && now - hook_started_at >= 2 &&
+        !profile_browser_wake_seen && !player_pane_override_installed &&
+        (!last_player_pane_override || now - last_player_pane_override >= 1)) {
         last_player_pane_override = now;
+        const char *gui_ready = Con__evaluate("isObject(TWBTabView);", 0, NULL, 0);
+        if (gui_ready && atoi(gui_ready) > 0) {
+            Con__evaluate(player_pane_button_click_override, 0, NULL, 0);
+            player_pane_override_installed = 1;
+            fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
+        }
     }
 }
 
@@ -504,6 +598,15 @@ static const char* hook_test_cb(void *obj, S32 argc, const char **argv) {
     return "ok_from_c";
 }
 
+static const char* hook_profile_browser_wake_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!profile_browser_wake_seen) {
+        profile_browser_wake_seen = 1;
+        fprintf(stderr, "[t2_hook] Runtime Community Browser hooks confirmed active\n");
+    }
+    return "ok";
+}
+
 static const char* hook_sha1_cb(void *obj, S32 argc, const char **argv) {
     static char hex[41];
     (void)obj; (void)argc;
@@ -512,42 +615,61 @@ static const char* hook_sha1_cb(void *obj, S32 argc, const char **argv) {
     return hex;
 }
 
+static int run_rsa_helper(const char *base, const char *exp, const char *mod,
+                          char *result, size_t result_size) {
+    int input_pipe[2], output_pipe[2];
+    if (access("/home/loki/game/rsa_helper", X_OK) != 0) return 0;
+    if (pipe(input_pipe) != 0) return 0;
+    if (pipe(output_pipe) != 0) {
+        close(input_pipe[0]); close(input_pipe[1]);
+        return 0;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(input_pipe[1]); close(output_pipe[0]);
+        dup2(input_pipe[0], STDIN_FILENO);
+        dup2(output_pipe[1], STDOUT_FILENO);
+        close(input_pipe[0]); close(output_pipe[1]);
+        char *args[] = {"/home/loki/game/rsa_helper", "--stdin", NULL};
+        execv(args[0], args);
+        _exit(1);
+    }
+    close(input_pipe[0]); close(output_pipe[1]);
+    if (child < 0) {
+        close(input_pipe[1]); close(output_pipe[0]);
+        return 0;
+    }
+    char request[16384];
+    int request_len = snprintf(request, sizeof(request), "%s\n%s\n%s\n", base, exp, mod);
+    int write_ok = request_len > 0 && (size_t)request_len < sizeof(request);
+    int written = 0;
+    while (write_ok && written < request_len) {
+        ssize_t count = write(input_pipe[1], request + written, request_len - written);
+        if (count <= 0) { write_ok = 0; break; }
+        written += (int)count;
+    }
+    close(input_pipe[1]);
+    ssize_t length = read(output_pipe[0], result, result_size - 1);
+    close(output_pipe[0]);
+    int status = 0;
+    waitpid(child, &status, 0);
+    if (!write_ok || length <= 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        result[0] = 0;
+        return 0;
+    }
+    result[length] = 0;
+    result[strcspn(result, "\r\n")] = 0;
+    for (int i = 0; result[i]; i++)
+        if (result[i] >= 'A' && result[i] <= 'F') result[i] += 32;
+    return 1;
+}
+
 static const char* hook_rsa_mod_exp_cb(void *obj, S32 argc, const char **argv) {
     static char result[2048];
     (void)obj;
     if (argc < 4) return "usage";
-    fprintf(stderr, "[t2_hook] rsa_mod_exp b=%.20s... e=%.20s... m=%.20s...\n",
-        argv[1], argv[2], argv[3]);
-    /* Use precompiled GMP helper for fast modexp via fork+exec */
-    int pipefd[2];
-    if (pipe(pipefd) != 0) { strcpy(result, "ERR:pipe"); return result; }
-    pid_t cpid = fork();
-    if (cpid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-        char *args[] = {"/home/loki/game/rsa_helper", (char*)argv[1], (char*)argv[2], (char*)argv[3], NULL};
-        execv("/home/loki/game/rsa_helper", args);
-        _exit(1);
-    } else if (cpid > 0) {
-        close(pipefd[1]);
-        ssize_t n = read(pipefd[0], result, sizeof(result)-1);
-        close(pipefd[0]);
-        waitpid(cpid, NULL, 0);
-        if (n <= 0) { strcpy(result, "ERR:no_output"); return result; }
-        result[n] = 0;
-    } else {
-        strcpy(result, "ERR:fork");
-        close(pipefd[0]); close(pipefd[1]);
-        return result;
-    }
-    /* strip newline */
-    result[strcspn(result, "\r\n")] = 0;
-    /* lowercase */
-    for (int i = 0; result[i]; i++)
-        if (result[i] >= 'A' && result[i] <= 'F')
-            result[i] += 32;
-    fprintf(stderr, "[t2_hook] rsa_mod_exp result=%.40s...\n", result);
+    if (!run_rsa_helper(argv[1], argv[2], argv[3], result, sizeof(result)))
+        return "ERR:rsa";
     return result;
 }
 
@@ -566,38 +688,8 @@ static const char* hook_rand64_cb(void *obj, S32 argc, const char **argv) {
         srand((unsigned)time(NULL) ^ (unsigned)getpid());
         val = ((uint64_t)rand() << 32) | (uint64_t)rand();
     }
-    sprintf(buf, "%016llx", (unsigned long long)val);
+    sprintf(buf, "%llx", (unsigned long long)val);
     return buf;
-}
-
-/* ── RC4 implementation in C (correct, no TS──────── */
-
-static void rc4_ksa(uint8_t *S, const uint8_t *key, int keylen) {
-    for (int i = 0; i < 256; i++) S[i] = i;
-    int j = 0;
-    for (int i = 0; i < 256; i++) {
-        j = (j + S[i] + key[i % keylen]) & 0xFF;
-        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
-    }
-}
-
-static void rc4_drop(uint8_t *S, int n) {
-    int i = 0, j = 0;
-    for (int k = 0; k < n; k++) {
-        i = (i + 1) & 0xFF;
-        j = (j + S[i]) & 0xFF;
-        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
-    }
-}
-
-static void rc4_crypt(uint8_t *S, const uint8_t *in, uint8_t *out, int len) {
-    int i = 0, j = 0;
-    for (int k = 0; k < len; k++) {
-        i = (i + 1) & 0xFF;
-        j = (j + S[i]) & 0xFF;
-        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
-        out[k] = in[k] ^ S[(S[i] + S[j]) & 0xFF];
-    }
 }
 
 static int hex2nibble(char c) {
@@ -607,119 +699,352 @@ static int hex2nibble(char c) {
     return -1;
 }
 
-static int hex_to_bytes(const char *hex, uint8_t *out, int max_out) {
-    int len = 0;
-    for (int i = 0; hex[i] && hex[i+1] && len < max_out; i += 2) {
-        int hi = hex2nibble(hex[i]);
-        int lo = hex2nibble(hex[i+1]);
-        if (hi < 0 || lo < 0) return -1;
-        out[len++] = (hi << 4) | lo;
-    }
-    return len;
-}
-
 static void bytes_to_hex(const uint8_t *data, int len, char *out) {
     for (int i = 0; i < len; i++)
         sprintf(out + i*2, "%02x", data[i]);
     out[len*2] = '\0';
 }
 
-static const char* hook_login_cb(void *obj, S32 argc, const char **argv) {
-    static char result[2048];
-    (void)obj; (void)argc;
+static const char* hook_tn_ipv4_hex_cb(void *obj, S32 argc, const char **argv) {
+    static char result[9];
+    struct in_addr address;
+    (void)obj;
+    result[0] = 0;
+    if (argc < 2 || !argv[1] || inet_pton(AF_INET, argv[1], &address) != 1)
+        return result;
+    bytes_to_hex((const uint8_t *)&address.s_addr, 4, result);
+    return result;
+}
 
-    const char *username = "LouCypher";
-    if (argc >= 2) username = argv[1];
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
 
-    /* ── Read password from file ── */
-    char password[256] = {0};
-    FILE *fp = fopen("/home/loki/.loki/tribes2/password", "r");
-    if (!fp) { snprintf(result, sizeof(result), "ERR:no_pw_file"); return result; }
-    if (!fgets(password, sizeof(password), fp)) { fclose(fp); snprintf(result, sizeof(result), "ERR:empty_pw"); return result; }
-    fclose(fp);
-    password[strcspn(password, "\r\n")] = 0;
-    fprintf(stderr, "[t2_hook] login: pw=%s (len=%zu)\n", password, strlen(password));
+static int decode_base64(const char *input, uint8_t *output, int capacity) {
+    unsigned int value = 0;
+    int bits = -8, length = 0;
+    for (int i = 0; input[i]; i++) {
+        unsigned char c = (unsigned char)input[i];
+        if (c == '=') break;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        int digit = base64_value(c);
+        if (digit < 0) return -1;
+        value = (value << 6) | (unsigned int)digit;
+        bits += 6;
+        if (bits >= 0) {
+            if (length >= capacity) return -1;
+            output[length++] = (uint8_t)((value >> bits) & 0xff);
+            bits -= 8;
+        }
+    }
+    return length;
+}
 
-    /* ── Read private.store ── */
-    char store_path[512];
-    snprintf(store_path, sizeof(store_path), "/home/loki/game/base/private.store");
-    FILE *fs = fopen(store_path, "r");
-    if (!fs) { snprintf(result, sizeof(result), "ERR:no_store"); return result; }
-    char line[2048], enc_data[2048] = {0};
-    while (fgets(line, sizeof(line), fs)) {
-        line[strcspn(line, "\r\n")] = 0;
+static int parse_hex_bytes(const char *hex, uint8_t *bytes, int capacity) {
+    size_t length = strlen(hex);
+    if ((length & 1) || length / 2 > (size_t)capacity) return -1;
+    for (size_t i = 0; i < length; i += 2) {
+        int hi = hex2nibble(hex[i]), lo = hex2nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) return -1;
+        bytes[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+    return (int)(length / 2);
+}
+
+static void rc4_drop2048_crypt(const uint8_t *key, int keylen,
+                               const uint8_t *input, uint8_t *output, int length) {
+    uint8_t state[256];
+    for (int i = 0; i < 256; i++) state[i] = (uint8_t)i;
+    int i = 0, j = 0;
+    for (int k = 0; k < 256; k++) {
+        j = (j + state[k] + key[k % keylen]) & 0xff;
+        uint8_t temp = state[k]; state[k] = state[j]; state[j] = temp;
+    }
+    i = 0; j = 0;
+    for (int k = 0; k < 2048 + length; k++) {
+        i = (i + 1) & 0xff;
+        j = (j + state[i]) & 0xff;
+        uint8_t temp = state[i]; state[i] = state[j]; state[j] = temp;
+        uint8_t stream = state[(state[i] + state[j]) & 0xff];
+        if (k >= 2048) output[k - 2048] = input[k - 2048] ^ stream;
+    }
+    memset(state, 0, sizeof(state));
+}
+
+static const char* hook_tn_unlock_cb(void *obj, S32 argc, const char **argv) {
+    static char result[32];
+    char password[512] = {0};
+    char line[32768], cert_copy[20001], private_entry[8192];
+    char fields[5][4097];
+    uint8_t decoded_store[8192], cipher[4096], plaintext[4096];
+    char key[41];
+    char private_hex[8193], check_hash[41];
+    FILE *file = NULL;
+    int ok = 0;
+    const char *failure_reason = "stored credentials are invalid";
+    (void)obj;
+    if (argc < 3 || !argv[1] || !argv[2] || strlen(argv[1]) >= sizeof(tribesnext_username) ||
+        strlen(argv[2]) >= sizeof(password)) return "invalid";
+    snprintf(password, sizeof(password), "%s", argv[2]);
+    memset(tribesnext_password, 0, sizeof(tribesnext_password));
+    snprintf(tribesnext_username, sizeof(tribesnext_username), "%s", argv[1]);
+    tribesnext_certificate[0] = 0;
+    tribesnext_modulus[0] = tribesnext_exponent[0] = tribesnext_private_exponent[0] = 0;
+
+    file = fopen("/home/loki/game/base/public.store", "r");
+    if (!file) { failure_reason = "public.store is unavailable"; goto cleanup; }
+    while (fgets(line, sizeof(line), file)) {
         char *tab = strchr(line, '\t');
         if (!tab) continue;
         *tab = 0;
-        if (strcmp(line, username) == 0) {
-            strncpy(enc_data, tab + 1, sizeof(enc_data) - 1);
+        if (strcasecmp(line, argv[1]) == 0) {
+            *tab = '\t';
+            line[strcspn(line, "\r\n")] = 0;
+            if (strlen(line) >= sizeof(tribesnext_certificate)) goto cleanup;
+            snprintf(tribesnext_certificate, sizeof(tribesnext_certificate), "%s", line);
             break;
         }
     }
-    fclose(fs);
-    if (!enc_data[0]) { snprintf(result, sizeof(result), "ERR:no_user"); return result; }
+    fclose(file); file = NULL;
+    if (!tribesnext_certificate[0]) {
+        failure_reason = "account certificate is missing";
+        goto cleanup;
+    }
+    snprintf(cert_copy, sizeof(cert_copy), "%s", tribesnext_certificate);
+    int count = 0;
+    char *save = NULL;
+    for (char *field = strtok_r(cert_copy, "\t", &save); field;
+         field = strtok_r(NULL, "\t", &save)) {
+        if (count >= 5 || strlen(field) >= sizeof(fields[0])) goto cleanup;
+        snprintf(fields[count++], sizeof(fields[0]), "%s", field);
+    }
+    if (count != 5 || strcasecmp(fields[0], argv[1]) != 0 ||
+        !fields[1][0] || !fields[2][0] || !fields[3][0] || !fields[4][0]) {
+        failure_reason = "account certificate format is invalid";
+        goto cleanup;
+    }
+    for (int i = 0; fields[3][i]; i++) if (hex2nibble(fields[3][i]) < 0) goto cleanup;
+    for (int i = 0; fields[2][i]; i++) if (hex2nibble(fields[2][i]) < 0) goto cleanup;
+    snprintf(tribesnext_exponent, sizeof(tribesnext_exponent), "%s", fields[2]);
+    snprintf(tribesnext_modulus, sizeof(tribesnext_modulus), "%s", fields[3]);
 
-    /* ── Parse nonce:ciphertext ── */
-    char *colon = strchr(enc_data, ':');
-    if (!colon) { snprintf(result, sizeof(result), "ERR:bad_fmt"); return result; }
+    file = fopen("/home/loki/game/base/private.store", "r");
+    if (!file) { failure_reason = "private.store is unavailable"; goto cleanup; }
+    private_entry[0] = 0;
+    while (fgets(line, sizeof(line), file)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        if (strcasecmp(line, argv[1]) == 0) {
+            snprintf(private_entry, sizeof(private_entry), "%s", tab + 1);
+            private_entry[strcspn(private_entry, "\r\n")] = 0;
+            break;
+        }
+    }
+    fclose(file); file = NULL;
+    if (!private_entry[0]) {
+        failure_reason = "account private-key entry is missing";
+        goto cleanup;
+    }
+    char *entry = private_entry;
+    if (!strchr(entry, ':')) {
+        int decoded_len = decode_base64(entry, decoded_store, sizeof(decoded_store) - 1);
+        if (decoded_len <= 0 || decoded_len >= (int)sizeof(decoded_store)) {
+            failure_reason = "private-key store encoding is invalid";
+            goto cleanup;
+        }
+        decoded_store[decoded_len] = 0;
+        entry = (char *)decoded_store;
+    }
+    char *colon = strchr(entry, ':');
+    if (!colon) { failure_reason = "private-key store format is invalid"; goto cleanup; }
     *colon = 0;
-    char *nonce_hex = enc_data;
-    char *ct_hex = colon + 1;
-
-    /* ── Compute RC4 key = SHA1(password + nonce) ── */
-    char pw_nonce[512];
-    snprintf(pw_nonce, sizeof(pw_nonce), "%s%s", password, nonce_hex);
-    char key_hex[41];
-    sha1((const uint8_t *)pw_nonce, strlen(pw_nonce), key_hex);
-
-    uint8_t key_bytes[20];
-    for (int i = 0; i < 20; i++) {
-        unsigned int b;
-        sscanf(key_hex + i*2, "%02x", &b);
-        key_bytes[i] = (uint8_t)b;
+    const char *nonce = entry;
+    const char *cipher_hex = colon + 1;
+    if (strlen(nonce) != 40) { failure_reason = "private-key nonce is invalid"; goto cleanup; }
+    char password_nonce[1024];
+    if (snprintf(password_nonce, sizeof(password_nonce), "%s%s", password, nonce) >= (int)sizeof(password_nonce)) goto cleanup;
+    sha1((const uint8_t *)password_nonce, strlen(password_nonce), key);
+    int cipher_len = parse_hex_bytes(cipher_hex, cipher, sizeof(cipher));
+    if (cipher_len <= 0) { failure_reason = "private-key ciphertext is invalid"; goto cleanup; }
+    rc4_drop2048_crypt((const uint8_t *)key, 40, cipher, plaintext, cipher_len);
+    bytes_to_hex(plaintext, cipher_len, private_hex);
+    sha1((const uint8_t *)private_hex, (int)strlen(private_hex), check_hash);
+    if (strcasecmp(check_hash, nonce) != 0) {
+        failure_reason = "entered password did not unlock private.store";
+        goto cleanup;
     }
+    snprintf(tribesnext_private_exponent, sizeof(tribesnext_private_exponent), "%s", private_hex);
+    snprintf(tribesnext_password, sizeof(tribesnext_password), "%s", password);
+    ok = 1;
 
-    /* ── Decode ciphertext hex ── */
-    int ct_len = strlen(ct_hex) / 2;
-    uint8_t ct[1024], pt[1024];
-    if (ct_len > sizeof(ct)) { snprintf(result, sizeof(result), "ERR:ct_too_long"); return result; }
-    for (int i = 0; i < ct_len; i++) {
-        unsigned int b;
-        sscanf(ct_hex + i*2, "%02x", &b);
-        ct[i] = (uint8_t)b;
+cleanup:
+    if (file) fclose(file);
+    memset(password, 0, sizeof(password));
+    memset(password_nonce, 0, sizeof(password_nonce));
+    memset(key, 0, sizeof(key));
+    memset(cipher, 0, sizeof(cipher));
+    memset(plaintext, 0, sizeof(plaintext));
+    memset(private_hex, 0, sizeof(private_hex));
+    memset(decoded_store, 0, sizeof(decoded_store));
+    memset(fields, 0, sizeof(fields));
+    memset(private_entry, 0, sizeof(private_entry));
+    if (!ok) {
+        fprintf(stderr, "[t2_hook] TribesNext credential unlock failed: %s\n", failure_reason);
+        memset(tribesnext_password, 0, sizeof(tribesnext_password));
+        memset(tribesnext_private_exponent, 0, sizeof(tribesnext_private_exponent));
+        tribesnext_certificate[0] = 0;
+        tribesnext_modulus[0] = tribesnext_exponent[0] = 0;
+        snprintf(result, sizeof(result), "invalid");
+        return result;
     }
-
-    /* ── RC4 KSA ── */
-    uint8_t S[256];
-    for (int i = 0; i < 256; i++) S[i] = i;
-    int j = 0;
-    for (int i = 0; i < 256; i++) {
-        j = (j + S[i] + key_bytes[i % 20]) & 0xFF;
-        uint8_t tmp = S[i]; S[i] = S[j]; S[j] = tmp;
-    }
-
-    /* ── RC4 drop 2048 ── */
-    int ii = 0, jj = 0;
-    for (int k = 0; k < 2048; k++) {
-        ii = (ii + 1) & 0xFF;
-        jj = (jj + S[ii]) & 0xFF;
-        uint8_t tmp = S[ii]; S[ii] = S[jj]; S[jj] = tmp;
-    }
-
-    /* ── RC4 PRGA + decrypt ── */
-    for (int k = 0; k < ct_len; k++) {
-        ii = (ii + 1) & 0xFF;
-        jj = (jj + S[ii]) & 0xFF;
-        uint8_t tmp = S[ii]; S[ii] = S[jj]; S[jj] = tmp;
-        pt[k] = ct[k] ^ S[(S[ii] + S[jj]) & 0xFF];
-    }
-
-    /* ── Convert plaintext bytes to hex string ── */
-    for (int i = 0; i < ct_len; i++)
-        sprintf(result + i*2, "%02x", pt[i]);
-    result[ct_len*2] = 0;
-    fprintf(stderr, "[t2_hook] login: decrypted %d bytes = %.40s...\n", ct_len, result);
+    snprintf(result, sizeof(result), "ok");
+    fprintf(stderr, "[t2_hook] TribesNext stored-key unlock succeeded\n");
     return result;
+}
+
+static int reload_tribesnext_certificate(void) {
+    static char line[32768];
+    static char copy[20001];
+    static char fields[5][4097];
+    FILE *file;
+    if (!tribesnext_username[0] || !tribesnext_modulus[0] || !tribesnext_exponent[0])
+        return 0;
+    file = fopen("/home/loki/game/base/public.store", "r");
+    if (!file) return 0;
+    line[0] = 0;
+    while (fgets(line, sizeof(line), file)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        if (strcasecmp(line, tribesnext_username) == 0) {
+            *tab = '\t';
+            line[strcspn(line, "\r\n")] = 0;
+            break;
+        }
+        line[0] = 0;
+    }
+    fclose(file);
+    if (!line[0] || strlen(line) >= sizeof(copy)) return 0;
+    snprintf(copy, sizeof(copy), "%s", line);
+    int count = 0;
+    char *save = NULL;
+    for (char *field = strtok_r(copy, "\t", &save); field;
+         field = strtok_r(NULL, "\t", &save)) {
+        if (count >= 5 || strlen(field) >= sizeof(fields[0])) return 0;
+        snprintf(fields[count++], sizeof(fields[0]), "%s", field);
+    }
+    if (count != 5 || strcasecmp(fields[0], tribesnext_username) != 0) return 0;
+    if (strcasecmp(fields[2], tribesnext_exponent) != 0 ||
+        strcasecmp(fields[3], tribesnext_modulus) != 0) {
+        if (!tribesnext_password[0]) return 0;
+        const char *unlock_args[] = {"hook_tn_unlock", tribesnext_username, tribesnext_password};
+        if (strcmp(hook_tn_unlock_cb(NULL, 3, unlock_args), "ok") != 0) return 0;
+        return tribesnext_certificate[0] != 0;
+    }
+    snprintf(tribesnext_certificate, sizeof(tribesnext_certificate), "%s", line);
+    fprintf(stderr, "[t2_hook] Loaded refreshed TribesNext account certificate\n");
+    memset(copy, 0, sizeof(copy));
+    memset(fields, 0, sizeof(fields));
+    return 1;
+}
+
+static const char* hook_tn_certificate_length_cb(void *obj, S32 argc, const char **argv) {
+    static char result[16];
+    (void)obj; (void)argc; (void)argv;
+    if (!reload_tribesnext_certificate()) {
+        result[0] = '0'; result[1] = 0;
+        return result;
+    }
+    snprintf(result, sizeof(result), "%lu", (unsigned long)strlen(tribesnext_certificate));
+    return result;
+}
+
+static const char* hook_tn_certificate_chunk_cb(void *obj, S32 argc, const char **argv) {
+    static char result[201];
+    (void)obj;
+    result[0] = 0;
+    if (argc < 2 || !argv[1] || !tribesnext_certificate[0]) return result;
+    char *end = NULL;
+    long offset = strtol(argv[1], &end, 10);
+    size_t cert_length = strlen(tribesnext_certificate);
+    if (!end || *end || offset < 0 || (size_t)offset >= cert_length) return result;
+    size_t chunk_length = cert_length - (size_t)offset;
+    if (chunk_length > 200) chunk_length = 200;
+    memcpy(result, tribesnext_certificate + offset, chunk_length);
+    result[chunk_length] = 0;
+    return result;
+}
+
+static const char* hook_tn_decrypt_cb(void *obj, S32 argc, const char **argv) {
+    static char result[4096];
+    (void)obj;
+    if (argc < 2 || !tribesnext_private_exponent[0] || !tribesnext_modulus[0] ||
+        strlen(argv[1]) >= sizeof(result)) return "";
+    for (int i = 0; argv[1][i]; i++) if (hex2nibble(argv[1][i]) < 0) return "";
+    if (!run_rsa_helper(argv[1], tribesnext_private_exponent, tribesnext_modulus,
+                        result, sizeof(result))) {
+        fprintf(stderr, "[t2_hook] TribesNext server challenge RSA operation failed\n");
+        return "";
+    }
+    fprintf(stderr, "[t2_hook] TribesNext server challenge decrypted\n");
+    return result;
+}
+
+static const char* hook_tn_clear_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    memset(tribesnext_certificate, 0, sizeof(tribesnext_certificate));
+    memset(tribesnext_modulus, 0, sizeof(tribesnext_modulus));
+    memset(tribesnext_exponent, 0, sizeof(tribesnext_exponent));
+    memset(tribesnext_private_exponent, 0, sizeof(tribesnext_private_exponent));
+    memset(tribesnext_username, 0, sizeof(tribesnext_username));
+    memset(tribesnext_password, 0, sizeof(tribesnext_password));
+    return "ok";
+}
+
+static const char* hook_tn_trace_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 2 || !argv[1]) return "invalid";
+    if (strcmp(argv[1], "poke") == 0)
+        fprintf(stderr, "[t2_hook] T2CSRI server authentication request received\n");
+    else if (strcmp(argv[1], "challenge_chunk") == 0)
+        fprintf(stderr, "[t2_hook] T2CSRI encrypted challenge chunk received\n");
+    else if (strcmp(argv[1], "decrypt_challenge") == 0)
+        fprintf(stderr, "[t2_hook] T2CSRI challenge decryption started\n");
+    else if (strcmp(argv[1], "response_sent") == 0)
+        fprintf(stderr, "[t2_hook] T2CSRI challenge response sent\n");
+    else if (strcmp(argv[1], "certificate_sent") == 0) {
+        char digest[41];
+        size_t cert_length = strlen(tribesnext_certificate);
+        sha1((const uint8_t *)tribesnext_certificate, (int)cert_length, digest);
+        fprintf(stderr, "[t2_hook] T2CSRI account certificate chunks sent length=%lu sha1=%s\n",
+                (unsigned long)cert_length, digest);
+    }
+    else if (strcmp(argv[1], "client_challenge_sent") == 0)
+        fprintf(stderr, "[t2_hook] T2CSRI client challenge sent\n");
+    else
+        return "invalid";
+    return "ok";
+}
+
+static const char* hook_tn_join_trace_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 3 || !argv[1] || !argv[2]) return "invalid";
+    fprintf(stderr, "[t2_hook] Join requested for %s (TribesNext key ready=%s)\n",
+            argv[1], strcmp(argv[2], "1") == 0 ? "yes" : "no");
+    return "ok";
+}
+
+static const char* hook_tn_ip_trace_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 3 || !argv[1] || !argv[2]) return "invalid";
+    fprintf(stderr, "[t2_hook] T2CSRI challenge target IP=%s hex=%s\n", argv[1], argv[2]);
+    return "ok";
 }
 
 /* ── Registration thread ─────────────────────────────────────────────── */
@@ -742,8 +1067,27 @@ static void* poll_thread(void *arg) {
                 Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
                 Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
                 Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);
-                Con__addMethodS(NULL, "hook_login", hook_login_cb, "hook_login [username] - C-based RC4 decrypt", 1, 2);
-                fprintf(stderr, "[t2_hook] Registered 5 commands\n");
+                Con__addMethodS(NULL, "hook_profile_browser_wake", hook_profile_browser_wake_cb,
+                    "hook_profile_browser_wake - confirm runtime browser patch", 1, 1);
+                Con__addMethodS(NULL, "hook_tn_unlock", hook_tn_unlock_cb,
+                    "hook_tn_unlock <username> <password> - unlock installed TribesNext key", 3, 3);
+                Con__addMethodS(NULL, "hook_tn_certificate_length", hook_tn_certificate_length_cb,
+                    "hook_tn_certificate_length - get installed certificate length", 1, 1);
+                Con__addMethodS(NULL, "hook_tn_certificate_chunk", hook_tn_certificate_chunk_cb,
+                    "hook_tn_certificate_chunk <offset> - get a safe certificate chunk", 2, 2);
+                Con__addMethodS(NULL, "hook_tn_decrypt", hook_tn_decrypt_cb,
+                    "hook_tn_decrypt <hex> - decrypt TribesNext server challenge", 2, 2);
+                Con__addMethodS(NULL, "hook_tn_clear", hook_tn_clear_cb,
+                    "hook_tn_clear - clear in-memory TribesNext credentials", 1, 1);
+                Con__addMethodS(NULL, "hook_tn_trace", hook_tn_trace_cb,
+                    "hook_tn_trace <known_stage> - report T2CSRI join stage", 2, 2);
+                Con__addMethodS(NULL, "hook_tn_join_trace", hook_tn_join_trace_cb,
+                    "hook_tn_join_trace <address> <ready> - safe join diagnostics", 3, 3);
+                Con__addMethodS(NULL, "hook_tn_ip_trace", hook_tn_ip_trace_cb,
+                    "hook_tn_ip_trace <ip> <hex> - safe challenge address diagnostics", 3, 3);
+                Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
+                    "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
+                fprintf(stderr, "[t2_hook] Registered 14 commands\n");
                 break;
             }
         }

@@ -41,7 +41,21 @@ Game files (not included) go in `~/t2-linux/`:
 2. **Native SHA1**: `hook_sha1()` — SHA1 hash computation in C, callable from TorqueScript
 3. **Native RSA**: `hook_rsa_mod_exp()` — modular exponentiation for 2048-bit RSA
 4. **Credentials**: Store files (`public.store`, `private.store`) for TribesNext certificate/key
-5. **Modified t2-scripts**: Replaces all Ruby crypto calls with native hook commands
+5. **Runtime T2CSRI auth**: The native hook unlocks the existing stored key in memory and handles TribesNext certificate/challenge messages without installing or editing game scripts.
+
+`tribesnext.py` implements the official TribesNext account-recovery protocol and
+testable certificate/key/challenge helpers. The published TribesNext source does
+not contain the production certificate-signing trust key; T2Launch therefore
+preserves the official AuthServer certificate unchanged and lets the connected
+game server verify its issuer signature. The hook verifies the entered password
+against the encrypted private-store key and uses the recovered private exponent
+for the server challenge. Passwords and private exponents are not written to disk
+or included in diagnostics. If the local WON profile has a different password,
+wonemu accepts the TribesNext password only when it validates against that
+account's installed private-store entry. On a validated TribesNext login, wonemu
+also performs the official existing-account recovery and atomically refreshes
+the public/private stores; this repairs stale local certificates without creating
+or renaming an account.
 
 For the #25034 profile browser, the hook also replaces the local player's broken
 TRIBES-tab callback at runtime with a `DatabaseQueryArray(13, ...)` request. This
@@ -259,31 +273,22 @@ echo("SHA1: " @ %result);
 - [x] `hook_test()` — basic command test (returns "ok_from_c")
 - [x] `hook_sha1()` — SHA1 hash (verified: correct for "abc")
 - [x] `hook_rsa_mod_exp()` — RSA modular exponentiation (verified: 2^10 mod 101 = 0e)
-- [x] `hook_rand64()` — random 64-bit hex from /dev/urandom
-- [x] TribesNext script integration (modified t2-scripts with native crypto)
-- [x] Cert store reader (public.store / private.store)
-- [x] `t2csri_getAccount()` login flow (cert + RC4 decrypt + RSA key setup)
-- [x] loginScreens.cs GUI wrapper (TribesNext login dialog, no Ruby dependency)
-- [x] Game boots to TribesNext login screen in `-online` mode (EXIT=0, no errors)
-- [x] **Login SUCCEEDED** — correct password accepted, RC4 decrypt verified, cert loaded
-- [x] Auth server connection established (tribesnext.thyth.com:60659)
-- [ ] Challenge-response decryption working (server rejecting RSA decrypt result)
+- [x] `hook_rand64()` — unpadded random 64-bit hex from `/dev/urandom`
+- [x] Runtime T2CSRI client handlers, installed by the native hook without changing game scripts or archives
+- [x] Existing `public.store` / `private.store` unlock in memory with password nonce verification
+- [x] TribesNext certificate chunk transfer and server challenge-response handlers
+- [ ] End-to-end public TribesNext server login verified in a live game session
 - [ ] Account creation (needs RSA keygen in C)
-- [ ] Persisting downloaded accounts to store files
 
-## TribesNext Script Integration
+## TribesNext Runtime Integration
 
-The official t2-scripts are loaded from `~/t2-linux/base/t2csri/` with the following modifications:
-- `sha1sum()` → calls `hook_sha1()` instead of Ruby SHA1Pure
-- `rsa_mod_exp()` → calls `hook_rsa_mod_exp()` instead of Ruby
-- `t2csri_verify_auth/deleg/update_signature()` → direct RSA with hardcoded keys
-- `$accountKey.decrypt()` → `hook_rsa_mod_exp(challenge, d, n)`
-- `rand()` → `hook_rand64()`
-- `t2csri_getAccountCertificate()` → reads public.store
-- `t2csri_getEncryptedAccountKey()` → reads private.store
-- `rubyEval()` / `rubyGetValue()` / `rubyExec()` → no-op stubs
-
-All RSA public keys (1024-bit, public exponent 3) are embedded from the Windows DLL.
+The hook monitors the existing login fields in memory, uses the entered
+username/password to unlock the installed private-store key, and clears the
+temporary C password buffer after verification. It sends the existing certificate unchanged
+when a TribesNext server requests it. The issuer signature is left to the game
+server because the production AuthServer trust key is not present in the
+published source. Challenge RSA input is passed to `rsa_helper` over a pipe,
+not on the helper process command line.
 
 ## Hook Console Commands
 
@@ -292,7 +297,17 @@ All RSA public keys (1024-bit, public exponent 3) are embedded from the Windows 
 | `hook_test` | none | Returns "ok_from_c" |
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
-| `hook_rand64` | none | Random 16-char hex |
+| `hook_rand64` | none | Random unpadded 64-bit hex |
+| `hook_profile_browser_wake` | none | Confirm runtime browser integration |
+| `hook_tn_unlock` | `<username> <password>` | Unlock existing key in memory; no password logging |
+| `hook_tn_certificate_length` | none | Get installed certificate length |
+| `hook_tn_certificate_chunk` | `<offset>` | Return one certificate chunk |
+| `hook_tn_decrypt` | `<hex>` | Decrypt server challenge using the unlocked private key |
+| `hook_tn_clear` | none | Clear in-memory account material |
+| `hook_tn_trace` | `<known_stage>` | Safe diagnostic marker for T2CSRI join stages |
+| `hook_tn_join_trace` | `<address> <ready>` | Log selected server endpoint and key-ready state |
+| `hook_tn_ip_trace` | `<ip> <hex>` | Log the parsed IPv4 used in the client challenge |
+| `hook_tn_ipv4_hex` | `<dotted_ipv4>` | Encode the T2CSRI IPv4 challenge suffix |
 
 ## Technical Findings
 
@@ -307,15 +322,15 @@ The hook CANNOT register commands from its constructor — the console hash tabl
 ### LD_PRELOAD Configuration
 
 The launcher composes `LD_PRELOAD` in `docker/asgard-run` when the hook option
-is enabled. The hook must precede SDL so its main-thread `SDL_PollEvent`
-interposer can defer runtime TorqueScript work safely. The Xenial container
-also needs `libpthread` preloaded explicitly:
+is enabled. The hook must precede SDL so its main-thread
+`SDL_GL_SwapBuffers` interposer can defer runtime TorqueScript work safely. The
+Xenial container also needs `libpthread` preloaded explicitly:
 ```
 LD_PRELOAD=/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:/usr/lib/libSDL-1.2.so.0
 ```
 
 The hook toggle removes only `t2_hook.so`; `libpthread` and SDL remain available
-for the legacy game runtime. It registers five native commands and installs the
+for the legacy game runtime. It registers fourteen native commands and installs the
 Player TRIBES-tab override at runtime after the Community Browser control exists.
 
 ### Hook Build Requirements
