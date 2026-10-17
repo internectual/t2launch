@@ -261,8 +261,17 @@ if ! docker image inspect "$GAME_NAME" >/dev/null 2>&1; then
 fi
 
 DOCKER_EXTRA_ARGS=()
+TRACE_CONNECTS=${T2LAUNCH_TRACE_CONNECTS:-0}
+if [[ "$TRACE_CONNECTS" == "1" ]]; then
+    TRACE_DIR=${T2LAUNCH_TRACE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/diagnostics}
+    mkdir -p "$TRACE_DIR"
+    DOCKER_EXTRA_ARGS+=(-v "$TRACE_DIR:/home/loki/t2trace:rw")
+fi
 if [[ "$SOFTWARE_GL" == "1" ]]; then
     DOCKER_EXTRA_ARGS+=(-e LIBGL_ALWAYS_SOFTWARE=1)
+fi
+if [[ "${USE_SDL_X11_NODIRECTCOLOR:-0}" == "1" ]]; then
+    DOCKER_EXTRA_ARGS+=(-e SDL_VIDEO_X11_NODIRECTCOLOR=1)
 fi
 if [[ -n "$MESA_YEAR" ]]; then
     DOCKER_EXTRA_ARGS+=(-e "MESA_EXTENSION_MAX_YEAR=$MESA_YEAR")
@@ -332,14 +341,65 @@ if [[ -n "$EXTRA_ENV" ]]; then
 fi
 
 PRELOAD="/usr/lib/libSDL-1.2.so.0"
-if [[ "$LOAD_HOOK" == "1" ]]; then
+PULSE_DSP_PRELOAD="/usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so"
+if [[ "$LOAD_HOOK" == "1" && "$USE_PADSP" == "1" ]]; then
+    PRELOAD="/home/loki/game/t2_hook.so:$PULSE_DSP_PRELOAD:/lib/i386-linux-gnu/libpthread.so.0:$PRELOAD"
+elif [[ "$LOAD_HOOK" == "1" ]]; then
     PRELOAD="/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:$PRELOAD"
+elif [[ "$USE_PADSP" == "1" ]]; then
+    PRELOAD="$PULSE_DSP_PRELOAD:$PRELOAD"
 fi
 # The hook uses game-specific addresses; do not preload it into the shell.
 DOCKER_EXTRA_ARGS+=(-e "LD_PRELOAD=" -e "T2_GAME_PRELOAD=$PRELOAD" -e "T2LAUNCH_WONEMU=$WONEMU")
-if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" ]] && ! command -v gamescope >/dev/null 2>&1; then
-    DOCKER_EXTRA_ARGS+=(-e "SDL_VIDEO_FULLSCREEN_HEAD=$T2LAUNCH_MONITOR_INDEX")
+GAME_FULLSCREEN_REQUESTED=0
+GAME_WINDOWED_REQUESTED=0
+for game_arg in "${GAME_ARGS[@]}"; do
+    case "$game_arg" in
+        -f|--fullscreen)
+            GAME_FULLSCREEN_REQUESTED=1
+            GAME_WINDOWED_REQUESTED=0
+            ;;
+        -w|--windowed)
+            GAME_FULLSCREEN_REQUESTED=0
+            GAME_WINDOWED_REQUESTED=1
+            ;;
+    esac
+done
+if [[ "$USE_GAMESCOPE" != "1" ]] &&
+   [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" || -n "$T2LAUNCH_MONITOR" ]]; then
+    SDL_FULLSCREEN_HEAD="${T2LAUNCH_MONITOR_INDEX:-0}"
+    if [[ -n "$T2LAUNCH_MONITOR" ]] && command -v xrandr >/dev/null 2>&1 &&
+       command -v python3 >/dev/null 2>&1; then
+        XRANDR_HEAD=$(python3 -c '
+import re, subprocess, sys
+name = sys.argv[1]
+result = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True)
+if result.returncode == 0:
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        match = re.match(r"^(\d+):$", fields[0]) if fields else None
+        if match and fields[-1] == name:
+            print(match.group(1))
+            break
+' "$T2LAUNCH_MONITOR")
+        if [[ "$XRANDR_HEAD" =~ ^[0-9]+$ ]]; then
+            SDL_FULLSCREEN_HEAD="$XRANDR_HEAD"
+        fi
+    fi
+    DOCKER_EXTRA_ARGS+=(-e "SDL_VIDEO_FULLSCREEN_HEAD=$SDL_FULLSCREEN_HEAD")
+    T2_SDL_HEAD_LOG=$SDL_FULLSCREEN_HEAD
+    unset SDL_FULLSCREEN_HEAD XRANDR_HEAD
 fi
+if [[ "$USE_GAMESCOPE" != "1" && "$GAME_FULLSCREEN_REQUESTED" != "1" ]]; then
+    # SDL 1.2 disables XRandR enumeration by default. Enable it in windowed
+    # mode so the game's video settings see the host's full resolution list.
+    DOCKER_EXTRA_ARGS+=(-e SDL_VIDEO_X11_XRANDR=1)
+fi
+DOCKER_EXTRA_ARGS+=(-e "T2LAUNCH_MONITOR_NAME=$T2LAUNCH_MONITOR"
+                    -e "T2LAUNCH_FORCE_FULLSCREEN=$GAME_FULLSCREEN_REQUESTED"
+                    -e "T2LAUNCH_FORCE_WINDOWED=$GAME_WINDOWED_REQUESTED")
+echo "[t2launch] Gamescope=$USE_GAMESCOPE fullscreen=$GAME_FULLSCREEN_REQUESTED windowed=$GAME_WINDOWED_REQUESTED monitor=${T2LAUNCH_MONITOR:-default} SDL_HEAD=${T2_SDL_HEAD_LOG:-default}"
+unset game_arg GAME_FULLSCREEN_REQUESTED GAME_WINDOWED_REQUESTED T2_SDL_HEAD_LOG
 
 # Grant the container access to the X server. 'xhost' lives in 'xorg-xhost' on
 # Arch/Fedora and 'x11-xserver-utils' on Debian/Ubuntu. A missing or failing
@@ -359,7 +419,7 @@ else
 fi
 
 GAMESCOPE_CMD=()
-if [[ "$USE_GAMESCOPE" == "1" || -n "$T2LAUNCH_MONITOR" || -n "${T2LAUNCH_MONITOR_INDEX:-}" ]]; then
+if [[ "$USE_GAMESCOPE" == "1" ]]; then
     if command -v gamescope >/dev/null 2>&1; then
         GAMESCOPE_CMD=(gamescope -w "$GAMESCOPE_WIDTH" -h "$GAMESCOPE_HEIGHT")
         if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" ]]; then
@@ -367,7 +427,7 @@ if [[ "$USE_GAMESCOPE" == "1" || -n "$T2LAUNCH_MONITOR" || -n "${T2LAUNCH_MONITO
         fi
         GAMESCOPE_CMD+=(--)
     else
-        echo "NOTE: gamescope not installed — using SDL monitor selection where supported."
+        echo "NOTE: gamescope not installed — launching directly; SDL fullscreen monitor selection may still apply."
     fi
 fi
 
@@ -396,6 +456,12 @@ mkdir -p "${HOME}/.loki"   # game writes prefs/saves here; ensure it's user-owne
 
 add_device /dev/snd
 add_device /dev/dri
+if [[ "${USE_PULSE_ALSA:-0}" == "1" ]]; then
+    DOCKER_EXTRA_ARGS+=(-v "$ROOT_DIR/alsa-pulse.conf:/home/loki/.asoundrc:ro")
+fi
+if [[ -n "${T2LAUNCH_PULSE_SINK:-}" ]]; then
+    DOCKER_EXTRA_ARGS+=(-e "PULSE_SINK=$T2LAUNCH_PULSE_SINK")
+fi
 add_mount /etc/machine-id /etc/machine-id ro
 add_mount /var/lib/dbus   /var/lib/dbus   rw
 add_mount "${XDG_RUNTIME_DIR}/pulse/native"  "${XDG_RUNTIME_DIR}/pulse/native"  rw
@@ -448,9 +514,26 @@ fi
     -e GAME_BINARY="$GAME_BINARY" \
     -e PRE_LAUNCH="$PRE_LAUNCH" \
     -e USE_STRACE="$USE_STRACE" \
+    -e TRACE_CONNECTS="$TRACE_CONNECTS" \
     -e USE_PADSP="$USE_PADSP" \
+    -e USE_GAME_WINDOW_RESIZE="${USE_GAME_WINDOW_RESIZE:-0}" \
     $GAME_NAME \
-    bash --norc -c 'cd /home/loki/game; export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH; if [ -n "$PRE_LAUNCH" ]; then eval "$PRE_LAUNCH"; fi; STRACE=(); if [ "$USE_STRACE" = "1" ]; then STRACE=(strace -e trace=none -o /dev/null -f); fi; PADSP=(); if [ "$USE_PADSP" = "1" ]; then PADSP=(padsp); fi; exec "${STRACE[@]}" "${PADSP[@]}" env LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"' \
+    bash --norc -c '
+        cd /home/loki/game
+        export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH
+        if [ -n "$PRE_LAUNCH" ]; then eval "$PRE_LAUNCH"; fi
+        STRACE=()
+        if [ "$TRACE_CONNECTS" = "1" ]; then
+            STRACE=(strace -e trace=connect -o /home/loki/t2trace/tribes2-connect.strace -f)
+        elif [ "$USE_STRACE" = "1" ]; then
+            STRACE=(strace -e trace=none -o /dev/null -f)
+        fi
+        if [ "$USE_GAME_WINDOW_RESIZE" = "1" ]; then
+            /home/loki/window_resize.sh "/home/loki/.loki/$GAME_NAME/base/prefs/ClientPrefs.cs" "$$" \
+                "$T2LAUNCH_MONITOR_NAME" "$T2LAUNCH_FORCE_FULLSCREEN" "$T2LAUNCH_FORCE_WINDOWED" &
+        fi
+        exec "${STRACE[@]}" env LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"
+    ' \
     _ "${GAME_ARGS[@]}"
 
 # Cleanup RSA proxy on exit

@@ -4,6 +4,10 @@
 #include <assert.h>
 
 int main(void) {
+    char browser_ip[64] = "IP:185.66.108.39:28000";
+    strcpy(browser_ip, browser_ip + 3);
+    assert(strcmp(browser_ip, "185.66.108.39:28000") == 0);
+
     long size = sysconf(_SC_PAGESIZE);
     uintptr_t page = 0x084846B1 & ~((uintptr_t)size - 1);
     char *mapping = mmap((void *)page, size, PROT_READ | PROT_WRITE,

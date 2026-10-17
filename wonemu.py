@@ -2112,7 +2112,8 @@ def main():
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--client-binary", type=Path, default=Path.home() / "t2-linux/tribes2.dynamic",
                         help="client from which to recover the public cryptographic parameters")
-    parser.add_argument("--auth-key-profile", choices=("compat", "native"), default="compat",
+    parser.add_argument("--auth-key-profile", choices=("compat", "native"),
+                        default=os.environ.get("T2LAUNCH_AUTH_KEY_PROFILE", "compat"),
                         help="auth-key group profile; compat avoids the client's oversized-c2 truncation")
     parser.add_argument("--private-store", type=Path,
                         help="legacy password-verification fallback (defaults to base/private.store beside the game binary)")
@@ -2125,7 +2126,7 @@ def main():
                         default=os.environ.get("T2LAUNCH_TRIBESNEXT_MASTER_URL", TRIBESNEXT_MASTER_URL),
                         help="HTTP base URL for the TribesNext master service")
     parser.add_argument("--refresh-tribesnext", action="store_true",
-                        default=os.environ.get("T2LAUNCH_REFRESH_TRIBESNEXT", "1") == "1",
+                        default=os.environ.get("T2LAUNCH_REFRESH_TRIBESNEXT", "0") == "1",
                         help="refresh existing TribesNext certificate/key from the official account server on login")
     parser.add_argument("--empty-directory", action="store_true", help="serve successful queries with no entities")
     for service, port in PORTS.items():

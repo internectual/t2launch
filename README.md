@@ -383,15 +383,29 @@ CRITICAL: Also `pkill -9 -f tribes2.dynamic` before testing — stale processes 
 ### Game Config
 
 The default config (`docker/config/tribes2.cfg`) sets the game binary and
-enables the hook. The desktop profile supplies `-online` or `-nologin`:
+enables the hook. Tribes 2 runs windowed at its selected resolution, without
+Gamescope, and uses hardware OpenGL by default. An explicit `-f`/`--fullscreen`
+argument or `FULLSCREEN=true` requests fullscreen. An X11 watcher keeps the
+window aligned with the selected monitor and scales fullscreen output while
+preserving the game's aspect ratio; in windowed mode it follows the saved game
+resolution when SDL 1.2 leaves the top-level window at its previous size. The
+desktop profile supplies `-online` or `-nologin`:
 ```
 USE_GAMESCOPE=0
-SOFTWARE_GL=1
+SOFTWARE_GL=0
 USE_STRACE=0
-USE_PADSP=0
+USE_PADSP=1
+USE_PULSE_ALSA=1
 GAME_BINARY="./tribes2.dynamic"
 LOAD_HOOK=1
 ```
+
+The bundled Loki OpenAL backend uses OSS `/dev/dsp`; `USE_PADSP=1` keeps its
+provider available and routes playback through PulseAudio/PipeWire. The
+`USE_PULSE_ALSA=1` overlay also routes ALSA clients through the same socket. To
+select a specific host output for the game, set `T2LAUNCH_PULSE_SINK` to a sink
+name reported by `pactl list short sinks`. When unset, the game follows the
+host's current PulseAudio/PipeWire default output.
 
 ## Credits
 

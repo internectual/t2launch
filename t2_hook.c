@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <dlfcn.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 
 typedef int S32;
 
@@ -21,13 +22,16 @@ typedef void (*con_addMethodS_t)(const char *nsName, const char *name,
 typedef const char *(*con_evaluate_t)(const char *code, unsigned char echo,
     const char *fileName, unsigned char noCalls);
 typedef void (*sdl_gl_swap_buffers_t)(void);
+typedef void *(*sdl_set_video_mode_t)(int width, int height, int bpp, uint32_t flags);
 
 static con_addMethodS_t Con__addMethodS = NULL;
 static con_evaluate_t Con__evaluate = (con_evaluate_t)0x080E88F4;
 static sdl_gl_swap_buffers_t real_sdl_gl_swap_buffers = NULL;
+static sdl_set_video_mode_t real_sdl_set_video_mode = NULL;
 static pthread_t game_main_thread;
 static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
+static int register_hook_commands(void);
 static volatile int profile_browser_wake_seen = 0;
 static volatile int tribesnext_runtime_installed = 0;
 static volatile int player_pane_override_installed = 0;
@@ -42,13 +46,47 @@ static char won_endpoint[28] = "127.0.0.1:15104";
 static time_t hook_started_at = 0;
 static time_t last_player_pane_override = 0;
 static int sdl_gl_swap_hook_reported = 0;
+static volatile unsigned int video_mode_repaint_frames = 0;
+static volatile int won_patch_pending = 0;
+
+/* The native server-browser IP column formats "IP:<address>:<port>" and then
+ * strips the prefix with strcpy(dst, dst + 3).  That overlapping copy is
+ * undefined and corrupts the address with the 32-bit libc used by the game.
+ * Preserve normal strcpy behavior while making overlapping copies well-defined.
+ */
+char *strcpy(char *destination, const char *source)
+{
+    char *result = destination;
+    size_t length = 0;
+    while (source[length] != '\0')
+        ++length;
+    ++length;
+
+    uintptr_t destination_address = (uintptr_t)destination;
+    uintptr_t source_address = (uintptr_t)source;
+    if ((destination_address <= source_address &&
+         source_address - destination_address < length) ||
+        (source_address < destination_address &&
+         destination_address - source_address < length))
+        return memmove(destination, source, length);
+
+    volatile unsigned char *output = (volatile unsigned char *)destination;
+    for (size_t i = 0; i < length; ++i)
+        output[i] = (unsigned char)source[i];
+    return result;
+}
 
 static const char tribesnext_runtime_script[] =
-    "function t2launch_tnUnlockPoll() {"
-    " if ($T2Launch::TNReady && trim($LoginName) !$= \"\" && stricmp($T2Launch::TNUsername, $LoginName) != 0) {"
-    "  hook_tn_clear(); $T2Launch::TNReady = 0; $T2Launch::TNLastAttempt = \"\";"
-    " }"
-    " if (!$T2Launch::TNReady && trim($LoginName) !$= \"\" && $LoginPassword !$= \"\") {"
+     "function t2launch_tnUnlockPoll() {"
+     " if ($T2Launch::TNReady && trim($LoginName) !$= \"\" && stricmp($T2Launch::TNUsername, $LoginName) != 0) {"
+     "  hook_tn_clear(); $T2Launch::TNReady = 0; $T2Launch::TNLastAttempt = \"\"; $T2Launch::HadAuthInfo = 0;"
+     " }"
+     " if (!$T2Launch::HadAuthInfo && trim(WONGetAuthInfo()) !$= \"\") $T2Launch::HadAuthInfo = 1;"
+     " if ($Audio::initialized && isObject(OptionsDlg) && OptionsDlg.isAwake() &&"
+     "     isObject(OP_AudioProviderMenu) && OP_AudioProviderMenu.size() == 0) {"
+     "  OP_AudioProviderMenu.add(\"OpenAL\", 0); OP_AudioProviderMenu.setSelected(0);"
+     " }"
+     " if (!$T2Launch::TNReady && trim($LoginName) !$= \"\" && $LoginPassword !$= \"\") {"
     "  %fingerprint = hook_sha1($LoginName @ \"\\t\" @ $LoginPassword);"
     "  if (%fingerprint !$= $T2Launch::TNLastAttempt) {"
     "   $T2Launch::TNLastAttempt = %fingerprint;"
@@ -57,10 +95,15 @@ static const char tribesnext_runtime_script[] =
     " }"
     " schedule(100, 0, \"t2launch_tnUnlockPoll\");"
     "}"
+    "function t2launch_refreshServerBrowser() {"
+    " if (isObject(Canvas) && isObject(GMJ_Browser) && GMJ_Browser.isAwake()) Canvas.repaint();"
+    " schedule(500, 0, \"t2launch_refreshServerBrowser\");"
+    "}"
+    "t2launch_refreshServerBrowser();"
     "function t2launch_tnTryUnlock(%fingerprint) {"
     " if ($T2Launch::TNReady || %fingerprint !$= hook_sha1($LoginName @ \"\\t\" @ $LoginPassword)) return;"
-    " if (hook_tn_unlock($LoginName, $LoginPassword) $= \"ok\") {"
-    "  $T2Launch::TNReady = 1; $T2Launch::TNUsername = $LoginName;"
+     " if (hook_tn_unlock($LoginName, $LoginPassword) $= \"ok\") {"
+     "  $T2Launch::TNReady = 1; $T2Launch::TNUsername = $LoginName; $T2Launch::HadAuthInfo = 1;"
     " }"
     "}"
     "function t2launch_tnReject(%message) {"
@@ -129,6 +172,15 @@ static const char tribesnext_runtime_script[] =
  * local account's branch never sends query 13 and leaves the wait cursor active.
  * Preserve the other tabs but always fetch the tribe list through DBProxy. */
 static const char player_pane_button_click_override[] =
+    "function LaunchGui::onWake(%this) {"
+    " $enableDirectInput = \"0\"; deactivateDirectInput(); Canvas.pushDialog(LaunchToolbarDlg);"
+    " if (!$FirstLaunch) LaunchTabView.viewLastTab();"
+    " if (!isDemo()) {"
+    "  if (%this.getWarrior && ($T2Launch::HadAuthInfo || $T2Launch::TNReady) &&"
+    "      trim(WONGetAuthInfo()) $= \"\" && $pref::Player::Count > 0) %this.getWarrior = \"\";"
+    "  checkNamesAndAliases();"
+    " } else OpenLaunchTabs();"
+    "}"
     "function PlayerPane::ButtonClick(%this, %senderid) {"
     " canvas.SetCursor(ArrowWaitCursor);"
     " %this.key = LaunchGui.key++; %this.tabstate = \"WARRIOR\";"
@@ -495,6 +547,57 @@ static int is_supported_game(void) {
         readable_range(CONSOLE_GLOBAL, sizeof(uint32_t), &protection);
 }
 
+/* In opt-in connection-trace mode, record resolver hostnames without logging
+   packet contents or credentials. The trace mount is provided by asgard-run. */
+static int is_won_bootstrap_host(const char *node);
+
+static void trace_resolver_name(const char *node, const char *service) {
+    const char *enabled = getenv("TRACE_CONNECTS");
+    if (!enabled || strcmp(enabled, "1") != 0 || !node || !*node) return;
+    FILE *file = fopen("/home/loki/t2trace/tribes2-dns.log", "a");
+    if (!file) return;
+    fprintf(file, "%s%s%s -> %s\n", node, service ? ":" : "",
+            service ? service : "",
+            is_won_bootstrap_host(node) ? "127.0.0.1" : node);
+    fclose(file);
+}
+
+static int is_won_bootstrap_host(const char *node) {
+    static const char *hosts[] = {
+        "tribes2.m1.sierra.com", "tribes2.m2.sierra.com",
+        "tribes2.m3.sierra.com"
+    };
+    const char *won = getenv("T2LAUNCH_WONEMU");
+    if (!won || strcmp(won, "1") != 0 || !node) return 0;
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); ++i)
+        if (strcasecmp(node, hosts[i]) == 0) return 1;
+    return 0;
+}
+
+int getaddrinfo(const char *node, const char *service,
+                const struct addrinfo *hints, struct addrinfo **results) {
+    typedef int (*getaddrinfo_fn)(const char *, const char *,
+                                  const struct addrinfo *, struct addrinfo **);
+    static getaddrinfo_fn real_getaddrinfo;
+    if (!real_getaddrinfo)
+        real_getaddrinfo = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+    trace_resolver_name(node, service);
+    if (!real_getaddrinfo) return EAI_SYSTEM;
+    if (is_won_bootstrap_host(node)) node = "127.0.0.1";
+    return real_getaddrinfo(node, service, hints, results);
+}
+
+struct hostent *gethostbyname(const char *name) {
+    typedef struct hostent *(*gethostbyname_fn)(const char *);
+    static gethostbyname_fn real_gethostbyname;
+    if (!real_gethostbyname)
+        real_gethostbyname = (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
+    trace_resolver_name(name, NULL);
+    if (!real_gethostbyname) return NULL;
+    if (is_won_bootstrap_host(name)) name = "127.0.0.1";
+    return real_gethostbyname(name);
+}
+
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
@@ -509,10 +612,22 @@ void SDL_GL_SwapBuffers(void) {
         game_main_thread_known = 1;
         fprintf(stderr, "[t2_hook] SDL_GL_SwapBuffers main-loop hook active\n");
     }
+    if (!registered)
+        register_hook_commands();
     if (!registered || !Con__evaluate ||
         !game_main_thread_known ||
         !pthread_equal(pthread_self(), game_main_thread))
         return;
+
+    /* SDL 1.2 mode changes can leave stale damage on accelerated XWayland
+       surfaces. A full Canvas repaint clears the same stale regions that a
+       pointer-expose event otherwise repairs. Limit the extra work to the
+       first two seconds after a mode change. */
+    if (video_mode_repaint_frames > 0) {
+        unsigned int frame = __sync_fetch_and_sub(&video_mode_repaint_frames, 1);
+        if (frame % 6 == 1)
+            Con__evaluate("if (isObject(Canvas)) Canvas.repaint();", 0, NULL, 0);
+    }
 
     if (!tribesnext_runtime_installed) {
         Con__evaluate(tribesnext_runtime_script, 0, NULL, 0);
@@ -522,16 +637,60 @@ void SDL_GL_SwapBuffers(void) {
 
     time_t now = time(NULL);
     if (now != (time_t)-1 && hook_started_at && now - hook_started_at >= 2 &&
-        !profile_browser_wake_seen && !player_pane_override_installed &&
+        !player_pane_override_installed &&
         (!last_player_pane_override || now - last_player_pane_override >= 1)) {
         last_player_pane_override = now;
-        const char *gui_ready = Con__evaluate("isObject(TWBTabView);", 0, NULL, 0);
+        /* LaunchGui is created before the tribe browser tab control. Install
+           the launcher fallback as soon as its GUI script is available, even
+           if the browser's first wake has already occurred. */
+        const char *gui_ready = Con__evaluate("isObject(LaunchGui);", 0, NULL, 0);
         if (gui_ready && atoi(gui_ready) > 0) {
+            Con__evaluate("audioDetect();", 0, NULL, 0);
+            Con__evaluate(
+                "if (!$Audio::initialized && $pref::Audio::drivers $= \"OpenAL\") {"
+                " $Audio::defaultDriver = \"native\";"
+                " $Audio::initialized = audioSetDriver(\"OpenAL\");"
+                " if ($Audio::initialized) $pref::Audio::activeDriver = \"OpenAL\";"
+                "}",
+                0, NULL, 0);
+            Con__evaluate(
+                "if ($Audio::initialized && !$T2Launch::AudioResetDone) {"
+                " $T2Launch::AudioResetDone = 1; audioSetDriver(\"none\");"
+                " $Audio::initialized = audioSetDriver($pref::Audio::activeDriver);"
+                " if ($Audio::initialized) $HudHandle[shellScreen] = alxPlay(ShellScreenHumSound, 0, 0, 0);"
+                "}",
+                0, NULL, 0);
+            const char *audio_state = Con__evaluate(
+                "$Audio::initialized @ \"|\" @ $pref::Audio::activeDriver @ \"|\" @ $pref::Audio::drivers;",
+                0, NULL, 0);
+            fprintf(stderr, "[t2_hook] Audio state initialized|active|available: %s\n",
+                    audio_state ? audio_state : "unavailable");
             Con__evaluate(player_pane_button_click_override, 0, NULL, 0);
             player_pane_override_installed = 1;
-            fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
+            fprintf(stderr, "[t2_hook] Installed runtime LaunchGui account-info fallback and PlayerPane TRIBES handler\n");
         }
     }
+}
+
+/* Observe SDL 1.2 mode changes without replacing its return surface or flags. */
+void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
+    if (!real_sdl_set_video_mode)
+        real_sdl_set_video_mode = (sdl_set_video_mode_t)dlsym(
+            RTLD_NEXT, "SDL_SetVideoMode");
+    if (!real_sdl_set_video_mode) return NULL;
+    if (won_patch_pending && !won_redirected) {
+        won_redirected = redirect_won_bootstrap();
+        if (!won_redirected) _exit(1);
+        won_patch_pending = 0;
+        fprintf(stderr, "[t2_hook] WON bootstrap redirected before video-mode initialization\n");
+    }
+    void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
+    if (surface && width > 0 && height > 0) {
+        __sync_lock_test_and_set(&video_mode_repaint_frames, 120);
+        fprintf(stderr, "[t2_hook] Queued full-canvas refresh after video mode %dx%d\n",
+                width, height);
+    }
+    return surface;
 }
 
 /* ── SHA1 ────────────────────────────────────────────────────────────── */
@@ -1049,53 +1208,41 @@ static const char* hook_tn_ip_trace_cb(void *obj, S32 argc, const char **argv) {
 
 /* ── Registration thread ─────────────────────────────────────────────── */
 
-static void* poll_thread(void *arg) {
-    (void)arg;
-    fprintf(stderr, "[t2_hook] Poll thread started\n");
+static int register_hook_commands(void) {
+    if (registered) return 1;
+    uint32_t console_ptr = *(volatile uint32_t *)CONSOLE_GLOBAL;
+    if (console_ptr == 0) return 0;
+    uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
+    if (table_size == 0) return 0;
 
-    for (int i = 0; i < 100; i++) {
-        usleep(500000);  /* 500ms */
-
-        uint32_t console_ptr = *(volatile uint32_t *)CONSOLE_GLOBAL;
-        if (console_ptr != 0) {
-            uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
-            if (table_size > 0 && !registered) {
-                registered = 1;
-                Con__addMethodS = (con_addMethodS_t)0x80E85C0;
-                fprintf(stderr, "[t2_hook] Console ready (table_size=%d) at ~%ds\n", table_size, i/2);
-                Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
-                Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
-                Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
-                Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);
-                Con__addMethodS(NULL, "hook_profile_browser_wake", hook_profile_browser_wake_cb,
-                    "hook_profile_browser_wake - confirm runtime browser patch", 1, 1);
-                Con__addMethodS(NULL, "hook_tn_unlock", hook_tn_unlock_cb,
-                    "hook_tn_unlock <username> <password> - unlock installed TribesNext key", 3, 3);
-                Con__addMethodS(NULL, "hook_tn_certificate_length", hook_tn_certificate_length_cb,
-                    "hook_tn_certificate_length - get installed certificate length", 1, 1);
-                Con__addMethodS(NULL, "hook_tn_certificate_chunk", hook_tn_certificate_chunk_cb,
-                    "hook_tn_certificate_chunk <offset> - get a safe certificate chunk", 2, 2);
-                Con__addMethodS(NULL, "hook_tn_decrypt", hook_tn_decrypt_cb,
-                    "hook_tn_decrypt <hex> - decrypt TribesNext server challenge", 2, 2);
-                Con__addMethodS(NULL, "hook_tn_clear", hook_tn_clear_cb,
-                    "hook_tn_clear - clear in-memory TribesNext credentials", 1, 1);
-                Con__addMethodS(NULL, "hook_tn_trace", hook_tn_trace_cb,
-                    "hook_tn_trace <known_stage> - report T2CSRI join stage", 2, 2);
-                Con__addMethodS(NULL, "hook_tn_join_trace", hook_tn_join_trace_cb,
-                    "hook_tn_join_trace <address> <ready> - safe join diagnostics", 3, 3);
-                Con__addMethodS(NULL, "hook_tn_ip_trace", hook_tn_ip_trace_cb,
-                    "hook_tn_ip_trace <ip> <hex> - safe challenge address diagnostics", 3, 3);
-                Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
-                    "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
-                fprintf(stderr, "[t2_hook] Registered 14 commands\n");
-                break;
-            }
-        }
-    }
-    if (!registered) {
-        fprintf(stderr, "[t2_hook] TIMEOUT\n");
-    }
-    return NULL;
+    Con__addMethodS = (con_addMethodS_t)0x80E85C0;
+    Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
+    Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
+    Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
+    Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);
+    Con__addMethodS(NULL, "hook_profile_browser_wake", hook_profile_browser_wake_cb,
+        "hook_profile_browser_wake - confirm runtime browser patch", 1, 1);
+    Con__addMethodS(NULL, "hook_tn_unlock", hook_tn_unlock_cb,
+        "hook_tn_unlock <username> <password> - unlock installed TribesNext key", 3, 3);
+    Con__addMethodS(NULL, "hook_tn_certificate_length", hook_tn_certificate_length_cb,
+        "hook_tn_certificate_length - get installed certificate length", 1, 1);
+    Con__addMethodS(NULL, "hook_tn_certificate_chunk", hook_tn_certificate_chunk_cb,
+        "hook_tn_certificate_chunk <offset> - get a safe certificate chunk", 2, 2);
+    Con__addMethodS(NULL, "hook_tn_decrypt", hook_tn_decrypt_cb,
+        "hook_tn_decrypt <hex> - decrypt TribesNext server challenge", 2, 2);
+    Con__addMethodS(NULL, "hook_tn_clear", hook_tn_clear_cb,
+        "hook_tn_clear - clear in-memory TribesNext credentials", 1, 1);
+    Con__addMethodS(NULL, "hook_tn_trace", hook_tn_trace_cb,
+        "hook_tn_trace <known_stage> - report T2CSRI join stage", 2, 2);
+    Con__addMethodS(NULL, "hook_tn_join_trace", hook_tn_join_trace_cb,
+        "hook_tn_join_trace <address> <ready> - safe join diagnostics", 3, 3);
+    Con__addMethodS(NULL, "hook_tn_ip_trace", hook_tn_ip_trace_cb,
+        "hook_tn_ip_trace <ip> <hex> - safe challenge address diagnostics", 3, 3);
+    Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
+        "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
+    registered = 1;
+    fprintf(stderr, "[t2_hook] Registered 14 commands on the game thread (table_size=%d)\n", table_size);
+    return 1;
 }
 
 #ifndef T2_HOOK_TEST
@@ -1110,22 +1257,17 @@ static void __attribute__((constructor)) init(void) {
         return;
     }
     if (won && strcmp(won, "1") == 0) {
+        /* The client copies the embedded verifier during its own global
+           initialization, before SDL_SetVideoMode. Install our verifier now;
+           keep only the endpoint rewrite deferred to the video-mode hook. */
         if (!install_won_verifier()) _exit(1);
-        won_redirected = redirect_won_bootstrap();
-        if (!won_redirected) _exit(1);
+        won_patch_pending = 1;
     }
     const char *disable_commands = getenv("T2LAUNCH_DISABLE_HOOK_COMMANDS");
     if (disable_commands && strcmp(disable_commands, "1") == 0) {
         fprintf(stderr, "[t2_hook] Console helper registration disabled by environment\n");
         return;
     }
-    fprintf(stderr, "[t2_hook] Constructor: starting poll thread\n");
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
-    pthread_create(&tid, &attr, poll_thread, NULL);
-    pthread_attr_destroy(&attr);
+    fprintf(stderr, "[t2_hook] Console command registration deferred to the game thread\n");
 }
 #endif

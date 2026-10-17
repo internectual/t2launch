@@ -22,6 +22,7 @@ RUN \
         libasound2-data \
         libasound2 \
         libasound2-plugins \
+        alsa-utils \
         libgtk2.0-0 \
         libcanberra-gtk-module \
         libnss3 \
@@ -39,6 +40,7 @@ RUN \
         libsdl-image1.2 \
         libsmpeg0 \
         libxml2 \
+        mesa-utils \
         pulseaudio-utils \
         xdotool && \
   rm -rf /var/lib/apt/lists/*
@@ -69,6 +71,8 @@ RUN groupmod --gid $USER_GID "$USER"
 WORKDIR /home/loki
 COPY ./build/ /home/loki/game/
 COPY --from=hook-build /tmp/t2_hook.so /home/loki/game/t2_hook.so
+COPY window_resize.sh /home/loki/window_resize.sh
+RUN chmod 0755 /home/loki/window_resize.sh
 RUN chown $USER_UID:$USER_GID -R /home/loki/
 USER $USER
 

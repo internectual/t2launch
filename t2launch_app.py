@@ -22,6 +22,8 @@ try:
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install it with: python3 -m pip install -r requirements.txt") from exc
 
+from shiboken6 import isValid as is_qobject_valid
+
 
 ROOT = Path(__file__).resolve().parent
 DOCKER = ROOT / "docker"
@@ -154,7 +156,7 @@ def sensitive_profile_arguments(args):
 
 def is_safe_launch_diagnostic(line):
     lower = line.casefold()
-    return (line.startswith(("[wonemu]", "[t2_hook]", "ERROR:", "WARNING:",
+    return (line.startswith(("[wonemu]", "[t2_hook]", "[t2launch]", "ERROR:", "WARNING:",
                              "OpenGL", "Activating the OpenGL", "Setting video mode",
                              "RSA proxy")) or
             any(marker in lower for marker in
@@ -530,10 +532,16 @@ class Launcher(QApplication):
         self.update_tooltip()
 
     def read_launch_output(self, process, name):
+        if not is_qobject_valid(process):
+            return
         state = self.launch_output_states.get(id(process))
         if state is None:
             return
-        state["buffer"] += bytes(process.readAllStandardOutput()).decode(errors="replace")
+        try:
+            output = process.readAllStandardOutput()
+        except RuntimeError:
+            return
+        state["buffer"] += bytes(output).decode(errors="replace")
         while "\n" in state["buffer"]:
             line, state["buffer"] = state["buffer"].split("\n", 1)
             self._record_launch_output_line(line.rstrip("\r"), state)
@@ -547,7 +555,8 @@ class Launcher(QApplication):
             append_launch_diagnostic(line)
 
     def launch_finished(self, name, process, code):
-        self.read_launch_output(process, name)
+        if is_qobject_valid(process):
+            self.read_launch_output(process, name)
         state = self.launch_output_states.pop(id(process), None)
         if state and state["buffer"]:
             self._record_launch_output_line(state["buffer"].rstrip("\r"), state)
@@ -556,11 +565,14 @@ class Launcher(QApplication):
         if code:
             self.tray.showMessage("Tribes 2 exited", f"Profile {name} exited with status {code}.", QSystemTrayIcon.Warning)
         self.update_tooltip()
-        process.deleteLater()
+        if is_qobject_valid(process):
+            process.deleteLater()
 
     def launch_error(self, process, error):
-        append_launch_diagnostic(f"QProcess launch error={int(error)}")
-        self.tray.showMessage("Launch error", process.errorString(), QSystemTrayIcon.Critical)
+        error_code = getattr(error, "value", error)
+        append_launch_diagnostic(f"QProcess launch error={int(error_code)}")
+        if is_qobject_valid(process):
+            self.tray.showMessage("Launch error", process.errorString(), QSystemTrayIcon.Critical)
 
     def build_image(self):
         if self.build_process and self.build_process.state() != QProcess.NotRunning:
