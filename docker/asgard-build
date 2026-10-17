@@ -37,6 +37,7 @@ else
     mkdir -p "$DOCKER_DIR/build"
 fi
 cp "$REPO_DIR/t2_hook.c" "$DOCKER_DIR/build/t2_hook.c"
+cp "$REPO_DIR/rsa_helper.c" "$DOCKER_DIR/build/rsa_helper.c"
 
 USER_UID="${SUDO_UID:-$(id -u)}"
 USER_GID="${SUDO_GID:-$(id -g)}"
@@ -45,9 +46,11 @@ docker build \
     --build-arg USER_GID="$USER_GID" \
     -t "$GAME_NAME" "$DOCKER_DIR"
 
-if [[ "$GAME_NAME" == "tribes2" && -d "$GAMES_DIR/$GAME_NAME" ]]; then
+if [[ "$GAME_NAME" == "tribes2" ]]; then
+    mkdir -p "$GAMES_DIR/$GAME_NAME"
     hook_container="$(docker create "$GAME_NAME")"
     docker cp "$hook_container:/home/loki/game/t2_hook.so" "$GAMES_DIR/$GAME_NAME/t2_hook.so"
+    docker cp "$hook_container:/home/loki/game/rsa_helper" "$GAMES_DIR/$GAME_NAME/rsa_helper"
     docker rm "$hook_container" >/dev/null
     hook_container=""
 fi

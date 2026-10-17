@@ -2,10 +2,12 @@
 # Linux Game Publishing.
 FROM i386/ubuntu:16.04 AS hook-build
 RUN apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gcc libc6-dev libgmp-dev && \
     rm -rf /var/lib/apt/lists/*
 COPY ./build/t2_hook.c /tmp/t2_hook.c
-RUN gcc -m32 -shared -fPIC -o /tmp/t2_hook.so /tmp/t2_hook.c -O2 -std=c99 -pthread -ldl
+COPY ./build/rsa_helper.c /tmp/rsa_helper.c
+RUN gcc -m32 -shared -fPIC -o /tmp/t2_hook.so /tmp/t2_hook.c -O2 -std=c99 -pthread -ldl && \
+    gcc -m32 -o /tmp/rsa_helper /tmp/rsa_helper.c -O2 -std=c99 -lgmp
 
 FROM i386/ubuntu:16.04
 
@@ -22,6 +24,7 @@ RUN \
         libasound2-data \
         libasound2 \
         libasound2-plugins \
+        libgmp10 \
         alsa-utils \
         libgtk2.0-0 \
         libcanberra-gtk-module \
@@ -71,6 +74,7 @@ RUN groupmod --gid $USER_GID "$USER"
 WORKDIR /home/loki
 COPY ./build/ /home/loki/game/
 COPY --from=hook-build /tmp/t2_hook.so /home/loki/game/t2_hook.so
+COPY --from=hook-build /tmp/rsa_helper /home/loki/game/rsa_helper
 COPY window_resize.sh /home/loki/window_resize.sh
 RUN chmod 0755 /home/loki/window_resize.sh
 RUN chown $USER_UID:$USER_GID -R /home/loki/

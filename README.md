@@ -105,7 +105,9 @@ The launcher automatically builds the image if it is missing. Its build
 context stages the local `games/tribes2` support files, installs the image's
 runtime dependencies, and includes the legacy Loki compatibility libraries in
 `docker/compat-libs`; it does not fetch code or libraries from the upstream
-project.
+project. It compiles `t2_hook.so` and `rsa_helper` from the tracked C sources
+and exports both under `games/tribes2/` for overlaying onto an external game
+directory.
 
 ### Local WON emulator and master proxy
 
