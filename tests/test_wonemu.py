@@ -608,11 +608,10 @@ class ProtocolTests(unittest.TestCase):
         encrypted_data = SMALL_AUTH_ENCRYPTED_DATA
         payload = (bytes.fromhex("05 0c 00 03 00") + struct.pack("<HH", 1, len(encrypted_key)) +
                    encrypted_key + struct.pack("<H", len(encrypted_data)) + encrypted_data)
-        from build import rc4
         private_hex = "00112233445566778899aabbccddeeff"
         nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
         rc4_key = hashlib.sha1(("probe_not_a_real_password" + nonce).encode("ascii")).hexdigest().encode("ascii")
-        store_value = rc4(rc4_key, bytes.fromhex(private_hex)).hex()
+        store_value = woncrypto._rc4_drop2048(rc4_key, bytes.fromhex(private_hex)).hex()
         with tempfile.TemporaryDirectory() as directory:
             private_store = Path(directory) / "private.store"
             private_store.write_text(f"WONEMUXPROBE\t{nonce}:{store_value}\n", encoding="ascii")
@@ -670,8 +669,6 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(tribesnext_password_result["account_enrolled"])
 
     def test_valid_private_store_login_gets_signed_auth1_success_reply(self):
-        from build import rc4
-
         game_binary = Path.home() / "t2-linux/tribes2.dynamic"
         root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))
         auth_key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
@@ -680,7 +677,7 @@ class ProtocolTests(unittest.TestCase):
         private_hex = "00112233445566778899aabbccddeeff"
         nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
         rc4_key = hashlib.sha1((password + nonce).encode("ascii")).hexdigest().encode("ascii")
-        encrypted_private = rc4(rc4_key, bytes.fromhex(private_hex))
+        encrypted_private = woncrypto._rc4_drop2048(rc4_key, bytes.fromhex(private_hex))
 
         with tempfile.TemporaryDirectory() as directory:
             private_store = Path(directory) / "private.store"
@@ -793,15 +790,13 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(migrated["auth"]["p"], parameters["p"])
 
     def test_private_store_password_verification_matches_store_format(self):
-        from build import rc4
-
         username = "local-test-account"
         password = "fixture-password"
         encrypted_private_key = bytes.fromhex("00112233445566778899aabbccddeeff")
         private_hex = encrypted_private_key.hex()
         nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
         rc4_key = hashlib.sha1((password + nonce).encode("ascii")).hexdigest().encode("ascii")
-        ciphertext = rc4(rc4_key, encrypted_private_key)
+        ciphertext = woncrypto._rc4_drop2048(rc4_key, encrypted_private_key)
         with tempfile.TemporaryDirectory() as directory:
             store = Path(directory) / "private.store"
             store.write_text(f"{username}\t{nonce}:{ciphertext.hex()}\n", encoding="ascii")

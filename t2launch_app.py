@@ -30,8 +30,8 @@ DOCKER = ROOT / "docker"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "t2launch"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
-# TorqueScript options recognized in console_start.cs. Each argument that takes
-# values has its own enable checkbox and the correct number of value fields.
+# Tribes 2 command-line options. Each argument that takes values has its own
+# enable checkbox and the correct number of value fields.
 BOOL_OPTIONS = [
     ("-dedicated", "Dedicated server"), ("-nonpure", "Non-pure server"),
     ("-host", "Host game"), ("-demo", "Demo mode"), ("-show", "TSShow"),

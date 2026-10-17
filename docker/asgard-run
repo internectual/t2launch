@@ -290,16 +290,11 @@ if [[ -n "$HOST_GAME_PATH" ]]; then
     DOCKER_EXTRA_ARGS+=(-v "$HOST_GAME_PATH:/home/loki/game:rw")
     echo "Bind-mounting host game: $HOST_GAME_PATH -> /home/loki/game"
 
-    # The user's game folder only contains the original game files. The launcher
-    # script and the bundled replacement fonts live in THIS repo (games/$GAME_NAME)
-    # and would be hidden by the bind-mount above, so layer them back on top.
+    # The hook, RSA helper, and bundled replacement fonts live in this repo
+    # (games/$GAME_NAME) and are layered over the host game directory.
     # Docker applies mounts ordered by destination depth, so these nested mounts
     # correctly overlay onto the game mount.
     HELPER_DIR="$GAMES_DIR/$GAME_NAME"
-    if [[ -f "$HELPER_DIR/run_t2.sh" ]]; then
-        DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/run_t2.sh:/home/loki/game/run_t2.sh:ro")
-        echo "  + overlay launcher: run_t2.sh"
-    fi
     HOOK_FILE="$HELPER_DIR/t2_hook.so"
     [[ -f "$HOOK_FILE" ]] || HOOK_FILE="$REPO_DIR/t2_hook.so"
     if [[ -f "$HOOK_FILE" ]]; then

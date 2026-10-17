@@ -20,18 +20,23 @@ t2launch/
 │   ├── Dockerfile             # 32-bit Ubuntu 16.04 container
 │   ├── asgard-run             # Launch script
 │   ├── config/tribes2.cfg     # Per-game config (LD_PRELOAD, etc.)
-│   └── run_t2.sh              # In-container launcher
-├── t2_hook.c                  # LD_PRELOAD hook (SHA1, RSA, console commands)
-└── README.md
+│   ├── asgard-build           # Build image and compile hook
+│   ├── alsa-pulse.conf        # Route ALSA audio through PulseAudio/PipeWire
+│   ├── window_resize.sh       # Follow game mode and selected display
+│   └── compat-libs/           # Loki-era compatibility libraries
+├── games/tribes2/             # Generated hook/helper overlays
+├── t2_hook.c                  # LD_PRELOAD hook and runtime game patches
+├── wonemu.py                  # Local WON/Auth/IRC/master services
+├── tribesnext.py              # TribesNext certificate/challenge helpers
+├── woncrypto.py               # WON wire-format crypto
+└── t2launch_app.py            # Desktop launcher
 ```
 
-Game files (not included) go in `~/t2-linux/`:
+Your original Tribes 2 Linux game files (not included) go in `~/t2-linux/`:
 ```
 ~/t2-linux/
 ├── tribes2.dynamic            # Loki Linux binary (#25034)
-├── t2_hook.so                 # Compiled hook (built from t2_hook.c)
-├── console_start.cs           # Game startup script
-├── autoexec.cs / base/        # Game scripts
+├── base/                      # Original game data and scripts
 └── *.vl2                      # Script archives
 ```
 
@@ -237,11 +242,10 @@ Protocol checks: `python3 -m unittest discover -s tests -v`.
 - Your own Tribes 2 Linux game files (from Loki Software release)
 - TribesNext account credentials
 
-### Build the hook
+### Build the image and hook
 
 ```bash
-docker run --rm -v /path/to/t2_hook.c:/build/t2_hook.c -v ~/t2-linux:/output tribes2:hook \
-  bash -c 'cd /build; gcc -m32 -shared -fPIC -o t2_hook.so t2_hook.c -lc -O2 -std=c99'
+./docker/asgard-build tribes2
 ```
 
 ### Run
@@ -277,7 +281,7 @@ echo("SHA1: " @ %result);
 - [x] Runtime T2CSRI client handlers, installed by the native hook without changing game scripts or archives
 - [x] Existing `public.store` / `private.store` unlock in memory with password nonce verification
 - [x] TribesNext certificate chunk transfer and server challenge-response handlers
-- [ ] End-to-end public TribesNext server login verified in a live game session
+- [x] End-to-end TribesNext authentication and server join verified in a live game session
 - [ ] Account creation (needs RSA keygen in C)
 
 ## TribesNext Runtime Integration
@@ -313,11 +317,10 @@ not on the helper process command line.
 
 ### Hook Registration Timing
 
-The hook CANNOT register commands from its constructor — the console hash table isn't initialized yet. The working approach:
-1. Constructor spawns a detached `pthread`
-2. Thread polls `0x8493dec + 4` (console hash table size) every 500ms
-3. When `table_size > 0`, calls `Con::addMethodS()` to register commands
-4. Registration typically completes within 1-2 seconds of game startup
+The constructor installs the local verifier when WON emulation is enabled, but
+defers console registration and TorqueScript changes until the SDL render loop is
+running. Hook commands are registered on the game's main thread after the console
+table is available, avoiding concurrent mutation while startup scripts load.
 
 ### LD_PRELOAD Configuration
 
@@ -326,21 +329,12 @@ is enabled. The hook must precede SDL so its main-thread
 `SDL_GL_SwapBuffers` interposer can defer runtime TorqueScript work safely. The
 Xenial container also needs `libpthread` preloaded explicitly:
 ```
-LD_PRELOAD=/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:/usr/lib/libSDL-1.2.so.0
+LD_PRELOAD=/home/loki/game/t2_hook.so:/usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so:/lib/i386-linux-gnu/libpthread.so.0:/usr/lib/libSDL-1.2.so.0
 ```
 
 The hook toggle removes only `t2_hook.so`; `libpthread` and SDL remain available
 for the legacy game runtime. It registers fourteen native commands and installs the
 Player TRIBES-tab override at runtime after the Community Browser control exists.
-
-### Hook Build Requirements
-
-The hook MUST be compiled as pure C (not C++):
-```bash
-gcc -m32 -shared -fPIC -o t2_hook.so t2_hook.c -lc -O2 -std=c99
-```
-
-Compiling in the `tribes2:hook` container ensures glibc 2.23 compatibility.
 
 ### Key Binary Addresses (Tribes 2 Linux #25034)
 
