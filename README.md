@@ -58,9 +58,11 @@ for the server challenge. Passwords and private exponents are not written to dis
 or included in diagnostics. If the local WON profile has a different password,
 wonemu accepts the TribesNext password only when it validates against that
 account's installed private-store entry. On a validated TribesNext login, wonemu
-also performs the official existing-account recovery and atomically refreshes
-the public/private stores; this repairs stale local certificates without creating
-or renaming an account.
+uses the cached installed key; it does not contact the official account-recovery
+service on routine logins. To refresh an existing account explicitly, start the
+service with `--refresh-tribesnext` or set `T2LAUNCH_REFRESH_TRIBESNEXT=1`.
+Refreshes atomically update the public/private stores without creating or renaming
+an account.
 
 For the #25034 profile browser, the hook also replaces the local player's broken
 TRIBES-tab callback at runtime with a `DatabaseQueryArray(13, ...)` request. This
