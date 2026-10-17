@@ -260,6 +260,15 @@ if ! docker image inspect "$GAME_NAME" >/dev/null 2>&1; then
     echo ""
 fi
 
+# A cached image does not imply that this checkout has its ignored host-game
+# overlays yet. Rebuild once when a supported external Tribes 2 install lacks
+# either generated artifact.
+if [[ "$GAME_NAME" == "tribes2" && -n "$HOST_GAME_PATH" && "$LOAD_HOOK" == "1" &&
+      ( ! -x "$GAMES_DIR/tribes2/t2_hook.so" || ! -x "$GAMES_DIR/tribes2/rsa_helper" ) ]]; then
+    echo "Hook/RSA helper overlays missing — building Tribes 2 support artifacts."
+    "$ROOT_DIR/asgard-build" tribes2
+fi
+
 DOCKER_EXTRA_ARGS=()
 TRACE_CONNECTS=${T2LAUNCH_TRACE_CONNECTS:-0}
 if [[ "$TRACE_CONNECTS" == "1" ]]; then
@@ -296,7 +305,6 @@ if [[ -n "$HOST_GAME_PATH" ]]; then
     # correctly overlay onto the game mount.
     HELPER_DIR="$GAMES_DIR/$GAME_NAME"
     HOOK_FILE="$HELPER_DIR/t2_hook.so"
-    [[ -f "$HOOK_FILE" ]] || HOOK_FILE="$REPO_DIR/t2_hook.so"
     if [[ -f "$HOOK_FILE" ]]; then
         DOCKER_EXTRA_ARGS+=(-v "$HOOK_FILE:/home/loki/game/t2_hook.so:ro")
         echo "  + overlay hook:     t2_hook.so"
@@ -305,7 +313,6 @@ if [[ -n "$HOST_GAME_PATH" ]]; then
     fi
     if [[ "$LOAD_HOOK" == "1" ]]; then
         RSA_HELPER_FILE="$HELPER_DIR/rsa_helper"
-        [[ -f "$RSA_HELPER_FILE" ]] || RSA_HELPER_FILE="$REPO_DIR/rsa_helper"
         if [[ -f "$RSA_HELPER_FILE" ]]; then
             DOCKER_EXTRA_ARGS+=(-v "$RSA_HELPER_FILE:/home/loki/game/rsa_helper:ro")
             echo "  + overlay RSA helper"
