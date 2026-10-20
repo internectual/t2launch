@@ -41,10 +41,18 @@ cp "$REPO_DIR/rsa_helper.c" "$DOCKER_DIR/build/rsa_helper.c"
 
 USER_UID="${SUDO_UID:-$(id -u)}"
 USER_GID="${SUDO_GID:-$(id -g)}"
-docker build \
-    --build-arg USER_UID="$USER_UID" \
-    --build-arg USER_GID="$USER_GID" \
-    -t "$GAME_NAME" "$DOCKER_DIR"
+BUILD_ARGS=(
+    --build-arg USER_UID="$USER_UID"
+    --build-arg USER_GID="$USER_GID"
+    -t "$GAME_NAME"
+    "$DOCKER_DIR"
+)
+if docker buildx version >/dev/null 2>&1; then
+    docker buildx build --platform=linux/386 --load "${BUILD_ARGS[@]}"
+else
+    echo "Docker Buildx is unavailable; using the legacy docker build command." >&2
+    docker build "${BUILD_ARGS[@]}"
+fi
 
 if [[ "$GAME_NAME" == "tribes2" ]]; then
     mkdir -p "$GAMES_DIR/$GAME_NAME"

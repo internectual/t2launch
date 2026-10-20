@@ -493,7 +493,7 @@ class CommunityStore:
         limit = max(0, min(int(limit), 100))
         with self.lock, self._connection() as connection:
             rows = connection.execute("""
-                SELECT t.tribe_id, t.name, t.tag, m.access, m.title, m.joined_at
+                SELECT t.tribe_id, t.name, t.tag, t.appending, m.access, m.title, m.joined_at
                 FROM memberships AS m
                 JOIN tribes AS t USING (tribe_id)
                 JOIN profiles AS p USING (user_id)

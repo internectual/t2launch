@@ -160,7 +160,8 @@ def is_safe_launch_diagnostic(line):
                              "OpenGL", "Activating the OpenGL", "Setting video mode",
                              "RSA proxy")) or
             any(marker in lower for marker in
-                ("segmentation fault", "fatal error", "xio:", "core dumped")))
+                ("segmentation fault", "fatal error", "xio:", "core dumped",
+                 "syntax error", "unable to find function")))
 
 
 class ProfileEditor(QWidget):

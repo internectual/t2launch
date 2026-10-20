@@ -1,5 +1,5 @@
-import json
 import hashlib
+import json
 import socket
 import sqlite3
 import struct
@@ -7,11 +7,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-import wonemu
-import woncrypto
 import community_store
-
+import tribesnext
+import woncrypto
+import wonemu
 
 # Recovered from GetDirOp::GetNextRequest and WriteBuffer in #25034.
 TRIBES2_QUERY = bytes.fromhex(
@@ -26,6 +27,61 @@ AUTH_QUERY = bytes.fromhex(
 SMALL_AUTH_P = 280113052720621736320677874810934783027
 SMALL_AUTH_Q = 140056526360310868160338937405467391513
 SMALL_AUTH_X = 0x123456789ABCDEF
+def native_won_get_auth_info(auth2_certificate, signature_bytes):
+    """Mirror Loki #25034 WONGetAuthInfo(): Auth2 unpack, 0x8348fcc, 0x8348eac."""
+    body = auth2_certificate[:-signature_bytes]
+    family, _, _, count = struct.unpack_from("<HIIH", body)
+    assert family == 2
+    offset, user_id, communities = 12, None, {}
+    for _ in range(count):
+        data_type, length = struct.unpack_from("<HH", body, offset)
+        data = body[offset + 4:offset + 4 + length]
+        offset += 4 + length
+        if data_type == 0:
+            user_id, = struct.unpack_from("<I", data)
+        elif data_type == 1:
+            community_id, blob_length = struct.unpack_from("<IH", data)
+            assert len(data) == 6 + blob_length
+            communities[community_id] = data[6:]
+    assert offset == len(body)
+    if not communities:
+        return ""
+    stream = communities[min(communities)]
+    position = 0
+
+    def take(size):
+        nonlocal position
+        chunk = stream[position:position + size]
+        position += size
+        return chunk
+
+    def text(limit):
+        length, = struct.unpack("<H", take(2))
+        if length > limit:
+            raise OverflowError
+        return take(length).decode("latin-1")
+
+    try:
+        tribes = []
+        for _ in range(take(1)[0]):
+            tribe_id, = struct.unpack("<I", take(4))
+            tag = text(15)
+            append = int(take(1)[0] != 0)
+            name = text(63)
+            rank, = struct.unpack("<I", take(4))
+            title = text(40) if rank > 9 else ""
+            tribes.append((name, tag, append, tribe_id, rank, title))
+        warrior = text(31)
+    except OverflowError:
+        return ""
+    if tribes:
+        lines = [f"{warrior}\t{tribes[0][1]}\t{tribes[0][2]}\t{user_id}", str(len(tribes))]
+    else:
+        lines = [f"{warrior}\t\t1\t{user_id}", "0"]
+    lines.extend("\t".join(str(field) for field in tribe) for tribe in tribes)
+    return "\n".join(lines) + "\n"
+
+
 SMALL_AUTH_ENCRYPTED_KEY = bytes.fromhex(
     "01000000acf325a19af96a77fb4852da2913d469b355de39da085b28a72f0337c6f8a8b4"
 )
@@ -95,6 +151,336 @@ def read_dbmsg(stream):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_auth_user_id_prefers_the_installed_tribes2_certificate_guid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            private_store.write_text("test-user\tprivate-entry\n", encoding="ascii")
+            private_store.with_name("public.store").write_text(
+                "test-user\t7654321\t10001\tabcdef\tsignature\n", encoding="ascii")
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory), private_store=private_store)
+
+            self.assertEqual(emulator.auth_user_id("TEST-USER"), 7654321)
+
+    def test_auth1_reply_uses_the_supplied_tribes2_user_id(self):
+        keys = {"root": {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                         "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)},
+                "auth": {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                         "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}}
+        session_key = bytes.fromhex("0102030405060708")
+        reply = woncrypto.auth1_login_reply(keys, session_key, "test-user", now=1700000000,
+                                            user_id=7654321)
+        auth2 = woncrypto.auth1_login_material(reply)["auth2_certificate"]
+        self.assertEqual(struct.unpack_from("<I", auth2, 16)[0], 7654321)
+
+    def test_auth1_reply_carries_native_won_auth_info(self):
+        keys = {"root": {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                         "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)},
+                "auth": {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                         "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}}
+        signature_bytes = 2 * ((SMALL_AUTH_Q.bit_length() + 7) // 8)
+        session_key = bytes.fromhex("0102030405060708")
+        tribes = [{"id": 77, "name": "Live Clan", "tag": "[LC]", "append": 1, "rank": 4,
+                   "title": "Founder"},
+                  {"id": 78, "name": "Titled", "tag": "TT", "append": 0, "rank": 12,
+                   "title": "Overlord"}]
+        reply = woncrypto.auth1_login_reply(keys, session_key, "Player", now=1700000000,
+                                            user_id=7654321, tribes=tribes)
+        auth2 = woncrypto.auth1_login_material(reply)["auth2_certificate"]
+        self.assertTrue(woncrypto.verify(keys["auth"], auth2[:-signature_bytes],
+                                         auth2[-signature_bytes:]))
+        self.assertEqual(native_won_get_auth_info(auth2, signature_bytes),
+                         "Player\t[LC]\t1\t7654321\n2\n"
+                         "Live Clan\t[LC]\t1\t77\t4\t\n"
+                         "Titled\tTT\t0\t78\t12\tOverlord\n")
+
+        reply = woncrypto.auth1_login_reply(keys, session_key, "Loner", now=1700000000,
+                                            user_id=7654321)
+        auth2 = woncrypto.auth1_login_material(reply)["auth2_certificate"]
+        self.assertEqual(native_won_get_auth_info(auth2, signature_bytes),
+                         "Loner\t\t1\t7654321\n0\n")
+
+    def test_auth_info_rejects_values_the_client_cannot_hold(self):
+        tribe = {"id": 1, "name": "Clan", "tag": "C", "append": 0, "rank": 1, "title": ""}
+        woncrypto.t2_auth_info_blob("w" * 31, [tribe] * woncrypto.T2_AUTH_INFO_MAX_TRIBES)
+        with self.assertRaises(ValueError):
+            woncrypto.t2_auth_info_blob("Player", [tribe] * 11)
+        with self.assertRaises(ValueError):
+            woncrypto.t2_auth_info_blob("w" * 32)
+        with self.assertRaises(ValueError):
+            woncrypto.t2_auth_info_blob("Player", [dict(tribe, tag="t" * 16)])
+        with self.assertRaises(ValueError):
+            woncrypto.t2_auth_info_blob("Player", [dict(tribe, name="n" * 64)])
+        with self.assertRaises(ValueError):
+            woncrypto.t2_auth_info_blob("Player", [dict(tribe, rank=10, title="t" * 41)])
+
+    def test_auth_info_tribes_come_from_the_login_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            emulator.community.ensure_profile("Player", 7654321)
+            emulator.community.create_tribe("Local Clan", "[LC]", 1, 0, "", "Player", 7654321)
+            local = emulator.auth_info_tribes("player")
+            self.assertEqual([(tribe["name"], tribe["tag"], tribe["append"], tribe["rank"])
+                              for tribe in local],
+                             [("Local Clan", "[LC]", 1, 4)])
+
+            credentials = object()
+            emulator.tribesnext_user_id = lambda username: 123456
+            emulator.tribesnext_robot.user_view = lambda supplied, guid: {"memberships": [
+                {"id": "77", "name": "Live Clan", "rank": "3", "title": "Lead",
+                 "tag": "[TN]", "append": "1"},
+                {"id": "78", "name": "n" * 64, "rank": "1", "title": "", "tag": "",
+                 "append": "0"}]}
+            remote = emulator.auth_info_tribes("Player", "tribesnext", credentials)
+            self.assertEqual(remote, [{"id": 77, "name": "Live Clan", "tag": "[TN]",
+                                       "append": 1, "rank": 3, "title": "Lead"}])
+
+            def unavailable(supplied, guid):
+                raise tribesnext.RobotAPIError("offline")
+            emulator.tribesnext_robot.user_view = unavailable
+            self.assertEqual(emulator.auth_info_tribes("Player", "tribesnext", credentials), [])
+            self.assertEqual(emulator.auth_info_tribes("Player", "tribesnext", None), [])
+
+    def test_tribesnext_guid_is_resolved_from_public_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            private_store.write_text("player\tprivate-value\n", encoding="ascii")
+            private_store.with_name("public.store").write_text(
+                "Player\t123456\t10001\tabcdef\tsignature\n", encoding="ascii")
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory), private_store=private_store)
+            self.assertEqual(emulator.tribesnext_user_id("PLAYER"), 123456)
+            self.assertIsNone(emulator.tribesnext_user_id("missing"))
+
+    def test_dbproxy_profile_and_membership_reads_use_tribesnext_response(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            credentials = object()
+            session = {"username": "Player", "irc_authenticated": True,
+                       "tribesnext_credentials": credentials, "auth_provider": "tribesnext"}
+            profile = {"guid": 123456, "name": "LiveName", "tag": "[TN]", "append": "1",
+                       "creation": "1234567890", "website": "https://example.invalid",
+                       "info": "authoritative text", "online": "1",
+                       "memberships": [{"id": "77", "name": "Live Clan", "rank": "4",
+                                        "title": "Founder", "tag": "[LC]", "append": "0"}]}
+            emulator.tribesnext_user_id = lambda username: 123456
+            emulator.tribesnext_robot.user_view = lambda supplied, guid: profile
+            emulator.tribesnext_robot.user_search = lambda supplied, search: [
+                {"index": "0", "name": "LiveName", "tag": "[TN]", "append": "1",
+                 "guid": "123456"}]
+            emulator.tribesnext_robot.clan_search = lambda supplied, search: [
+                {"index": "0", "id": "77", "name": "Live Clan"}]
+            remote_clan = {"id": "77", "name": "Live Clan", "tag": "[LC]", "append": "0",
+                           "recruiting": "1", "picture": "team.png", "info": "live clan info",
+                           "members": [{"name": "Member", "tag": "[LC]", "append": "0",
+                                        "guid": "654321", "rank": "4", "title": "Leader",
+                                        "online": "1"}]}
+            emulator.tribesnext_robot.clan_view = lambda supplied, clan_id: remote_clan
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+            handler._handle_dbqax("10 23 0 :Player", session, 1)
+            profile_reply = "".join(handler.request.sent)
+            self.assertIn("LiveName", profile_reply)
+            self.assertIn("authoritative text", profile_reply)
+            self.assertIn("https://example.invalid", profile_reply)
+
+            profile["creation"] = "invalid timestamp"
+            handler.request.sent.clear()
+            handler._handle_dbqax("18 23 0 :Player", session, 1)
+            malformed_date_reply = "".join(handler.request.sent)
+            self.assertIn("LiveName", malformed_date_reply)
+            self.assertIn("DBMSG 18 1 :0", malformed_date_reply)
+            profile["creation"] = "1234567890"
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("11 C13 10 :Player", session, 1)
+            membership_reply = "".join(handler.request.sent)
+            self.assertIn("Live Clan", membership_reply)
+            self.assertIn("77", membership_reply)
+            self.assertIn("Founder", membership_reply)
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("12 C3 10 :Live", session, 1)
+            player_search = "".join(handler.request.sent)
+            self.assertIn("LiveName", player_search)
+            self.assertIn("123456", player_search)
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("13 4 10 :Live", session, 1)
+            clan_search = "".join(handler.request.sent)
+            self.assertIn("Live Clan", clan_search)
+
+            handler.request.sent.clear()
+            def unavailable_clan_search(supplied, search):
+                raise tribesnext.RobotAPIError("offline")
+
+            emulator.tribesnext_robot.clan_search = unavailable_clan_search
+            emulator.community.search_tribes = lambda *args, **kwargs: self.fail(
+                "TribesNext clan search must not fall back to local records")
+            handler._handle_dbqax("13 4 10 :Live", session, 1)
+            unavailable_clan_search_reply = "".join(handler.request.sent)
+            self.assertIn("TribesNext search unavailable", unavailable_clan_search_reply)
+            self.assertNotIn("Live Clan", unavailable_clan_search_reply)
+            emulator.tribesnext_robot.clan_search = lambda supplied, search: [
+                {"index": "0", "id": "77", "name": "Live Clan"}]
+            del emulator.community.search_tribes
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("14 22 0 :Live Clan", session, 1)
+            clan_profile = "".join(handler.request.sent)
+            self.assertIn("live clan info", clan_profile)
+            self.assertIn("team.png", clan_profile)
+
+            handler.request.sent.clear()
+            emulator.tribesnext_robot.clan_search = lambda supplied, search: []
+            emulator.community.get_tribe = lambda *args, **kwargs: self.fail(
+                "A missing TribesNext clan must not fall back to local records")
+            handler._handle_dbqax("141 22 0 :Missing Clan", session, 1)
+            missing_clan_reply = "".join(handler.request.sent)
+            self.assertIn("Tribe not found", missing_clan_reply)
+            del emulator.community.get_tribe
+            emulator.tribesnext_robot.clan_search = lambda supplied, search: [
+                {"index": "0", "id": "77", "name": "Live Clan"}]
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("15 C6 10 :Live Clan", session, 1)
+            clan_roster = "".join(handler.request.sent)
+            self.assertIn("Member", clan_roster)
+            self.assertIn("654321", clan_roster)
+            self.assertIn("Leader", clan_roster)
+
+            handler.request.sent.clear()
+            handler._handle_dbqax("16 17 0 :local-only edit", session, 1)
+            rejected_write = "".join(handler.request.sent)
+            self.assertIn("TribesNext community operation unavailable", rejected_write)
+
+            handler.request.sent.clear()
+            def unavailable_profile(supplied, guid):
+                raise tribesnext.RobotAPIError("offline")
+
+            emulator.tribesnext_robot.user_view = unavailable_profile
+            handler._handle_dbqax("17 23 0 :Player", session, 1)
+            unavailable_profile = "".join(handler.request.sent)
+            self.assertIn("TribesNext profile unavailable", unavailable_profile)
+            self.assertNotIn("authoritative text", unavailable_profile)
+
+    def test_tribesnext_auth_session_does_not_create_local_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            emulator.community.ensure_profile = lambda *args, **kwargs: self.fail(
+                "TribesNext authentication must not seed an unverified local profile")
+            credentials = object()
+            emulator.register_auth_session("127.0.0.1", "Player", b"session",
+                                           b"auth1", {"x": 1}, credentials, "tribesnext")
+            session = emulator.auth_session_for_peer("127.0.0.1")
+            self.assertEqual(session["auth_provider"], "tribesnext")
+            self.assertIs(session["tribesnext_credentials"], credentials)
+
+    def test_tribesnext_auth_unlocks_stored_key_for_authoritative_profile_lookup(self):
+        username = "WONEMUXPROBE"
+        password = "probe_not_a_real_password"
+        private_hex = "0ac1"
+        nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
+        store_key = hashlib.sha1((password + nonce).encode("ascii")).hexdigest().encode("ascii")
+        encrypted_private = woncrypto._rc4_drop2048(store_key, bytes.fromhex(private_hex)).hex()
+        auth_key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4, "x": SMALL_AUTH_X,
+                    "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        keys = {"root": auth_key, "auth": auth_key}
+
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            private_store.write_text(f"{username}\t{nonce}:{encrypted_private}\n", encoding="ascii")
+            private_store.with_name("public.store").write_text(
+                f"{username}\t7654321\t11\tca1\t1\n", encoding="ascii")
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory), keys=keys, private_store=private_store)
+            robot_requests = []
+
+            def robot_request(endpoint, params=None, body=None, content_type=None):
+                robot_requests.append((endpoint, params))
+                if endpoint == "robot_login.php" and "nonce" in params:
+                    challenge = int(params["nonce"] + "2", 16)
+                    encrypted = pow(challenge, 17, 0xCA1)
+                    return [f"CHALLENGE: {encrypted:x}"]
+                if endpoint == "robot_login.php" and "response" in params:
+                    self.assertEqual(params["response"], "2")
+                    return ["UUID: robot-session"]
+                if endpoint == "robot_browser.php":
+                    self.assertEqual(params["uuid"], "robot-session")
+                    self.assertEqual(params["method"], "uview")
+                    self.assertEqual(params["a0"], "7654321")
+                    return ["PLAYER\tNAME\t7654321\tVerifiedName",
+                            "PLAYER\tDATE\t7654321\t1234567890",
+                            "PLAYER\tSITE\t7654321\thttps://verified.invalid",
+                            "PLAYER\tINFO\t7654321\tverified profile"]
+                self.fail(f"Unexpected TribesNext robot request: {endpoint}")
+
+            emulator.tribesnext_robot._request = robot_request
+            emulator.start()
+            try:
+                session_key = bytes.fromhex("0102030405060708")
+                with socket.create_connection((wonemu.HOST, emulator.ports["auth"]),
+                                              timeout=2) as connection:
+                    connection.sendall(wonemu.frame(bytes.fromhex("05 0c 00 01 00")))
+                    wonemu.recv_frame(connection)
+                    login = (bytes.fromhex("05 0c 00 03 00") +
+                             struct.pack("<HH", 1, len(SMALL_AUTH_ENCRYPTED_KEY)) +
+                             SMALL_AUTH_ENCRYPTED_KEY +
+                             struct.pack("<H", len(SMALL_AUTH_ENCRYPTED_DATA)) +
+                             SMALL_AUTH_ENCRYPTED_DATA)
+                    connection.sendall(wonemu.frame(login))
+                    challenge = wonemu.recv_frame(connection)
+                    challenge_length, = struct.unpack_from("<H", challenge, 5)
+                    self.assertEqual(len(woncrypto.decrypt_won_crypt_transform(
+                        session_key, challenge[7:7 + challenge_length])), 16)
+                    response_cipher = woncrypto.encrypt_won_crypt_transform(session_key, b"\0")
+                    connection.sendall(wonemu.frame(
+                        bytes.fromhex("05 0c 00 05 00") +
+                        struct.pack("<H", len(response_cipher)) + response_cipher))
+                    auth_reply = wonemu.recv_frame(connection)
+                    self.assertEqual(struct.unpack_from("<BHHhB", auth_reply), (5, 12, 6, 0, 0))
+
+                session = emulator.auth_session_for_peer("127.0.0.1")
+                self.assertEqual(session["auth_provider"], "tribesnext")
+                self.assertEqual(session["tribesnext_credentials"].certificate.guid, 7654321)
+                self.assertEqual(emulator.community.get_profile(username), None)
+                session["irc_authenticated"] = True
+
+                class Request:
+                    def __init__(self):
+                        self.sent = []
+
+                    def sendall(self, payload):
+                        self.sent.append(payload.decode("utf-8"))
+
+                handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+                handler.server = SimpleNamespace(emulator=emulator)
+                handler.request = Request()
+                handler._handle_dbqax("50 23 0 :WONEMUXPROBE", session, 1)
+                reply = "".join(handler.request.sent)
+                self.assertIn("VerifiedName", reply)
+                self.assertIn("https://verified.invalid", reply)
+                self.assertIn("verified profile", reply)
+                # One profile view supplies AuthInfo memberships at login; the
+                # other answers the Browser profile query.
+                self.assertEqual([endpoint for endpoint, _ in robot_requests], [
+                    "robot_login.php", "robot_login.php", "robot_browser.php",
+                    "robot_browser.php"])
+            finally:
+                emulator.close()
+
     def test_community_store_migrates_legacy_mail_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "community.sqlite3"
@@ -760,6 +1146,8 @@ class ProtocolTests(unittest.TestCase):
                     self.assertEqual(confirmation[2:], bytes.fromhex("0102030405060708"))
                 session = emulator.auth_session_for_peer("127.0.0.1")
                 self.assertEqual(session["username"], "WONEMUXPROBE")
+                self.assertEqual(session["auth_provider"], "tribesnext")
+                self.assertIsNone(session["tribesnext_credentials"])
                 self.assertEqual(session["session_key"], bytes.fromhex("0102030405060708"))
                 self.assertEqual(pow(session["client_key"]["g"], session["client_key"]["x"],
                                      session["client_key"]["p"]), session["client_key"]["y"])
@@ -878,12 +1266,14 @@ class NetworkTests(unittest.TestCase):
         username = "irc-test-account"
         session_key = bytes.fromhex("0102030405060708")
         reply = woncrypto.auth1_login_reply(keys, session_key, username, now=1700000000,
-                                            client_key=client_key)
+                                            client_key=client_key, user_id=7654321)
         temp = tempfile.TemporaryDirectory()
         private_store = Path(temp.name) / "private.store"
         private_store.write_text(
             f"{username}\tignored-private-value\ntribe-friend\tother-private-value\n",
             encoding="ascii")
+        private_store.with_name("public.store").write_text(
+            f"{username}\t7654321\t10001\tabcdef\tsignature\n", encoding="ascii")
         emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
                                    Path(temp.name), keys=keys, private_store=private_store)
         emulator.start()
@@ -910,6 +1300,7 @@ class NetworkTests(unittest.TestCase):
                 final_line = stream.readline().decode("ascii").strip().split()
                 self.assertEqual(final_line[1], "CHALRESP_REPLY")
                 self.assertEqual(final_line[2], username)
+                self.assertEqual(final_line[3], "7654321")
 
                 final = woncrypto.parse_won_irc_token(final_line[4])
                 self.assertEqual(final["subtype"], 0x35)
@@ -920,7 +1311,7 @@ class NetworkTests(unittest.TestCase):
                 chunk_length = decrypted[-1]
                 chunk = decrypted[-1 - chunk_length:-1]
                 self.assertEqual(chunk, struct.pack("<H", len(session_key)) + session_key)
-                user_id = woncrypto.local_auth_user_id(username)
+                user_id = 7654321
                 conn.sendall(f"dbqax 16 69 0 :{user_id}\t{user_id + 1}\r\n".encode("ascii"))
                 presence = stream.readline().decode("utf-8").strip()
                 self.assertIn("DBMSG 16 1 :0\t\\S10\\S", presence)
@@ -939,8 +1330,8 @@ class NetworkTests(unittest.TestCase):
                 profile_reply = stream.readline().decode("utf-8").strip()
                 self.assertIn("\\SA local description\\S", profile_reply)
                 long_description = " " + "long-description-" * 35 + " "
-                conn.sendall(f"dbqa 200 :{long_description[:400]}\r\n".encode("utf-8"))
-                conn.sendall(f"dbqax 200 17 0 :{long_description[400:]}\r\n".encode("utf-8"))
+                conn.sendall(f"dbqa 200 :{long_description[:400]}\r\n".encode())
+                conn.sendall(f"dbqax 200 17 0 :{long_description[400:]}\r\n".encode())
                 self.assertIn("DBMSG 200 1 :0\tUpdated", stream.readline().decode("utf-8"))
                 conn.sendall(b"dbqax 201 23 0 :irc-test-account\r\n")
                 long_profile = read_dbmsg(stream)
@@ -1292,6 +1683,8 @@ class NetworkTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         store = Path(temp.name) / "private.store"
         store.write_text("local-user\tignored-private-value\n", encoding="ascii")
+        store.with_name("public.store").write_text(
+            "local-user\t7654321\t10001\tabcdef\tsignature\n", encoding="ascii")
         emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(temp.name),
                                    private_store=store)
         emulator.start()
@@ -1309,7 +1702,7 @@ class NetworkTests(unittest.TestCase):
                              (5, 14, 1002, 17, 0, 0))
             self.assertEqual(reply[11], 0x80)
             user_id, = struct.unpack_from("<I", reply, 12)
-            self.assertEqual(user_id, woncrypto.local_auth_user_id("LOCAL-USER"))
+            self.assertEqual(user_id, 7654321)
             missing_status, missing_error_length = struct.unpack_from("<hH", missing_reply, 7)
             self.assertEqual(missing_status, -1)
             self.assertEqual(missing_reply[11:11 + missing_error_length], b"User not found")
@@ -1421,8 +1814,8 @@ class NetworkTests(unittest.TestCase):
 
         emulator.start()
         try:
-            with patch.object(emulator, "fetch_tribesnext", side_effect=upstream):
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+            with (patch.object(emulator, "fetch_tribesnext", side_effect=upstream),
+                  socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client):
                     client.bind((wonemu.HOST, 0))
                     client.settimeout(2)
                     client.sendto(struct.pack("<BBHH", 2, 0, 0x1020, 0x3040),

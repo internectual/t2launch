@@ -1,9 +1,10 @@
-import unittest
 import hashlib
 import socket
 import tempfile
-from pathlib import Path
 import threading
+import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import tribesnext
 from woncrypto import _rc4_drop2048
@@ -55,6 +56,133 @@ class ChallengeTests(unittest.TestCase):
         cert = tribesnext.AccountCertificate("Name", 42, exponent, modulus, 1,
                                              f"Name\t42\t{exponent:x}\t{modulus:x}\t1")
         self.credentials = tribesnext.AccountCredentials(cert, private_exponent)
+
+
+class RobotClientTests(unittest.TestCase):
+    def setUp(self):
+        modulus = (1 << 1024) - 109
+        cert = tribesnext.AccountCertificate(
+            "Name", 42, 1, modulus, 1,
+            f"Name\t42\t1\t{modulus:x}\t1")
+        self.credentials = tribesnext.AccountCredentials(cert, 1)
+
+    def test_robot_login_challenge_and_browser_get(self):
+        client = tribesnext.RobotClient()
+        nonce = "1" + "2" * 127
+        response = "abc123"
+        encrypted = format(int(nonce + response, 16), "x")
+        requests = []
+
+        def request(endpoint, params=None, **kwargs):
+            requests.append((endpoint, params, kwargs))
+            if "nonce" in (params or {}):
+                return ["", f"CHALLENGE: {encrypted}"]
+            if "response" in (params or {}):
+                return ["UUID: session-token"]
+            return ["profile"]
+
+        client._request = request
+        with patch.object(client, "_new_nonce", return_value=nonce):
+            self.assertEqual(client.browser_get(self.credentials, "profile", page=2),
+                             ["profile"])
+        self.assertEqual(requests[0][0], "robot_login.php")
+        self.assertEqual(requests[0][1], {"guid": "42", "nonce": nonce})
+        self.assertEqual(requests[1][1], {"guid": "42", "response": response})
+        self.assertEqual(requests[2][0], "robot_browser.php")
+        self.assertEqual(requests[2][1], {
+            "guid": "42", "uuid": "session-token", "method": "profile", "page": "2"})
+
+    def test_robot_browser_post_uses_multipart_fields_and_reuses_session(self):
+        client = tribesnext.RobotClient()
+        client._sessions[42] = {"uuid": "session-token", "refreshed_at": 10**20}
+        calls = []
+
+        def request(endpoint, params=None, **kwargs):
+            calls.append((endpoint, params, kwargs))
+            return ["ok"]
+
+        client._request = request
+        self.assertEqual(client.browser_post(self.credentials, "message", body="hello"), ["ok"])
+        endpoint, params, kwargs = calls[0]
+        self.assertEqual(endpoint, "robot_browser.php")
+        self.assertIsNone(params)
+        self.assertIn(b'name="guid"', kwargs["body"])
+        self.assertIn(b'name="uuid"', kwargs["body"])
+        self.assertIn(b'name="method"', kwargs["body"])
+        self.assertIn(b'name="body"', kwargs["body"])
+        self.assertIn(b"hello", kwargs["body"])
+        self.assertTrue(kwargs["content_type"].startswith("multipart/form-data; boundary="))
+
+    def test_robot_rejects_error_and_nonce_mismatch(self):
+        client = tribesnext.RobotClient()
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "denied"):
+            client._line_value(["ERR: denied"], "UUID: ")
+
+        nonce = "1" + "2" * 127
+        client._request = lambda *args, **kwargs: ["CHALLENGE: 2"]
+        with (patch.object(client, "_new_nonce", return_value=nonce),
+              self.assertRaisesRegex(tribesnext.RobotAPIError, "did not echo")):
+            client._start_session(self.credentials)
+
+    def test_user_view_maps_official_robot_profile_and_membership_rows(self):
+        profile = tribesnext.parse_robot_profile([
+            "PLAYER\tNAME\t42\tLouCypher",
+            "PLAYER\tTAG\t42\t[ABC]\t1",
+            "PLAYER\tDATE\t42\t1234567890",
+            "PLAYER\tSITE\t42\thttps://example.invalid",
+            "PLAYER\tINFO\t42\tline one\\nline two\\tmore",
+            "PLAYER\tONLINE\t42\t1",
+            "PLAYER\tCLAN\t42\t0\t77\tExample Clan\t4\tFounder\\tRank\t[ABC]\t1",
+        ])
+        self.assertEqual(profile, {
+            "memberships": [{"id": "77", "name": "Example Clan", "rank": "4",
+                             "title": "Founder\tRank", "tag": "[ABC]", "append": "1"}],
+            "name": "LouCypher", "tag": "[ABC]", "append": "1", "creation": "1234567890",
+            "website": "https://example.invalid", "info": "line one\nline two\tmore",
+            "online": "1",
+        })
+
+    def test_user_view_uses_official_uview_argument_and_rejects_missing_profile(self):
+        client = tribesnext.RobotClient()
+        observed = []
+        client.browser_get = lambda credentials, method, **args: (
+            observed.append((method, args)) or ["PLAYER\tNAME\t42\tName"])
+        self.assertEqual(client.user_view(self.credentials, 42)["name"], "Name")
+        self.assertEqual(observed, [("uview", {"a0": 42})])
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "no usable profile"):
+            tribesnext.parse_robot_profile(["TIMEOUT"])
+
+    def test_user_and_clan_search_rows_parse_official_fields(self):
+        self.assertEqual(tribesnext.parse_robot_search([
+            "SEARCH\tLou\t0\tLouCypher\t[ABC]\t1\t42"], "user"),
+            [{"index": "0", "name": "LouCypher", "tag": "[ABC]",
+              "append": "1", "guid": "42"}])
+        self.assertEqual(tribesnext.parse_robot_search([
+            "CSEARCH\tExample\t0\t77\tExample Clan"], "clan"),
+            [{"index": "0", "id": "77", "name": "Example Clan"}])
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "player GUID"):
+            tribesnext.parse_robot_search(
+                ["SEARCH\tLou\t0\tLouCypher\t[ABC]\t1\tinvalid"], "user")
+
+    def test_clan_view_maps_official_detail_and_roster_rows(self):
+        clan = tribesnext.parse_robot_clan([
+            "CLAN\tNAME\t77\tExample Clan",
+            "CLAN\tTAG\t77\t[ABC]\t1",
+            "CLAN\tRECR\t77\t1",
+            "CLAN\tSITE\t77\thttps://example.invalid",
+            "CLAN\tDATE\t77\t1234567890",
+            "CLAN\tPICT\t77\tteam.png",
+            "CLAN\tACTIVE\t77\t1",
+            "CLAN\tINFO\t77\tClan\\ninfo",
+            "CLAN\tMEMB\t77\t0\tName\t[TN]\t0\t42\t4\tFounder\\tRank\t1",
+        ])
+        self.assertEqual(clan, {
+            "members": [{"name": "Name", "tag": "[TN]", "append": "0", "guid": "42",
+                         "rank": "4", "title": "Founder\tRank", "online": "1"}],
+            "name": "Example Clan", "tag": "[ABC]", "append": "1", "recruiting": "1",
+            "website": "https://example.invalid", "creation": "1234567890",
+            "picture": "team.png", "active": "1", "info": "Clan\ninfo",
+        })
 
     def test_client_challenge_encodes_nonce_and_server_address(self):
         self.assertEqual(tribesnext.make_client_challenge("192.0.2.1", 0x123),
@@ -136,6 +264,99 @@ class RecoveryTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertFalse(thread.is_alive())
         self.assertTrue(received[0].startswith(b"RECOVER\tTestAccount\t"))
+
+
+class AccountCreationTests(unittest.TestCase):
+    def test_registration_signs_protocol_request_and_persists_unlockable_stores(self):
+        username, password = "NewAccount", "account-create-password"
+        exponent, modulus, private_exponent = 17, 0xCA1, 0xAC1
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(2)
+        requests = []
+
+        def serve_registration():
+            for response in (b"SUCCESS\n", None):
+                conn, _ = listener.accept()
+                with conn:
+                    conn.settimeout(2)
+                    payload = bytearray()
+                    while not payload.endswith(b"\n"):
+                        block = conn.recv(4096)
+                        if not block:
+                            break
+                        payload.extend(block)
+                    request = bytes(payload)
+                    requests.append(request)
+                    if response is not None:
+                        conn.sendall(response)
+                    else:
+                        fields = request.decode("ascii").strip().split("\t")
+                        self.assertEqual(fields[0], "SIGN")
+                        signed = "\t".join(fields[1:-1])
+                        signature = int(fields[-1], 16)
+                        expected = int(hashlib.sha1(signed.encode("ascii")).hexdigest(), 16)
+                        self.assertEqual(pow(signature, exponent, modulus), expected % modulus)
+                        self.assertEqual(fields[1], username)
+                        self.assertEqual(fields[2], format(exponent, "x"))
+                        self.assertIn(":", fields[4])
+                        self.assertEqual(fields[5], hashlib.sha1(
+                            ("3.14159265" + username.lower() + password).encode("ascii")
+                        ).hexdigest())
+                        conn.sendall(f"{username}\t42\t{exponent:x}\t{modulus:x}\t1\n".encode())
+            listener.close()
+
+        thread = threading.Thread(target=serve_registration)
+        thread.start()
+        with tempfile.TemporaryDirectory() as directory:
+            public_path = Path(directory) / "public.store"
+            private_path = Path(directory) / "private.store"
+            with patch.object(tribesnext, "generate_account_key",
+                              return_value=(exponent, modulus, private_exponent)):
+                credentials = tribesnext.create_account(
+                    username, password, public_path, private_path,
+                    endpoint=listener.getsockname(), timeout=2)
+            self.assertEqual(credentials.private_exponent, private_exponent)
+            self.assertEqual(credentials.certificate.guid, 42)
+            self.assertEqual(public_path.read_text("ascii").strip(),
+                             f"{username}\t42\t{exponent:x}\t{modulus:x}\t1")
+            self.assertEqual(tribesnext.unlock_account(
+                public_path, private_path, username, password).private_exponent,
+                private_exponent)
+            self.assertEqual(public_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(private_path.stat().st_mode & 0o777, 0o600)
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(requests[0], f"NAME\t{username}\n".encode("ascii"))
+        self.assertTrue(requests[1].startswith(f"SIGN\t{username}\t".encode("ascii")))
+
+    def test_name_rejection_does_not_generate_or_write_credentials(self):
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+
+        def reject_name():
+            conn, _ = listener.accept()
+            with conn:
+                conn.recv(4096)
+                conn.sendall(b"TAKEN\n")
+            listener.close()
+
+        thread = threading.Thread(target=reject_name)
+        thread.start()
+        with tempfile.TemporaryDirectory() as directory:
+            public_path = Path(directory) / "public.store"
+            private_path = Path(directory) / "private.store"
+            with patch.object(tribesnext, "generate_account_key") as generate:
+                with self.assertRaisesRegex(ValueError, "already taken"):
+                    tribesnext.create_account(
+                        "TakenName", "account-create-password", public_path, private_path,
+                        endpoint=listener.getsockname(), timeout=2)
+                generate.assert_not_called()
+            self.assertFalse(public_path.exists())
+            self.assertFalse(private_path.exists())
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
 
 
 if __name__ == "__main__":

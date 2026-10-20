@@ -14,7 +14,6 @@ import hashlib
 import itertools
 import json
 import os
-from pathlib import Path
 import secrets
 import signal
 import socket
@@ -27,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import community_store
 import tribesnext
@@ -236,6 +236,22 @@ def getdir_response(request, records):
     return b"".join(replies)
 
 
+def robot_memberships(memberships):
+    """Normalize TribesNext robot memberships to id/name/tag/append/rank/title."""
+    return [{"id": int(tribe["id"]), "name": tribe["name"], "tag": tribe.get("tag", ""),
+             "append": int(str(tribe.get("append", "0")).strip() == "1"),
+             "rank": int(tribe["rank"]), "title": tribe["title"]}
+            for tribe in memberships]
+
+
+def community_memberships(rows):
+    """Normalize local community memberships to id/name/tag/append/rank/title."""
+    return [{"id": int(tribe["tribe_id"]), "name": tribe["name"], "tag": tribe["tag"],
+             "append": int(tribe.get("appending") or 0), "rank": int(tribe["access"]),
+             "title": tribe["title"]}
+            for tribe in rows]
+
+
 def parse_login_payload(payload, session_key):
     """Decode the native auth payload without returning it to the traffic log."""
     reader = Reader(payload)
@@ -346,7 +362,8 @@ class CaptureLog:
         self.lock = threading.Lock()
 
     def event(self, event, **fields):
-        record = {"time": datetime.datetime.now(datetime.timezone.utc).isoformat(), "event": event, **fields}
+        record = {"time": datetime.datetime.now(datetime.timezone.utc).isoformat(),  # noqa: UP017
+                  "event": event, **fields}
         with self.lock:
             if not self.stream.closed:
                 self.stream.write(json.dumps(record) + "\n")
@@ -421,7 +438,7 @@ class CaptureHandler(socketserver.BaseRequestHandler):
                     break
                 data.extend(chunk)
                 emulator.log.event("received", service=service, connection=connection, chunk_hex=chunk.hex())
-        except socket.timeout:
+        except TimeoutError:
             pass
         except OSError as exc:
             emulator.log.event("connection_error", service=service, connection=connection, error=str(exc))
@@ -464,7 +481,7 @@ class DBProxyHandler(socketserver.BaseRequestHandler):
                 reply = (struct.pack("<BHHHhH", 5, 14, 1002, 17, status, len(error)) +
                          error + b"\x80")
                 if account_found:
-                    reply += struct.pack("<I", woncrypto.local_auth_user_id(username))
+                    reply += struct.pack("<I", emulator.auth_user_id(username))
                 self.request.sendall(frame(reply))
                 emulator.log.event("dbproxy_account_lookup", connection=connection,
                                    account_found=account_found, status=status)
@@ -498,7 +515,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
             while True:
                 try:
                     chunk = self.request.recv(4096)
-                except socket.timeout:
+                except TimeoutError:
                     if not session.get("irc_authenticated"):
                         raise
                     if pending_ping is not None:
@@ -536,7 +553,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
         finally:
             if session.get("presence_registered"):
                 emulator.update_irc_presence(
-                    woncrypto.local_auth_user_id(session["username"]), connection, False)
+                    emulator.auth_user_id(session["username"]), connection, False)
 
     def _send(self, line):
         self.request.sendall(line.encode("utf-8"))
@@ -719,13 +736,13 @@ class IRCHandler(socketserver.BaseRequestHandler):
             token = woncrypto.build_won_irc_cb35(
                 session["auth1_reply"], response_secret or session["session_key"])
             nickname = session["username"].replace(" ", "_")
-            ident = str(woncrypto.local_auth_user_id(session["username"]))
+            ident = str(emulator.auth_user_id(session["username"]))
             self._send(f":wonemu.local CHALRESP_REPLY {nickname} {ident} {token}\r\n")
             session["irc_authenticated"] = True
             session["irc_nickname"] = nickname
             session["irc_ident"] = ident
             emulator.update_irc_presence(
-                woncrypto.local_auth_user_id(session["username"]), connection, True)
+                emulator.auth_user_id(session["username"]), connection, True)
             session["presence_registered"] = True
             emulator.log.event("irc_authenticated", connection=connection,
                                token_bytes=len(token))
@@ -782,8 +799,22 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                reason="malformed_dbproxy_query")
             return
 
+        if session.get("auth_provider") == "tribesnext" and (
+                (ordinal, array_query) not in {
+                    (3, True), (4, True), (4, False), (6, True), (13, True),
+                    (22, False), (23, False), (69, False),
+                }):
+            self._send_dbmsg(query_id,
+                             "1\tTribesNext community operation unavailable\\S0\\S")
+            emulator.log.event("irc_dbproxy_query", connection=connection, query_id=query_id,
+                               ordinal=ordinal, array_query=array_query,
+                               argument_characters=len(query), supported=False,
+                               status=1, row_count=0)
+            return
+
         arguments = query.replace("\\n", "\n").replace("\\\\", "\\")
         rows = []
+        tribesnext_clan_not_found = object()
         try:
             max_rows = int(fields[2]) if len(fields) > 2 else 100
         except ValueError:
@@ -842,7 +873,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
             if profile is None and (emulator.community.local_account_exists(username) or
                                     woncrypto.private_store_contains(emulator.private_store, username)):
                 profile = emulator.community.ensure_profile(
-                    username, woncrypto.local_auth_user_id(username))
+                    username, emulator.auth_user_id(username))
             return profile
 
         def resolve_profile_reference(reference):
@@ -855,13 +886,70 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 last_profile = session.get("last_profile_username")
                 fallback = last_profile or session["username"]
                 profile = emulator.community.get_profile(
-                    fallback, woncrypto.local_auth_user_id(fallback))
+                    fallback, emulator.auth_user_id(fallback))
                 if profile is not None:
                     emulator.log.event(
                         "irc_profile_reference_fallback", connection=connection,
                         target_characters=len(reference), target_numeric=reference.isdecimal(),
                         profile_found=True)
             return profile
+
+        def tribesnext_profile(reference):
+            if session.get("auth_provider") != "tribesnext":
+                return None
+            credentials = session.get("tribesnext_credentials")
+            if credentials is None:
+                return False
+            reference = str(reference).strip()
+            guid = (int(reference) if reference.isdecimal() else
+                    emulator.tribesnext_user_id(reference))
+            if guid is None:
+                return False
+            try:
+                profile = emulator.tribesnext_robot.user_view(credentials, guid)
+            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+                emulator.log.event("tribesnext_profile_unavailable", connection=connection,
+                                   guid=guid, error=type(exc).__name__)
+                return False
+            profile["guid"] = guid
+            return profile
+
+        def tribesnext_search(method, search):
+            if session.get("auth_provider") != "tribesnext":
+                return None
+            credentials = session.get("tribesnext_credentials")
+            if credentials is None:
+                return False
+            try:
+                return method(credentials, search)
+            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+                emulator.log.event("tribesnext_search_unavailable", connection=connection,
+                                   search_characters=len(search), error=type(exc).__name__)
+                return False
+
+        def tribesnext_clan(reference):
+            if session.get("auth_provider") != "tribesnext":
+                return None
+            credentials = session.get("tribesnext_credentials")
+            if credentials is None:
+                return False
+            reference = str(reference).strip()
+            try:
+                if reference.isdecimal():
+                    clan_id = reference
+                else:
+                    matches = emulator.tribesnext_robot.clan_search(credentials, reference)
+                    match = next((clan for clan in matches
+                                  if clan["name"].casefold() == reference.casefold()), None)
+                    if match is None:
+                        return tribesnext_clan_not_found
+                    clan_id = match["id"]
+                return emulator.tribesnext_robot.clan_view(credentials, clan_id)
+            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+                emulator.log.event("tribesnext_clan_unavailable", connection=connection,
+                                   reference_characters=len(reference),
+                                   error=type(exc).__name__)
+                return False
 
         def known_account_names():
             return ({name.casefold() for name in
@@ -904,9 +992,9 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     for name, _ in recipients:
                         if name.casefold() not in known_names:
                             raise ValueError(f"Player not found: {name}")
-                        emulator.community.ensure_profile(name, woncrypto.local_auth_user_id(name))
+                        emulator.community.ensure_profile(name, emulator.auth_user_id(name))
                     count = emulator.community.send_mail(
-                        session["username"], woncrypto.local_auth_user_id(session["username"]),
+                        session["username"], emulator.auth_user_id(session["username"]),
                         recipients, query_fields[2], "\t".join(query_fields[3:]),
                         ", ".join(to_names), ", ".join(cc_names))
                     status, result, status_code = "0\tMail sent", str(count), 0
@@ -944,7 +1032,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     raise ValueError("Invalid news post request")
                 article_id = emulator.community.post_news(
                     query_fields[0], session["username"],
-                    woncrypto.local_auth_user_id(session["username"]),
+                    emulator.auth_user_id(session["username"]),
                     query_fields[1], "\t".join(query_fields[2:]))
                 status, result, status_code = "0\tArticle submitted", str(article_id), 0
             except ValueError as exc:
@@ -993,8 +1081,8 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     raise ValueError("Player not found")
                 if ordinal == 10:
                     emulator.community.add_buddy(
-                        session["username"], woncrypto.local_auth_user_id(session["username"]),
-                        buddy_name, woncrypto.local_auth_user_id(buddy_name))
+                        session["username"], emulator.auth_user_id(session["username"]),
+                        buddy_name, emulator.auth_user_id(buddy_name))
                     status, result = "0\tBuddy added", ""
                 else:
                     if not emulator.community.remove_buddy(session["username"], buddy_name):
@@ -1052,7 +1140,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 if blocked_name.casefold() not in known_names:
                     raise ValueError("Player not found")
                 emulator.community.ensure_profile(
-                    blocked_name, woncrypto.local_auth_user_id(blocked_name))
+                    blocked_name, emulator.auth_user_id(blocked_name))
                 if ordinal == 9:
                     emulator.community.set_email_block(session["username"], blocked_name)
                     status, result = "0\tSender blocked", ""
@@ -1179,23 +1267,31 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     created = emulator.community.create_forum_post(
                         int(query_fields[0]), int(query_fields[1] or "0"),
                         int(query_fields[2] or "0"), session["username"],
-                        woncrypto.local_auth_user_id(session["username"]),
+                        emulator.auth_user_id(session["username"]),
                         query_fields[3], "\t".join(query_fields[4:]))
                     status, result, status_code = "0\tPost created", str(created["post_id"]), 0
                 except (ValueError, IndexError) as exc:
                     status, result, status_code = f"1\t{exc}", "", 1
         elif ordinal == 13 and array_query:
             target = arguments.strip()
-            profile = resolve_profile_reference(target)
+            remote_profile = tribesnext_profile(target)
+            profile = (resolve_profile_reference(target) if remote_profile is None
+                       else remote_profile)
             if profile is None:
                 status, result, status_code = "1\tPlayer not found", "0", 1
+            elif profile is False:
+                status, result, status_code = "1\tTribesNext profile unavailable", "0", 1
             else:
-                tribes = emulator.community.list_profile_tribes(profile["username"], limit)
+                if "memberships" in profile:
+                    tribes = robot_memberships(profile["memberships"][:limit])
+                else:
+                    tribes = community_memberships(
+                        emulator.community.list_profile_tribes(profile["username"], limit))
+                rows.extend("\t".join((tribe["name"], tribe["tag"], str(tribe["id"]),
+                                        str(tribe["rank"]), str(int(tribe["rank"] >= 2)),
+                                        tribe["title"]))
+                            for tribe in tribes)
                 status, result, status_code = "0\t", str(len(tribes)), 0
-                rows.extend("\t".join((tribe["name"], tribe["tag"],
-                                        str(tribe["tribe_id"]), str(tribe["access"]),
-                                        str(int(tribe["access"] >= 2)), tribe["title"]))
-                             for tribe in tribes)
         elif ordinal == 13 and not array_query:
             query_fields = arguments.split("\t")
             try:
@@ -1228,19 +1324,41 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 # A missing local AuthInfo display name should still open the
                 # authenticated player's own Browser profile.
                 requested = session["username"]
-            local_account = emulator.community.local_account_exists(requested)
-            session_account = requested.casefold() == session["username"].casefold()
-            legacy_account = woncrypto.private_store_contains(emulator.private_store, requested)
-            found = local_account or session_account or legacy_account
+            remote_profile = tribesnext_profile(requested)
+            if remote_profile is False:
+                found = False
+                local_account = session_account = legacy_account = False
+            else:
+                local_account = emulator.community.local_account_exists(requested)
+                session_account = requested.casefold() == session["username"].casefold()
+                legacy_account = woncrypto.private_store_contains(emulator.private_store, requested)
+                found = remote_profile is not None or local_account or session_account or legacy_account
             emulator.log.event("irc_profile_lookup", connection=connection,
                                requested_characters=len(requested),
                                matches_session=session_account,
                                local_account=local_account,
                                legacy_account=legacy_account,
                                profile_found=found)
-            if found:
+            if remote_profile is False:
+                status, result, status_code = "1\tTribesNext profile unavailable", "", 1
+            elif remote_profile is not None:
+                session["last_profile_username"] = requested
+                try:
+                    created = int(remote_profile.get("creation", "0"))
+                    registered = datetime.datetime.fromtimestamp(created).strftime("%m/%d/%Y")
+                except (ValueError, OverflowError, OSError):
+                    registered = ""
+                status = "\t".join(("0", "", remote_profile.get("name", requested),
+                                    remote_profile.get("tag", ""),
+                                    remote_profile.get("append", "0"),
+                                    str(remote_profile["guid"]), registered,
+                                    remote_profile.get("online", "0"),
+                                    remote_profile.get("website", ""), ""))
+                result = remote_profile.get("info", "")
+                status_code = 0
+            elif found:
                 profile = emulator.community.get_profile(
-                    requested, woncrypto.local_auth_user_id(requested))
+                    requested, emulator.auth_user_id(requested))
                 session["last_profile_username"] = profile["username"]
                 registered = datetime.datetime.fromtimestamp(
                     profile["registered_at"]).strftime("%m/%d/%Y")
@@ -1256,53 +1374,91 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 status_code = 1
         elif ordinal == 3 and array_query:
             query_fields = arguments.split("\t")
-            search = query_fields[0].strip().casefold() if query_fields else ""
-            known = {profile["username"].casefold()
-                     for profile in emulator.community.search_players("", 100)}
-            all_names = (set(woncrypto.private_store_usernames(emulator.private_store)) |
-                         set(emulator.community.local_account_usernames()))
-            for name in all_names:
-                if (name.casefold() not in known and search in name.casefold()):
-                    emulator.community.ensure_profile(name, woncrypto.local_auth_user_id(name))
-                    known.add(name.casefold())
-            matches = emulator.community.search_players(search, limit)
-            result = str(len(matches))
-            status_code = 0
-            status = "0\t"
-            for index, profile in enumerate(matches):
-                # The T2 browser consumes display name from column 0 and
-                # stable WON user ID from column 3 of each result row.
-                rows.append("\t".join((str(index), profile["display_name"], "", "",
-                                       str(profile["user_id"]))))
+            raw_search = query_fields[0].strip() if query_fields else ""
+            search = raw_search.casefold()
+            remote_matches = tribesnext_search(
+                emulator.tribesnext_robot.user_search, raw_search)
+            if remote_matches is False:
+                status, result, status_code = "1\tTribesNext search unavailable", "0", 1
+            elif remote_matches is None:
+                known = {profile["username"].casefold()
+                         for profile in emulator.community.search_players("", 100)}
+                all_names = (set(woncrypto.private_store_usernames(emulator.private_store)) |
+                             set(emulator.community.local_account_usernames()))
+                for name in all_names:
+                    if (name.casefold() not in known and search in name.casefold()):
+                        emulator.community.ensure_profile(name, emulator.auth_user_id(name))
+                        known.add(name.casefold())
+                matches = emulator.community.search_players(search, limit)
+                result = str(len(matches))
+                status_code = 0
+                status = "0\t"
+                for index, profile in enumerate(matches):
+                    # The T2 browser consumes display name from column 0 and
+                    # stable WON user ID from column 3 of each result row.
+                    rows.append("\t".join((str(index), profile["display_name"], "", "",
+                                           str(profile["user_id"]))))
+            else:
+                matches = remote_matches[:limit]
+                result = str(len(matches))
+                status_code = 0
+                status = "0\t"
+                rows.extend("\t".join((str(index), player["name"], player.get("tag", ""),
+                                        player.get("append", "0"), str(player["guid"])))
+                            for index, player in enumerate(matches))
         elif ordinal == 4:
             query_fields = arguments.split("\t")
             search = query_fields[0].strip() if query_fields else ""
-            matches = emulator.community.search_tribes(search, limit)
-            result = str(len(matches))
-            status_code = 0
-            status = "0\t"
-            for index, tribe in enumerate(matches):
-                rows.append("\t".join((str(index), tribe["name"], tribe["tag"],
-                                       str(tribe["member_count"]))))
+            remote_matches = tribesnext_search(emulator.tribesnext_robot.clan_search, search)
+            if remote_matches is False:
+                status, result, status_code = "1\tTribesNext search unavailable", "0", 1
+            else:
+                if remote_matches is not None:
+                    matches = remote_matches[:limit]
+                    rows.extend("\t".join((str(index), clan["name"], "", ""))
+                                for index, clan in enumerate(matches))
+                else:
+                    matches = emulator.community.search_tribes(search, limit)
+                    rows.extend("\t".join((str(index), tribe["name"], tribe["tag"],
+                                            str(tribe["member_count"])))
+                                for index, tribe in enumerate(matches))
+                result = str(len(matches))
+                status_code = 0
+                status = "0\t"
         elif ordinal == 6:
             tribe_name = arguments.split("\t", 1)[0].strip()
-            members = emulator.community.list_tribe_members(tribe_name, limit)
-            online = emulator.online_user_ids()
-            result = str(len(members))
-            status_code = 0
-            status = "0\t"
-            for member in members:
-                rows.append("\t".join((member["display_name"], "", "",
-                                       str(member["user_id"]), member["title"],
-                                        str(member["access"]), str(member["joined_at"]), "",
-                                        str(int(member["access"] >= 2)),
-                                        str(int(member["user_id"] in online)))))
+            remote_clan = tribesnext_clan(tribe_name)
+            if remote_clan is False:
+                members = []
+                status, result, status_code = "1\tTribesNext clan unavailable", "0", 1
+            elif remote_clan is tribesnext_clan_not_found:
+                members = []
+                status, result, status_code = "1\tTribe not found", "0", 1
+            elif remote_clan is not None:
+                members = remote_clan["members"][:limit]
+                rows.extend("\t".join((member["name"], member.get("tag", ""),
+                                        member.get("append", "0"), member["guid"],
+                                        member["title"], member["rank"], "", "",
+                                        str(int(int(member["rank"]) >= 2)),
+                                        member["online"])) for member in members)
+            else:
+                members = emulator.community.list_tribe_members(tribe_name, limit)
+                online = emulator.online_user_ids()
+                rows.extend("\t".join([
+                    member["display_name"], "", "", str(member["user_id"]), member["title"],
+                    str(member["access"]), str(member["joined_at"]), "",
+                    str(int(member["access"] >= 2)), str(int(member["user_id"] in online)),
+                ]) for member in members)
+            if remote_clan is not False:
+                result = str(len(members))
+                status_code = 0
+                status = "0\t"
         elif ordinal == 15 and array_query:
             links = (("Tribes 2 Home Page", "www.tribes2.com"),
                      ("T2 Technical Information", "sierrastudios.com/games/tribes2/support"))
             links = links[:limit]
             status, result, status_code = "0\t", str(len(links)), 0
-            rows.extend("\t".join(("0", name, address)) for name, address in links)
+            rows.extend(f"0\t{name}\t{address}" for name, address in links)
         elif ordinal == 15 and not array_query:
             query_fields = arguments.split("\t")
             if len(query_fields) < 3:
@@ -1326,14 +1482,26 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     emulator.community.create_tribe(
                         query_fields[0], query_fields[1], query_fields[2], query_fields[3],
                         description, session["username"],
-                        woncrypto.local_auth_user_id(session["username"]))
+                        emulator.auth_user_id(session["username"]))
                     status, result, status_code = "0\tCreated", "", 0
                 except ValueError as exc:
                     status, result, status_code = f"1\t{exc}", "", 1
         elif ordinal == 22:
             tribe_name = arguments.split("\t", 1)[0].strip()
-            tribe = emulator.community.get_tribe(tribe_name)
-            if tribe is None:
+            remote_clan = tribesnext_clan(tribe_name)
+            tribe = emulator.community.get_tribe(tribe_name) if remote_clan is None else None
+            if remote_clan is False:
+                status, result, status_code = "1\tTribesNext clan unavailable", "", 1
+            elif remote_clan is tribesnext_clan_not_found:
+                status, result, status_code = "1\tTribe not found", "", 1
+            elif remote_clan is not None:
+                status = "\t".join(("0", "", str(remote_clan.get("id", "")),
+                                    remote_clan["name"], remote_clan.get("tag", ""),
+                                    remote_clan.get("append", "0"),
+                                    remote_clan.get("recruiting", "0"),
+                                    remote_clan.get("picture", "")))
+                result, status_code = remote_clan.get("info", ""), 0
+            elif tribe is None:
                 status, result, status_code = "1\tTribe not found", "", 1
             else:
                 status = "\t".join(("0", "", str(tribe["tribe_id"]), tribe["name"],
@@ -1417,7 +1585,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 primary_tribe = None
             if primary_tribe is not None:
                 emulator.community.update_profile(session["username"],
-                                                  woncrypto.local_auth_user_id(session["username"]),
+                                                  emulator.auth_user_id(session["username"]),
                                                   primary_tribe=primary_tribe)
                 status, result, status_code = "0\tPrimary tribe updated", primary_tribe, 0
         elif ordinal == 27:
@@ -1431,9 +1599,9 @@ class IRCHandler(socketserver.BaseRequestHandler):
                         not woncrypto.private_store_contains(emulator.private_store, invited_name)):
                     raise ValueError("Player not found")
                 emulator.community.invite(tribe_name, invited_name,
-                                          woncrypto.local_auth_user_id(invited_name),
+                                          emulator.auth_user_id(invited_name),
                                           session["username"],
-                                          woncrypto.local_auth_user_id(session["username"]))
+                                          emulator.auth_user_id(session["username"]))
                 status, result, status_code = "0\tInvitation sent", "", 0
             except ValueError as exc:
                 status, result, status_code = f"1\t{exc}", "", 1
@@ -1453,7 +1621,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     expected_status = "pending"
                 result = emulator.community.respond_to_invite(
                     action, tribe_name, target_name,
-                    woncrypto.local_auth_user_id(target_name), expected_status)
+                    emulator.auth_user_id(target_name), expected_status)
                 status, status_code = "0\tInvitation updated", 0
             except ValueError as exc:
                 status, result, status_code = f"1\t{exc}", "", 1
@@ -1462,7 +1630,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
             try:
                 emulator.community.request_invitation(
                     tribe_name, session["username"],
-                    woncrypto.local_auth_user_id(session["username"]))
+                    emulator.auth_user_id(session["username"]))
                 status, result, status_code = "0\tInvitation request sent", "", 0
             except ValueError as exc:
                 status, result, status_code = f"1\t{exc}", "", 1
@@ -1495,7 +1663,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
         elif ordinal in {17, 31, 32, 33}:
             field = {17: "description", 31: "graphic", 32: "url", 33: "display_name"}[ordinal]
             emulator.community.update_profile(
-                session["username"], woncrypto.local_auth_user_id(session["username"]),
+                session["username"], emulator.auth_user_id(session["username"]),
                 **{field: arguments})
             result = ""
             status_code = 0
@@ -1529,6 +1697,8 @@ class AuthHandler(socketserver.BaseRequestHandler):
         emulator.log.event("connected", service="auth", connection=connection, peer=list(self.client_address))
         session_key = None
         login_username = None
+        tribesnext_credentials = None
+        auth_provider = None
         try:
             while True:
                 payload = recv_frame(self.request)
@@ -1576,7 +1746,17 @@ class AuthHandler(socketserver.BaseRequestHandler):
                         try:
                             session_key, login_data = woncrypto.decrypt_won_login_data(
                                 emulator.keys["auth"], encrypted_key, encrypted_data)
-                            login_username = parse_login_payload(login_data, session_key)["username"]
+                            decoded_login = parse_login_payload(login_data, session_key)
+                            login_username = decoded_login["username"]
+                            auth_provider = login.get("credential_source")
+                            if (auth_provider == "tribesnext" and emulator.private_store and
+                                    emulator.public_store):
+                                try:
+                                    tribesnext_credentials = tribesnext.unlock_account(
+                                        emulator.public_store, emulator.private_store,
+                                        login_username, decoded_login["password"])
+                                except (OSError, ValueError, UnicodeError):
+                                    tribesnext_credentials = None
                         except (OSError, ValueError) as exc:
                             emulator.log.event("auth_challenge_error", connection=connection, error=str(exc))
                         else:
@@ -1608,9 +1788,13 @@ class AuthHandler(socketserver.BaseRequestHandler):
                                        plaintext_bytes=len(response), expected_response=expected_response)
                     if expected_response and login_username:
                         reply, client_key = woncrypto.auth1_login_reply(
-                            emulator.keys, session_key, login_username, return_client_key=True)
+                            emulator.keys, session_key, login_username, return_client_key=True,
+                            user_id=emulator.auth_user_id(login_username, log_selection=True),
+                            tribes=emulator.auth_info_tribes(login_username, auth_provider,
+                                                             tribesnext_credentials))
                         emulator.register_auth_session(self.client_address[0], login_username,
-                                                       session_key, reply, client_key)
+                                                       session_key, reply, client_key,
+                                                       tribesnext_credentials, auth_provider)
                         self.request.sendall(frame(reply))
                         emulator.log.event("sent", service="auth", connection=connection,
                                            message=6, status=0, response_bytes=len(reply))
@@ -1646,6 +1830,8 @@ class Emulator:
         self.empty = empty
         self.keys = keys
         self.private_store = Path(private_store) if private_store is not None else None
+        self.public_store = self.private_store.with_name("public.store") if self.private_store else None
+        self.tribesnext_robot = tribesnext.RobotClient()
         self.refresh_tribesnext = bool(refresh_tribesnext)
         self.community = community_store.CommunityStore(
             community_db or (Path(log_dir) / "community.sqlite3"))
@@ -1667,17 +1853,97 @@ class Emulator:
         self.servers = []
         self.threads = []
 
-    def register_auth_session(self, peer_ip, username, session_key, auth1_reply, client_key):
-        user_id = woncrypto.local_auth_user_id(username)
-        self.community.ensure_profile(username, user_id)
+    def register_auth_session(self, peer_ip, username, session_key, auth1_reply, client_key,
+                              tribesnext_credentials=None, auth_provider="local"):
+        auth_provider = auth_provider or "local"
+        if auth_provider != "tribesnext":
+            user_id = self.auth_user_id(username)
+            self.community.ensure_profile(username, user_id)
         with self.auth_session_lock:
             self.auth_sessions[peer_ip] = {
                 "username": str(username),
                 "session_key": bytes(session_key),
                 "auth1_reply": bytes(auth1_reply),
                 "client_key": dict(client_key),
+                "tribesnext_credentials": tribesnext_credentials,
+                "auth_provider": auth_provider,
                 "created": time.time(),
             }
+
+    def auth_info_tribes(self, username, auth_provider=None, tribesnext_credentials=None):
+        """Return the memberships to embed in the Auth2 AuthInfo, best effort.
+
+        A lookup failure yields no tribes rather than failing the login.
+        """
+        provider = auth_provider or "local"
+        try:
+            if provider == "tribesnext":
+                guid = self.tribesnext_user_id(username)
+                if tribesnext_credentials is None or guid is None:
+                    memberships = []
+                else:
+                    memberships = robot_memberships(self.tribesnext_robot.user_view(
+                        tribesnext_credentials, guid)["memberships"])
+            else:
+                memberships = community_memberships(self.community.list_profile_tribes(username))
+        except (OSError, ValueError, KeyError, tribesnext.RobotAPIError) as exc:
+            self.log.event("auth_info_tribes_unavailable", provider=provider,
+                           error=type(exc).__name__)
+            return []
+        tribes = []
+        for tribe in memberships:
+            if len(tribes) == woncrypto.T2_AUTH_INFO_MAX_TRIBES:
+                break
+            try:
+                woncrypto.t2_auth_info_blob("", [tribe])
+            except ValueError:
+                self.log.event("auth_info_tribe_skipped", provider=provider, tribe_id=tribe["id"])
+                continue
+            tribes.append(tribe)
+        self.log.event("auth_info_tribes", provider=provider, tribes=len(tribes),
+                       available=len(memberships))
+        return tribes
+
+    def auth_user_id(self, username, log_selection=False):
+        """Use the T2 certificate GUID for WON identity when it is locally stored."""
+        if self.public_store and self.public_store.is_file():
+            try:
+                with self.public_store.open("r", encoding="ascii") as public_store:
+                    for line in public_store:
+                        fields = line.rstrip("\r\n").split("\t")
+                        if len(fields) < 2 or fields[0].casefold() != str(username).casefold():
+                            continue
+                        if fields[1].isdecimal():
+                            user_id = int(fields[1])
+                            if 0 < user_id <= 0xffffffff:
+                                if log_selection:
+                                    self.log.event("auth_identity_selected",
+                                                   source="tribes2_public_store",
+                                                   username_characters=len(str(username)))
+                                return user_id
+                        break
+            except (OSError, UnicodeError):
+                pass
+        if log_selection:
+            self.log.event("auth_identity_selected", source="local_fallback",
+                           username_characters=len(str(username)))
+        return woncrypto.local_auth_user_id(username)
+
+    def tribesnext_user_id(self, username):
+        """Resolve a local account name to its TribesNext certificate GUID."""
+        if not self.public_store or not self.public_store.is_file():
+            return None
+        try:
+            with self.public_store.open("r", encoding="ascii") as public_store:
+                for line in public_store:
+                    fields = line.rstrip("\r\n").split("\t")
+                    if len(fields) >= 2 and fields[0].casefold() == str(username).casefold():
+                        if fields[1].isdecimal() and 0 < int(fields[1]) <= 0xffffffff:
+                            return int(fields[1])
+                        return None
+        except (OSError, UnicodeError):
+            return None
+        return None
 
     def auth_session_for_peer(self, peer_ip):
         with self.auth_session_lock:
@@ -1869,7 +2135,7 @@ class Emulator:
         if len(data) < 6:
             self.log.event("unhandled", service="master_udp", peer=list(peer), payload_bytes=len(data))
             return
-        packet_type, flags, session, key = struct.unpack_from("<BBHH", data)
+        packet_type, _flags, session, key = struct.unpack_from("<BBHH", data)
         try:
             if packet_type == 22:  # Game heartbeat
                 with self.master_lock:

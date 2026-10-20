@@ -64,13 +64,23 @@ service with `--refresh-tribesnext` or set `T2LAUNCH_REFRESH_TRIBESNEXT=1`.
 Refreshes atomically update the public/private stores without creating or renaming
 an account.
 
+New accounts can be registered with the official `NAME`/`SIGN` protocol after
+building the RSA helper overlay. Run `python3 tribesnext.py create-account NAME`
+to check name availability, generate a 1024-bit key using `/dev/urandom` and
+GMP, submit the signed registration, then install the returned certificate and
+password-encrypted private exponent in the selected game's `base/public.store`
+and `base/private.store`. The password is prompted interactively and is not
+sent to the authentication server. Use `--game-dir` for a game directory other
+than `~/t2-linux`; `--key-bits` permits the legacy 512/768-bit sizes when needed.
+
 For the #25034 profile browser, the hook also replaces the local player's broken
 TRIBES-tab callback at runtime with a `DatabaseQueryArray(13, ...)` request. This
 prefetches tribe memberships for the first browser wake, adds those tribes to the
 browser tabs and membership checks, and repaints the member list when rows arrive.
-It also falls back to the saved login name for an empty AuthInfo display name and
-disables IRC nickname filtering on the tribe creation fields. These are in-memory
-GUI/script changes; no `.cs` files or archives on disk are modified.
+It also falls back to the saved login name for an empty AuthInfo display name
+and disables IRC nickname filtering on
+tribe creation fields. These are in-memory GUI/script changes; no `.cs` files or
+archives on disk are modified.
 
 ## Quick Start
 
@@ -180,6 +190,12 @@ its path with `--community-db`. Tribes and memberships are persisted there as
 well. The current DBProxy subset includes player search/profile and profile
 updates, live IRC presence, tribe search/profile/roster, tribe creation and settings,
 membership roles, primary-tribe selection, invitations, and persistent buddy lists.
+For sessions authenticated with an installed TribesNext account, player/clan
+search, player/clan profiles, clan rosters, and profile membership reads use the TribesNext robot API; the
+unlocked account key is retained only in session memory. Local community data
+is used only for local-authenticated sessions. TribesNext-authenticated sessions
+do not fall back to local community records when a robot lookup is unavailable;
+unsupported local-only community operations are rejected for those sessions.
 Mail supports sending
 to local accounts, inbox polling, and read/delete status. Forums provide a local
 General board with topic and post persistence; post mutations are limited to the
@@ -287,7 +303,8 @@ echo("SHA1: " @ %result);
 - [x] Existing `public.store` / `private.store` unlock in memory with password nonce verification
 - [x] TribesNext certificate chunk transfer and server challenge-response handlers
 - [x] End-to-end TribesNext authentication and server join verified in a live game session
-- [ ] Account creation (needs RSA keygen in C)
+- [x] Live TribesNext login, tribe search, and roster viewing verified in-game
+- [x] Account creation via the TribesNext `NAME`/`SIGN` protocol with GMP-backed RSA key generation
 
 ## TribesNext Runtime Integration
 
@@ -313,7 +330,7 @@ not on the helper process command line.
 | `hook_tn_certificate_chunk` | `<offset>` | Return one certificate chunk |
 | `hook_tn_decrypt` | `<hex>` | Decrypt server challenge using the unlocked private key |
 | `hook_tn_clear` | none | Clear in-memory account material |
-| `hook_tn_trace` | `<known_stage>` | Safe diagnostic marker for T2CSRI join stages |
+| `hook_tn_trace` | `<known_stage> [safe_state...]` | Safe diagnostic marker for auth stages |
 | `hook_tn_join_trace` | `<address> <ready>` | Log selected server endpoint and key-ready state |
 | `hook_tn_ip_trace` | `<ip> <hex>` | Log the parsed IPv4 used in the client challenge |
 | `hook_tn_ipv4_hex` | `<dotted_ipv4>` | Encode the T2CSRI IPv4 challenge suffix |
@@ -354,6 +371,30 @@ Player TRIBES-tab override at runtime after the Community Browser control exists
 | `Con::getReturnBuffer` | IFC22:0x08122490 | `__cdecl` |
 | Console global ptr | `0x08493DEC` | — |
 | `Sim::postEvent` | `0x080FE128` | `__cdecl` |
+| `WONGetAuthInfo` | `0x0834E804` | console callback |
+| AuthInfo parser | `0x08348FCC` | `__cdecl` |
+| `Auth2Certificate::UnpackData` | `0x083615A4` | `__thiscall` |
+
+### AuthInfo (`WONGetAuthInfo`)
+
+The launcher's "Failed to get account information" check reads `WONGetAuthInfo()`.
+The client builds that text from the current Auth2 certificate (global
+`0x086C0434`). It does not use the identity data (type 0). It decodes the first
+community-data entry (Auth2 data type 1: `u32 communityId, u16 len, blob`), whose
+blob is little-endian:
+
+```
+u8 tribeCount (<= 10; the client does not check)
+  per tribe: u32 id, u16+tag (<= 15), u8 appendTag, u16+name (<= 63), u32 rank,
+             u16+title (<= 40) only when rank > 9
+u16+warrior name (<= 31)
+```
+
+If a length is over its limit, or the entry is missing, `WONGetAuthInfo()`
+returns `""`. `woncrypto.t2_auth_info_blob()` builds this blob, and
+`Emulator.auth_info_tribes()` fills it at login from TribesNext or the local
+community store. The value stays set across game-server disconnects, so the
+game's own `checkNamesAndAliases()` runs unmodified.
 
 ### Game Console Settings
 
@@ -389,6 +430,13 @@ window aligned with the selected monitor and scales fullscreen output while
 preserving the game's aspect ratio; in windowed mode it follows the saved game
 resolution when SDL 1.2 leaves the top-level window at its previous size. The
 desktop profile supplies `-online` or `-nologin`:
+
+SDL 1.2's windowed `SDL_ListModes` may report “any size”; Tribes 2 then falls
+back to a short built-in 4:3 list. For non-Gamescope runs the launcher enables
+SDL XRandR enumeration, and the hook substitutes SDL's actual fullscreen host
+mode list only for that windowed sentinel. The list is taken from the host
+display, not synthesized or tied to a GPU vendor.
+
 ```
 USE_GAMESCOPE=0
 SOFTWARE_GL=0

@@ -17,7 +17,7 @@ set -e
 # Re-pick the folder any time:  ASGARD_PICK=1 ./asgard-run
 # Note: no flags are forced. For offline play pass -nologin yourself, e.g.
 #   ./asgard-run tribes2 -nologin
-GAME_ARGS=(${GAME_ARGS:-})          # seed from the environment if provided
+read -r -a GAME_ARGS <<< "${GAME_ARGS:-}" # seed from the environment if provided
 POSITIONAL=()
 _collect=0
 for _a in "$@"; do
@@ -227,18 +227,16 @@ USE_PADSP=${USE_PADSP:-1}
 SOFTWARE_GL=${SOFTWARE_GL:-1}
 MESA_YEAR=${MESA_YEAR:-}
 SAVE_DIRS=()
-LAUNCH_CMD=""
 GAME_BINARY="./${GAME_NAME:-tribes2}.dynamic"
 PRE_LAUNCH=""
 USE_STRACE=${USE_STRACE:-1}
-GAMESCOPE_ARGS=""
-HOST_WRAPPER=""
 EXTRA_ENV=""
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-1}"
 T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
 
 # Source per-game config if it exists
 if [[ -f "$ROOT_DIR/config/$GAME_NAME.cfg" ]]; then
+    # shellcheck disable=SC1090 # Per-game config path is selected at runtime.
     source "$ROOT_DIR/config/$GAME_NAME.cfg"
 fi
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
@@ -392,9 +390,9 @@ if result.returncode == 0:
     T2_SDL_HEAD_LOG=$SDL_FULLSCREEN_HEAD
     unset SDL_FULLSCREEN_HEAD XRANDR_HEAD
 fi
-if [[ "$USE_GAMESCOPE" != "1" && "$GAME_FULLSCREEN_REQUESTED" != "1" ]]; then
-    # SDL 1.2 disables XRandR enumeration by default. Enable it in windowed
-    # mode so the game's video settings see the host's full resolution list.
+if [[ "$USE_GAMESCOPE" != "1" ]]; then
+    # SDL 1.2 disables XRandR enumeration by default. Enable it so the hook can
+    # query real host modes for both windowed listings and fullscreen selection.
     DOCKER_EXTRA_ARGS+=(-e SDL_VIDEO_X11_XRANDR=1)
 fi
 DOCKER_EXTRA_ARGS+=(-e "T2LAUNCH_MONITOR_NAME=$T2LAUNCH_MONITOR"
@@ -408,7 +406,7 @@ unset game_arg GAME_FULLSCREEN_REQUESTED GAME_WINDOWED_REQUESTED T2_SDL_HEAD_LOG
 # xhost must NOT abort the run (set -e) — warn and continue.
 if command -v xhost >/dev/null 2>&1; then
     if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" DISPLAY=$DISPLAY xhost +local:docker >/dev/null 2>&1 || true
+        sudo -u "$SUDO_USER" DISPLAY="$DISPLAY" xhost +local:docker >/dev/null 2>&1 || true
     else
         xhost +local:docker >/dev/null 2>&1 || true
     fi
@@ -504,13 +502,14 @@ else
     fi
 fi
 
-"${GAMESCOPE_CMD[@]}" $HOST_WRAPPER docker run \
+# shellcheck disable=SC2016 # The script passed to bash is interpreted inside the container.
+"${GAMESCOPE_CMD[@]}" docker run \
     --rm \
     --network host \
     --group-add=audio \
-    -e PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native \
+    -e "PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native" \
     --env=DISPLAY \
-    --env=XDG_RUNTIME_DIR=/run/user/$uid \
+    --env="XDG_RUNTIME_DIR=/run/user/$uid" \
     "${DOCKER_EXTRA_ARGS[@]}" \
     -e GAME_NAME="$GAME_NAME" \
     -e GAME_BINARY="$GAME_BINARY" \
@@ -519,7 +518,7 @@ fi
     -e TRACE_CONNECTS="$TRACE_CONNECTS" \
     -e USE_PADSP="$USE_PADSP" \
     -e USE_GAME_WINDOW_RESIZE="${USE_GAME_WINDOW_RESIZE:-0}" \
-    $GAME_NAME \
+    "$GAME_NAME" \
     bash --norc -c '
         cd /home/loki/game
         export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH
@@ -540,6 +539,6 @@ fi
 
 # Cleanup RSA proxy on exit
 if [[ -n "$RSA_PROXY_PID" ]]; then
-    kill $RSA_PROXY_PID 2>/dev/null || true
+    kill "$RSA_PROXY_PID" 2>/dev/null || true
     echo "RSA proxy stopped"
 fi

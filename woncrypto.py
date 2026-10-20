@@ -3,16 +3,16 @@
 Public keys are DER SEQUENCE(p, q, g, y). Key-block signatures verify as
 r == (g**s * y**r mod p + MD5(message)) mod q, serialized r || s big-endian.
 """
+import base64
 import ctypes
 import ctypes.util
-import base64
 import hashlib
 import json
 import os
-from pathlib import Path
 import secrets
 import struct
 import time
+from pathlib import Path
 
 ROOT_ADDRESS = 0x0849A860
 ROOT_SLOT_SIZE = 817
@@ -378,12 +378,52 @@ def private_store_usernames(path):
                  if "\t" in line and line.split("\t", 1)[0])
 
 
+# Limits enforced by the client's AuthInfo parser (Loki #25034, 0x8348fcc).
+# The parser has no tribe-count check; its stack record holds ten tribes.
+T2_AUTH_INFO_MAX_TRIBES = 10
+T2_AUTH_INFO_MAX_TAG = 15
+T2_AUTH_INFO_MAX_TRIBE_NAME = 63
+T2_AUTH_INFO_MAX_TITLE = 40
+T2_AUTH_INFO_MAX_WARRIOR = 31
+
+
+def _auth_info_string(value, limit, label):
+    encoded = str(value).encode("latin-1")
+    if len(encoded) > limit:
+        raise ValueError(f"AuthInfo {label} is too long")
+    return struct.pack("<H", len(encoded)) + encoded
+
+
+def t2_auth_info_blob(warrior, tribes=()):
+    """Encode the Tribes 2 community data that WONGetAuthInfo() decodes.
+
+    Each tribe is a mapping with id, name, tag, append, rank and title. The
+    client reads a title only for ranks above 9, so lower ranks omit it.
+    """
+    tribes = list(tribes)
+    if len(tribes) > T2_AUTH_INFO_MAX_TRIBES:
+        raise ValueError("AuthInfo has too many tribes")
+    blob = struct.pack("<B", len(tribes))
+    for tribe in tribes:
+        rank = int(tribe.get("rank", 0))
+        blob += (struct.pack("<I", int(tribe["id"])) +
+                 _auth_info_string(tribe.get("tag", ""), T2_AUTH_INFO_MAX_TAG, "tribe tag") +
+                 struct.pack("<B", int(bool(int(tribe.get("append", 0))))) +
+                 _auth_info_string(tribe["name"], T2_AUTH_INFO_MAX_TRIBE_NAME, "tribe name") +
+                 struct.pack("<I", rank))
+        if rank > 9:
+            blob += _auth_info_string(tribe.get("title", ""), T2_AUTH_INFO_MAX_TITLE,
+                                      "tribe title")
+    return blob + _auth_info_string(warrior, T2_AUTH_INFO_MAX_WARRIOR, "warrior name")
+
+
 def auth1_login_reply(keys, session_key, username, now=None, client_key=None,
-                      return_client_key=False):
+                      return_client_key=False, user_id=None, tribes=()):
     """Build a signed, local-realm Auth1 success reply for a verified account.
 
     The response contains a family-1 certificate, a family-2 certificate, and
-    the encrypted session-key confirmation required by the Auth1 client.
+    the encrypted session-key confirmation required by the Auth1 client. The
+    family-2 certificate also carries the Tribes 2 AuthInfo community data.
     """
     auth_key = keys["auth"]
     if not session_key or len(session_key) > 56:
@@ -395,7 +435,9 @@ def auth1_login_reply(keys, session_key, username, now=None, client_key=None,
 
     now = int(time.time()) if now is None else int(now)
     expires = now + 86400
-    user_id = local_auth_user_id(username)
+    user_id = local_auth_user_id(username) if user_id is None else int(user_id)
+    if not 0 < user_id <= 0xffffffff:
+        raise ValueError("Invalid Auth1 user ID")
     community_id = 1
     trust_level = 1
     client_key = make_key(auth_key) if client_key is None else dict(client_key)
@@ -410,12 +452,16 @@ def auth1_login_reply(keys, session_key, username, now=None, client_key=None,
     certificate_signer = auth_key
     auth1_certificate = auth1_body + sign(certificate_signer, auth1_body)
 
-    # Auth2Certificate with one CTAuthData block for the account identity.
+    # Auth2Certificate data: type 0 is the account identity; type 1 is the
+    # per-community blob that WONGetAuthInfo() reads from the first community.
     auth_data = (struct.pack("<IH", user_id, len(encoded_key)) + encoded_key +
                  struct.pack("<H", len(name) // 2) + name +
                  struct.pack("<BIH", 1, community_id, trust_level))
-    auth2_body = (struct.pack("<HIIH", 2, now, expires, 1) +
-                  struct.pack("<HH", 0, len(auth_data)) + auth_data)
+    auth_info = t2_auth_info_blob(username, tribes)
+    community_data = struct.pack("<IH", community_id, len(auth_info)) + auth_info
+    auth2_body = (struct.pack("<HIIH", 2, now, expires, 2) +
+                  struct.pack("<HH", 0, len(auth_data)) + auth_data +
+                  struct.pack("<HH", 1, len(community_data)) + community_data)
     auth2_certificate = auth2_body + sign(certificate_signer, auth2_body)
 
     # Clear blocks are emitted in Auth1 enum order: certificate, current key

@@ -4,6 +4,26 @@
 #include <assert.h>
 
 int main(void) {
+    /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
+       account check and warning must run unmodified. */
+    const char *scripts[] = {tribesnext_runtime_script, player_pane_button_click_override};
+    for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); ++i) {
+        assert(strstr(scripts[i], "function checkNamesAndAliases") == NULL);
+        assert(strstr(scripts[i], "function LaunchGui::onWake") == NULL);
+        assert(strstr(scripts[i], "function MessageBoxOK") == NULL);
+        assert(strstr(scripts[i], "CachedAuthInfo") == NULL);
+    }
+
+    sdl_rect_t mode_16_9 = {0, 0, 1920, 1080};
+    sdl_rect_t mode_16_10 = {0, 0, 1920, 1200};
+    sdl_rect_t *host_modes[] = {&mode_16_9, &mode_16_10, NULL};
+    sdl_rect_t **windowed_any = (sdl_rect_t **)(intptr_t)-1;
+    sdl_rect_t *windowed_modes[] = {&mode_16_9, NULL};
+    assert(prefer_concrete_host_modes(windowed_any, host_modes) == host_modes);
+    assert(prefer_concrete_host_modes(windowed_modes, host_modes) == windowed_modes);
+    assert(prefer_concrete_host_modes(windowed_any, NULL) == windowed_any);
+    assert(sdl_mode_count(host_modes) == 2);
+
     char browser_ip[64] = "IP:185.66.108.39:28000";
     strcpy(browser_ip, browser_ip + 3);
     assert(strcmp(browser_ip, "185.66.108.39:28000") == 0);
@@ -33,6 +53,6 @@ int main(void) {
     assert(readable_range((uintptr_t)a, 15, &protection));
     assert(protection == PROT_READ);
     munmap(mapping, size);
-    puts("Hook WON patch: all-or-nothing validation, replacement, permissions passed");
+    puts("Hook mode enumeration and WON patch: host modes preserved, replacement and permissions passed");
     return 0;
 }
