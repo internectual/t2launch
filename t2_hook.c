@@ -101,7 +101,10 @@ static const char tribesnext_runtime_script[] =
      " }\n"
      " schedule(100, 0, \"t2launch_tnUnlockPoll\");\n"
      "}\n"
-     "function t2launch_refreshServerBrowser() {\n"
+    "function t2launch_audioState() {\n"
+    " return $Audio::initialized @ \"|\" @ $pref::Audio::activeDriver @ \"|\" @ $pref::Audio::drivers;\n"
+    "}\n"
+    "function t2launch_refreshServerBrowser() {\n"
     " if (isObject(Canvas) && isObject(GMJ_Browser) && GMJ_Browser.isAwake()) Canvas.repaint();\n"
     " schedule(500, 0, \"t2launch_refreshServerBrowser\");\n"
     "}\n"
@@ -661,9 +664,9 @@ void SDL_GL_SwapBuffers(void) {
                 player_pane_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
             }
-            const char *audio_state = Con__evaluate(
-                "$Audio::initialized @ \"|\" @ $pref::Audio::activeDriver @ \"|\" @ $pref::Audio::drivers;",
-                0, NULL, 0);
+            /* A bare expression is not a TorqueScript statement; call a
+               function so the evaluation returns the value. */
+            const char *audio_state = Con__evaluate("t2launch_audioState();", 0, NULL, 0);
             fprintf(stderr, "[t2_hook] Audio state initialized|active|available: %s\n",
                     audio_state ? audio_state : "unavailable");
             shell_audio_setup_done = 1;
