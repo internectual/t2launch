@@ -101,6 +101,10 @@ static const char tribesnext_runtime_script[] =
      " }\n"
      " schedule(100, 0, \"t2launch_tnUnlockPoll\");\n"
      "}\n"
+    "function t2launch_launchGuiReady() {\n"
+    " if (isObject(LaunchGui)) return \"1\";\n"
+    " return \"0\";\n"
+    "}\n"
     "function t2launch_audioState() {\n"
     " return $Audio::initialized @ \"|\" @ $pref::Audio::activeDriver @ \"|\" @ $pref::Audio::drivers;\n"
     "}\n"
@@ -642,8 +646,10 @@ void SDL_GL_SwapBuffers(void) {
         !shell_audio_setup_done &&
         (!last_shell_audio_setup || now - last_shell_audio_setup >= 1)) {
         last_shell_audio_setup = now;
-        const char *gui_ready = Con__evaluate("isObject(LaunchGui);", 0, NULL, 0);
-        if (gui_ready && atoi(gui_ready) > 0) {
+        /* Built-ins such as isObject() leave the evaluation's string result
+           untouched; a script function's return value is reliable. */
+        const char *gui_ready = Con__evaluate("t2launch_launchGuiReady();", 0, NULL, 0);
+        if (gui_ready && strcmp(gui_ready, "1") == 0) {
             Con__evaluate("audioDetect();", 0, NULL, 0);
             Con__evaluate(
                 "if (!$Audio::initialized && $pref::Audio::drivers $= \"OpenAL\") {"

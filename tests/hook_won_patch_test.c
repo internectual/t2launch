@@ -16,6 +16,7 @@ int main(void) {
 
     /* Hook evaluations must be statements; a bare expression is a syntax error. */
     assert(strstr(tribesnext_runtime_script, "function t2launch_audioState()") != NULL);
+    assert(strstr(tribesnext_runtime_script, "function t2launch_launchGuiReady()") != NULL);
 
     sdl_rect_t mode_16_9 = {0, 0, 1920, 1080};
     sdl_rect_t mode_16_10 = {0, 0, 1920, 1200};
