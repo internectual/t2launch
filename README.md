@@ -83,13 +83,57 @@ archives on disk are modified.
 
 ## Quick Start
 
+### Install
+
+You need your own Tribes 2 Linux game files (Loki release #25034) and, for
+online play, a TribesNext account.
+
+T2Launch runs the 32-bit game on your distribution's 32-bit libraries, so the
+host needs multilib support. On Arch, enable the `[multilib]` repository in
+`/etc/pacman.conf` if it is not already (CachyOS enables it by default):
+
+```ini
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+```
+
+Then install the packages:
+
+```bash
+sudo pacman -Syu --needed \
+    lib32-glibc lib32-gcc-libs lib32-mesa lib32-glu lib32-libx11 lib32-libxext \
+    lib32-libxrandr lib32-freetype2 lib32-libpulse lib32-gmp \
+    gcc python xdotool xorg-xrandr
+```
+
+| Package | Used for |
+|---------|----------|
+| `lib32-glibc`, `lib32-gcc-libs` | 32-bit loader and C runtime; `gcc -m32` builds |
+| `lib32-mesa`, `lib32-glu` | OpenGL |
+| `lib32-libx11`, `lib32-libxext`, `lib32-libxrandr` | X11 windowing (the bundled SDL links XRandR) |
+| `lib32-freetype2` | TrueType text rendering |
+| `lib32-libpulse` | `padsp`, which gives Loki OpenAL its OSS `/dev/dsp` |
+| `lib32-gmp` | the RSA helper used for TribesNext authentication |
+| `gcc` | compiling the hook, RSA helper, and stack-realignment shim |
+| `python` | the WON emulator and the desktop launcher |
+| `xdotool`, `xorg-xrandr` | keeping the window on the selected monitor and mode |
+
+`gamescope` and `strace` are optional (for `USE_GAMESCOPE=1` and
+`T2LAUNCH_TRACE_CONNECTS=1`). The launcher reports any missing 32-bit library
+by name before it starts the game.
+
+Other distributions need the equivalent 32-bit (i386) packages but are
+untested. The launcher looks for the 32-bit loader at `/lib/ld-linux.so.2` and
+for `padsp` at `/usr/lib32/pulseaudio/libpulsedsp.so`, the Arch locations.
+
 ### Desktop launcher
 
 T2Launch provides a system-tray desktop app for running the native client with
 saved profiles. It runs the game on the host's 32-bit libraries (see *Running
 the game* below); nothing is downloaded and no game file is modified.
 
-Install the desktop app and start it:
+Install the desktop app (into a private Python environment with PySide6) and
+start it:
 
 ```bash
 ./install.sh
@@ -255,12 +299,7 @@ Protocol checks: `python3 -m unittest discover -s tests -v`.
 
 The game runs on the host's 32-bit libraries plus the bundled Loki-era
 libraries in `runtime/compat-libs`. Neither the game binary nor any game file
-is modified. On Arch/CachyOS the multilib packages needed are:
-
-```bash
-sudo pacman -S --needed lib32-glibc lib32-gcc-libs lib32-mesa lib32-glu lib32-libx11 \
-    lib32-libxext lib32-libxrandr lib32-freetype2 lib32-libpulse lib32-gmp
-```
+is modified. The required packages are listed under *Install* above.
 
 The first launch compiles `t2_hook.so`, `rsa_helper`, and `t2_realign.so`
 into `games/tribes2/` with `gcc -m32` (`./runtime/build`), and rebuilds them
@@ -276,12 +315,6 @@ The game renders text from the font caches in `base.vl2` and, for other sizes,
 from the TrueType files in your install's `base/fonts/` (the Loki release ships
 Arial and Verdana there). It aborts if Arial is missing, so keep that folder
 intact; no font files come from this repository.
-
-### Prerequisites
-
-- The 32-bit packages listed under *Running the game*
-- Your own Tribes 2 Linux game files (from Loki Software release)
-- TribesNext account credentials
 
 ### Verify Hook Loading
 
