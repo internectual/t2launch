@@ -283,13 +283,9 @@ fi
 if [[ "$SOFTWARE_GL" == "1" ]]; then
     GAME_ENV+=(LIBGL_ALWAYS_SOFTWARE=1)
 fi
-# Hardware GL does not preserve the back buffer that Torque's partial GUI
-# redraws rely on, so redraw the whole canvas each frame there by default.
-FULL_REDRAW="${T2LAUNCH_FULL_REDRAW:-}"
-if [[ -z "$FULL_REDRAW" && "$NATIVE" == "1" && "$SOFTWARE_GL" != "1" ]]; then
-    FULL_REDRAW=1
-fi
-if [[ "$FULL_REDRAW" == "1" ]]; then
+# Drivers need not preserve the back buffer that Torque's partial GUI redraws
+# rely on, so redraw the whole canvas each frame unless told otherwise.
+if [[ "${T2LAUNCH_FULL_REDRAW:-1}" == "1" ]]; then
     GAME_ENV+=(T2LAUNCH_FULL_REDRAW=1)
 fi
 if [[ "${USE_SDL_X11_NODIRECTCOLOR:-0}" == "1" ]]; then
