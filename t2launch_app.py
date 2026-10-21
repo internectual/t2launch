@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer
+    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer  # noqa: I001 (grid-wrapped names)
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -23,7 +23,6 @@ except ImportError as exc:
     raise SystemExit("PySide6 is required. Install it with: python3 -m pip install -r requirements.txt") from exc
 
 from shiboken6 import isValid as is_qobject_valid
-
 
 ROOT = Path(__file__).resolve().parent
 DOCKER = ROOT / "docker"
@@ -402,7 +401,7 @@ class SettingsDialog(QDialog):
             if any(profile.get("wonemu") for profile in self.profiles) and not self.load_hook.isChecked():
                 raise ValueError("Local WON emulator profiles require Load t2_hook.so to be enabled.")
             names = [p["name"].strip() for p in self.profiles]
-            if len(set(name.casefold() for name in names)) != len(names):
+            if len({name.casefold() for name in names}) != len(names):
                 raise ValueError("Profile names must be unique.")
             selected_auto = self.autolaunch.currentData()
             if selected_auto and selected_auto not in names:

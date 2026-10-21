@@ -1,12 +1,12 @@
 """Small persistent local community profile store for the WON emulator."""
 
-from contextlib import contextmanager
 import hashlib
 import hmac
+import secrets
 import sqlite3
 import threading
 import time
-import secrets
+from contextlib import contextmanager
 from pathlib import Path
 
 LOCAL_PASSWORD_ITERATIONS = 310_000
@@ -14,9 +14,9 @@ DEFAULT_PROFILE_GRAPHIC = "texticons/twb/twb_Laserrifle.jpg"
 
 
 class CommunityStore:
-    PROFILE_FIELDS = {"display_name", "tag", "appending", "description", "url", "graphic",
-                      "primary_tribe"}
-    TRIBE_FIELDS = {"tag", "appending", "recruiting", "description", "graphic"}
+    PROFILE_FIELDS = frozenset({"display_name", "tag", "appending", "description", "url",
+                                "graphic", "primary_tribe"})
+    TRIBE_FIELDS = frozenset({"tag", "appending", "recruiting", "description", "graphic"})
 
     def __init__(self, path):
         self.path = Path(path).expanduser().resolve()
