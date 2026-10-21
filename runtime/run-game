@@ -2,21 +2,21 @@
 
 set -e
 
-# Usage: asgard-run [GAME] [HOST_GAME_PATH] [GAME_ARGS...]
+# Usage: run-game [GAME] [HOST_GAME_PATH] [GAME_ARGS...]
 #
 # Any flag-like argument (starting with "-") and everything after it is passed
 # straight through to the game. The game folder is remembered between runs, so
 # after the first time you can just do:
-#   ./asgard-run tribes2 -nologin -mod Classic
-#   ./asgard-run tribes2 -window
+#   ./run-game tribes2 -nologin -mod Classic
+#   ./run-game tribes2 -window
 # First time / to set the folder explicitly, give the path before the flags:
-#   ./asgard-run tribes2 /path/to/t2 -window
+#   ./run-game tribes2 /path/to/t2 -window
 # You can also force the boundary with "--", or set GAME_ARGS in the env:
-#   ./asgard-run tribes2 -- -window
-#   GAME_ARGS="-window -mod Classic" ./asgard-run
-# Re-pick the folder any time:  ASGARD_PICK=1 ./asgard-run
+#   ./run-game tribes2 -- -window
+#   GAME_ARGS="-window -mod Classic" ./run-game
+# Re-pick the folder any time:  ASGARD_PICK=1 ./run-game
 # Note: no flags are forced. For offline play pass -nologin yourself, e.g.
-#   ./asgard-run tribes2 -nologin
+#   ./run-game tribes2 -nologin
 read -r -a GAME_ARGS <<< "${GAME_ARGS:-}" # seed from the environment if provided
 POSITIONAL=()
 _collect=0
@@ -39,25 +39,6 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$ROOT_DIR/.." && pwd)"
 GAMES_DIR="$REPO_DIR/games"
 
-# By default the game runs on the host's 32-bit libraries (see native_launch
-# below); T2LAUNCH_NATIVE=0 runs it in the Docker image instead.
-NATIVE="${T2LAUNCH_NATIVE:-1}"
-
-# Preflight: Docker is the only hard requirement of a container launch.
-if [[ "$NATIVE" != "1" ]] && ! command -v docker >/dev/null 2>&1; then
-    echo "ERROR: Docker is not installed (or not on PATH)."
-    echo "  Arch/CachyOS:  sudo pacman -S docker && sudo systemctl enable --now docker"
-    echo "  Debian/Ubuntu: sudo apt install docker.io && sudo systemctl enable --now docker"
-    echo "  Then add yourself to the docker group: sudo usermod -aG docker \$USER  (log out/in)"
-    exit 1
-fi
-if [[ "$NATIVE" != "1" ]] && ! docker info >/dev/null 2>&1; then
-    echo "ERROR: Docker is installed but not usable by this user."
-    echo "  Start it:           sudo systemctl enable --now docker"
-    echo "  Fix permissions:    sudo usermod -aG docker \$USER   (then log out and back in)"
-    exit 1
-fi
-
 # Pick the game automatically — the user's only job is to point at the game
 # folder, so don't bother them with this when there's only one game.
 if [[ -z "$GAME_NAME" ]]; then
@@ -66,7 +47,7 @@ if [[ -z "$GAME_NAME" ]]; then
         GAME_NAME="${_games[0]}"
     elif [[ ${#_games[@]} -gt 1 ]] && command -v whiptail >/dev/null 2>&1 && [[ -t 0 && -t 1 ]]; then
         _menu=(); for g in "${_games[@]}"; do _menu+=("$g" ""); done
-        GAME_NAME=$(whiptail --title "Tribes 2 Docker — Select Game" \
+        GAME_NAME=$(whiptail --title "Tribes 2 — Select Game" \
             --menu "Which game do you want to run?" 18 60 8 "${_menu[@]}" \
             3>&1 1>&2 2>&3) || { echo "Cancelled."; exit 1; }
     else
@@ -145,14 +126,13 @@ browse_for_folder() {
 }
 
 # Top-level picker: list detected installs + a "Browse..." option.
-# Prints the chosen path (empty = use the copy baked into the image).
+# Prints the chosen path.
 # Returns non-zero if the user quits.
 select_game_folder() {
     local cands=() c menu=()
     while IFS= read -r c; do [[ -n "$c" ]] && cands+=("$c"); done < <(detect_game_candidates)
     for c in "${cands[@]}"; do menu+=("$c" "use this: $c"); done
     menu+=("__browse__"  "Browse for a folder...")
-    menu+=("__builtin__" "Use the copy baked into the image")
 
     local sel
     sel=$(whiptail --title "Tribes 2 - Select Game Folder" \
@@ -163,7 +143,6 @@ select_game_folder() {
 
     case "$sel" in
         __browse__)  browse_for_folder "${cands[0]:-$HOME}" ;;
-        __builtin__) printf '' ;;
         *)           printf '%s\n' "$sel" ;;
     esac
 }
@@ -194,7 +173,7 @@ if [[ -z "$HOST_GAME_PATH" ]]; then
     else
         # Plain-text fallback (no whiptail, or non-interactive terminal)
         echo "Enter the path to your Tribes 2 game directory."
-        echo "(folder containing tribes2.dynamic, base/, etc.; empty = built-in copy)"
+        echo "(the folder containing tribes2.dynamic, base/, etc.)"
         mapfile -t CANDIDATES < <(detect_game_candidates)
         if [[ ${#CANDIDATES[@]} -gt 0 ]]; then
             echo "Detected:"
@@ -207,7 +186,7 @@ if [[ -z "$HOST_GAME_PATH" ]]; then
                 HOST_GAME_PATH="$INPUT"
             fi
         else
-            read -rp "Enter path (or empty for built-in): " HOST_GAME_PATH
+            read -rp "Enter path: " HOST_GAME_PATH
         fi
     fi
 
@@ -223,25 +202,23 @@ if [[ -n "$HOST_GAME_PATH" && -d "$HOST_GAME_PATH" ]]; then
     printf '%s\n' "$HOST_GAME_PATH" > "$SAVED_PATH_FILE" 2>/dev/null || true
 fi
 
-# Defaults (can be overridden by per-game asgard.cfg)
+# Defaults (can be overridden by the per-game config, e.g. tribes2.cfg)
 GAMESCOPE_WIDTH=${GAMESCOPE_WIDTH:-1280}
 GAMESCOPE_HEIGHT=${GAMESCOPE_HEIGHT:-1024}
 USE_GAMESCOPE=${USE_GAMESCOPE:-1}
 USE_PADSP=${USE_PADSP:-1}
 SOFTWARE_GL=${SOFTWARE_GL:-1}
 MESA_YEAR=${MESA_YEAR:-}
-SAVE_DIRS=()
 GAME_BINARY="./${GAME_NAME:-tribes2}.dynamic"
 PRE_LAUNCH=""
-USE_STRACE=${USE_STRACE:-1}
 EXTRA_ENV=""
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-1}"
 T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
 
 # Source per-game config if it exists
-if [[ -f "$ROOT_DIR/config/$GAME_NAME.cfg" ]]; then
+if [[ -f "$ROOT_DIR/$GAME_NAME.cfg" ]]; then
     # shellcheck disable=SC1090 # Per-game config path is selected at runtime.
-    source "$ROOT_DIR/config/$GAME_NAME.cfg"
+    source "$ROOT_DIR/$GAME_NAME.cfg"
 fi
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
 SOFTWARE_GL="${T2LAUNCH_SOFTWARE_GL:-$SOFTWARE_GL}"
@@ -252,33 +229,11 @@ if [[ "$WONEMU" == "1" && "$LOAD_HOOK" != "1" ]]; then
     exit 2
 fi
 
-# First run: build the Docker image automatically if it doesn't exist yet, so
-# the only thing the user ever has to do is pick the game folder above.
-if [[ "$NATIVE" != "1" ]] && ! docker image inspect "$GAME_NAME" >/dev/null 2>&1; then
-    echo ""
-    echo "Docker image '$GAME_NAME' not found — building it now (one-time setup)."
-    echo "This can take a few minutes the first time..."
-    echo ""
-    "$ROOT_DIR/asgard-build" "$GAME_NAME"
-    echo ""
-fi
-
-# A cached image does not imply that this checkout has its ignored host-game
-# overlays yet. Rebuild once when a supported external Tribes 2 install lacks
-# either generated artifact.
-if [[ "$NATIVE" != "1" && "$GAME_NAME" == "tribes2" && -n "$HOST_GAME_PATH" && "$LOAD_HOOK" == "1" &&
-      ( ! -x "$GAMES_DIR/tribes2/t2_hook.so" || ! -x "$GAMES_DIR/tribes2/rsa_helper" ) ]]; then
-    echo "Hook/RSA helper overlays missing — building Tribes 2 support artifacts."
-    "$ROOT_DIR/asgard-build" tribes2
-fi
-
-DOCKER_EXTRA_ARGS=()
-GAME_ENV=()  # NAME=value pairs for the game process, in either launch mode
+GAME_ENV=()  # NAME=value pairs for the game process
 TRACE_CONNECTS=${T2LAUNCH_TRACE_CONNECTS:-0}
 if [[ "$TRACE_CONNECTS" == "1" ]]; then
     TRACE_DIR=${T2LAUNCH_TRACE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/diagnostics}
     mkdir -p "$TRACE_DIR"
-    DOCKER_EXTRA_ARGS+=(-v "$TRACE_DIR:/home/loki/t2trace:rw")
 fi
 if [[ "$SOFTWARE_GL" == "1" ]]; then
     GAME_ENV+=(LIBGL_ALWAYS_SOFTWARE=1)
@@ -303,68 +258,10 @@ if [[ -n "$HOST_GAME_PATH" ]]; then
     HOST_GAME_PATH="$(cd "$HOST_GAME_PATH" && pwd)"  # resolve to absolute path
 fi
 
-# If a host game path is provided, bind-mount it over the container's /home/loki/game
-# This avoids copying game files into the image at build time.
-if [[ "$NATIVE" != "1" && -n "$HOST_GAME_PATH" ]]; then
-    # Mount read-write so the engine can write console.log / prefs / screenshots
-    # into the game tree, matching how a normal local install behaves.
-    DOCKER_EXTRA_ARGS+=(-v "$HOST_GAME_PATH:/home/loki/game:rw")
-    echo "Bind-mounting host game: $HOST_GAME_PATH -> /home/loki/game"
-
-    # The hook, RSA helper, and bundled replacement fonts live in this repo
-    # (games/$GAME_NAME) and are layered over the host game directory.
-    # Docker applies mounts ordered by destination depth, so these nested mounts
-    # correctly overlay onto the game mount.
-    HELPER_DIR="$GAMES_DIR/$GAME_NAME"
-    HOOK_FILE="$HELPER_DIR/t2_hook.so"
-    if [[ -f "$HOOK_FILE" ]]; then
-        DOCKER_EXTRA_ARGS+=(-v "$HOOK_FILE:/home/loki/game/t2_hook.so:ro")
-        echo "  + overlay hook:     t2_hook.so"
-    elif [[ "$LOAD_HOOK" == "1" ]]; then
-        echo "WARNING: hook requested but no t2_hook.so was found in $HELPER_DIR or $REPO_DIR."
-    fi
-    if [[ "$LOAD_HOOK" == "1" ]]; then
-        RSA_HELPER_FILE="$HELPER_DIR/rsa_helper"
-        if [[ -f "$RSA_HELPER_FILE" ]]; then
-            DOCKER_EXTRA_ARGS+=(-v "$RSA_HELPER_FILE:/home/loki/game/rsa_helper:ro")
-            echo "  + overlay RSA helper"
-        else
-            echo "WARNING: hook RSA helper not found; RSA challenge commands may fail."
-        fi
-    fi
-    if [[ -d "$HELPER_DIR/base/fonts" ]]; then
-        DOCKER_EXTRA_ARGS+=(-v "$HELPER_DIR/base/fonts:/home/loki/game/base/fonts:ro")
-        echo "  + overlay fonts:    base/fonts"
-    fi
-fi
-
-for save_dir in "${SAVE_DIRS[@]}"; do
-    host_dir="${save_dir%%:*}"
-    container_dir="${save_dir#*:}"
-    mkdir -p "$host_dir"
-    DOCKER_EXTRA_ARGS+=(-v "$host_dir:$container_dir:rw")
-done
-
-# Pass /dev/dsp if available (OSS emulation via snd-pcm-oss kernel module)
-if [[ -e /dev/dsp ]]; then
-    DOCKER_EXTRA_ARGS+=(--device /dev/dsp)
-fi
-
 if [[ -n "$EXTRA_ENV" ]]; then
     GAME_ENV+=("$EXTRA_ENV")
 fi
 
-PRELOAD="/usr/lib/libSDL-1.2.so.0"
-PULSE_DSP_PRELOAD="/usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so"
-if [[ "$LOAD_HOOK" == "1" && "$USE_PADSP" == "1" ]]; then
-    PRELOAD="/home/loki/game/t2_hook.so:$PULSE_DSP_PRELOAD:/lib/i386-linux-gnu/libpthread.so.0:$PRELOAD"
-elif [[ "$LOAD_HOOK" == "1" ]]; then
-    PRELOAD="/home/loki/game/t2_hook.so:/lib/i386-linux-gnu/libpthread.so.0:$PRELOAD"
-elif [[ "$USE_PADSP" == "1" ]]; then
-    PRELOAD="$PULSE_DSP_PRELOAD:$PRELOAD"
-fi
-# The hook uses game-specific addresses; do not preload it into the shell.
-DOCKER_EXTRA_ARGS+=(-e "LD_PRELOAD=" -e "T2_GAME_PRELOAD=$PRELOAD")
 GAME_ENV+=("T2LAUNCH_WONEMU=$WONEMU")
 GAME_FULLSCREEN_REQUESTED=0
 GAME_WINDOWED_REQUESTED=0
@@ -416,25 +313,6 @@ GAME_ENV+=("T2LAUNCH_MONITOR_NAME=$T2LAUNCH_MONITOR"
 echo "[t2launch] Gamescope=$USE_GAMESCOPE fullscreen=$GAME_FULLSCREEN_REQUESTED windowed=$GAME_WINDOWED_REQUESTED monitor=${T2LAUNCH_MONITOR:-default} SDL_HEAD=${T2_SDL_HEAD_LOG:-default}"
 unset game_arg GAME_FULLSCREEN_REQUESTED GAME_WINDOWED_REQUESTED T2_SDL_HEAD_LOG
 
-# Grant the container access to the X server. 'xhost' lives in 'xorg-xhost' on
-# Arch/Fedora and 'x11-xserver-utils' on Debian/Ubuntu. A missing or failing
-# xhost must NOT abort the run (set -e) — warn and continue.
-if [[ "$NATIVE" == "1" ]]; then
-    :  # the game runs as this user and needs no X access grant
-elif command -v xhost >/dev/null 2>&1; then
-    if [ -n "$SUDO_USER" ]; then
-        sudo -u "$SUDO_USER" DISPLAY="$DISPLAY" xhost +local:docker >/dev/null 2>&1 || true
-    else
-        xhost +local:docker >/dev/null 2>&1 || true
-    fi
-else
-    echo "NOTE: 'xhost' is not installed — the game window may fail to open."
-    echo "      Install it, then re-run:"
-    echo "        Arch/CachyOS:   sudo pacman -S --needed xorg-xhost"
-    echo "        Debian/Ubuntu:  sudo apt install x11-xserver-utils"
-    echo "        Fedora:         sudo dnf install xorg-x11-server-utils"
-fi
-
 GAMESCOPE_CMD=()
 if [[ "$USE_GAMESCOPE" == "1" ]]; then
     if command -v gamescope >/dev/null 2>&1; then
@@ -448,12 +326,6 @@ if [[ "$USE_GAMESCOPE" == "1" ]]; then
     fi
 fi
 
-uid=${SUDO_UID:-$(id -u)}
-if [ -n "$SUDO_USER" ]; then
-    HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    XDG_RUNTIME_DIR="/run/user/$uid"
-fi
-
 # The game is an X11 app. On Wayland it draws via XWayland; if DISPLAY is unset,
 # fall back to :0 so it still has somewhere to connect.
 if [[ -z "$DISPLAY" ]]; then
@@ -462,70 +334,39 @@ if [[ -z "$DISPLAY" ]]; then
 fi
 export DISPLAY
 
-# Add host-integration mounts/devices only when the source actually exists, so
-# the same command works across X11/Wayland, PulseAudio/PipeWire and distros.
-# A missing bind-mount source otherwise makes Docker create a junk root-owned
-# dir (which is what broke audio/display on non-Ubuntu hosts).
-add_mount()  { if [[ -e "$1" ]]; then DOCKER_EXTRA_ARGS+=(-v "$1:$2:${3:-rw}"); fi; return 0; }
-add_device() { if [[ -e "$1" ]]; then DOCKER_EXTRA_ARGS+=(--device "$1"); fi; return 0; }
-
 mkdir -p "${HOME}/.loki"   # game writes prefs/saves here; ensure it's user-owned
 
-add_device /dev/snd
-add_device /dev/dri
-if [[ "${USE_PULSE_ALSA:-0}" == "1" ]]; then
-    DOCKER_EXTRA_ARGS+=(-v "$ROOT_DIR/alsa-pulse.conf:/home/loki/.asoundrc:ro")
-fi
 if [[ -n "${T2LAUNCH_PULSE_SINK:-}" ]]; then
     GAME_ENV+=("PULSE_SINK=$T2LAUNCH_PULSE_SINK")
 fi
-add_mount /etc/machine-id /etc/machine-id ro
-add_mount /var/lib/dbus   /var/lib/dbus   rw
-add_mount "${XDG_RUNTIME_DIR}/pulse/native"  "${XDG_RUNTIME_DIR}/pulse/native"  rw
-add_mount "${HOME}/.config/pulse/cookie"     /home/loki/.config/pulse/cookie    ro
-add_mount "${HOME}/.Xauthority"              /home/loki/.Xauthority             rw
-add_mount /tmp/.X11-unix  /tmp/.X11-unix  rw
-add_mount "${HOME}/.loki" /home/loki/.loki rw
-add_mount "${XDG_RUNTIME_DIR}" "/run/loki/$uid" rw
-add_mount /media/cdrom /cdrom rw
-
-# Host 'audio' group GID, so the container user can access /dev/snd (if present).
-AUDIO_GID=$(getent group audio | cut -d: -f3)
-if [[ -n "$AUDIO_GID" ]]; then DOCKER_EXTRA_ARGS+=(--group-add "$AUDIO_GID"); fi
-
 if [[ "$WONEMU" == "1" ]]; then
     python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/tribes2.dynamic"
     WONEMU_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/wonemu"
-    if [[ "$NATIVE" == "1" ]]; then
-        GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
-    else
-        DOCKER_EXTRA_ARGS+=(-v "$WONEMU_STATE_DIR/verifier.der:/home/loki/wonemu-verifier.der:ro" \
-            -e "T2LAUNCH_WON_VERIFIER=/home/loki/wonemu-verifier.der")
-    fi
+    GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
 fi
 
 # Run on the host's 32-bit libraries. Tribes 2 and its Loki libraries predate
 # the 16-byte stack alignment that current 32-bit builds assume, so the
 # t2_realign audit module realigns every call from old code into a modern
 # library. Nothing in the game folder is modified.
-native_launch() {
-    local native_dir="$GAMES_DIR/$GAME_NAME/native" compat_dir="$ROOT_DIR/compat-libs"
+launch_game() {
+    local support_dir="$GAMES_DIR/$GAME_NAME" compat_dir="$ROOT_DIR/compat-libs"
     local loader="/lib/ld-linux.so.2" pulse_dsp="/usr/lib32/pulseaudio/libpulsedsp.so"
     if [[ -z "$HOST_GAME_PATH" ]]; then
-        echo "ERROR: a native launch needs your Tribes 2 game folder (there is no built-in copy)." >&2
+        echo "ERROR: choose your Tribes 2 game folder (the one containing tribes2.dynamic)." >&2
         exit 2
     fi
     local artifact source rebuild=0
     for artifact in t2_hook.so rsa_helper t2_realign.so; do
-        [[ -x "$native_dir/$artifact" ]] || rebuild=1
+        [[ -x "$support_dir/$artifact" ]] || rebuild=1
     done
     for source in t2_hook.c rsa_helper.c t2_realign.c; do
         for artifact in t2_hook.so rsa_helper t2_realign.so; do
-            [[ "$REPO_DIR/$source" -nt "$native_dir/$artifact" ]] && rebuild=1
+            [[ "$REPO_DIR/$source" -nt "$support_dir/$artifact" ]] && rebuild=1
         done
     done
     if [[ "$rebuild" == "1" ]]; then
-        "$ROOT_DIR/native-build" "$native_dir"
+        "$ROOT_DIR/build" "$support_dir"
     fi
     if [[ ! -x "$loader" ]]; then
         echo "ERROR: the 32-bit loader $loader is missing. Arch/CachyOS: sudo pacman -S --needed lib32-glibc" >&2
@@ -539,12 +380,9 @@ native_launch() {
         echo "  Arch/CachyOS: sudo pacman -S --needed lib32-libx11 lib32-libxext lib32-libxrandr lib32-freetype2 lib32-mesa lib32-glu" >&2
         exit 1
     fi
-    if [[ -d "$GAMES_DIR/$GAME_NAME/base/fonts" ]]; then
-        echo "NOTE: the base/fonts overlay is only applied in Docker launches." >&2
-    fi
 
     local preload=()
-    [[ "$LOAD_HOOK" == "1" ]] && preload+=("$native_dir/t2_hook.so")
+    [[ "$LOAD_HOOK" == "1" ]] && preload+=("$support_dir/t2_hook.so")
     if [[ "$USE_PADSP" == "1" ]]; then
         if [[ -f "$pulse_dsp" ]]; then
             preload+=("$pulse_dsp")
@@ -556,17 +394,22 @@ native_launch() {
     if [[ -z "$MESA_YEAR" ]]; then GAME_ENV+=(MESA_EXTENSION_MAX_YEAR=2000); fi
     GAME_ENV+=(__GL_ExtensionStringVersion=17700
                "T2LAUNCH_GAME_DIR=$HOST_GAME_PATH"
-               "T2LAUNCH_RSA_HELPER=$native_dir/rsa_helper"
+               "T2LAUNCH_RSA_HELPER=$support_dir/rsa_helper"
                "T2_GAME_DIR=$HOST_GAME_PATH"
                "T2_LIBRARY_PATH=$compat_dir:$HOST_GAME_PATH"
-               "T2_GAME_AUDIT=$native_dir/t2_realign.so"
+               "T2_GAME_AUDIT=$support_dir/t2_realign.so"
                "T2_GAME_PRELOAD=$(IFS=:; echo "${preload[*]}")"
                "T2_RESIZE_SCRIPT=$ROOT_DIR/window_resize.sh"
                "T2_PREFS_FILE=$HOME/.loki/$GAME_NAME/base/prefs/ClientPrefs.cs"
                "GAME_BINARY=$GAME_BINARY" "PRE_LAUNCH=$PRE_LAUNCH"
                "USE_GAME_WINDOW_RESIZE=${USE_GAME_WINDOW_RESIZE:-0}")
-    [[ -n "${TRACE_DIR:-}" ]] && GAME_ENV+=("T2LAUNCH_TRACE_DIR=$TRACE_DIR")
-    echo "[t2launch] Native launch from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
+    if [[ -n "${TRACE_DIR:-}" ]]; then
+        GAME_ENV+=("T2LAUNCH_TRACE_DIR=$TRACE_DIR")
+        if command -v strace >/dev/null 2>&1; then
+            GAME_ENV+=("T2_STRACE_LOG=$TRACE_DIR/tribes2-connect.strace")
+        fi
+    fi
+    echo "[t2launch] Launching from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
     # LD_AUDIT and LD_PRELOAD are set only on the game itself, not the helpers.
     # shellcheck disable=SC2016 # The script is interpreted by the child bash.
     exec "${GAMESCOPE_CMD[@]}" env "${GAME_ENV[@]}" bash --norc -c '
@@ -576,47 +419,13 @@ native_launch() {
             "$T2_RESIZE_SCRIPT" "$T2_PREFS_FILE" "$$" \
                 "$T2LAUNCH_MONITOR_NAME" "$T2LAUNCH_FORCE_FULLSCREEN" "$T2LAUNCH_FORCE_WINDOWED" &
         fi
+        if [ -n "${T2_STRACE_LOG:-}" ]; then
+            set -- strace -e trace=connect -f -o "$T2_STRACE_LOG" -- "$GAME_BINARY" "$@"
+        else
+            set -- "$GAME_BINARY" "$@"
+        fi
         exec env LD_LIBRARY_PATH="$T2_LIBRARY_PATH" LD_AUDIT="$T2_GAME_AUDIT" \
-            LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"
+            LD_PRELOAD="$T2_GAME_PRELOAD" "$@"
     ' _ "${GAME_ARGS[@]}"
 }
-if [[ "$NATIVE" == "1" ]]; then
-    native_launch
-fi
-
-for game_env in "${GAME_ENV[@]}"; do DOCKER_EXTRA_ARGS+=(-e "$game_env"); done
-
-# shellcheck disable=SC2016 # The script passed to bash is interpreted inside the container.
-"${GAMESCOPE_CMD[@]}" docker run \
-    --rm \
-    --network host \
-    --group-add=audio \
-    -e "PULSE_SERVER=unix:${XDG_RUNTIME_DIR}/pulse/native" \
-    --env=DISPLAY \
-    --env="XDG_RUNTIME_DIR=/run/user/$uid" \
-    "${DOCKER_EXTRA_ARGS[@]}" \
-    -e GAME_NAME="$GAME_NAME" \
-    -e GAME_BINARY="$GAME_BINARY" \
-    -e PRE_LAUNCH="$PRE_LAUNCH" \
-    -e USE_STRACE="$USE_STRACE" \
-    -e TRACE_CONNECTS="$TRACE_CONNECTS" \
-    -e USE_PADSP="$USE_PADSP" \
-    -e USE_GAME_WINDOW_RESIZE="${USE_GAME_WINDOW_RESIZE:-0}" \
-    "$GAME_NAME" \
-    bash --norc -c '
-        cd /home/loki/game
-        export LD_LIBRARY_PATH=/usr/lib:./lib:$LD_LIBRARY_PATH
-        if [ -n "$PRE_LAUNCH" ]; then eval "$PRE_LAUNCH"; fi
-        STRACE=()
-        if [ "$TRACE_CONNECTS" = "1" ]; then
-            STRACE=(strace -e trace=connect -o /home/loki/t2trace/tribes2-connect.strace -f)
-        elif [ "$USE_STRACE" = "1" ]; then
-            STRACE=(strace -e trace=none -o /dev/null -f)
-        fi
-        if [ "$USE_GAME_WINDOW_RESIZE" = "1" ]; then
-            /home/loki/window_resize.sh "/home/loki/.loki/$GAME_NAME/base/prefs/ClientPrefs.cs" "$$" \
-                "$T2LAUNCH_MONITOR_NAME" "$T2LAUNCH_FORCE_FULLSCREEN" "$T2LAUNCH_FORCE_WINDOWED" &
-        fi
-        exec "${STRACE[@]}" env LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"
-    ' \
-    _ "${GAME_ARGS[@]}"
+launch_game

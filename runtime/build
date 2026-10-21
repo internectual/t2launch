@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build the Tribes 2 support binaries for a native (no-Docker) launch with the
-# host's 32-bit toolchain: the hook, the RSA helper, and the stack-realignment
-# audit module. Output goes to games/tribes2/native/ by default.
+# Build the Tribes 2 support binaries with the host's 32-bit toolchain: the
+# hook, the RSA helper, and the stack-realignment audit module. Output goes to
+# games/tribes2/ by default.
 set -Eeuo pipefail
 
-DOCKER_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$DOCKER_DIR/.." && pwd)"
-OUT_DIR="${1:-$REPO_DIR/games/tribes2/native}"
+RUNTIME_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$RUNTIME_DIR/.." && pwd)"
+OUT_DIR="${1:-$REPO_DIR/games/tribes2}"
 mkdir -p "$OUT_DIR"
 STAGE="$(mktemp -d "$OUT_DIR/.build.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
@@ -28,4 +28,4 @@ if ! gcc "${CFLAGS[@]}" -o "$STAGE/rsa_helper" "$REPO_DIR/rsa_helper.c" -lgmp; t
     exit 1
 fi
 mv -f "$STAGE/t2_realign.so" "$STAGE/t2_hook.so" "$STAGE/rsa_helper" "$OUT_DIR/"
-echo "Built native Tribes 2 support binaries in $OUT_DIR"
+echo "Built Tribes 2 support binaries in $OUT_DIR"

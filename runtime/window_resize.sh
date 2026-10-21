@@ -11,11 +11,11 @@ FORCE_FULLSCREEN=${4:-0}
 FORCE_WINDOWED=${5:-0}
 
 fullscreen_monitor() {
-    local monitors line index flags geometry name
+    local monitors line flags geometry name
     monitors=$(xrandr --listmonitors 2>/dev/null) || return 1
     while IFS= read -r line; do
         [[ "$line" == Monitors:* ]] && continue
-        read -r index flags geometry name <<<"$line"
+        read -r _ flags geometry name <<<"$line"
         if [[ -n "$MONITOR_NAME" ]]; then
             [[ "$name" == "$MONITOR_NAME" ]] || continue
         else
@@ -36,6 +36,7 @@ while kill -0 "$GAME_PID" 2>/dev/null; do
     fullscreen="1"
     if [[ -r "$PREFS" ]]; then
         while IFS= read -r line; do
+            # shellcheck disable=SC2016 # These match literal TorqueScript pref names.
             case "$line" in
                 '$pref::Video::resolution = '* )
                     value=${line#*\"}

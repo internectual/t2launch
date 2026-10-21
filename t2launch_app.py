@@ -25,7 +25,7 @@ except ImportError as exc:
 from shiboken6 import isValid as is_qobject_valid
 
 ROOT = Path(__file__).resolve().parent
-DOCKER = ROOT / "docker"
+RUNTIME = ROOT / "runtime"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "t2launch"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
@@ -71,7 +71,6 @@ def read_settings():
         "game_directory": settings.get("game_directory", str(Path.home() / "t2-linux")),
         "profiles": profiles,
         "load_hook": bool(settings.get("load_hook", True)),
-        "native": bool(settings.get("native", True)),
         "monitor": settings.get("monitor", ""),
         "autolaunch_profile": settings.get("autolaunch_profile", ""),
         "autolaunch_delay": int(settings.get("autolaunch_delay", 10)),
@@ -258,11 +257,6 @@ class SettingsDialog(QDialog):
         self.load_hook = QCheckBox("Load t2_hook.so (LD_PRELOAD)")
         self.load_hook.setChecked(app.settings["load_hook"])
         general_form.addRow(self.load_hook)
-        self.native = QCheckBox("Run without Docker (host 32-bit libraries)")
-        self.native.setToolTip("Needs lib32-glibc, lib32-mesa, lib32-libx11, lib32-libxrandr, "
-                               "lib32-freetype2, lib32-glu, lib32-libpulse, and lib32-gmp.")
-        self.native.setChecked(app.settings["native"])
-        general_form.addRow(self.native)
         self.monitor = QComboBox()
         self.monitor.addItem("Default display", "")
         for screen in QApplication.screens():
@@ -284,12 +278,12 @@ class SettingsDialog(QDialog):
         self.delay.setValue(app.settings.get("autolaunch_delay", 10))
         general_form.addRow("Autolaunch delay", self.delay)
         build_row = QHBoxLayout()
-        self.build_status = QLabel("Build the local Docker image from this checkout.")
-        self.build_button = QPushButton("Build / Rebuild image")
-        self.build_button.clicked.connect(app.build_image)
+        self.build_status = QLabel("Compile the hook, RSA helper, and stack-realignment shim.")
+        self.build_button = QPushButton("Rebuild")
+        self.build_button.clicked.connect(app.build_support)
         build_row.addWidget(self.build_status, 1)
         build_row.addWidget(self.build_button)
-        general_form.addRow("Docker image", build_row)
+        general_form.addRow("Support binaries", build_row)
         root_layout.addWidget(general)
 
         profile_group = QHBoxLayout()
@@ -416,7 +410,6 @@ class SettingsDialog(QDialog):
                 "game_directory": self.game_path.text().strip(),
                 "profiles": sorted(self.profiles, key=lambda p: p["name"].casefold()),
                 "load_hook": self.load_hook.isChecked(),
-                "native": self.native.isChecked(),
                 "monitor": self.monitor.currentData() or "",
                 "autolaunch_profile": selected_auto,
                 "autolaunch_delay": self.delay.value(),
@@ -518,21 +511,19 @@ class Launcher(QApplication):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("T2LAUNCH_LOAD_HOOK", "1" if self.settings["load_hook"] else "0")
         env.insert("T2LAUNCH_WONEMU", "1" if profile.get("wonemu", False) else "0")
-        env.insert("T2LAUNCH_NATIVE", "1" if self.settings["native"] else "0")
         monitor = self.settings.get("monitor", "")
         env.insert("T2LAUNCH_MONITOR", monitor)
         screen_index = next((i for i, screen in enumerate(QApplication.screens()) if screen.name() == monitor), 0)
         env.insert("T2LAUNCH_MONITOR_INDEX", str(screen_index))
         process.setProcessEnvironment(env)
         process.setProgram("bash")
-        process.setArguments([str(DOCKER / "asgard-run"), "tribes2", str(game_path), *args])
+        process.setArguments([str(RUNTIME / "run-game"), "tribes2", str(game_path), *args])
         process.setProcessChannelMode(QProcess.MergedChannels)
         self.launch_output_states[id(process)] = {
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
         append_launch_diagnostic(
             f"launch requested; wonemu={int(bool(profile.get('wonemu')))} "
-            f"hook={int(bool(self.settings['load_hook']))} "
-            f"native={int(bool(self.settings['native']))}")
+            f"hook={int(bool(self.settings['load_hook']))}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))
         process.errorOccurred.connect(lambda error, p=process: self.launch_error(p, error))
@@ -583,21 +574,21 @@ class Launcher(QApplication):
         if is_qobject_valid(process):
             self.tray.showMessage("Launch error", process.errorString(), QSystemTrayIcon.Critical)
 
-    def build_image(self):
+    def build_support(self):
         if self.build_process and self.build_process.state() != QProcess.NotRunning:
             return
         self.build_dialog = QDialog()
-        self.build_dialog.setWindowTitle("Build Docker image")
+        self.build_dialog.setWindowTitle("Build support binaries")
         layout = QVBoxLayout(self.build_dialog)
         self.build_output = QTextEdit()
         self.build_output.setReadOnly(True)
-        layout.addWidget(QLabel("Building the Tribes 2 image from this checkout…"))
+        layout.addWidget(QLabel("Building the Tribes 2 support binaries from this checkout…"))
         layout.addWidget(self.build_output)
         self.build_dialog.resize(720, 420)
         self.build_dialog.show()
         self.build_process = QProcess(self)
         self.build_process.setProgram("bash")
-        self.build_process.setArguments([str(DOCKER / "asgard-build"), "tribes2"])
+        self.build_process.setArguments([str(RUNTIME / "build")])
         self.build_process.setProcessChannelMode(QProcess.MergedChannels)
         self.build_process.readyReadStandardOutput.connect(self.read_build_output)
         self.build_process.finished.connect(self.build_finished)

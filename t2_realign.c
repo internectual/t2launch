@@ -1,5 +1,5 @@
 /* t2_realign: an LD_AUDIT module that lets Tribes 2 run on modern 32-bit
- * libraries outside the Docker image.
+ * libraries.
  *
  * Tribes 2 and its Loki-era libraries were built when the i386 stack only had
  * to be 4-byte aligned. Current distributions build their 32-bit libraries

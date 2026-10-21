@@ -551,9 +551,9 @@ static int is_supported_game(void) {
         readable_range(CONSOLE_GLOBAL, sizeof(uint32_t), &protection);
 }
 
-/* Files the hook reads live beside the game. Docker runs from /home/loki/game;
-   a native launch runs from its runtime directory. T2LAUNCH_GAME_DIR overrides
-   the working directory captured on first use. */
+/* Files the hook reads live beside the game. The launcher sets
+   T2LAUNCH_GAME_DIR; otherwise the working directory captured at startup is
+   used. */
 static const char *game_path(char *buffer, size_t size, const char *relative) {
     static char game_dir[4096];
     if (!game_dir[0]) {
@@ -568,16 +568,16 @@ static const char *game_path(char *buffer, size_t size, const char *relative) {
 }
 
 /* In opt-in connection-trace mode, record resolver hostnames without logging
-   packet contents or credentials. T2LAUNCH_TRACE_DIR defaults to asgard-run's trace mount. */
+   packet contents or credentials. The launcher sets T2LAUNCH_TRACE_DIR. */
 static int is_won_bootstrap_host(const char *node);
 
 static void trace_resolver_name(const char *node, const char *service) {
     const char *enabled = getenv("TRACE_CONNECTS");
     if (!enabled || strcmp(enabled, "1") != 0 || !node || !*node) return;
     const char *trace_dir = getenv("T2LAUNCH_TRACE_DIR");
+    if (!trace_dir || !trace_dir[0]) return;
     char path[4096];
-    snprintf(path, sizeof(path), "%s/tribes2-dns.log",
-             trace_dir && trace_dir[0] ? trace_dir : "/home/loki/t2trace");
+    snprintf(path, sizeof(path), "%s/tribes2-dns.log", trace_dir);
     FILE *file = fopen(path, "a");
     if (!file) return;
     fprintf(file, "%s%s%s -> %s\n", node, service ? ":" : "",

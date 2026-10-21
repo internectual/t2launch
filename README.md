@@ -16,18 +16,15 @@ This project replaces the Ruby-based crypto layer (which the Windows patch depen
 
 ```
 t2launch/
-├── docker/                    # Docker compatibility wrapper
-│   ├── Dockerfile             # 32-bit Ubuntu 16.04 container
-│   ├── asgard-run             # Launch script
-│   ├── config/tribes2.cfg     # Per-game config (LD_PRELOAD, etc.)
-│   ├── asgard-build           # Build image and compile hook
-│   ├── native-build           # Compile hook/helpers with the host 32-bit toolchain
-│   ├── alsa-pulse.conf        # Route ALSA audio through PulseAudio/PipeWire
+├── runtime/                   # Launch runtime
+│   ├── run-game               # Launch script
+│   ├── build                  # Compile hook/helpers with the host 32-bit toolchain
+│   ├── tribes2.cfg            # Per-game config
 │   ├── window_resize.sh       # Follow game mode and selected display
 │   └── compat-libs/           # Loki-era compatibility libraries
-├── games/tribes2/             # Generated hook/helper overlays
+├── games/tribes2/             # Built t2_hook.so, rsa_helper, t2_realign.so
 ├── t2_hook.c                  # LD_PRELOAD hook and runtime game patches
-├── t2_realign.c               # LD_AUDIT stack-realignment shim for native launches
+├── t2_realign.c               # LD_AUDIT stack-realignment shim
 ├── wonemu.py                  # Local WON/Auth/IRC/master services
 ├── tribesnext.py              # TribesNext certificate/challenge helpers
 ├── woncrypto.py               # WON wire-format crypto
@@ -89,10 +86,8 @@ archives on disk are modified.
 ### Desktop launcher
 
 T2Launch provides a system-tray desktop app for running the native client with
-saved profiles. By default it runs the game natively on the host's 32-bit
-libraries (see *Native launch* below); with **Run without Docker** unticked it
-builds and runs the Docker image from this checkout instead. No files
-are downloaded from the original `tribes-2-docker` project.
+saved profiles. It runs the game on the host's 32-bit libraries (see *Running
+the game* below); nothing is downloaded and no game file is modified.
 
 Install the desktop app and start it:
 
@@ -103,28 +98,12 @@ Install the desktop app and start it:
 
 Open **Settings** from the tray menu to choose the game directory, create/edit
 profiles, choose the fullscreen display, toggle the hook, configure autolaunch,
-or use **Build / Rebuild image**. The tray menu lists profiles alphabetically;
-click a profile to launch it. Hovering the tray icon shows running profiles.
-The hook is enabled by default and its library/helper are overlaid into an
-external game directory when available. Settings are stored in
+or use **Rebuild** to recompile the support binaries. The tray menu lists
+profiles alphabetically; click a profile to launch it. Hovering the tray icon
+shows running profiles. The hook is enabled by default. Settings are stored in
 `~/.config/t2launch/settings.json` with private permissions.
 Launcher and crash-stage diagnostics are written, with login arguments redacted,
 to `~/.local/state/t2launch/launch-diagnostics.log`.
-
-The underlying command-line image build remains available:
-
-```bash
-./docker/asgard-build tribes2
-```
-
-The launcher automatically builds the image if it is missing. Its build
-context stages the local `games/tribes2` support files, installs the image's
-runtime dependencies, and includes the legacy Loki compatibility libraries in
-`docker/compat-libs`; it does not fetch code or libraries from the upstream
-project. It compiles `t2_hook.so` and `rsa_helper` from the tracked C sources
-and exports both under `games/tribes2/` for overlaying onto an external game
-directory. The launcher regenerates those overlays if they are missing, even
-when the Docker image is already cached.
 
 ### Local WON emulator and master proxy
 
@@ -235,7 +214,7 @@ existing T2 scripts remain untouched.
 For command-line launches:
 
 ```bash
-T2LAUNCH_WONEMU=1 ./docker/asgard-run tribes2 ~/t2-linux
+T2LAUNCH_WONEMU=1 ./runtime/run-game tribes2 ~/t2-linux
 ```
 
 The directory is contacted when the **native WON login flow** runs. `-nologin`
@@ -268,61 +247,46 @@ arbitrary process on that port.
 
 Protocol checks: `python3 -m unittest discover -s tests -v`.
 
-### Native launch (no Docker)
-
-Both the desktop launcher (**Run without Docker** in Settings) and
-`asgard-run` launch natively by default:
+### Running the game
 
 ```bash
-./docker/asgard-run tribes2 /path/to/your/t2-linux
+./runtime/run-game tribes2 /path/to/your/t2-linux -online
 ```
 
-Untick the setting, or set `T2LAUNCH_NATIVE=0`, to use the Docker image.
-
-The game then runs on the host's 32-bit libraries plus the bundled Loki-era
-libraries in `docker/compat-libs`. Neither the game binary nor any game file is
-modified. On Arch/CachyOS the multilib packages needed are:
+The game runs on the host's 32-bit libraries plus the bundled Loki-era
+libraries in `runtime/compat-libs`. Neither the game binary nor any game file
+is modified. On Arch/CachyOS the multilib packages needed are:
 
 ```bash
 sudo pacman -S --needed lib32-glibc lib32-gcc-libs lib32-mesa lib32-glu lib32-libx11 \
     lib32-libxext lib32-libxrandr lib32-freetype2 lib32-libpulse lib32-gmp
 ```
 
-The first native launch compiles `t2_hook.so`, `rsa_helper`, and
-`t2_realign.so` into `games/tribes2/native/` with `gcc -m32`
-(`./docker/native-build`), and rebuilds them when their sources change. The
-launcher checks that every library the game links resolves before starting it.
-Native launches use the hardware GL driver. Every launch, native or Docker,
-redraws the whole GUI canvas each frame (see *Native runtime* below); set
+The first launch compiles `t2_hook.so`, `rsa_helper`, and `t2_realign.so`
+into `games/tribes2/` with `gcc -m32` (`./runtime/build`), and rebuilds them
+when their sources change. The launcher checks that every library the game
+links resolves before starting it. It uses the hardware GL driver and redraws
+the whole GUI canvas each frame (see *Runtime compatibility* below); set
 `T2LAUNCH_SOFTWARE_GL=1` for software GL, or `T2LAUNCH_FULL_REDRAW=0` to turn
-the redraw off.
+the redraw off. `T2LAUNCH_TRACE_CONNECTS=1` records resolver names and, when
+`strace` is installed, `connect()` calls under
+`~/.local/state/t2launch/diagnostics`.
+
+The game renders text from the font caches in `base.vl2` and, for other sizes,
+from the TrueType files in your install's `base/fonts/` (the Loki release ships
+Arial and Verdana there). It aborts if Arial is missing, so keep that folder
+intact; no font files come from this repository.
 
 ### Prerequisites
 
-- For native launches: the 32-bit packages listed under *Native launch*
-- For Docker launches (`T2LAUNCH_NATIVE=0`): Docker installed and running
+- The 32-bit packages listed under *Running the game*
 - Your own Tribes 2 Linux game files (from Loki Software release)
 - TribesNext account credentials
-
-### Build the image and hook
-
-Native launches build their binaries automatically (`./docker/native-build`).
-For Docker launches:
-
-```bash
-./docker/asgard-build tribes2
-```
-
-### Run
-
-```bash
-./docker/asgard-run tribes2 /path/to/your/t2-linux -online
-```
 
 ### Verify Hook Loading
 
 ```bash
-./docker/asgard-run tribes2 /path/to/your/t2-linux -nologin 2>&1 | grep "Registered"
+./runtime/run-game tribes2 /path/to/your/t2-linux -nologin 2>&1 | grep "Registered"
 ```
 
 ### Test in-game
@@ -390,23 +354,23 @@ table is available, avoiding concurrent mutation while startup scripts load.
 
 ### LD_PRELOAD Configuration
 
-The launcher composes `LD_PRELOAD` in `docker/asgard-run` when the hook option
-is enabled. The hook must precede SDL so its main-thread
-`SDL_GL_SwapBuffers` interposer can defer runtime TorqueScript work safely. The
-Xenial container also needs `libpthread` preloaded explicitly:
+The launcher composes `LD_PRELOAD` and `LD_AUDIT` in `runtime/run-game` and sets
+them on the game process only. The hook must precede SDL so its main-thread
+`SDL_GL_SwapBuffers` interposer can defer runtime TorqueScript work safely:
 ```
-LD_PRELOAD=/home/loki/game/t2_hook.so:/usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so:/lib/i386-linux-gnu/libpthread.so.0:/usr/lib/libSDL-1.2.so.0
+LD_AUDIT=games/tribes2/t2_realign.so
+LD_PRELOAD=games/tribes2/t2_hook.so:/usr/lib32/pulseaudio/libpulsedsp.so:runtime/compat-libs/libSDL-1.2.so.0
 ```
 
-The hook toggle removes only `t2_hook.so`; `libpthread` and SDL remain available
-for the legacy game runtime. It registers fourteen native commands and installs the
-Player TRIBES-tab override at runtime after the Community Browser control exists.
+The hook toggle removes only `t2_hook.so`. It registers fourteen native commands
+and installs the Player TRIBES-tab override at runtime after the Community
+Browser control exists.
 
-### Native runtime
+### Runtime compatibility
 
-Docker supplies nothing the host cannot: a 32-bit userland, the
-`docker/compat-libs` files, and a few environment settings. Three differences
-from the Xenial image matter on a current distribution:
+The project first ran the game in a 32-bit Ubuntu 16.04 Docker image. That image
+supplied nothing a current multilib host cannot, but three behaviors of the
+game need handling on current 32-bit libraries:
 
 - **Stack alignment.** Tribes 2 and its Loki libraries keep the 4-byte stack
   alignment of 2001 compilers; current 32-bit libraries assume 16 bytes and
@@ -424,17 +388,17 @@ from the Xenial image matter on a current distribution:
   threads it did not record as joinable.
 - **Back-buffer contents.** Torque's GUI redraws only dirty regions and assumes
   the back buffer still holds the previous frame. Current hardware drivers do
-  not preserve it, which shows as flicker and ghost cursors (to a lesser
-  degree in Docker as well). The hook calls `Canvas.reset()` after every swap
+  not preserve it, which shows as flicker and ghost cursors. The hook calls
+  `Canvas.reset()` after every swap
   (`T2LAUNCH_FULL_REDRAW=1`, the launcher default), marking the whole canvas
   dirty so each frame is drawn in full.
 
-`MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` are set
-as in the image, and `padsp` (`lib32-libpulse`) provides the OSS `/dev/dsp`
-device that Loki OpenAL opens. The hook reads `base/*.store` from
-`T2LAUNCH_GAME_DIR` (default: the startup working directory) and runs the RSA
-helper from `T2LAUNCH_RSA_HELPER`, so nothing is copied into the game folder;
-the Docker-only `base/fonts` overlay is not applied natively.
+`MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` keep
+the GL extension string short enough for the client's fixed buffer, and `padsp`
+(`lib32-libpulse`) provides the OSS `/dev/dsp` device that Loki OpenAL opens.
+The hook reads `base/*.store` from `T2LAUNCH_GAME_DIR` (default: the startup
+working directory) and runs the RSA helper from `T2LAUNCH_RSA_HELPER`, so
+nothing is copied into the game folder.
 
 ### Key Binary Addresses (Tribes 2 Linux #25034)
 
@@ -476,7 +440,7 @@ game's own `checkNamesAndAliases()` runs unmodified.
 
 ### Game Console Settings
 
-To see game output in Docker, add these to `base/autoexec.cs`:
+To see game output in the terminal, add these to `base/autoexec.cs`:
 ```cs
 $Con::logBufferEnabled = false;
 $pref::NoClearConsole = true;
@@ -500,7 +464,7 @@ CRITICAL: Also `pkill -9 -f tribes2.dynamic` before testing — stale processes 
 
 ### Game Config
 
-The default config (`docker/config/tribes2.cfg`) sets the game binary and
+The default config (`runtime/tribes2.cfg`) sets the game binary and
 enables the hook. Tribes 2 runs windowed at its selected resolution, without
 Gamescope, and uses hardware OpenGL by default. An explicit `-f`/`--fullscreen`
 argument or `FULLSCREEN=true` requests fullscreen. An X11 watcher keeps the
@@ -518,16 +482,13 @@ display, not synthesized or tied to a GPU vendor.
 ```
 USE_GAMESCOPE=0
 SOFTWARE_GL=0
-USE_STRACE=0
 USE_PADSP=1
-USE_PULSE_ALSA=1
 GAME_BINARY="./tribes2.dynamic"
 LOAD_HOOK=1
 ```
 
 The bundled Loki OpenAL backend uses OSS `/dev/dsp`; `USE_PADSP=1` keeps its
-provider available and routes playback through PulseAudio/PipeWire. The
-`USE_PULSE_ALSA=1` overlay also routes ALSA clients through the same socket. To
+provider available and routes playback through PulseAudio/PipeWire. To
 select a specific host output for the game, set `T2LAUNCH_PULSE_SINK` to a sink
 name reported by `pactl list short sinks`. When unset, the game follows the
 host's current PulseAudio/PipeWire default output.
@@ -538,6 +499,7 @@ host's current PulseAudio/PipeWire default output.
 - **t2-mapper** (exogen/t2-mapper) — protocol and crypto reference implementation
 - **IFC22** — binary address reference and API documentation
 - **Loki Software** — Linux port of Tribes 2
+- **tribes-2-docker** — the original Docker launcher this project started from
 
 ## License
 
