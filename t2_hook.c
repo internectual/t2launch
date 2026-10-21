@@ -38,6 +38,7 @@ static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
 static int register_hook_commands(void);
 static volatile int profile_browser_wake_seen = 0;
+static volatile int core_runtime_installed = 0;
 static volatile int tribesnext_runtime_installed = 0;
 static volatile int shell_audio_setup_done = 0;
 static volatile int player_pane_override_installed = 0;
@@ -48,13 +49,120 @@ static char tribesnext_private_exponent[4097];
 static char tribesnext_username[128];
 static char tribesnext_password[512];
 static int won_redirected = 0;
-static char won_endpoint[28] = "127.0.0.1:15104";
 static time_t hook_started_at = 0;
 static time_t last_shell_audio_setup = 0;
 static int sdl_gl_swap_hook_reported = 0;
 static volatile unsigned int video_mode_repaint_frames = 0;
 static volatile int won_patch_pending = 0;
 static volatile int xrandr_mode_list_reported = 0;
+
+/* ── Hook options ─────────────────────────────────────────────────────────
+ * The launcher writes one key=value per line to the file named by
+ * T2LAUNCH_HOOK_CONFIG; t2options.py declares the same keys. A value comes
+ * from that file, else the option's legacy environment variable, else its
+ * default. Keys the hook does not know yet are kept for hook_option(). */
+struct hook_option {
+    const char *key;
+    const char *fallback;
+    const char *legacy_env;   /* NULL when there is none */
+    int legacy_inverted;      /* the variable's "1" turns the option off */
+    char value[256];
+    int set;
+};
+static struct hook_option hook_options[] = {
+    {"hook.console_commands", "1", "T2LAUNCH_DISABLE_HOOK_COMMANDS", 1, "", 0},
+    {"hook.tribesnext", "1", NULL, 0, "", 0},
+    {"hook.tribes_tab", "1", NULL, 0, "", 0},
+    {"video.full_redraw", "1", "T2LAUNCH_FULL_REDRAW", 0, "", 0},
+    {"video.xrandr_modes", "1", NULL, 0, "", 0},
+    {"audio.launch_reset", "1", NULL, 0, "", 0},
+    {"runtime.thread_join_guard", "1", NULL, 0, "", 0},
+};
+#define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
+#define HOOK_EXTRA_OPTION_LIMIT 64
+static struct { char key[64]; char value[256]; } hook_extra_options[HOOK_EXTRA_OPTION_LIMIT];
+static int hook_extra_option_count;
+static pthread_once_t hook_options_once = PTHREAD_ONCE_INIT;
+
+static char *trim_space(char *text) {
+    while (*text == ' ' || *text == '\t') text++;
+    size_t length = strlen(text);
+    while (length && (text[length - 1] == ' ' || text[length - 1] == '\t' ||
+                      text[length - 1] == '\r' || text[length - 1] == '\n'))
+        text[--length] = 0;
+    return text;
+}
+
+static void store_hook_option(const char *key, const char *value) {
+    for (size_t i = 0; i < HOOK_OPTION_COUNT; i++) {
+        if (strcmp(hook_options[i].key, key) == 0) {
+            snprintf(hook_options[i].value, sizeof(hook_options[i].value), "%s", value);
+            hook_options[i].set = 1;
+            return;
+        }
+    }
+    for (int i = 0; i < hook_extra_option_count; i++) {
+        if (strcmp(hook_extra_options[i].key, key) == 0) {
+            snprintf(hook_extra_options[i].value, sizeof(hook_extra_options[i].value), "%s", value);
+            return;
+        }
+    }
+    if (hook_extra_option_count < HOOK_EXTRA_OPTION_LIMIT && strlen(key) < sizeof(hook_extra_options[0].key)) {
+        snprintf(hook_extra_options[hook_extra_option_count].key, sizeof(hook_extra_options[0].key), "%s", key);
+        snprintf(hook_extra_options[hook_extra_option_count].value, sizeof(hook_extra_options[0].value),
+                 "%s", value);
+        hook_extra_option_count++;
+    }
+}
+
+static void load_hook_options(void) {
+    for (size_t i = 0; i < HOOK_OPTION_COUNT; i++) {
+        const char *legacy = hook_options[i].legacy_env ? getenv(hook_options[i].legacy_env) : NULL;
+        if (!legacy || !legacy[0]) continue;
+        if (hook_options[i].legacy_inverted)
+            store_hook_option(hook_options[i].key, strcmp(legacy, "1") == 0 ? "0" : "1");
+        else
+            store_hook_option(hook_options[i].key, legacy);
+    }
+    const char *path = getenv("T2LAUNCH_HOOK_CONFIG");
+    if (!path || !path[0]) return;
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        fprintf(stderr, "[t2_hook] Hook config unavailable: %s\n", strerror(errno));
+        return;
+    }
+    char line[512];
+    int count = 0;
+    while (fgets(line, sizeof(line), file)) {
+        char *text = trim_space(line);
+        char *equals = strchr(text, '=');
+        if (!*text || *text == '#' || !equals) continue;
+        *equals = 0;
+        char *key = trim_space(text);
+        if (*key) {
+            store_hook_option(key, trim_space(equals + 1));
+            count++;
+        }
+    }
+    fclose(file);
+    fprintf(stderr, "[t2_hook] Loaded %d hook options\n", count);
+}
+
+static const char *hook_option_str(const char *key) {
+    pthread_once(&hook_options_once, load_hook_options);
+    for (size_t i = 0; i < HOOK_OPTION_COUNT; i++)
+        if (strcmp(hook_options[i].key, key) == 0)
+            return hook_options[i].set ? hook_options[i].value : hook_options[i].fallback;
+    for (int i = 0; i < hook_extra_option_count; i++)
+        if (strcmp(hook_extra_options[i].key, key) == 0) return hook_extra_options[i].value;
+    return NULL;
+}
+
+static int hook_option_bool(const char *key) {
+    const char *value = hook_option_str(key);
+    return value && (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+                     strcasecmp(value, "on") == 0 || strcasecmp(value, "yes") == 0);
+}
 
 /* The native server-browser IP column formats "IP:<address>:<port>" and then
  * strips the prefix with strcpy(dst, dst + 3).  That overlapping copy is
@@ -83,24 +191,9 @@ char *strcpy(char *destination, const char *source)
     return result;
 }
 
-static const char tribesnext_runtime_script[] =
-     "function t2launch_tnUnlockPoll() {\n"
-       " if ($T2Launch::TNReady && trim($LoginName) !$= \"\" && stricmp($T2Launch::TNUsername, $LoginName) != 0) {\n"
-       "  hook_tn_clear(); $T2Launch::TNReady = 0; $T2Launch::TNLastAttempt = \"\";\n"
-      " }\n"
-        " if ($Audio::initialized && isObject(OptionsDlg) && OptionsDlg.isAwake() &&\n"
-     "     isObject(OP_AudioProviderMenu) && OP_AudioProviderMenu.size() == 0) {\n"
-     "  OP_AudioProviderMenu.add(\"OpenAL\", 0); OP_AudioProviderMenu.setSelected(0);\n"
-     " }\n"
-      " if (!$T2Launch::TNReady && trim($LoginName) !$= \"\" && $LoginPassword !$= \"\") {\n"
-     "  %fingerprint = hook_sha1($LoginName @ \"\\t\" @ $LoginPassword);\n"
-     "  if (%fingerprint !$= $T2Launch::TNLastAttempt) {\n"
-     "   $T2Launch::TNLastAttempt = %fingerprint;\n"
-     "   schedule(350, 0, \"t2launch_tnTryUnlock\", %fingerprint);\n"
-     "  }\n"
-     " }\n"
-     " schedule(100, 0, \"t2launch_tnUnlockPoll\");\n"
-     "}\n"
+/* Installed whenever the hook runs: helpers the hook itself evaluates, the
+ * server-browser repaint, and a provider entry for an empty audio menu. */
+static const char core_runtime_script[] =
     "function t2launch_launchGuiReady() {\n"
     " if (isObject(LaunchGui)) return \"1\";\n"
     " return \"0\";\n"
@@ -112,7 +205,31 @@ static const char tribesnext_runtime_script[] =
     " if (isObject(Canvas) && isObject(GMJ_Browser) && GMJ_Browser.isAwake()) Canvas.repaint();\n"
     " schedule(500, 0, \"t2launch_refreshServerBrowser\");\n"
     "}\n"
+    "function t2launch_audioMenuPoll() {\n"
+    " if ($Audio::initialized && isObject(OptionsDlg) && OptionsDlg.isAwake() &&\n"
+    "     isObject(OP_AudioProviderMenu) && OP_AudioProviderMenu.size() == 0) {\n"
+    "  OP_AudioProviderMenu.add(\"OpenAL\", 0); OP_AudioProviderMenu.setSelected(0);\n"
+    " }\n"
+    " schedule(100, 0, \"t2launch_audioMenuPoll\");\n"
+    "}\n"
     "t2launch_refreshServerBrowser();\n"
+    "t2launch_audioMenuPoll();\n";
+
+/* TribesNext account unlock and T2CSRI client handlers (hook.tribesnext). */
+static const char tribesnext_runtime_script[] =
+     "function t2launch_tnUnlockPoll() {\n"
+       " if ($T2Launch::TNReady && trim($LoginName) !$= \"\" && stricmp($T2Launch::TNUsername, $LoginName) != 0) {\n"
+       "  hook_tn_clear(); $T2Launch::TNReady = 0; $T2Launch::TNLastAttempt = \"\";\n"
+      " }\n"
+      " if (!$T2Launch::TNReady && trim($LoginName) !$= \"\" && $LoginPassword !$= \"\") {\n"
+     "  %fingerprint = hook_sha1($LoginName @ \"\\t\" @ $LoginPassword);\n"
+     "  if (%fingerprint !$= $T2Launch::TNLastAttempt) {\n"
+     "   $T2Launch::TNLastAttempt = %fingerprint;\n"
+     "   schedule(350, 0, \"t2launch_tnTryUnlock\", %fingerprint);\n"
+     "  }\n"
+     " }\n"
+     " schedule(100, 0, \"t2launch_tnUnlockPoll\");\n"
+     "}\n"
     "function t2launch_tnTryUnlock(%fingerprint) {\n"
     " if ($T2Launch::TNReady || %fingerprint !$= hook_sha1($LoginName @ \"\\t\" @ $LoginPassword)) return;\n"
        " if (hook_tn_unlock($LoginName, $LoginPassword) $= \"ok\") {\n"
@@ -449,18 +566,61 @@ static int readable_range(uintptr_t address, size_t length, int *protection) {
     return found;
 }
 
+/* Fill the three bootstrap slots from T2LAUNCH_WON_ENDPOINTS
+   ("host:port[,host:port[,host:port]]", fewer entries repeat the last), else
+   127.0.0.1 with T2LAUNCH_WON_PORT or the default port. Each entry replaces a
+   "tribes2.mN.sierra.com:15104" string in place, so it may use 27 bytes. */
+#define WON_ENDPOINT_SIZE 28
+static int parse_won_endpoints(const char *list, const char *port_text,
+                               char endpoints[3][WON_ENDPOINT_SIZE]) {
+    if (!list || !*list) {
+        unsigned long port = 15104;
+        if (port_text && *port_text) {
+            char *end;
+            port = strtoul(port_text, &end, 10);
+            if (*end || port == 0 || port > 65535) return 0;
+        }
+        for (int i = 0; i < 3; i++)
+            snprintf(endpoints[i], WON_ENDPOINT_SIZE, "127.0.0.1:%lu", port);
+        return 1;
+    }
+    int count = 0;
+    const char *start = list;
+    while (*start) {
+        const char *end = strchr(start, ',');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        if (count == 3 || length == 0 || length >= WON_ENDPOINT_SIZE) return 0;
+        char entry[WON_ENDPOINT_SIZE];
+        memcpy(entry, start, length);
+        entry[length] = 0;
+        char *colon = strrchr(entry, ':');
+        if (!colon || colon == entry || !colon[1]) return 0;
+        for (const char *c = entry; c < colon; c++)
+            if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                  (*c >= '0' && *c <= '9') || *c == '.' || *c == '-'))
+                return 0;
+        char *port_end;
+        unsigned long port = strtoul(colon + 1, &port_end, 10);
+        if (*port_end || port == 0 || port > 65535) return 0;
+        memcpy(endpoints[count++], entry, length + 1);
+        if (!end) break;
+        start = end + 1;
+    }
+    if (count == 0) return 0;
+    for (int i = count; i < 3; i++) memcpy(endpoints[i], endpoints[count - 1], WON_ENDPOINT_SIZE);
+    return 1;
+}
+
 static int redirect_won_bootstrap(void) {
     static const uintptr_t addresses[] = {0x084846B1, 0x084846CD, 0x084846E9};
     static const char *original[] = {
         "tribes2.m1.sierra.com:15104", "tribes2.m2.sierra.com:15104",
         "tribes2.m3.sierra.com:15104"
     };
-    const char *port_text = getenv("T2LAUNCH_WON_PORT");
-    if (port_text && *port_text) {
-        char *end;
-        unsigned long port = strtoul(port_text, &end, 10);
-        if (*end || port == 0 || port > 65535) return 0;
-        snprintf(won_endpoint, sizeof(won_endpoint), "127.0.0.1:%lu", port);
+    char endpoints[3][WON_ENDPOINT_SIZE];
+    if (!parse_won_endpoints(getenv("T2LAUNCH_WON_ENDPOINTS"), getenv("T2LAUNCH_WON_PORT"), endpoints)) {
+        fprintf(stderr, "[t2_hook] WON redirect refused: invalid T2LAUNCH_WON_ENDPOINTS or T2LAUNCH_WON_PORT\n");
+        return 0;
     }
     int protection = 0;
     long page_size = sysconf(_SC_PAGESIZE);
@@ -487,13 +647,14 @@ static int redirect_won_bootstrap(void) {
     }
     for (size_t i = 0; i < 3; i++) {
         memset((void *)addresses[i], 0, strlen(original[i]) + 1);
-        memcpy((void *)addresses[i], won_endpoint, strlen(won_endpoint) + 1);
+        memcpy((void *)addresses[i], endpoints[i], strlen(endpoints[i]) + 1);
     }
     if (mprotect((void *)page, (size_t)page_size, protection) != 0) {
         fprintf(stderr, "[t2_hook] WON redirect: restoring page permissions failed: %s\n", strerror(errno));
         return 0;
     }
-    fprintf(stderr, "[t2_hook] WON bootstrap: redirected 3 endpoints to %s (memory only)\n", won_endpoint);
+    fprintf(stderr, "[t2_hook] WON bootstrap: redirected endpoints to %s, %s, %s (memory only)\n",
+            endpoints[0], endpoints[1], endpoints[2]);
     return 1;
 }
 
@@ -676,7 +837,8 @@ int pthread_join(pthread_t thread, void **value) {
     if (!real_join) real_join = (pthread_join_t)dlsym(RTLD_NEXT, "pthread_join");
     if (!real_join) return ESRCH;
     /* Past the table limit untracked threads may be joinable, so trust the caller. */
-    if (!take_joinable_thread(thread) && !joinable_overflow) {
+    if (!take_joinable_thread(thread) && !joinable_overflow &&
+        hook_option_bool("runtime.thread_join_guard")) {
         fprintf(stderr, "[t2_hook] Refused pthread_join on a detached or unknown thread\n");
         return EINVAL;
     }
@@ -728,8 +890,7 @@ void SDL_GL_SwapBuffers(void) {
        the whole canvas dirty so the next frame is drawn in full. */
     static int full_redraw = -1;
     if (full_redraw < 0) {
-        const char *setting = getenv("T2LAUNCH_FULL_REDRAW");
-        full_redraw = setting && strcmp(setting, "1") == 0;
+        full_redraw = hook_option_bool("video.full_redraw");
         if (full_redraw) fprintf(stderr, "[t2_hook] Full canvas redraw every frame enabled\n");
     }
     if (full_redraw)
@@ -737,10 +898,17 @@ void SDL_GL_SwapBuffers(void) {
 
     /* Named, newline-separated scripts let Torque report "<file> Line: N"
        instead of an unattributed "Syntax error in input." */
+    if (!core_runtime_installed) {
+        Con__evaluate(core_runtime_script, 0, "t2launch/core.cs", 0);
+        core_runtime_installed = 1;
+    }
+    /* The TribesNext handlers call the hook's console commands. */
     if (!tribesnext_runtime_installed) {
-        Con__evaluate(tribesnext_runtime_script, 0, "t2launch/tribesnext.cs", 0);
-        fprintf(stderr, "[t2_hook] Installed runtime TribesNext authentication handlers\n");
         tribesnext_runtime_installed = 1;
+        if (hook_option_bool("hook.tribesnext") && hook_option_bool("hook.console_commands")) {
+            Con__evaluate(tribesnext_runtime_script, 0, "t2launch/tribesnext.cs", 0);
+            fprintf(stderr, "[t2_hook] Installed runtime TribesNext authentication handlers\n");
+        }
     }
 
     time_t now = time(NULL);
@@ -760,14 +928,15 @@ void SDL_GL_SwapBuffers(void) {
                 " if ($Audio::initialized) $pref::Audio::activeDriver = \"OpenAL\";"
                 "}",
                 0, NULL, 0);
-            Con__evaluate(
-                "if ($Audio::initialized && !$T2Launch::AudioResetDone) {"
-                " $T2Launch::AudioResetDone = 1; audioSetDriver(\"none\");"
-                " $Audio::initialized = audioSetDriver($pref::Audio::activeDriver);"
-                " if ($Audio::initialized) $HudHandle[shellScreen] = alxPlay(ShellScreenHumSound, 0, 0, 0);"
-                "}",
-                0, NULL, 0);
-            if (!player_pane_override_installed) {
+            if (hook_option_bool("audio.launch_reset"))
+                Con__evaluate(
+                    "if ($Audio::initialized && !$T2Launch::AudioResetDone) {"
+                    " $T2Launch::AudioResetDone = 1; audioSetDriver(\"none\");"
+                    " $Audio::initialized = audioSetDriver($pref::Audio::activeDriver);"
+                    " if ($Audio::initialized) $HudHandle[shellScreen] = alxPlay(ShellScreenHumSound, 0, 0, 0);"
+                    "}",
+                    0, NULL, 0);
+            if (!player_pane_override_installed && hook_option_bool("hook.tribes_tab")) {
                 Con__evaluate(player_pane_button_click_override, 0, "t2launch/browser.cs", 0);
                 player_pane_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
@@ -1325,6 +1494,13 @@ static const char* hook_tn_ip_trace_cb(void *obj, S32 argc, const char **argv) {
     return "ok";
 }
 
+static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 2 || !argv[1]) return "";
+    const char *value = hook_option_str(argv[1]);
+    return value ? value : "";
+}
+
 /* ── Registration thread ─────────────────────────────────────────────── */
 
 static int register_hook_commands(void) {
@@ -1334,8 +1510,15 @@ static int register_hook_commands(void) {
     uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
     if (table_size == 0) return 0;
 
+    if (!hook_option_bool("hook.console_commands")) {
+        registered = 1;  /* the console is ready; only the commands are skipped */
+        fprintf(stderr, "[t2_hook] Console commands disabled by hook.console_commands\n");
+        return 1;
+    }
     Con__addMethodS = (con_addMethodS_t)0x80E85C0;
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
+    Con__addMethodS(NULL, "hook_option", hook_option_cb,
+        "hook_option <key> - value of a T2Launch hook option", 2, 2);
     Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
     Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
     Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);
@@ -1360,7 +1543,7 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
         "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
     registered = 1;
-    fprintf(stderr, "[t2_hook] Registered 14 commands on the game thread (table_size=%d)\n", table_size);
+    fprintf(stderr, "[t2_hook] Registered 15 commands on the game thread (table_size=%d)\n", table_size);
     return 1;
 }
 
@@ -1390,7 +1573,8 @@ sdl_rect_t **SDL_ListModes(void *format, uint32_t flags) {
     if (!real_sdl_list_modes) return NULL;
 
     sdl_rect_t **modes = real_sdl_list_modes(format, flags);
-    if (!sdl_modes_is_any(modes) || (flags & SDL_FULLSCREEN_FLAG))
+    if (!sdl_modes_is_any(modes) || (flags & SDL_FULLSCREEN_FLAG) ||
+        !hook_option_bool("video.xrandr_modes"))
         return modes;
 
     /* Tribes 2 treats SDL's windowed "any size" sentinel as a cue to show its
@@ -1426,11 +1610,7 @@ static void __attribute__((constructor)) init(void) {
         if (!install_won_verifier()) _exit(1);
         won_patch_pending = 1;
     }
-    const char *disable_commands = getenv("T2LAUNCH_DISABLE_HOOK_COMMANDS");
-    if (disable_commands && strcmp(disable_commands, "1") == 0) {
-        fprintf(stderr, "[t2_hook] Console helper registration disabled by environment\n");
-        return;
-    }
+    pthread_once(&hook_options_once, load_hook_options);
     fprintf(stderr, "[t2_hook] Console command registration deferred to the game thread\n");
 }
 #endif

@@ -188,16 +188,98 @@ def decode_getdir(payload):
     return {"path": path, "flags": flags, "entities_per_reply": per_reply, "data_types": data_types}
 
 
-def service_entity(name, port, display_name="0"):
-    return {"name": name, "display_name": display_name, "port": port}
+def service_entity(name, port, display_name="0", address=HOST):
+    return {"name": name, "display_name": display_name, "port": port, "address": address}
 
 
-def directory_records(ports):
+def directory_records(ports, address=HOST):
+    """Directory entries for each service, advertised at an IPv4 address."""
     return {
-        "/TitanServers/Auth": [service_entity("AuthServer", ports["auth"])],
-        "/TitanServers/DBProxy": [service_entity("DBProxyServer", ports["dbproxy"])],
-        "/Tribes2": [service_entity("IRCServer", ports["irc"]), service_entity("MasterServer", ports["master"])],
+        "/TitanServers/Auth": [service_entity("AuthServer", ports["auth"], address=address)],
+        "/TitanServers/DBProxy": [service_entity("DBProxyServer", ports["dbproxy"], address=address)],
+        "/Tribes2": [service_entity("IRCServer", ports["irc"], address=address),
+                     service_entity("MasterServer", ports["master"], address=address)],
     }
+
+
+# Master-server sources, merged in order. Each is a kind and an address:
+#   lan                  game servers that heartbeat to this master
+#   tribesnext=URL       the TribesNext HTTP list service
+#   torque=HOST:PORT     another Torque-protocol master (read-only)
+MASTER_SOURCE_KINDS = ("lan", "tribesnext", "torque")
+
+
+def parse_master_sources(spec, tribesnext_url=TRIBESNEXT_MASTER_URL):
+    """Parse "kind[=address],..." into (kind, address) pairs, in order."""
+    sources = []
+    for item in (part.strip() for part in str(spec).split(",")):
+        if not item:
+            continue
+        kind, _, address = item.partition("=")
+        kind, address = kind.strip().lower(), address.strip()
+        if kind not in MASTER_SOURCE_KINDS:
+            raise ValueError(f"Unknown master-server source kind: {kind}")
+        if kind == "lan":
+            address = ""
+        elif kind == "tribesnext":
+            address = (address or tribesnext_url).rstrip("/")
+            if urllib.parse.urlsplit(address).scheme not in ("http", "https"):
+                raise ValueError(f"TribesNext master source needs an http(s) URL: {address}")
+        else:
+            host, port = parse_endpoint(address)
+            address = f"{host}:{port}"
+        if (kind, address) not in sources:
+            sources.append((kind, address))
+    return sources
+
+
+def master_backend_sources(backend, tribesnext_url=TRIBESNEXT_MASTER_URL):
+    """Sources equivalent to the older --master-backend choices."""
+    url = tribesnext_url.rstrip("/")
+    return {"local": [("lan", "")], "tribesnext": [("tribesnext", url)],
+            "hybrid": [("tribesnext", url), ("lan", "")]}[backend]
+
+
+def format_master_sources(sources):
+    return ",".join(kind if not address else f"{kind}={address}" for kind, address in sources)
+
+
+def parse_endpoint(text):
+    """Parse "host:port", returning (host, port)."""
+    host, separator, port_text = str(text).strip().rpartition(":")
+    if not separator or not host or not port_text.isdecimal() or not 0 < int(port_text) <= 65535:
+        raise ValueError(f"Expected host:port, got {text!r}")
+    return host, int(port_text)
+
+
+def is_loopback(address):
+    return address == "localhost" or address.startswith("127.")
+
+
+def from_this_machine(conn, peer):
+    """True for a peer on this host: loopback, or this socket's own address.
+
+    When listening on a LAN address, this machine's own game reaches the
+    services through that address rather than loopback."""
+    try:
+        return is_loopback(peer[0]) or peer[0] == conn.getsockname()[0]
+    except OSError:
+        return False
+
+
+def advertised_address(bind_address, advertise_address=""):
+    """IPv4 address the directory gives clients for the other services."""
+    if advertise_address:
+        return socket.gethostbyname(advertise_address)
+    if bind_address in ("", "0.0.0.0"):
+        # The address of the interface that routes outward, without sending.
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            try:
+                probe.connect(("192.0.2.1", 9))
+                return probe.getsockname()[0]
+            except OSError:
+                return HOST
+    return socket.gethostbyname(bind_address)
 
 
 def encode_entity(entity, flags):
@@ -214,7 +296,7 @@ def encode_entity(entity, flags):
         data += wide(entity["name"])
     if flags & 0x04000000:
         # IPAddr::Set at 0x083B42F0 expects sockaddr_in's port then IPv4 bytes.
-        address = struct.pack("!H", entity["port"]) + socket.inet_aton(HOST)
+        address = struct.pack("!H", entity["port"]) + socket.inet_aton(entity.get("address", HOST))
         data += bytes([len(address)]) + address
     if flags & 0x20:
         data += wide(entity["display_name"])
@@ -404,7 +486,12 @@ class DirectoryHandler(socketserver.BaseRequestHandler):
                 payload = recv_frame(conn)
                 if payload is None:
                     break
-                # Launcher health checks identify this service, not just an open port.
+                # Launcher health checks identify this service, not just an open
+                # port. Identity and STOP are answered only for this machine.
+                if payload.startswith(IDENTITY) and not from_this_machine(conn, self.client_address):
+                    emulator.log.event("control_refused", connection=connection,
+                                       peer=list(self.client_address))
+                    break
                 if payload == IDENTITY:
                     conn.sendall(frame(json.dumps(emulator.identity()).encode("ascii")))
                     continue
@@ -2238,9 +2325,14 @@ class AuthHandler(socketserver.BaseRequestHandler):
                     encrypted_key = None
                     encrypted_data = None
                     try:
+                        # TribesNext keys never serve another machine's login: a
+                        # remote client can use only this emulator's own accounts.
+                        this_machine = from_this_machine(self.request, self.client_address)
                         login = decode_login_envelope(
-                            payload, emulator.keys, emulator.private_store, emulator.community,
-                            emulator.refresh_tribesnext_account if emulator.refresh_tribesnext else None)
+                            payload, emulator.keys,
+                            emulator.private_store if this_machine else None, emulator.community,
+                            emulator.refresh_tribesnext_account
+                            if emulator.refresh_tribesnext and this_machine else None)
                         reader = Reader(payload)
                         reader.take(5)
                         reader.take(2)
@@ -2261,8 +2353,8 @@ class AuthHandler(socketserver.BaseRequestHandler):
                             decoded_login = parse_login_payload(login_data, session_key)
                             login_username = decoded_login["username"]
                             auth_provider = login.get("credential_source")
-                            if (auth_provider == "tribesnext" and emulator.private_store and
-                                    emulator.public_store):
+                            if (auth_provider == "tribesnext" and this_machine and
+                                    emulator.private_store and emulator.public_store):
                                 try:
                                     tribesnext_credentials = tribesnext.unlock_account(
                                         emulator.public_store, emulator.private_store,
@@ -2336,9 +2428,13 @@ class MasterDatagramHandler(socketserver.BaseRequestHandler):
 class Emulator:
     def __init__(self, ports=None, log_dir=LOG_DIR, empty=False, keys=None, private_store=None,
                  master_backend="local", tribesnext_master_url=TRIBESNEXT_MASTER_URL,
-                 community_db=None, refresh_tribesnext=False):
+                 community_db=None, refresh_tribesnext=False, master_sources=None,
+                 bind_address=HOST, advertise_address=""):
         self.ports = dict(ports or PORTS)
-        self.records = {path: [] for path in directory_records(self.ports)} if empty else directory_records(self.ports)
+        self.bind_address = bind_address or "0.0.0.0"
+        self.advertise_address = advertised_address(self.bind_address, advertise_address)
+        self.records = ({path: [] for path in directory_records(self.ports)} if empty
+                        else directory_records(self.ports, self.advertise_address))
         self.empty = empty
         self.keys = keys
         self.private_store = Path(private_store) if private_store is not None else None
@@ -2352,10 +2448,22 @@ class Emulator:
         self.auth_session_lock = threading.RLock()
         self.irc_presence = {}
         self.irc_presence_lock = threading.RLock()
-        if master_backend not in {"local", "tribesnext", "hybrid"}:
-            raise ValueError(f"Unknown master-server backend: {master_backend}")
-        self.master_backend = master_backend
-        self.tribesnext_master_url = tribesnext_master_url.rstrip("/")
+        if master_sources is None:
+            if master_backend not in {"local", "tribesnext", "hybrid"}:
+                raise ValueError(f"Unknown master-server backend: {master_backend}")
+            master_sources = master_backend_sources(master_backend, tribesnext_master_url)
+        self.master_sources = list(master_sources)
+        own_hosts = {"localhost", "0.0.0.0", self.bind_address, self.advertise_address}
+        for kind, address in self.master_sources:
+            if kind == "torque":
+                host, port = parse_endpoint(address)
+                if (host in own_hosts or is_loopback(host)) and port == self.ports["master"]:
+                    raise ValueError(f"Master source {address} is this emulator's own master service")
+        # Shown in logs and identity; a canonical "kind=address,..." string.
+        self.master_backend = format_master_sources(self.master_sources)
+        self.tribesnext_master_url = next(
+            (address for kind, address in self.master_sources if kind == "tribesnext"),
+            tribesnext_master_url.rstrip("/"))
         self.master_servers = {}
         self.master_sessions = {}
         self.master_lock = threading.RLock()
@@ -2502,9 +2610,10 @@ class Emulator:
                 "pid": os.getpid(),
                 "stage": AUTH_STAGE if self.keys else "directory + DBProxy + Torque master proxy",
                 "implementation_sha256": IMPLEMENTATION_SHA256,
-                "master_backend": self.master_backend,
+                "master_sources": self.master_backend,
+                "bind_address": self.bind_address,
+                "advertise_address": self.advertise_address,
                 "refresh_tribesnext": self.refresh_tribesnext,
-                "master_url_sha256": hashlib.sha256(self.tribesnext_master_url.encode()).hexdigest(),
                 "verifier_sha256": hashlib.sha256(woncrypto.public_key(self.keys["root"])).hexdigest() if self.keys else None,
                 "auth_key_sha256": hashlib.sha256(woncrypto.public_key(self.keys["auth"])).hexdigest() if self.keys else None,
                 "private_store_path_sha256": hashlib.sha256(str(self.private_store.resolve()).encode()).hexdigest()
@@ -2512,13 +2621,13 @@ class Emulator:
                 "community_db_path_sha256": hashlib.sha256(
                     str(self.community_db_path).encode()).hexdigest()}
 
-    def fetch_tribesnext(self, path):
-        url = self.tribesnext_master_url + path
+    def fetch_tribesnext(self, path, base_url=None):
+        url = (base_url or self.tribesnext_master_url) + path
         request = urllib.request.Request(url, headers={"User-Agent": "Tribes 2"})
         with urllib.request.urlopen(request, timeout=3) as response:
             return response.read(1_000_000).decode("utf-8", errors="replace")
 
-    def tribesnext_servers(self, query):
+    def tribesnext_servers(self, query, base_url=None):
         game_type = query["game_type"] or "Any"
         mission_type = query["mission_type"] or "Any"
         unfiltered = (game_type.casefold() == "any" and mission_type.casefold() == "any" and
@@ -2535,7 +2644,7 @@ class Emulator:
             values = (game_type, mission_type, query["min_players"], query["max_players"],
                       query["max_bots"], flags)
             path = "/list/" + "/".join(urllib.parse.quote(str(value), safe="") for value in values)
-        text = self.fetch_tribesnext(path)
+        text = self.fetch_tribesnext(path, base_url)
         servers = []
         for line in text.splitlines():
             value = line.strip()
@@ -2551,8 +2660,8 @@ class Emulator:
                 servers.append((address, port))
         return servers
 
-    def tribesnext_types(self):
-        text = self.fetch_tribesnext("/listtypes")
+    def tribesnext_types(self, base_url=None):
+        text = self.fetch_tribesnext("/listtypes", base_url)
         game_types = set()
         mission_types = set()
         for line in text.splitlines():
@@ -2565,18 +2674,69 @@ class Emulator:
                 mission_types.add(fields[1])
         return sorted(game_types), sorted(mission_types)
 
-    def publish_tribesnext_heartbeat(self, peer):
-        if self.master_backend not in {"tribesnext", "hybrid"}:
-            return
+    def publish_tribesnext_heartbeat(self, peer, base_url=None):
         ip, port = peer
         path = f"/add/{port}/{urllib.parse.quote(ip, safe='')}"
         try:
-            text = self.fetch_tribesnext(path)
+            text = self.fetch_tribesnext(path, base_url)
         except (OSError, ValueError) as exc:
             self.log.event("master_upstream_error", operation="heartbeat", error=str(exc))
             return
         result = next((line.strip() for line in text.splitlines() if line.strip()), "")
         self.log.event("master_upstream_heartbeat", result=result[:32])
+
+    def torque_master_exchange(self, address, request, reply_type):
+        """Send one Torque master request; return the replies of reply_type."""
+        host, port = parse_endpoint(address)
+        replies = {}
+        deadline = time.monotonic() + 2.0
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as conn:
+            conn.connect((socket.gethostbyname(host), port))
+            conn.send(request)
+            session_key = request[2:6]
+            while time.monotonic() < deadline:
+                conn.settimeout(max(0.05, deadline - time.monotonic()))
+                try:
+                    data = conn.recv(TORQUE_MASTER_PACKET_MAX)
+                except TimeoutError:
+                    break
+                if len(data) < 6 or data[0] != reply_type or data[2:6] != session_key:
+                    continue
+                if reply_type != 8:
+                    return [data]
+                index, count = data[6], data[7]
+                replies[index] = data
+                if count and len(replies) >= count:
+                    break
+        return [replies[index] for index in sorted(replies)]
+
+    def torque_master_servers(self, query, address):
+        session, key = secrets.randbelow(0xffff), secrets.randbelow(0xffff)
+        request = (struct.pack("<BBHHB", 6, 0, session, key, 0xff) +
+                   torque_string(query["game_type"] or "any") +
+                   torque_string(query["mission_type"] or "any") +
+                   struct.pack("<BBIIBBH", query["min_players"], query["max_players"], query["regions"],
+                               query["version"], query["info_flags"], query["max_bots"],
+                               min(query["min_cpu"], 0xffff)) +
+                   struct.pack("<B", min(len(query["buddies"]), 255)) +
+                   b"".join(struct.pack("<I", buddy) for buddy in query["buddies"][:255]))
+        servers = []
+        for reply in self.torque_master_exchange(address, request, 8):
+            count = struct.unpack_from("<H", reply, 8)[0]
+            for offset in range(10, min(len(reply), 10 + count * 6), 6):
+                servers.append((reply[offset:offset + 4], struct.unpack_from("<H", reply, offset + 4)[0]))
+        return servers
+
+    def torque_master_types(self, address):
+        session, key = secrets.randbelow(0xffff), secrets.randbelow(0xffff)
+        replies = self.torque_master_exchange(address, struct.pack("<BBHH", 2, 0, session, key), 4)
+        if not replies:
+            return [], []
+        reader = Reader(replies[0])
+        reader.take(6)
+        game_types = [read_torque_string(reader) for _ in range(reader.number("<B"))]
+        mission_types = [read_torque_string(reader) for _ in range(reader.number("<B"))]
+        return game_types, mission_types
 
     def local_master_servers(self, query):
         now = time.monotonic()
@@ -2614,33 +2774,39 @@ class Emulator:
 
     def master_list(self, query):
         results = []
-        if self.master_backend in {"tribesnext", "hybrid"}:
+        for kind, address in self.master_sources:
             try:
-                results.extend(self.tribesnext_servers(query))
-            except (OSError, ValueError) as exc:
-                self.log.event("master_upstream_error", operation="server_list", error=str(exc))
-        if self.master_backend in {"local", "hybrid"}:
-            results.extend(self.local_master_servers(query))
+                if kind == "lan":
+                    results.extend(self.local_master_servers(query))
+                elif kind == "tribesnext":
+                    results.extend(self.tribesnext_servers(query, address))
+                elif kind == "torque":
+                    results.extend(self.torque_master_servers(query, address))
+            except (OSError, ValueError, struct.error) as exc:
+                self.log.event("master_upstream_error", operation="server_list", source=kind,
+                               error=str(exc))
         return list(dict.fromkeys(results))
 
     def master_game_types(self):
         types = (set(), set())
-        if self.master_backend in {"tribesnext", "hybrid"}:
+        for kind, address in self.master_sources:
             try:
-                upstream = self.tribesnext_types()
-                types[0].update(upstream[0])
-                types[1].update(upstream[1])
-            except (OSError, ValueError) as exc:
-                self.log.event("master_upstream_error", operation="game_types", error=str(exc))
-        if self.master_backend in {"local", "hybrid"}:
-            with self.master_lock:
-                local_records = [info for info in self.master_servers.values()
-                                 if time.monotonic() - info["last_heartbeat"] <= 180]
-            for record in local_records:
-                if record["game_type"]:
-                    types[0].add(record["game_type"])
-                if record["mission_type"]:
-                    types[1].add(record["mission_type"])
+                if kind == "lan":
+                    with self.master_lock:
+                        local_records = [info for info in self.master_servers.values()
+                                         if time.monotonic() - info["last_heartbeat"] <= 180]
+                    upstream = ([record["game_type"] for record in local_records],
+                                [record["mission_type"] for record in local_records])
+                elif kind == "tribesnext":
+                    upstream = self.tribesnext_types(address)
+                else:
+                    upstream = self.torque_master_types(address)
+            except (OSError, ValueError, struct.error) as exc:
+                self.log.event("master_upstream_error", operation="game_types", source=kind,
+                               error=str(exc))
+                continue
+            types[0].update(value for value in upstream[0] if value)
+            types[1].update(value for value in upstream[1] if value)
         return tuple(sorted(items) for items in types)
 
     def handle_master_datagram(self, data, peer, udp_socket):
@@ -2689,7 +2855,9 @@ class Emulator:
                 with self.master_lock:
                     self.master_servers[peer] = info
                     self.master_sessions.pop(peer, None)
-                self.publish_tribesnext_heartbeat(peer)
+                for kind, address in self.master_sources:
+                    if kind == "tribesnext":
+                        self.publish_tribesnext_heartbeat(peer, address)
                 self.log.event("master_game_info", peer=list(peer), game_type=game_type,
                                mission_type=mission_type, players=info["player_count"])
             elif packet_type == 6:  # Server-list request
@@ -2743,24 +2911,40 @@ class Emulator:
 
     def start(self):
         try:
-            for service, port in self.ports.items():
-                handler = DirectoryHandler if service == "directory" else CaptureHandler
-                if service == "auth" and self.keys:
-                    handler = AuthHandler
-                elif service == "dbproxy":
-                    handler = DBProxyHandler
-                elif service == "irc" and self.keys:
-                    handler = IRCHandler
-                server = TCPServer((HOST, port), handler)
-                server.emulator = self
-                server.service = service
-                self.servers.append(server)
-                self.ports[service] = server.server_address[1]
-            udp = UDPServer((HOST, self.ports["master"]), MasterDatagramHandler)
+            # The master service shares one port number over UDP (the Torque
+            # protocol) and TCP. Bind UDP first so an ephemeral port is taken
+            # from the UDP side, and retry if that number is busy over TCP.
+            for attempt in range(5):
+                udp = UDPServer((self.bind_address, self.ports["master"]), MasterDatagramHandler)
+                try:
+                    master_tcp = TCPServer((self.bind_address, udp.server_address[1]), CaptureHandler)
+                    break
+                except OSError:
+                    udp.server_close()
+                    if self.ports["master"] or attempt == 4:
+                        raise
+            self.ports["master"] = udp.server_address[1]
             udp.emulator = self
-            self.servers.append(udp)
+            master_tcp.emulator = self
+            master_tcp.service = "master"
+            # Registered now so close() releases them if a later bind fails.
+            self.servers += [master_tcp, udp]
+            for service, port in self.ports.items():
+                if service != "master":
+                    handler = DirectoryHandler if service == "directory" else CaptureHandler
+                    if service == "auth" and self.keys:
+                        handler = AuthHandler
+                    elif service == "dbproxy":
+                        handler = DBProxyHandler
+                    elif service == "irc" and self.keys:
+                        handler = IRCHandler
+                    server = TCPServer((self.bind_address, port), handler)
+                    server.emulator = self
+                    server.service = service
+                    self.servers.append(server)
+                    self.ports[service] = server.server_address[1]
             if not self.empty:
-                self.records = directory_records(self.ports)
+                self.records = directory_records(self.ports, self.advertise_address)
             for server in self.servers:
                 thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
                 thread.start()
@@ -2769,7 +2953,11 @@ class Emulator:
             self.close()
             raise
         self.log.event("ready", **self.identity())
-        print(f"[wonemu] Ready on {HOST}:{self.ports['directory']}; traffic log: {self.log.path}", flush=True)
+        print(f"[wonemu] Ready on {self.bind_address}:{self.ports['directory']} (advertising "
+              f"{self.advertise_address}); traffic log: {self.log.path}", flush=True)
+        if not is_loopback(self.bind_address):
+            print(f"[wonemu] WARNING: listening on {self.bind_address}; other machines on this "
+                  "network can reach the login, community, and master services", flush=True)
 
     def close(self):
         for server, thread in zip(self.servers, self.threads):
@@ -2784,9 +2972,14 @@ class Emulator:
         self.log.close()
 
 
-def health(port=DIRECTORY_PORT):
+def control_host(bind_address):
+    """Address the launcher uses to reach a local service bound to bind_address."""
+    return HOST if bind_address in ("", "0.0.0.0") or is_loopback(bind_address) else bind_address
+
+
+def health(port=DIRECTORY_PORT, bind_address=HOST):
     try:
-        with socket.create_connection((HOST, port), timeout=0.5) as conn:
+        with socket.create_connection((control_host(bind_address), port), timeout=0.5) as conn:
             conn.sendall(frame(IDENTITY))
             payload = recv_frame(conn)
             reply = json.loads(payload)
@@ -2796,82 +2989,73 @@ def health(port=DIRECTORY_PORT):
 
 
 def ensure(args):
-    if args.ports != PORTS or args.empty_directory:
-        raise ValueError("--ensure uses the default local endpoints and populated directory")
+    if args.empty_directory:
+        raise ValueError("--ensure serves a populated directory")
     keys = woncrypto.provision(args.log_dir, args.client_binary, args.auth_key_profile)
     private_store = args.private_store or args.client_binary.expanduser().resolve().parent / "base/private.store"
     community_db = args.community_db or (args.log_dir / "community.sqlite3")
-    fingerprint = hashlib.sha256(woncrypto.public_key(keys["root"])).hexdigest()
-    auth_fingerprint = hashlib.sha256(woncrypto.public_key(keys["auth"])).hexdigest()
-    private_store_fingerprint = hashlib.sha256(str(private_store.resolve()).encode()).hexdigest()
-    community_db_fingerprint = hashlib.sha256(str(community_db.expanduser().resolve()).encode()).hexdigest()
-    master_url_fingerprint = hashlib.sha256(args.tribesnext_master_url.rstrip("/").encode()).hexdigest()
-    implementation_fingerprint = IMPLEMENTATION_SHA256
-    ready = health()
+    expected = {
+        "ports": args.ports, "empty_directory": False, "stage": AUTH_STAGE,
+        "verifier_sha256": hashlib.sha256(woncrypto.public_key(keys["root"])).hexdigest(),
+        "auth_key_sha256": hashlib.sha256(woncrypto.public_key(keys["auth"])).hexdigest(),
+        "implementation_sha256": IMPLEMENTATION_SHA256,
+        "refresh_tribesnext": args.refresh_tribesnext,
+        "private_store_path_sha256": hashlib.sha256(str(private_store.resolve()).encode()).hexdigest(),
+        "community_db_path_sha256": hashlib.sha256(
+            str(community_db.expanduser().resolve()).encode()).hexdigest(),
+        "master_sources": format_master_sources(args.master_sources),
+        "bind_address": args.bind_address,
+        "advertise_address": advertised_address(args.bind_address, args.advertise_address),
+    }
+
+    def matches(ready):
+        return bool(ready) and all(ready.get(key) == value for key, value in expected.items())
+
+    directory_port = args.ports["directory"]
+    ready = health(directory_port, args.bind_address)
     if ready:
-        if (ready["ports"] == PORTS and not ready["empty_directory"] and
-                ready.get("verifier_sha256") == fingerprint and
-                ready.get("auth_key_sha256") == auth_fingerprint and ready.get("stage") == AUTH_STAGE and
-                ready.get("implementation_sha256") == implementation_fingerprint and
-                ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
-                ready.get("private_store_path_sha256") == private_store_fingerprint and
-                ready.get("community_db_path_sha256") == community_db_fingerprint and
-                ready.get("master_backend") == args.master_backend and
-                ready.get("master_url_sha256") == master_url_fingerprint):
+        if matches(ready):
             print(f"[wonemu] Reusing PID {ready['pid']}; logs: {args.log_dir}", flush=True)
             return
         # Only stop a service that answered our private identity probe on the
-        # loopback endpoint; this handles auth-key profile upgrades safely.
-        with socket.create_connection((HOST, DIRECTORY_PORT), timeout=1) as conn:
+        # loopback endpoint; this handles configuration changes safely.
+        with socket.create_connection((control_host(args.bind_address), directory_port), timeout=1) as conn:
             conn.sendall(frame(IDENTITY + b" STOP"))
             if recv_frame(conn) != IDENTITY + b" STOPPING":
                 raise ValueError("Running wonemu has different settings; stop it before switching configuration")
         for _ in range(50):
-            if health() is None:
+            if health(directory_port, args.bind_address) is None:
                 break
             time.sleep(0.1)
-        if health() is not None:
+        if health(directory_port, args.bind_address) is not None:
             raise ValueError("Existing wonemu did not stop; stop it before switching configuration")
     args.log_dir.mkdir(parents=True, exist_ok=True)
     args.log_dir.chmod(0o700)
     fd = os.open(args.log_dir / "wonemu.log", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as log:
         child_args = [sys.executable, str(Path(__file__).resolve()), "--log-dir", str(args.log_dir),
-                                    "--client-binary", str(args.client_binary),
-                                    "--auth-key-profile", args.auth_key_profile,
-                                    "--private-store", str(private_store),
-                                    "--community-db", str(community_db),
-                                    "--master-backend", args.master_backend,
-                                    "--tribesnext-master-url", args.tribesnext_master_url]
+                      "--client-binary", str(args.client_binary),
+                      "--auth-key-profile", args.auth_key_profile,
+                      "--private-store", str(private_store),
+                      "--community-db", str(community_db),
+                      "--master-sources", format_master_sources(args.master_sources),
+                      "--bind-address", args.bind_address]
+        if args.advertise_address:
+            child_args += ["--advertise-address", args.advertise_address]
+        for service, port in args.ports.items():
+            child_args += [f"--{service}-port", str(port)]
         if args.refresh_tribesnext:
             child_args.append("--refresh-tribesnext")
         process = subprocess.Popen(child_args,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     for _ in range(50):
-        ready = health()
-        if (ready and ready["ports"] == PORTS and not ready["empty_directory"] and
-                ready.get("verifier_sha256") == fingerprint and ready.get("auth_key_sha256") == auth_fingerprint and
-                ready.get("stage") == AUTH_STAGE and
-                ready.get("implementation_sha256") == implementation_fingerprint and
-                ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
-                ready.get("private_store_path_sha256") == private_store_fingerprint and
-                ready.get("community_db_path_sha256") == community_db_fingerprint and
-                ready.get("master_backend") == args.master_backend and
-                ready.get("master_url_sha256") == master_url_fingerprint):
+        ready = health(directory_port, args.bind_address)
+        if matches(ready):
             print(f"[wonemu] Ready (PID {ready['pid']}); logs: {args.log_dir}", flush=True)
             return
         if process.poll() is not None:
             # Another launcher may have completed the same startup concurrently.
-            ready = health()
-            if (ready and ready["ports"] == PORTS and not ready["empty_directory"] and
-                    ready.get("verifier_sha256") == fingerprint and ready.get("auth_key_sha256") == auth_fingerprint and
-                    ready.get("stage") == AUTH_STAGE and
-                    ready.get("implementation_sha256") == implementation_fingerprint and
-                    ready.get("refresh_tribesnext", False) == args.refresh_tribesnext and
-                    ready.get("private_store_path_sha256") == private_store_fingerprint and
-                    ready.get("community_db_path_sha256") == community_db_fingerprint and
-                    ready.get("master_backend") == args.master_backend and
-                    ready.get("master_url_sha256") == master_url_fingerprint):
+            if matches(health(directory_port, args.bind_address)):
                 return
             raise ValueError(f"wonemu failed to bind/start; see {args.log_dir / 'wonemu.log'}")
         time.sleep(0.1)
@@ -2897,9 +3081,20 @@ def main():
                         help="legacy password-verification fallback (defaults to base/private.store beside the game binary)")
     parser.add_argument("--community-db", type=Path,
                         help="SQLite community profile database (defaults to community.sqlite3 under --log-dir)")
+    parser.add_argument("--master-sources", default=os.environ.get("T2LAUNCH_MASTER_SOURCES", ""),
+                        help="ordered master-server sources, e.g. 'tribesnext=URL,lan,torque=HOST:PORT' "
+                             "(kinds: " + ", ".join(MASTER_SOURCE_KINDS) + ")")
     parser.add_argument("--master-backend", choices=("local", "tribesnext", "hybrid"),
                         default=os.environ.get("T2LAUNCH_MASTER_BACKEND", "hybrid"),
-                        help="master-server discovery sources; hybrid merges TribesNext and local LAN servers")
+                        help="older shorthand used when --master-sources is empty; hybrid merges "
+                             "TribesNext and LAN servers")
+    parser.add_argument("--bind-address", default=os.environ.get("T2LAUNCH_WON_BIND", HOST),
+                        help="address the services listen on (0.0.0.0 for every interface)")
+    parser.add_argument("--advertise-address", default=os.environ.get("T2LAUNCH_WON_ADVERTISE", ""),
+                        help="address the directory gives clients (default: the bind address, or this "
+                             "machine's outward address when binding 0.0.0.0)")
+    parser.add_argument("--base-port", type=int, default=int(os.environ.get("T2LAUNCH_WON_BASE_PORT") or 0),
+                        help="directory port; the auth, DBProxy, IRC, and master ports follow it")
     parser.add_argument("--tribesnext-master-url",
                         default=os.environ.get("T2LAUNCH_TRIBESNEXT_MASTER_URL", TRIBESNEXT_MASTER_URL),
                         help="HTTP base URL for the TribesNext master service")
@@ -2911,6 +3106,18 @@ def main():
         parser.add_argument(f"--{service}-port", type=int, default=port)
     args = parser.parse_args()
     args.ports = {service: getattr(args, f"{service}_port") for service in PORTS}
+    if args.base_port:
+        if not 1 <= args.base_port <= 65535 - len(PORTS) + 1:
+            parser.error("--base-port must leave room for five consecutive ports")
+        for offset, service in enumerate(PORTS):
+            if args.ports[service] == PORTS[service]:
+                args.ports[service] = args.base_port + offset
+    try:
+        args.master_sources = (parse_master_sources(args.master_sources, args.tribesnext_master_url)
+                               if args.master_sources.strip() else
+                               master_backend_sources(args.master_backend, args.tribesnext_master_url))
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         if args.reserve_local_account:
             community_db = args.community_db or (args.log_dir / "community.sqlite3")
@@ -2926,9 +3133,10 @@ def main():
             ensure(args)
             return 0
         if args.stop:
-            if not health(args.ports["directory"]):
+            if not health(args.ports["directory"], args.bind_address):
                 raise ValueError("No identified wonemu service is listening")
-            with socket.create_connection((HOST, args.ports["directory"]), timeout=1) as conn:
+            with socket.create_connection((control_host(args.bind_address), args.ports["directory"]),
+                                          timeout=1) as conn:
                 conn.sendall(frame(IDENTITY + b" STOP"))
                 if recv_frame(conn) != IDENTITY + b" STOPPING":
                     raise ValueError("Unexpected stop response")
@@ -2938,7 +3146,8 @@ def main():
         private_store = args.private_store or args.client_binary.expanduser().resolve().parent / "base/private.store"
         emulator = Emulator(args.ports, args.log_dir, args.empty_directory, keys, private_store,
                             args.master_backend, args.tribesnext_master_url, args.community_db,
-                            args.refresh_tribesnext)
+                            args.refresh_tribesnext, master_sources=args.master_sources,
+                            bind_address=args.bind_address, advertise_address=args.advertise_address)
         def stop(_signum, _frame):
             emulator.stopped.set()
         signal.signal(signal.SIGTERM, stop)

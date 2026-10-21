@@ -1299,6 +1299,9 @@ class ProtocolTests(unittest.TestCase):
             private_store = Path(directory) / "private.store"
             private_store.write_text(f"WONEMUXPROBE\t{nonce}:{store_value}\n", encoding="ascii")
             result = wonemu.decode_login_envelope(payload, {"auth": key}, private_store)
+            # A remote peer's login is decoded without the private store, so the
+            # installed TribesNext key cannot authenticate it.
+            remote_result = wonemu.decode_login_envelope(payload, {"auth": key}, None)
             account_store = community_store.CommunityStore(Path(directory) / "community.sqlite3")
             account_store.reserve_local_account(
                 "WONEMUXPROBE", woncrypto.local_auth_user_id("WONEMUXPROBE"))
@@ -1323,6 +1326,9 @@ class ProtocolTests(unittest.TestCase):
         fields = wonemu.parse_login_payload(login_data, session_key)
         self.assertEqual(woncrypto.encrypt_won_crypt_transform(session_key, login_data), encrypted_data)
         self.assertEqual(result["login_data_decryption"], "decoded")
+        self.assertEqual(result["credential_source"], "tribesnext")
+        self.assertNotEqual(remote_result["account_validation"], "valid")
+        self.assertNotEqual(remote_result["credential_source"], "tribesnext")
         self.assertEqual(result["symmetric_key_bytes"], 8)
         self.assertEqual(result["login_plaintext_bytes"], 120)
         self.assertEqual(result["login_plaintext_sha256"],
@@ -2070,7 +2076,7 @@ class NetworkTests(unittest.TestCase):
         try:
             with patch.object(emulator, "fetch_tribesnext", return_value="192.0.2.4:28002\n") as fetch:
                 servers = emulator.tribesnext_servers(query)
-            fetch.assert_called_once_with("/list/Classic%20CTF/Map%20One/2/20/4/3%2017%2023")
+            fetch.assert_called_once_with("/list/Classic%20CTF/Map%20One/2/20/4/3%2017%2023", None)
             self.assertEqual(servers, [(socket.inet_aton("192.0.2.4"), 28002)])
 
             default_query = {"game_type": "Any", "mission_type": "Any", "min_players": 0,
@@ -2078,7 +2084,7 @@ class NetworkTests(unittest.TestCase):
                              "version": 0, "min_cpu": 0, "info_flags": 0, "buddies": []}
             with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
                 emulator.tribesnext_servers(default_query)
-            fetch.assert_called_once_with("/list")
+            fetch.assert_called_once_with("/list", None)
 
             with patch.object(emulator, "fetch_tribesnext",
                               return_value="66.42.121.64:28001\n"):
@@ -2090,10 +2096,76 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(emulator.tribesnext_types(), (["CLASSIC", "TRIBES2"], ["CTF"]))
             with patch.object(emulator, "fetch_tribesnext", return_value="2\n") as heartbeat:
                 emulator.publish_tribesnext_heartbeat(("203.0.113.7", 28002))
-            heartbeat.assert_called_once_with("/add/28002/203.0.113.7")
+            heartbeat.assert_called_once_with("/add/28002/203.0.113.7", None)
         finally:
             emulator.log.close()
             temp.cleanup()
+
+    def test_master_sources_parse_in_order_and_reject_bad_entries(self):
+        self.assertEqual(wonemu.parse_master_sources("tribesnext, lan,torque=192.0.2.9:28000,lan"), [
+            ("tribesnext", wonemu.TRIBESNEXT_MASTER_URL), ("lan", ""), ("torque", "192.0.2.9:28000")])
+        self.assertEqual(wonemu.parse_master_sources("tribesnext=https://example.invalid/m/"),
+                         [("tribesnext", "https://example.invalid/m")])
+        self.assertEqual(wonemu.master_backend_sources("hybrid"),
+                         [("tribesnext", wonemu.TRIBESNEXT_MASTER_URL), ("lan", "")])
+        for spec in ("gopher=x", "torque=nohost", "torque=host:99999", "tribesnext=ftp://x"):
+            with self.assertRaises(ValueError, msg=spec):
+                wonemu.parse_master_sources(spec)
+        self.assertEqual(wonemu.format_master_sources([("tribesnext", "http://a"), ("lan", "")]),
+                         "tribesnext=http://a,lan")
+
+    def test_directory_advertises_the_configured_address(self):
+        records = wonemu.directory_records(wonemu.PORTS, "192.0.2.50")
+        entity = records["/Tribes2"][1]
+        encoded = wonemu.encode_entity(entity, 0x04000000)
+        self.assertEqual(encoded, bytes([6]) + struct.pack("!H", wonemu.PORTS["master"]) +
+                         socket.inet_aton("192.0.2.50"))
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory),
+                                       advertise_address="192.0.2.51")
+            self.assertEqual(emulator.records["/TitanServers/Auth"][0]["address"], "192.0.2.51")
+            emulator.log.close()
+
+    def test_this_machine_means_loopback_or_the_sockets_own_address(self):
+        class FakeConnection:
+            def __init__(self, local):
+                self.local = local
+
+            def getsockname(self):
+                return (self.local, 15105)
+
+        lan = FakeConnection("192.0.2.10")
+        self.assertTrue(wonemu.from_this_machine(lan, ("127.0.0.1", 40000)))
+        self.assertTrue(wonemu.from_this_machine(lan, ("192.0.2.10", 40000)))
+        self.assertFalse(wonemu.from_this_machine(lan, ("192.0.2.11", 40000)))
+
+    def test_torque_source_pointing_at_itself_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaisesRegex(ValueError, "own master"):
+            wonemu.Emulator(dict(wonemu.PORTS), Path(directory),
+                            master_sources=[("torque", f"127.0.0.1:{wonemu.PORTS['master']}")])
+
+    def test_torque_source_reads_another_masters_list_and_types(self):
+        with tempfile.TemporaryDirectory() as first_dir, tempfile.TemporaryDirectory() as second_dir:
+            upstream = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(first_dir),
+                                       master_sources=[("lan", "")])
+            upstream.start()
+            try:
+                upstream.master_servers[("192.0.2.30", 28000)] = {
+                    "endpoint": (socket.inet_aton("192.0.2.30"), 28000), "game_type": "Classic",
+                    "mission_type": "CTF", "max_players": 32, "regions": 0, "version": 0,
+                    "info_flags": 0, "num_bots": 0, "cpu_speed": 0, "player_count": 3,
+                    "players": [], "last_heartbeat": time.monotonic()}
+                address = f"{wonemu.HOST}:{upstream.ports['master']}"
+                downstream = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(second_dir),
+                                             master_sources=[("torque", address), ("lan", "")])
+                query = {"game_type": "", "mission_type": "", "min_players": 0, "max_players": 0,
+                         "max_bots": 0, "regions": 0, "version": 0, "info_flags": 0, "min_cpu": 0,
+                         "buddies": []}
+                self.assertEqual(downstream.master_list(query), [(socket.inet_aton("192.0.2.30"), 28000)])
+                self.assertEqual(downstream.master_game_types(), (["Classic"], ["CTF"]))
+                downstream.log.close()
+            finally:
+                upstream.close()
 
     def test_torque_master_empty_types_info_and_paginated_lists(self):
         from unittest.mock import patch
@@ -2102,7 +2174,7 @@ class NetworkTests(unittest.TestCase):
         emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(temp.name),
                                    master_backend="tribesnext")
         servers = "".join(f"192.0.2.{(index % 250) + 1}:{28000 + index}\n" for index in range(250))
-        def upstream(path):
+        def upstream(path, base_url=None):
             if path == "/listtypes":
                 return "0 CTF\n1 Arena\n"
             if path == "/list":

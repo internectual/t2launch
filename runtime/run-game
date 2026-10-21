@@ -223,9 +223,19 @@ fi
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
 SOFTWARE_GL="${T2LAUNCH_SOFTWARE_GL:-$SOFTWARE_GL}"
 T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
-WONEMU="${T2LAUNCH_WONEMU:-0}"
+# WON emulation: off (the game's own login), local (start wonemu here), or
+# remote (use a wonemu elsewhere). T2LAUNCH_WONEMU=1 is the older spelling of local.
+WON_MODE="${T2LAUNCH_WON_MODE:-}"
+if [[ -z "$WON_MODE" ]]; then
+    if [[ "${T2LAUNCH_WONEMU:-0}" == "1" ]]; then WON_MODE=local; else WON_MODE=off; fi
+fi
+case "$WON_MODE" in
+    off) WONEMU=0 ;;
+    local|remote) WONEMU=1 ;;
+    *) echo "ERROR: T2LAUNCH_WON_MODE must be off, local, or remote (got '$WON_MODE')." >&2; exit 2 ;;
+esac
 if [[ "$WONEMU" == "1" && "$LOAD_HOOK" != "1" ]]; then
-    echo "ERROR: local WON emulation requires the hook to be enabled." >&2
+    echo "ERROR: WON emulation requires the hook to be enabled." >&2
     exit 2
 fi
 
@@ -339,10 +349,36 @@ mkdir -p "${HOME}/.loki"   # game writes prefs/saves here; ensure it's user-owne
 if [[ -n "${T2LAUNCH_PULSE_SINK:-}" ]]; then
     GAME_ENV+=("PULSE_SINK=$T2LAUNCH_PULSE_SINK")
 fi
-if [[ "$WONEMU" == "1" ]]; then
+WON_ENDPOINTS="${T2LAUNCH_WON_ENDPOINTS:-}"
+if [[ "$WON_MODE" == "local" ]]; then
+    # wonemu reads T2LAUNCH_WON_BIND, _BASE_PORT, _ADVERTISE, and
+    # T2LAUNCH_MASTER_SOURCES from the environment.
     python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/tribes2.dynamic"
     WONEMU_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/wonemu"
     GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
+    if [[ -z "$WON_ENDPOINTS" ]]; then
+        won_bind="${T2LAUNCH_WON_BIND:-127.0.0.1}"
+        if [[ "$won_bind" == "0.0.0.0" || "$won_bind" == 127.* || "$won_bind" == localhost ]]; then
+            won_bind=127.0.0.1
+        fi
+        WON_ENDPOINTS="$won_bind:${T2LAUNCH_WON_BASE_PORT:-15104}"
+    fi
+elif [[ "$WON_MODE" == "remote" ]]; then
+    if [[ -z "$WON_ENDPOINTS" ]]; then
+        echo "ERROR: remote WON emulation needs T2LAUNCH_WON_ENDPOINTS (host:port of the remote wonemu)." >&2
+        exit 2
+    fi
+    WON_VERIFIER="${T2LAUNCH_WON_VERIFIER:-}"
+    if [[ -z "$WON_VERIFIER" || ! -r "$WON_VERIFIER" ]]; then
+        echo "ERROR: remote WON emulation needs the remote wonemu's verifier.der (T2LAUNCH_WON_VERIFIER)." >&2
+        echo "       Copy it from ~/.local/state/t2launch/wonemu/verifier.der on the machine running wonemu." >&2
+        exit 2
+    fi
+    GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WON_VERIFIER")
+fi
+if [[ -n "$WON_ENDPOINTS" ]]; then
+    GAME_ENV+=("T2LAUNCH_WON_ENDPOINTS=$WON_ENDPOINTS")
+    echo "[t2launch] WON emulation: $WON_MODE (game connects to $WON_ENDPOINTS)"
 fi
 
 # shellcheck source=runtime/common.sh

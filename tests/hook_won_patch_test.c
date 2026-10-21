@@ -6,7 +6,8 @@
 int main(void) {
     /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
        account check and warning must run unmodified. */
-    const char *scripts[] = {tribesnext_runtime_script, player_pane_button_click_override};
+    const char *scripts[] = {core_runtime_script, tribesnext_runtime_script,
+                             player_pane_button_click_override};
     for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); ++i) {
         assert(strstr(scripts[i], "function checkNamesAndAliases") == NULL);
         assert(strstr(scripts[i], "function LaunchGui::onWake") == NULL);
@@ -15,8 +16,31 @@ int main(void) {
     }
 
     /* Hook evaluations must be statements; a bare expression is a syntax error. */
-    assert(strstr(tribesnext_runtime_script, "function t2launch_audioState()") != NULL);
-    assert(strstr(tribesnext_runtime_script, "function t2launch_launchGuiReady()") != NULL);
+    assert(strstr(core_runtime_script, "function t2launch_audioState()") != NULL);
+    assert(strstr(core_runtime_script, "function t2launch_launchGuiReady()") != NULL);
+    /* The hook evaluates these helpers even when the TribesNext script is off. */
+    assert(strstr(tribesnext_runtime_script, "function t2launch_audioState()") == NULL);
+    assert(strstr(tribesnext_runtime_script, "function t2launch_launchGuiReady()") == NULL);
+
+    /* Options: the config file wins, then a legacy environment variable, then
+       the default; unknown keys are kept for hook_option(). */
+    char config_path[] = "/tmp/t2_hook_options_XXXXXX";
+    int config_fd = mkstemp(config_path);
+    assert(config_fd >= 0);
+    const char config[] = "# comment\n video.full_redraw = 0 \nfuture.datablock=1.5\nnot a pair\n";
+    assert(write(config_fd, config, sizeof(config) - 1) == (ssize_t)(sizeof(config) - 1));
+    close(config_fd);
+    setenv("T2LAUNCH_HOOK_CONFIG", config_path, 1);
+    setenv("T2LAUNCH_FULL_REDRAW", "1", 1);
+    setenv("T2LAUNCH_DISABLE_HOOK_COMMANDS", "1", 1);
+    assert(!hook_option_bool("video.full_redraw"));
+    assert(!hook_option_bool("hook.console_commands"));
+    assert(hook_option_bool("hook.tribesnext"));
+    assert(strcmp(hook_option_str("future.datablock"), "1.5") == 0);
+    assert(hook_option_str("missing.key") == NULL);
+    const char *option_args[] = {"hook_option", "future.datablock"};
+    assert(strcmp(hook_option_cb(NULL, 2, option_args), "1.5") == 0);
+    unlink(config_path);
 
     sdl_rect_t mode_16_9 = {0, 0, 1920, 1080};
     sdl_rect_t mode_16_10 = {0, 0, 1920, 1200};
@@ -63,6 +87,21 @@ int main(void) {
                   "/games/t2/base/public.store") == 0);
     char tiny[8];
     assert(game_path(tiny, sizeof(tiny), "rsa_helper")[0] == 0);
+
+    char slots[3][WON_ENDPOINT_SIZE];
+    assert(parse_won_endpoints(NULL, NULL, slots) && strcmp(slots[2], "127.0.0.1:15104") == 0);
+    assert(parse_won_endpoints("", "16000", slots) && strcmp(slots[0], "127.0.0.1:16000") == 0);
+    assert(parse_won_endpoints("won.example.net:15104", NULL, slots));
+    assert(strcmp(slots[0], "won.example.net:15104") == 0 && strcmp(slots[2], slots[0]) == 0);
+    assert(parse_won_endpoints("10.0.0.2:15104,10.0.0.3:15200", NULL, slots));
+    assert(strcmp(slots[1], "10.0.0.3:15200") == 0 && strcmp(slots[2], "10.0.0.3:15200") == 0);
+    assert(!parse_won_endpoints("a-very-long-hostname.example:15104", NULL, slots));  /* 34 bytes */
+    assert(!parse_won_endpoints("10.0.0.2", NULL, slots));
+    assert(!parse_won_endpoints("10.0.0.2:0", NULL, slots));
+    assert(!parse_won_endpoints("bad host:1", NULL, slots));
+    assert(!parse_won_endpoints("a:1,b:2,c:3,d:4", NULL, slots));
+    assert(!parse_won_endpoints("a:1,,b:2", NULL, slots));
+    assert(!parse_won_endpoints("", "70000", slots));
 
     puts("Hook mode enumeration and WON patch: host modes preserved, replacement and permissions passed");
     return 0;

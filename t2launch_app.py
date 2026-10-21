@@ -11,18 +11,20 @@ import time
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer  # noqa: I001 (grid-wrapped names)
+    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Signal  # noqa: I001 (grid-wrapped names)
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+        QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
         QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
         QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
-        QStyle, QSystemTrayIcon, QTextEdit, QVBoxLayout, QWidget,
+        QStyle, QSystemTrayIcon, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install it with: python3 -m pip install -r requirements.txt") from exc
 
 from shiboken6 import isValid as is_qobject_valid
+
+import t2options
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / "runtime"
@@ -163,19 +165,107 @@ def is_safe_launch_diagnostic(line):
                  "syntax error", "unable to find function")))
 
 
+class EndpointsEdit(QWidget):
+    """Up to three host:port entries for the hook's WON bootstrap slots."""
+    changed = Signal()
+
+    def __init__(self, value, placeholder=""):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.fields = []
+        values = list(value or ())
+        for index in range(3):
+            field = QLineEdit(values[index] if index < len(values) else "")
+            field.setMaxLength(t2options.WON_ENDPOINT_MAX)
+            field.setPlaceholderText(placeholder if index == 0 else "optional fallback host:port")
+            field.textChanged.connect(self.changed)
+            layout.addWidget(field)
+            self.fields.append(field)
+
+    def value(self):
+        return tuple(field.text().strip() for field in self.fields if field.text().strip())
+
+
+class SourcesEdit(QWidget):
+    """An ordered list of master-server sources: a kind and an address each."""
+    changed = Signal()
+    PLACEHOLDERS = (("tribesnext", "http://master.tribesnext.com"), ("lan", "(servers heartbeating here)"),
+                    ("torque", "host:port"))
+
+    def __init__(self, value):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout = QVBoxLayout()
+        layout.addLayout(self.rows_layout)
+        add = QPushButton("Add source")
+        add.clicked.connect(lambda: self.add_row("torque", ""))
+        layout.addWidget(add)
+        self.rows = []
+        for kind, address in value or ():
+            self.add_row(kind, address)
+
+    def add_row(self, kind, address):
+        row = QWidget()
+        line = QHBoxLayout(row)
+        line.setContentsMargins(0, 0, 0, 0)
+        kind_box = QComboBox()
+        kind_box.addItems(list(t2options.MASTER_SOURCE_KINDS))
+        kind_box.setCurrentText(kind)
+        address_field = QLineEdit(address)
+        remove = QPushButton("Remove")
+        line.addWidget(kind_box)
+        line.addWidget(address_field, 1)
+        line.addWidget(remove)
+        entry = (row, kind_box, address_field)
+        self.rows.append(entry)
+        self.rows_layout.addWidget(row)
+
+        def update_kind():
+            selected = kind_box.currentText()
+            address_field.setEnabled(selected != "lan")
+            address_field.setPlaceholderText(dict(self.PLACEHOLDERS).get(selected, ""))
+            self.changed.emit()
+
+        def remove_row():
+            self.rows.remove(entry)
+            row.deleteLater()
+            self.changed.emit()
+
+        kind_box.currentTextChanged.connect(update_kind)
+        address_field.textChanged.connect(self.changed)
+        remove.clicked.connect(remove_row)
+        update_kind()
+
+    def value(self):
+        return tuple((kind_box.currentText(), "" if kind_box.currentText() == "lan" else field.text().strip())
+                     for _row, kind_box, field in self.rows)
+
+
+def requirement_text(key, allowed):
+    """Describe one unmet option requirement for the profile editor."""
+    if key == "launcher.load_hook":
+        return "Load t2_hook.so (Settings)"
+    option = t2options.BY_KEY[key]
+    if option.kind == "bool":
+        return option.label
+    return f"{option.label}: {' or '.join(str(value) for value in allowed)}"
+
+
 class ProfileEditor(QWidget):
-    def __init__(self, profile, changed):
+    def __init__(self, profile, changed, context):
         super().__init__()
         self.profile = profile
         self.changed = changed
+        self.context = context  # callable returning launcher-wide values, e.g. load_hook
         layout = QVBoxLayout(self)
         self.name = QLineEdit(profile.get("name", "New profile"))
         layout.addWidget(QLabel("Profile name"))
         layout.addWidget(self.name)
-        self.wonemu = QCheckBox("Use local WON emulator and master proxy (requires hook)")
-        self.wonemu.setToolTip("Master discovery defaults to TribesNext plus locally observed LAN servers.")
-        self.wonemu.setChecked(bool(profile.get("wonemu", False)))
-        layout.addWidget(self.wonemu)
+        tabs = QTabWidget()
+        layout.addWidget(tabs, 1)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
@@ -212,9 +302,51 @@ class ProfileEditor(QWidget):
         self.custom.setPlaceholderText("Additional arguments, e.g. -mod Classic -nologin")
         form.addRow("Custom options", self.custom)
         scroll.setWidget(body)
-        layout.addWidget(scroll)
+        tabs.addTab(scroll, "Game")
+
+        # WON emulator and Hook tabs are generated from the t2options registry.
+        saved_options = t2options.chosen(t2options.migrate(profile))
+        self.option_widgets = {}
+        self.option_rows = {}
+        for tab, title in (("won", "WON emulator"), ("hook", "Hook")):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            body = QWidget()
+            column = QVBoxLayout(body)
+            section = None
+            for option in t2options.OPTIONS:
+                if option.tab != tab:
+                    continue
+                if option.section != section:
+                    section = option.section
+                    heading = QLabel(f"<b>{section}</b>")
+                    column.addWidget(heading)
+                row = QWidget()
+                row_layout = QVBoxLayout(row)
+                row_layout.setContentsMargins(12, 0, 0, 4)
+                widget = self._option_widget(option, saved_options[option.key])
+                widget.setToolTip(option.help)
+                if option.kind == "bool":
+                    row_layout.addWidget(widget)
+                else:
+                    line = QHBoxLayout()
+                    line.addWidget(QLabel(option.label))
+                    line.addWidget(widget, 1)
+                    row_layout.addLayout(line)
+                note = QLabel()
+                note.setStyleSheet("color: gray")
+                note.setWordWrap(True)
+                row_layout.addWidget(note)
+                column.addWidget(row)
+                self.option_widgets[option.key] = widget
+                self.option_rows[option.key] = (row, note)
+            column.addStretch()
+            scroll.setWidget(body)
+            tabs.addTab(scroll, title)
+        self.show_advanced = QCheckBox("Show advanced options")
+        layout.addWidget(self.show_advanced)
+
         self.name.textChanged.connect(self.changed)
-        self.wonemu.toggled.connect(self.changed)
         for box in self.flag_boxes.values():
             box.stateChanged.connect(self.changed)
         for enabled, fields in self.value_boxes.values():
@@ -223,13 +355,84 @@ class ProfileEditor(QWidget):
                 field.textChanged.connect(self.changed)
         self.positional.textChanged.connect(self.changed)
         self.custom.textChanged.connect(self.changed)
+        for key, widget in self.option_widgets.items():
+            signal = {"bool": "toggled", "choice": "currentTextChanged", "int": "valueChanged",
+                      "float": "valueChanged", "endpoints": "changed",
+                      "sources": "changed"}.get(t2options.BY_KEY[key].kind, "textChanged")
+            getattr(widget, signal).connect(self.refresh_options)
+        self.show_advanced.toggled.connect(self.refresh_options)
+        self.refresh_options()
+
+    @staticmethod
+    def _option_widget(option, value):
+        if option.kind == "bool":
+            widget = QCheckBox(option.label)
+            widget.setChecked(bool(value))
+        elif option.kind == "endpoints":
+            widget = EndpointsEdit(value, "automatic in local mode: listen address:port")
+        elif option.kind == "sources":
+            widget = SourcesEdit(value)
+        elif option.kind == "choice":
+            widget = QComboBox()
+            widget.addItems(list(option.choices))
+            widget.setCurrentText(str(value))
+        elif option.kind == "int":
+            widget = QSpinBox()
+            widget.setRange(int(option.minimum if option.minimum is not None else -10**9),
+                            int(option.maximum if option.maximum is not None else 10**9))
+            widget.setValue(int(value))
+        elif option.kind == "float":
+            widget = QDoubleSpinBox()
+            widget.setRange(option.minimum if option.minimum is not None else -1e9,
+                            option.maximum if option.maximum is not None else 1e9)
+            widget.setDecimals(3)
+            widget.setValue(float(value))
+        else:
+            widget = QLineEdit(str(value))
+        return widget
+
+    def option_values(self):
+        values = {}
+        for key, widget in self.option_widgets.items():
+            kind = t2options.BY_KEY[key].kind
+            if kind == "bool":
+                values[key] = widget.isChecked()
+            elif kind == "choice":
+                values[key] = widget.currentText()
+            elif kind in ("int", "float", "endpoints", "sources"):
+                values[key] = widget.value()
+            else:
+                values[key] = widget.text()
+        return values
+
+    def refresh_options(self, *_args):
+        """Enable each option only while its requirements hold."""
+        values = t2options.chosen(self.option_values())
+        context = self.context()
+        effective = t2options.effective(values, context)
+        show_advanced = self.show_advanced.isChecked()
+        for option in t2options.OPTIONS:
+            row, note = self.option_rows[option.key]
+            row.setVisible(show_advanced or not option.advanced)
+            # Requirements are judged against effective values, so a chain
+            # (TribesNext -> console commands -> hook) disables in one step.
+            missing = t2options.unmet(option, effective, context)
+            self.option_widgets[option.key].setEnabled(not missing)
+            note.setText("Requires: " + ", ".join(requirement_text(key, allowed)
+                                                  for key, allowed in missing) if missing else "")
+            note.setVisible(bool(missing))
+        self.changed()
 
     def save_to(self):
         result = {
             "name": self.name.text().strip() or "Profile",
-            "wonemu": self.wonemu.isChecked(),
             "flags": {flag: box.isChecked() for flag, box in self.flag_boxes.items()},
             "values": {}, "positional": self.positional.text(), "custom": self.custom.text(),
+            # Store every choice, including disabled ones, so re-enabling a
+            # dependency restores what the user picked.
+            "options": {key: [list(item) if isinstance(item, tuple) else item for item in value]
+                        if isinstance(value, tuple) else value
+                        for key, value in self.option_values().items()},
         }
         for option, (enabled, fields) in self.value_boxes.items():
             values = [field.text() for field in fields]
@@ -256,6 +459,8 @@ class SettingsDialog(QDialog):
         general_form.addRow("Game folder", path_row)
         self.load_hook = QCheckBox("Load t2_hook.so (LD_PRELOAD)")
         self.load_hook.setChecked(app.settings["load_hook"])
+        self.load_hook.toggled.connect(
+            lambda _checked: self.profile_editor and self.profile_editor.refresh_options())
         general_form.addRow(self.load_hook)
         self.monitor = QComboBox()
         self.monitor.addItem("Default display", "")
@@ -337,7 +542,9 @@ class SettingsDialog(QDialog):
         self.profile_editor = None
         self.editor_row = row
         if 0 <= row < len(self.profiles):
-            self.profile_editor = ProfileEditor(self.profiles[row], self.update_profile_name)
+            self.profile_editor = ProfileEditor(
+                self.profiles[row], self.update_profile_name,
+                lambda: {"launcher.load_hook": self.load_hook.isChecked()})
             self.profile_widget_layout.addWidget(self.profile_editor)
 
     def update_profile_name(self):
@@ -398,7 +605,14 @@ class SettingsDialog(QDialog):
             self.commit_editor()
             for profile in self.profiles:
                 profile_arguments(profile)
-            if any(profile.get("wonemu") for profile in self.profiles) and not self.load_hook.isChecked():
+            for profile in self.profiles:
+                try:
+                    t2options.validate(t2options.migrate(profile),
+                                       {"launcher.load_hook": self.load_hook.isChecked()})
+                except ValueError as exc:
+                    raise ValueError(f"{profile.get('name', 'Profile')}: {exc}") from exc
+            if any(t2options.migrate(profile)["won.mode"] != "off" for profile in self.profiles) \
+                    and not self.load_hook.isChecked():
                 raise ValueError("Local WON emulator profiles require Load t2_hook.so to be enabled.")
             names = [p["name"].strip() for p in self.profiles]
             if len({name.casefold() for name in names}) != len(names):
@@ -501,7 +715,9 @@ class Launcher(QApplication):
             return
         try:
             args = profile_arguments(profile)
-            if profile.get("wonemu") and not self.settings["load_hook"]:
+            options = t2options.migrate(profile)
+            t2options.validate(options, {"launcher.load_hook": self.settings["load_hook"]})
+            if options["won.mode"] != "off" and not self.settings["load_hook"]:
                 raise ValueError("Local WON emulation requires the hook.")
         except ValueError as exc:
             self.tray.showMessage("Invalid profile", str(exc), QSystemTrayIcon.Warning)
@@ -510,7 +726,11 @@ class Launcher(QApplication):
         process = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
         env.insert("T2LAUNCH_LOAD_HOOK", "1" if self.settings["load_hook"] else "0")
-        env.insert("T2LAUNCH_WONEMU", "1" if profile.get("wonemu", False) else "0")
+        context = {"launcher.load_hook": self.settings["load_hook"]}
+        for key, value in t2options.launch_env(options, context).items():
+            env.insert(key, value)
+        if self.settings["load_hook"]:
+            env.insert("T2LAUNCH_HOOK_CONFIG", str(t2options.write_hook_config(name, options, context)))
         monitor = self.settings.get("monitor", "")
         env.insert("T2LAUNCH_MONITOR", monitor)
         screen_index = next((i for i, screen in enumerate(QApplication.screens()) if screen.name() == monitor), 0)
@@ -522,7 +742,7 @@ class Launcher(QApplication):
         self.launch_output_states[id(process)] = {
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
         append_launch_diagnostic(
-            f"launch requested; wonemu={int(bool(profile.get('wonemu')))} "
+            f"launch requested; won={options['won.mode']} "
             f"hook={int(bool(self.settings['load_hook']))}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))

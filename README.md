@@ -172,13 +172,36 @@ shows running profiles. The hook is enabled by default. Settings are stored in
 Launcher and crash-stage diagnostics are written, with login arguments redacted,
 to `~/.local/state/t2launch/launch-diagnostics.log`.
 
+### Profile options
+
+Each profile's editor has three tabs. **Game** holds the command-line flags.
+**WON emulator** and **Hook** are generated from `t2options.py`, which declares
+every option once: its default, its type, what it depends on, and how it is
+applied. An option whose requirements are unmet is greyed out with a
+"Requires: …" note (for example, the TribesNext handlers need WON emulation and
+the hook's console commands); its saved choice comes back when the dependency
+does. **Show advanced options** reveals the debugging and compatibility knobs.
+
+At launch, options become environment variables for `runtime/run-game` (WON
+emulation, master sources, software GL, the volume fix, tracing), and the hook's
+options are written to `~/.local/state/t2launch/hook/<profile>.conf` (one
+`key=value` per line, mode 0600), passed as `T2LAUNCH_HOOK_CONFIG`. The hook
+reads a value from that file, then from the option's legacy environment
+variable (such as `T2LAUNCH_FULL_REDRAW`), then its default, so command-line
+launches keep working. Keys the hook does not know yet are kept, and in-game
+scripts can read any option with `hook_option("key")`. Adding an option means
+one `Option(...)` entry, plus a row in the hook's `hook_options[]` table when
+the hook applies it; `tests/test_options.py` checks the two lists agree.
+
 ### Local WON emulator and master proxy
 
-Enable **Use local WON emulator** in a profile and leave **Load t2_hook.so**
-enabled. The launcher starts or reuses `wonemu.py` and checks readiness before
-starting the game. Readiness includes an implementation fingerprint, so an
-existing daemon is restarted when the emulator code changes. It binds only to
-localhost:
+Set **WON emulation** to `local` on a profile's WON emulator tab and leave
+**Load t2_hook.so** enabled. The launcher starts or reuses `wonemu.py` and checks readiness before
+starting the game. Readiness includes an implementation fingerprint and the
+service's addresses, ports, and master sources, so an existing daemon is
+restarted when the emulator code or its configuration changes. By default it
+listens on `127.0.0.1` at these ports (**Listen on** and **Port** move them;
+the other four always follow the directory port):
 
 | Port | Handler |
 |------|---------|
@@ -188,14 +211,46 @@ localhost:
 | TCP 15107 | Native IRC certificate/challenge login and basic IRC commands |
 | UDP 15108 | Native Torque master protocol and TribesNext discovery proxy |
 
-The hook replaces the three Sierra bootstrap strings with `127.0.0.1:15104`
-in the running client's memory before WON initialization. It checks the original
+The hook replaces the three Sierra bootstrap strings in the running client's
+memory before WON initialization, with the profile's **Game connects to**
+entries (`T2LAUNCH_WON_ENDPOINTS`, up to three `host:port` values of at most 27
+characters, the size of each original string). Left empty in local mode, they
+default to the listen address and port, `127.0.0.1:15104` unless changed. It checks the original
 strings and restores page permissions afterward. The executable on disk is
 unchanged. The option is off by default; enabling it on an unsupported executable
 fails instead of attempting the patch.
 
+**Remote mode.** Set **WON emulation** to `remote` to use a wonemu on another
+machine without starting one locally. On the server machine, choose a LAN
+address or `0.0.0.0` for **Listen on** (wonemu prints a warning, since the login,
+community, and master services become reachable on the network) and launch
+once so the service starts. On each client, enter the server's `host:port` in
+**Game connects to**, and copy the server's
+`~/.local/state/t2launch/wonemu/verifier.der` to the client and select it as
+**Remote verifier file**: the game checks the emulator's signatures against
+that key. Remote clients log in with the server's own T2Launch accounts
+(reserve them on the server with `python3 wonemu.py --reserve-local-account
+NAME`); TribesNext accounts work only in local mode, because checking a
+TribesNext password needs that account's key files on the machine doing the
+check. wonemu never uses its installed TribesNext keys for a login from
+another machine, and answers status and stop requests only for this machine,
+so a LAN-reachable instance cannot be stopped remotely. ("This machine" includes
+its own LAN address, which its local game uses when the service listens there.)
+
+**Master-server sources.** The emulator's master service answers the game's
+server-list queries by merging an ordered list of sources, each a kind and an
+address: `tribesnext` (an HTTP list service such as
+`http://master.tribesnext.com`), `lan` (game servers that heartbeat to this
+emulator), and `torque` (another Torque-protocol master server at `host:port`,
+queried read-only, such as a remote wonemu). The default is TribesNext followed
+by LAN. Local game servers' heartbeats are forwarded to each `tribesnext`
+source. On the command line, `--master-sources` (or `T2LAUNCH_MASTER_SOURCES`)
+takes `kind=address,...`; the older `--master-backend local|tribesnext|hybrid`
+still works. Further backends are added as new source kinds.
+
 The directory serves `/TitanServers/Auth`, `/Tribes2`, and
-`/TitanServers/DBProxy`, advertising the local endpoints. Directory discovery has
+`/TitanServers/DBProxy`, advertising the configured address (the listen
+address, or this machine's outward address when listening on `0.0.0.0`). Directory discovery has
 been verified against the actual #25034 client. The auth listener serves a
 generated auth key block signed with a per-install emulator root key, which the
 client verifies against an in-memory replacement for its embedded WON verifier.
@@ -418,7 +473,7 @@ LD_AUDIT=games/tribes2/t2_realign.so
 LD_PRELOAD=games/tribes2/t2_hook.so:/usr/lib32/pulseaudio/libpulsedsp.so:runtime/compat-libs/libSDL-1.2.so.0
 ```
 
-The hook toggle removes only `t2_hook.so`. It registers fourteen native commands
+The hook toggle removes only `t2_hook.so`. It registers fifteen native commands
 and installs the Player TRIBES-tab override at runtime after the Community
 Browser control exists.
 
