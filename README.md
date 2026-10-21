@@ -122,9 +122,29 @@ sudo pacman -Syu --needed \
 `T2LAUNCH_TRACE_CONNECTS=1`). The launcher reports any missing 32-bit library
 by name before it starts the game.
 
-Other distributions need the equivalent 32-bit (i386) packages but are
-untested. The launcher looks for the 32-bit loader at `/lib/ld-linux.so.2` and
-for `padsp` at `/usr/lib32/pulseaudio/libpulsedsp.so`, the Arch locations.
+Debian/Ubuntu and Fedora are untested but supported by the launcher. The game
+starts through `/lib/ld-linux.so.2`, which each distribution's 32-bit C library
+provides, and the launcher finds the 32-bit `libpulsedsp.so` under
+`/usr/lib32/pulseaudio` (Arch), `/usr/lib/i386-linux-gnu/pulseaudio`
+(Debian/Ubuntu), or `/usr/lib/pulseaudio` (Fedora), skipping 64-bit copies. When
+something is missing, it prints the install command for the detected
+distribution. The rough equivalents of the Arch list are:
+
+```bash
+# Debian/Ubuntu
+sudo dpkg --add-architecture i386 && sudo apt update
+sudo apt install libc6:i386 libgl1:i386 libglu1-mesa:i386 libx11-6:i386 libxext6:i386 \
+    libxrandr2:i386 libfreetype6:i386 pulseaudio-utils:i386 libgmp-dev:i386 \
+    gcc-multilib python3-venv xdotool x11-xserver-utils
+
+# Fedora
+sudo dnf install glibc-devel.i686 libgcc.i686 mesa-libGL.i686 mesa-libGLU.i686 \
+    libX11.i686 libXext.i686 libXrandr.i686 freetype.i686 pulseaudio-utils.i686 \
+    gmp-devel.i686 gcc python3 xdotool xrandr
+```
+
+On Debian/Ubuntu, `pulseaudio-utils:i386` may replace the 64-bit
+`pulseaudio-utils`; without it the game runs silently.
 
 ### Desktop launcher
 

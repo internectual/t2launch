@@ -18,6 +18,7 @@ if ! gcc "${CFLAGS[@]}" -shared -fPIC -o "$STAGE/t2_realign.so" "$REPO_DIR/t2_re
     echo "ERROR: 32-bit build failed. Install the 32-bit C runtime:" >&2
     echo "  Arch/CachyOS:  sudo pacman -S --needed lib32-glibc lib32-gcc-libs" >&2
     echo "  Debian/Ubuntu: sudo apt install gcc-multilib" >&2
+    echo "  Fedora:        sudo dnf install glibc-devel.i686 libgcc.i686" >&2
     exit 1
 fi
 gcc "${CFLAGS[@]}" -shared -fPIC -o "$STAGE/t2_hook.so" "$REPO_DIR/t2_hook.c" -pthread -ldl
@@ -25,6 +26,7 @@ if ! gcc "${CFLAGS[@]}" -o "$STAGE/rsa_helper" "$REPO_DIR/rsa_helper.c" -lgmp; t
     echo "ERROR: rsa_helper needs 32-bit GMP:" >&2
     echo "  Arch/CachyOS:  sudo pacman -S --needed lib32-gmp" >&2
     echo "  Debian/Ubuntu: sudo apt install libgmp-dev:i386" >&2
+    echo "  Fedora:        sudo dnf install gmp-devel.i686" >&2
     exit 1
 fi
 mv -f "$STAGE/t2_realign.so" "$STAGE/t2_hook.so" "$STAGE/rsa_helper" "$OUT_DIR/"

@@ -345,13 +345,46 @@ if [[ "$WONEMU" == "1" ]]; then
     GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
 fi
 
+# True when $1 is a 32-bit ELF file (EI_CLASS 1). Distributions keep 64-bit
+# copies under some of the same names, e.g. Arch's /usr/lib/pulseaudio.
+is_elf32() {
+    [[ -f "$1" && "$(od -An -tx1 -j4 -N1 "$1" 2>/dev/null | tr -d ' ')" == "01" ]]
+}
+
+# Print an install hint for this distribution family: install_hint ARCH DEBIAN FEDORA
+install_hint() {
+    local family=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        family=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
+    fi
+    case " $family " in
+        *" arch "*) echo "  sudo pacman -S --needed $1" >&2 ;;
+        *" debian "*|*" ubuntu "*)
+            echo "  sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install $2" >&2 ;;
+        *" fedora "*|*" rhel "*) echo "  sudo dnf install $3" >&2 ;;
+        *)
+            echo "  Arch:          sudo pacman -S --needed $1" >&2
+            echo "  Debian/Ubuntu: sudo apt install $2  (after dpkg --add-architecture i386)" >&2
+            echo "  Fedora:        sudo dnf install $3" >&2 ;;
+    esac
+}
+
 # Run on the host's 32-bit libraries. Tribes 2 and its Loki libraries predate
 # the 16-byte stack alignment that current 32-bit builds assume, so the
 # t2_realign audit module realigns every call from old code into a modern
 # library. Nothing in the game folder is modified.
 launch_game() {
     local support_dir="$GAMES_DIR/$GAME_NAME" compat_dir="$ROOT_DIR/compat-libs"
-    local loader="/lib/ld-linux.so.2" pulse_dsp="/usr/lib32/pulseaudio/libpulsedsp.so"
+    # The kernel starts the game through its PT_INTERP path, /lib/ld-linux.so.2,
+    # which Arch (lib32-glibc), Debian (libc6:i386), and Fedora (glibc.i686) all
+    # provide. libpulsedsp.so lives under each distribution's 32-bit libdir.
+    local loader="/lib/ld-linux.so.2" pulse_dsp="" candidate
+    for candidate in /usr/lib32/pulseaudio/libpulsedsp.so \
+                     /usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so \
+                     /usr/lib/pulseaudio/libpulsedsp.so; do
+        if is_elf32 "$candidate"; then pulse_dsp="$candidate"; break; fi
+    done
     if [[ -z "$HOST_GAME_PATH" ]]; then
         echo "ERROR: choose your Tribes 2 game folder (the one containing tribes2.dynamic)." >&2
         exit 2
@@ -368,8 +401,9 @@ launch_game() {
     if [[ "$rebuild" == "1" ]]; then
         "$ROOT_DIR/build" "$support_dir"
     fi
-    if [[ ! -x "$loader" ]]; then
-        echo "ERROR: the 32-bit loader $loader is missing. Arch/CachyOS: sudo pacman -S --needed lib32-glibc" >&2
+    if [[ ! -x "$loader" ]] || ! is_elf32 "$loader"; then
+        echo "ERROR: the 32-bit loader $loader is missing. Install the 32-bit C library:" >&2
+        install_hint lib32-glibc libc6:i386 glibc.i686
         exit 1
     fi
     local missing
@@ -377,17 +411,20 @@ launch_game() {
         "$HOST_GAME_PATH/$GAME_BINARY" 2>&1 | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')
     if [[ -n "$missing" ]]; then
         echo "ERROR: missing 32-bit libraries: $missing" >&2
-        echo "  Arch/CachyOS: sudo pacman -S --needed lib32-libx11 lib32-libxext lib32-libxrandr lib32-freetype2 lib32-mesa lib32-glu" >&2
+        install_hint "lib32-libx11 lib32-libxext lib32-libxrandr lib32-freetype2 lib32-mesa lib32-glu" \
+            "libx11-6:i386 libxext6:i386 libxrandr2:i386 libfreetype6:i386 libgl1:i386 libglu1-mesa:i386" \
+            "libX11.i686 libXext.i686 libXrandr.i686 freetype.i686 mesa-libGL.i686 mesa-libGLU.i686"
         exit 1
     fi
 
     local preload=()
     [[ "$LOAD_HOOK" == "1" ]] && preload+=("$support_dir/t2_hook.so")
     if [[ "$USE_PADSP" == "1" ]]; then
-        if [[ -f "$pulse_dsp" ]]; then
+        if [[ -n "$pulse_dsp" ]]; then
             preload+=("$pulse_dsp")
         else
-            echo "NOTE: $pulse_dsp not found; the game will have no sound. Arch/CachyOS: sudo pacman -S --needed lib32-libpulse" >&2
+            echo "NOTE: no 32-bit libpulsedsp.so found; the game will have no sound. Install it:" >&2
+            install_hint lib32-libpulse pulseaudio-utils:i386 pulseaudio-utils.i686
         fi
     fi
     preload+=("$compat_dir/libSDL-1.2.so.0")
