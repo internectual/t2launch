@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 enum { OBJECT_OTHER = 1, OBJECT_OLD = 2, OBJECT_MODERN = 3 };
+#define OBJECT_KIND(cookie) ((cookie) & 0xff)
+#define OBJECT_OPENAL 0x100  /* cookie flag: the game's Loki libopenal.so.0 */
 
 /* Arguments copied to the realigned frame. cdecl callers clean up their own
    arguments, so copying more than a function takes is harmless: the extra
@@ -133,6 +135,121 @@ static void *wrapped_get_proc_address_arb(const unsigned char *name) {
     return pointer ? (void *)make_thunk((uintptr_t)pointer) : NULL;
 }
 
+/* Volume fix for Loki's OpenAL. Torque sets every source's gain with Loki's
+ * linear AL_GAIN_LINEAR_LOKI (0x20000) and plays 2D sounds (interface, shell
+ * hum, music) as AL_SOURCE_RELATIVE. Loki applies source gain inside its
+ * distance-attenuation filter (alf_da), which returns early for relative
+ * sources, so their gain is ignored and every volume slider has no effect.
+ * Loki's min/max filter still runs for relative sources, so for those the
+ * wrappers below also set AL_MAX_GAIN to the value whose clamp produces the
+ * requested linear gain. Loki maps AL_MAX_GAIN non-linearly; the table was
+ * measured from its output (clean scaling, no clipping).
+ *
+ * On unless T2LAUNCH_OPENAL_VOLUME_FIX=0. T2LAUNCH_REALIGN_TRACE_AL=1 also
+ * logs each gain call. */
+typedef int ALenum;
+typedef unsigned int ALuint;
+typedef float ALfloat;
+#define AL_SOURCE_RELATIVE 0x202
+#define AL_MAX_GAIN 0x100E
+#define AL_GAIN_LINEAR_LOKI 0x20000
+typedef void (*al_sourcef_t)(ALuint, ALenum, ALfloat);
+typedef void (*al_sourcei_t)(ALuint, ALenum, int);
+typedef void *(*alc_create_context_t)(void *, const int *);
+static int trace_al, volume_fix;
+static al_sourcef_t real_al_sourcef;
+static al_sourcei_t real_al_sourcei;
+static alc_create_context_t real_alc_create_context;
+
+/* Per-source state; Loki numbers sources from 16385 within each context. */
+#define SOURCE_BASE 16384u
+#define SOURCE_SLOTS 4096u
+static struct { unsigned char relative, capped; float gain; } sources[SOURCE_SLOTS];
+static pthread_mutex_t sources_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Measured Loki response: AL_MAX_GAIN value -> output amplitude ratio. */
+static const float max_gain_curve[][2] = {
+    {0.0f, 0.0f}, {0.001f, 0.0078f}, {0.01f, 0.0469f}, {0.02f, 0.1016f}, {0.05f, 0.2266f},
+    {0.1f, 0.4140f}, {0.2f, 0.6797f}, {0.3f, 0.8046f}, {0.4f, 0.8906f}, {0.5f, 0.9140f},
+    {0.6f, 0.9218f}, {0.7f, 0.9375f}, {0.8f, 0.9531f}, {0.9f, 0.9687f}, {1.0f, 1.0f},
+};
+
+static float max_gain_for(float gain) {
+    const size_t points = sizeof(max_gain_curve) / sizeof(max_gain_curve[0]);
+    if (!(gain > 0.0f)) return 0.0f;
+    if (gain >= 1.0f) return 1.0f;
+    for (size_t i = 1; i < points; i++) {
+        float x0 = max_gain_curve[i - 1][0], y0 = max_gain_curve[i - 1][1];
+        float x1 = max_gain_curve[i][0], y1 = max_gain_curve[i][1];
+        if (gain <= y1) return x0 + (x1 - x0) * (gain - y0) / (y1 - y0);
+    }
+    return 1.0f;
+}
+
+/* Apply the cap for the slot's current state; call with sources_lock held. */
+static void apply_relative_gain(ALuint source, unsigned slot) {
+    if (sources[slot].relative) {
+        real_al_sourcef(source, AL_MAX_GAIN, max_gain_for(sources[slot].gain));
+        sources[slot].capped = 1;
+    } else if (sources[slot].capped) {
+        real_al_sourcef(source, AL_MAX_GAIN, 1.0f);
+        sources[slot].capped = 0;
+    }
+}
+
+__attribute__((force_align_arg_pointer))
+static void wrapped_al_sourcef(ALuint source, ALenum param, ALfloat value) {
+    real_al_sourcef(source, param, value);
+    if (trace_al && param == AL_GAIN_LINEAR_LOKI)
+        fprintf(stderr, "[t2_realign] alSourcef(%u, gain, %g)\n", source, (double)value);
+    unsigned slot = source - SOURCE_BASE;
+    if (!volume_fix || param != AL_GAIN_LINEAR_LOKI || slot >= SOURCE_SLOTS) return;
+    pthread_mutex_lock(&sources_lock);
+    sources[slot].gain = value;
+    apply_relative_gain(source, slot);
+    pthread_mutex_unlock(&sources_lock);
+}
+
+__attribute__((force_align_arg_pointer))
+static void wrapped_al_sourcei(ALuint source, ALenum param, int value) {
+    real_al_sourcei(source, param, value);
+    unsigned slot = source - SOURCE_BASE;
+    if (!volume_fix || param != AL_SOURCE_RELATIVE || slot >= SOURCE_SLOTS) return;
+    pthread_mutex_lock(&sources_lock);
+    sources[slot].relative = value != 0;
+    apply_relative_gain(source, slot);
+    pthread_mutex_unlock(&sources_lock);
+}
+
+__attribute__((force_align_arg_pointer))
+static void *wrapped_alc_create_context(void *device, const int *attributes) {
+    void *context = real_alc_create_context(device, attributes);
+    /* A new context starts with default sources; forget the old ones. */
+    pthread_mutex_lock(&sources_lock);
+    for (unsigned i = 0; i < SOURCE_SLOTS; i++) {
+        sources[i].relative = sources[i].capped = 0;
+        sources[i].gain = 1.0f;
+    }
+    pthread_mutex_unlock(&sources_lock);
+    return context;
+}
+
+static uintptr_t wrap_openal_binding(const char *symname, uintptr_t address) {
+    if (strcmp(symname, "alSourcef") == 0) {
+        real_al_sourcef = (al_sourcef_t)address;
+        return (uintptr_t)wrapped_al_sourcef;
+    }
+    if (strcmp(symname, "alSourcei") == 0) {
+        real_al_sourcei = (al_sourcei_t)address;
+        return (uintptr_t)wrapped_al_sourcei;
+    }
+    if (strcmp(symname, "alcCreateContext") == 0) {
+        real_alc_create_context = (alc_create_context_t)address;
+        return (uintptr_t)wrapped_alc_create_context;
+    }
+    return address;
+}
+
 static int has_prefix(const char *text, const char *prefix) {
     return strncmp(text, prefix, strlen(prefix)) == 0;
 }
@@ -158,13 +275,19 @@ static int classify(const char *path) {
 unsigned int la_version(unsigned int version) {
     const char *flag = getenv("T2LAUNCH_REALIGN_DEBUG");
     debug = flag && strcmp(flag, "1") == 0;
+    const char *al_flag = getenv("T2LAUNCH_REALIGN_TRACE_AL");
+    trace_al = al_flag && strcmp(al_flag, "1") == 0;
+    const char *fix_flag = getenv("T2LAUNCH_OPENAL_VOLUME_FIX");
+    volume_fix = !fix_flag || strcmp(fix_flag, "0") != 0;
     return version < LAV_CURRENT ? version : LAV_CURRENT;
 }
 
 unsigned int la_objopen(struct link_map *map, Lmid_t lmid, uintptr_t *cookie) {
     (void)lmid;
     int kind = classify(map->l_name);
-    *cookie = (uintptr_t)kind;
+    const char *base = strrchr(map->l_name, '/');
+    base = base ? base + 1 : map->l_name;
+    *cookie = (uintptr_t)kind | (strcmp(base, "libopenal.so.0") == 0 ? OBJECT_OPENAL : 0);
     if (debug)
         fprintf(stderr, "[t2_realign] %s: %s\n",
                 kind == OBJECT_OLD ? "old" : kind == OBJECT_MODERN ? "modern" : "other",
@@ -176,7 +299,10 @@ uintptr_t la_symbind32(Elf32_Sym *sym, unsigned int ndx, uintptr_t *refcook,
                        uintptr_t *defcook, unsigned int *flags, const char *symname) {
     (void)ndx; (void)flags;
     unsigned int type = ELF32_ST_TYPE(sym->st_info);
-    if (*refcook != OBJECT_OLD || *defcook != OBJECT_MODERN ||
+    if ((trace_al || volume_fix) && (*defcook & OBJECT_OPENAL) &&
+        OBJECT_KIND(*refcook) == OBJECT_OLD && !(*refcook & OBJECT_OPENAL) && sym->st_value)
+        return wrap_openal_binding(symname, sym->st_value);
+    if (OBJECT_KIND(*refcook) != OBJECT_OLD || OBJECT_KIND(*defcook) != OBJECT_MODERN ||
         (type != STT_FUNC && type != STT_GNU_IFUNC) || !sym->st_value)
         return sym->st_value;
     if (strcmp(symname, "glXGetProcAddress") == 0) {

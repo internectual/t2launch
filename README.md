@@ -425,7 +425,7 @@ Browser control exists.
 ### Runtime compatibility
 
 The project first ran the game in a 32-bit Ubuntu 16.04 Docker image. That image
-supplied nothing a current multilib host cannot, but three behaviors of the
+supplied nothing a current multilib host cannot, but four behaviors of the
 game need handling on current 32-bit libraries:
 
 - **Stack alignment.** Tribes 2 and its Loki libraries keep the 4-byte stack
@@ -448,6 +448,16 @@ game need handling on current 32-bit libraries:
   `Canvas.reset()` after every swap
   (`T2LAUNCH_FULL_REDRAW=1`, the launcher default), marking the whole canvas
   dirty so each frame is drawn in full.
+
+- **Volume controls.** Torque plays interface sounds, the shell hum, and music
+  as `AL_SOURCE_RELATIVE` sources and sets their gain with Loki's linear
+  `AL_GAIN_LINEAR_LOKI`. The bundled `libopenal.so.0` applies source gain in its
+  distance-attenuation filter, which returns early for relative sources, so
+  every volume slider was ignored. `t2_realign.so` tracks relative sources and
+  also sets `AL_MAX_GAIN`, which Loki's min/max filter still applies, to the
+  value that yields the requested linear gain (Loki maps it non-linearly; the
+  table was measured from its output). `T2LAUNCH_OPENAL_VOLUME_FIX=0` turns this
+  off and `T2LAUNCH_REALIGN_TRACE_AL=1` logs each gain call.
 
 `MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` keep
 the GL extension string short enough for the client's fixed buffer, and `padsp`
