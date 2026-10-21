@@ -8,6 +8,7 @@ by the hook must also appear in the option table in t2_hook.c.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -15,9 +16,23 @@ from pathlib import Path
 
 WON_MODES = ("off", "local", "remote")
 WON_ACTIVE = ("local", "remote")
-# Master-server source kinds understood by wonemu; see MASTER_SOURCE_KINDS there.
-MASTER_SOURCE_KINDS = ("tribesnext", "lan", "torque")
-DEFAULT_MASTER_SOURCES = (("tribesnext", "http://master.tribesnext.com"), ("lan", ""))
+# Backends wonemu offers the game, mirroring BACKEND_KINDS in wonemu.py: each
+# kind lists the services it supports and how each is addressed (None: no
+# address, "url": http(s) URL, "endpoint": host:port, "chat": optional host:port).
+BACKEND_KINDS = {
+    "tribesnext": {"auth": None, "master": "url", "irc": "chat"},
+    "native": {"auth": None, "master": None, "irc": None},
+    "torque": {"master": "endpoint"},
+}
+BACKEND_SERVICES = ("auth", "master", "irc")
+BACKEND_LABELS = {"tribesnext": "TribesNext", "native": "Native (this wonemu)",
+                  "torque": "Torque master"}
+BACKEND_DEFAULT_ADDRESSES = {("tribesnext", "master"): "http://master.tribesnext.com"}
+# TribesNext first for every service, then wonemu's native services.
+DEFAULT_BACKENDS = (
+    {"kind": "tribesnext", "auth": True, "master": "http://master.tribesnext.com", "irc": True},
+    {"kind": "native", "auth": True, "master": True, "irc": True},
+)
 # The hook rewrites each 28-byte bootstrap string in place.
 WON_ENDPOINT_MAX = 27
 _ENDPOINT = re.compile(r"^([A-Za-z0-9.-]+):(\d{1,5})$")
@@ -28,7 +43,7 @@ class Option:
     key: str
     section: str  # heading in the launcher's WON or Hook tab
     label: str
-    kind: str  # bool, choice, int, float, text, endpoints, sources
+    kind: str  # bool, choice, int, float, text, endpoints, backends
     default: object
     help: str = ""
     choices: tuple = ()
@@ -74,11 +89,13 @@ OPTIONS = (
            env="T2LAUNCH_WON_ADVERTISE", advanced=True, requires=(("won.mode", ("local",)),),
            help="Address the directory gives clients for the other services. Empty: the listen "
                 "address, or this machine's outward address when listening on 0.0.0.0."),
-    Option("won.master_sources", "Master server", "Server-list sources", "sources",
-           DEFAULT_MASTER_SOURCES, tab="won", env="T2LAUNCH_MASTER_SOURCES",
-           requires=(("won.mode", ("local",)),),
-           help="Merged in order. tribesnext: an HTTP list service (URL). lan: servers that "
-                "heartbeat to this emulator. torque: another Torque master server (host:port)."),
+    Option("won.backends", "Backends", "Backends", "backends", DEFAULT_BACKENDS, tab="won",
+           env="T2LAUNCH_WON_BACKENDS", requires=(("won.mode", ("local",)),),
+           help="Which backend serves each service, in priority order. Auth tries each checked "
+                "backend in turn; Master merges every checked server list; IRC serves a player's "
+                "community data from the backend that logged them in (or the next checked one) "
+                "and merges searches across checked backends. A TribesNext IRC address also "
+                "relays chat to that IRC network; empty keeps chat local."),
     Option("won.refresh_tribesnext", "Local service", "Refresh TribesNext keys at login", "bool",
            False, tab="won", env="T2LAUNCH_REFRESH_TRIBESNEXT", advanced=True,
            requires=(("won.mode", ("local",)),),
@@ -138,6 +155,9 @@ def migrate(profile):
     options = dict(profile.get("options") or {})
     if "won.mode" not in options:
         options["won.mode"] = "local" if profile.get("wonemu") else "off"
+    if "won.master_sources" in options and "won.backends" not in options:
+        options["won.backends"] = backends_from_master_sources(options["won.master_sources"])
+    options.pop("won.master_sources", None)
     return options
 
 
@@ -149,8 +169,8 @@ def coerce(option, value):
         return bool(value)
     if option.kind == "endpoints":
         return _coerce_endpoints(option, value)
-    if option.kind == "sources":
-        return _coerce_sources(option, value)
+    if option.kind == "backends":
+        return _coerce_backends(option, value)
     if option.kind == "int":
         value = int(value)
     elif option.kind == "float":
@@ -183,25 +203,45 @@ def _coerce_endpoints(option, value):
     return tuple(endpoints)
 
 
-def _coerce_sources(option, value):
+def _coerce_backends(option, value):
     if isinstance(value, str):
-        value = [item.partition("=")[::2] for item in value.split(",") if item.strip()]
-    sources = []
-    for item in value or ():
-        kind, address = (str(part).strip() for part in item)
-        kind = kind.lower()
-        if kind not in MASTER_SOURCE_KINDS:
-            raise ValueError(f"{option.label}: unknown source kind {kind!r}")
-        if kind == "lan":
-            address = ""
-        elif kind == "tribesnext":
-            if not re.match(r"^https?://[^\s,=]+$", address):
-                raise ValueError(f"{option.label}: tribesnext needs an http(s) URL")
-        elif not _ENDPOINT.match(address):
-            raise ValueError(f"{option.label}: torque needs host:port")
-        if (kind, address) not in sources:
-            sources.append((kind, address))
-    return tuple(sources)
+        value = json.loads(value)
+    backends = []
+    for entry in value or ():
+        kind = entry.get("kind") if isinstance(entry, dict) else None
+        if kind not in BACKEND_KINDS:
+            raise ValueError(f"{option.label}: unknown backend {kind!r}")
+        backend = {"kind": kind}
+        for service, address_type in BACKEND_KINDS[kind].items():
+            enabled = entry.get(service, False)
+            if not enabled:
+                backend[service] = False
+            elif address_type is None or (address_type == "chat" and
+                                          (enabled is True or not str(enabled).strip())):
+                backend[service] = True
+            else:
+                address = enabled.strip() if isinstance(enabled, str) else ""
+                address = (address or BACKEND_DEFAULT_ADDRESSES.get((kind, service), "")).rstrip("/")
+                label = f"{BACKEND_LABELS[kind]} {service}"
+                if address_type == "url" and not re.match(r"^https?://[^\s,]+$", address):
+                    raise ValueError(f"{option.label}: {label} needs an http(s) URL")
+                if address_type in ("endpoint", "chat") and not _ENDPOINT.match(address):
+                    raise ValueError(f"{option.label}: {label} needs host:port")
+                backend[service] = address
+        backends.append(backend)
+    if not any(backend.get("auth") for backend in backends):
+        raise ValueError(f"{option.label}: check Auth for at least one backend")
+    return tuple(backends)
+
+
+def backends_from_master_sources(sources):
+    """Backends equivalent to an older won.master_sources list."""
+    backends = [dict(backend) for backend in DEFAULT_BACKENDS]
+    sources = [tuple(item) for item in sources or ()]
+    backends[0]["master"] = next((address for kind, address in sources if kind == "tribesnext"), False)
+    backends[1]["master"] = ("lan", "") in sources
+    backends += [{"kind": "torque", "master": address} for kind, address in sources if kind == "torque"]
+    return backends
 
 
 def chosen(options):
@@ -252,9 +292,9 @@ def _text(value):
     if isinstance(value, bool):
         return "1" if value else "0"
     if isinstance(value, (tuple, list)):
-        # endpoints: "a,b"; sources: "kind=address,kind"
-        return ",".join(item if isinstance(item, str) else
-                        (item[0] if not item[1] else f"{item[0]}={item[1]}") for item in value)
+        if value and isinstance(value[0], dict):  # backends
+            return json.dumps(list(value), separators=(",", ":"))
+        return ",".join(value)  # endpoints
     return str(value)
 
 

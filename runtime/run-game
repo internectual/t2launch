@@ -352,7 +352,7 @@ fi
 WON_ENDPOINTS="${T2LAUNCH_WON_ENDPOINTS:-}"
 if [[ "$WON_MODE" == "local" ]]; then
     # wonemu reads T2LAUNCH_WON_BIND, _BASE_PORT, _ADVERTISE, and
-    # T2LAUNCH_MASTER_SOURCES from the environment.
+    # T2LAUNCH_WON_BACKENDS from the environment.
     python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/tribes2.dynamic"
     WONEMU_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/wonemu"
     GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")

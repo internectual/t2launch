@@ -15,7 +15,7 @@ try:
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
-        QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+        QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
         QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox,
         QStyle, QSystemTrayIcon, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     )
@@ -165,82 +165,126 @@ def is_safe_launch_diagnostic(line):
                  "syntax error", "unable to find function")))
 
 
-class EndpointsEdit(QWidget):
-    """Up to three host:port entries for the hook's WON bootstrap slots."""
+class EndpointsEdit(QLineEdit):
+    """One line of host:port entries for the hook's WON bootstrap slots."""
     changed = Signal()
 
     def __init__(self, value, placeholder=""):
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        self.fields = []
-        values = list(value or ())
-        for index in range(3):
-            field = QLineEdit(values[index] if index < len(values) else "")
-            field.setMaxLength(t2options.WON_ENDPOINT_MAX)
-            field.setPlaceholderText(placeholder if index == 0 else "optional fallback host:port")
-            field.textChanged.connect(self.changed)
-            layout.addWidget(field)
-            self.fields.append(field)
+        super().__init__(", ".join(value or ()))
+        self.setPlaceholderText(placeholder)
+        self.textChanged.connect(self.changed)
 
     def value(self):
-        return tuple(field.text().strip() for field in self.fields if field.text().strip())
+        return tuple(item.strip() for item in self.text().split(",") if item.strip())
 
 
-class SourcesEdit(QWidget):
-    """An ordered list of master-server sources: a kind and an address each."""
+class BackendsEdit(QWidget):
+    """Backends in priority order, with a checkbox (and address) per service."""
     changed = Signal()
-    PLACEHOLDERS = (("tribesnext", "http://master.tribesnext.com"), ("lan", "(servers heartbeating here)"),
-                    ("torque", "host:port"))
 
     def __init__(self, value):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self.rows_layout = QVBoxLayout()
-        layout.addLayout(self.rows_layout)
-        add = QPushButton("Add source")
-        add.clicked.connect(lambda: self.add_row("torque", ""))
+        self.grid = QGridLayout()
+        layout.addLayout(self.grid)
+        add = QPushButton("Add Torque master")
+        add.setToolTip("Another Torque-protocol master server (host:port), merged into the server list.")
+        add.clicked.connect(self.add_torque)
         layout.addWidget(add)
-        self.rows = []
-        for kind, address in value or ():
-            self.add_row(kind, address)
+        self.backends = [dict(backend) for backend in value or ()]
+        self.render()
 
-    def add_row(self, kind, address):
-        row = QWidget()
-        line = QHBoxLayout(row)
-        line.setContentsMargins(0, 0, 0, 0)
-        kind_box = QComboBox()
-        kind_box.addItems(list(t2options.MASTER_SOURCE_KINDS))
-        kind_box.setCurrentText(kind)
-        address_field = QLineEdit(address)
-        remove = QPushButton("Remove")
-        line.addWidget(kind_box)
-        line.addWidget(address_field, 1)
-        line.addWidget(remove)
-        entry = (row, kind_box, address_field)
-        self.rows.append(entry)
-        self.rows_layout.addWidget(row)
+    def add_torque(self):
+        self.capture()
+        self.backends.append({"kind": "torque", "master": ""})
+        self.render()
+        self.changed.emit()
 
-        def update_kind():
-            selected = kind_box.currentText()
-            address_field.setEnabled(selected != "lan")
-            address_field.setPlaceholderText(dict(self.PLACEHOLDERS).get(selected, ""))
+    def move(self, index, offset):
+        self.capture()
+        target = index + offset
+        if 0 <= target < len(self.backends):
+            self.backends[index], self.backends[target] = self.backends[target], self.backends[index]
+            self.render()
             self.changed.emit()
 
-        def remove_row():
-            self.rows.remove(entry)
-            row.deleteLater()
-            self.changed.emit()
+    def remove(self, index):
+        self.capture()
+        del self.backends[index]
+        self.render()
+        self.changed.emit()
 
-        kind_box.currentTextChanged.connect(update_kind)
-        address_field.textChanged.connect(self.changed)
-        remove.clicked.connect(remove_row)
-        update_kind()
+    def render(self):
+        while self.grid.count():
+            item = self.grid.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        for column, title in enumerate(("Backend", "Auth", "Master", "IRC", "")):
+            self.grid.addWidget(QLabel(f"<b>{title}</b>"), 0, column)
+        self.cells = []
+        for row, backend in enumerate(self.backends, start=1):
+            kind = backend["kind"]
+            self.grid.addWidget(QLabel(t2options.BACKEND_LABELS.get(kind, kind)), row, 0)
+            cells = {}
+            for column, service in enumerate(t2options.BACKEND_SERVICES, start=1):
+                if service not in t2options.BACKEND_KINDS[kind]:
+                    self.grid.addWidget(QLabel("—"), row, column)
+                    continue
+                cell = QWidget()
+                line = QHBoxLayout(cell)
+                line.setContentsMargins(0, 0, 0, 0)
+                box = QCheckBox()
+                value = backend.get(service, False)
+                box.setChecked(bool(value) or (kind == "torque" and service == "master"))
+                line.addWidget(box)
+                field = None
+                if t2options.BACKEND_KINDS[kind][service] is not None:
+                    default = t2options.BACKEND_DEFAULT_ADDRESSES.get((kind, service), "")
+                    field = QLineEdit(value if isinstance(value, str) else default)
+                    chat = t2options.BACKEND_KINDS[kind][service] == "chat"
+                    field.setPlaceholderText("chat server host:port (empty: local chat)" if chat
+                                             else default or "host:port")
+                    field.textChanged.connect(self.changed)
+                    line.addWidget(field, 1)
+                box.toggled.connect(self.changed)
+                if field is not None:
+                    box.toggled.connect(field.setEnabled)
+                    field.setEnabled(box.isChecked())
+                cells[service] = (box, field)
+                self.grid.addWidget(cell, row, column)
+            buttons = QWidget()
+            controls = QHBoxLayout(buttons)
+            controls.setContentsMargins(0, 0, 0, 0)
+            for text, handler in (("↑", lambda _c=False, i=row - 1: self.move(i, -1)),
+                                  ("↓", lambda _c=False, i=row - 1: self.move(i, 1))):
+                button = QPushButton(text)
+                button.setFixedWidth(28)
+                button.clicked.connect(handler)
+                controls.addWidget(button)
+            if kind == "torque":
+                remove = QPushButton("Remove")
+                remove.clicked.connect(lambda _c=False, i=row - 1: self.remove(i))
+                controls.addWidget(remove)
+            self.grid.addWidget(buttons, row, 4)
+            self.cells.append(cells)
+        self.grid.setColumnStretch(2, 1)
+        self.grid.setColumnStretch(3, 1)
+
+    def capture(self):
+        """Read the widgets back into self.backends."""
+        for backend, cells in zip(self.backends, self.cells):
+            for service, (box, field) in cells.items():
+                if not box.isChecked():
+                    backend[service] = False
+                elif field is None:
+                    backend[service] = True
+                else:
+                    backend[service] = field.text().strip()
 
     def value(self):
-        return tuple((kind_box.currentText(), "" if kind_box.currentText() == "lan" else field.text().strip())
-                     for _row, kind_box, field in self.rows)
+        self.capture()
+        return tuple(dict(backend) for backend in self.backends)
 
 
 def requirement_text(key, allowed):
@@ -358,7 +402,7 @@ class ProfileEditor(QWidget):
         for key, widget in self.option_widgets.items():
             signal = {"bool": "toggled", "choice": "currentTextChanged", "int": "valueChanged",
                       "float": "valueChanged", "endpoints": "changed",
-                      "sources": "changed"}.get(t2options.BY_KEY[key].kind, "textChanged")
+                      "backends": "changed"}.get(t2options.BY_KEY[key].kind, "textChanged")
             getattr(widget, signal).connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_options)
         self.refresh_options()
@@ -369,9 +413,10 @@ class ProfileEditor(QWidget):
             widget = QCheckBox(option.label)
             widget.setChecked(bool(value))
         elif option.kind == "endpoints":
-            widget = EndpointsEdit(value, "automatic in local mode: listen address:port")
-        elif option.kind == "sources":
-            widget = SourcesEdit(value)
+            widget = EndpointsEdit(value, "automatic in local mode: listen address:port "
+                                          "(optional fallbacks after commas)")
+        elif option.kind == "backends":
+            widget = BackendsEdit(value)
         elif option.kind == "choice":
             widget = QComboBox()
             widget.addItems(list(option.choices))
@@ -399,7 +444,7 @@ class ProfileEditor(QWidget):
                 values[key] = widget.isChecked()
             elif kind == "choice":
                 values[key] = widget.currentText()
-            elif kind in ("int", "float", "endpoints", "sources"):
+            elif kind in ("int", "float", "endpoints", "backends"):
                 values[key] = widget.value()
             else:
                 values[key] = widget.text()
@@ -430,8 +475,7 @@ class ProfileEditor(QWidget):
             "values": {}, "positional": self.positional.text(), "custom": self.custom.text(),
             # Store every choice, including disabled ones, so re-enabling a
             # dependency restores what the user picked.
-            "options": {key: [list(item) if isinstance(item, tuple) else item for item in value]
-                        if isinstance(value, tuple) else value
+            "options": {key: list(value) if isinstance(value, tuple) else value
                         for key, value in self.option_values().items()},
         }
         for option, (enabled, fields) in self.value_boxes.items():

@@ -150,7 +150,188 @@ def read_dbmsg(stream):
             return f":wonemu.local DBMSG {query_id} 1 :{''.join(chunks)}"
 
 
+NO_TRIBESNEXT_CHAT = [{"kind": "tribesnext", "auth": True, "master": True, "irc": False},
+                      {"kind": "native", "auth": True, "master": True, "irc": True}]
+TRIBESNEXT_ONLY_IRC = [{"kind": "tribesnext", "auth": True, "master": True, "irc": True},
+                       {"kind": "native", "auth": True, "master": True, "irc": False}]
+
+
 class ProtocolTests(unittest.TestCase):
+    def test_tribesnext_session_merges_native_searches_and_lookups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory))
+            emulator.community.ensure_profile("NativePlayer", 4242)
+            emulator.community.create_tribe("Native Clan", "[NC]", "0", "1", "local", "NativePlayer", 4242)
+            session = {"username": "Player", "irc_authenticated": True, "community": "tribesnext",
+                       "tribesnext_credentials": object(), "auth_provider": "tribesnext"}
+            emulator.tribesnext_user_id = lambda username: None
+            emulator.tribesnext_robot.user_search = lambda supplied, search: [
+                {"name": "TNPlayer", "tag": "", "append": "0", "guid": "777"}]
+            emulator.tribesnext_robot.clan_search = lambda supplied, search: []
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            def query(text):
+                handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+                handler.server = SimpleNamespace(emulator=emulator)
+                handler.request = Request()
+                handler._handle_dbqax(text, session, 1)
+                return "".join(handler.request.sent)
+
+            search = query("1 C3 10 :player")
+            self.assertLess(search.index("TNPlayer"), search.index("NativePlayer"))  # priority order
+            self.assertIn("Native Clan", query("2 C4 10 :native"))
+            # An unknown TribesNext name resolves to the native profile.
+            self.assertIn("NativePlayer", query("3 23 0 :NativePlayer"))
+            self.assertIn("Native Clan", query("4 22 0 :Native Clan"))
+            # Without native IRC, the same session stays TribesNext-only.
+            strict = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory) / "strict",
+                                     backends=TRIBESNEXT_ONLY_IRC)
+            self.assertFalse(strict.merges_native_community(session))
+            emulator.log.close()
+            strict.log.close()
+
+    def test_irc_relay_registers_queues_and_mirrors_upstream_chat(self):
+        import queue
+        import threading
+
+        listener = socket.socket()
+        listener.bind((wonemu.HOST, 0))
+        listener.listen(1)
+        received = queue.Queue()
+
+        def upstream():
+            conn, _ = listener.accept()
+            with conn:
+                stream = conn.makefile("rb")
+                lines = []
+                for _ in range(3):  # NICK, USER, retried NICK
+                    lines.append(stream.readline().decode().strip())
+                    if len(lines) == 2:
+                        conn.sendall(b":srv 433 * Lou_Cypher :Nickname is already in use\r\n")
+                received.put(lines)
+                conn.sendall(b":srv 001 Lou_Cypher_ :Welcome\r\n:srv 375 x :MOTD\r\nPING :tok\r\n")
+                received.put([stream.readline().decode().strip() for _ in range(3)])  # queued + PONG
+                conn.sendall(b":Other!u@h PRIVMSG #tribes :hello\r\n")
+                received.put("sent")
+
+        threading.Thread(target=upstream, daemon=True).start()
+
+        class Handler:
+            relay_nickname = "Lou_Cypher"
+
+            def __init__(self):
+                self.out = queue.Queue()
+                self.lost = threading.Event()
+
+            def send_raw(self, data):
+                self.out.put(data.decode())
+
+            def relay_lost(self, relay):
+                self.lost.set()
+
+        handler = Handler()
+        relay = wonemu.IRCRelay(handler, f"{wonemu.HOST}:{listener.getsockname()[1]}",
+                                wonemu.irc_nickname("Lou Cypher"), "4242")
+        relay.relay("JOIN #tribes")
+        relay.relay("PRIVMSG #tribes :hi")
+        self.assertEqual(received.get(timeout=5), ["NICK Lou_Cypher", "USER 4242 0 * :Tribes 2 player",
+                                                   "NICK Lou_Cypher_"])
+        # 001 arrives first, so the queued lines are flushed before the PING is answered.
+        self.assertEqual(received.get(timeout=5), ["JOIN #tribes", "PRIVMSG #tribes :hi", "PONG :tok"])
+        received.get(timeout=5)
+        mirrored = [handler.out.get(timeout=5) for _ in range(2)]
+        # The upstream nick change is reported, MOTD hidden, and chat mirrored.
+        self.assertEqual(mirrored[0], ":Lou_Cypher!4242@localhost NICK :Lou_Cypher_\r\n")
+        self.assertEqual(mirrored[1], ":Other!u@h PRIVMSG #tribes :hello\r\n")
+        self.assertTrue(handler.lost.wait(5))  # the upstream closed its side
+        listener.close()
+
+    def test_irc_chat_commands_go_to_the_relay_and_the_rest_stays_local(self):
+        class Relay:
+            def __init__(self):
+                self.lines = []
+
+            def relay(self, line):
+                self.lines.append(line)
+
+            def close(self):
+                pass
+
+        class Request:
+            def __init__(self):
+                self.sent = []
+
+            def sendall(self, data):
+                self.sent.append(data.decode())
+
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory))
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+            handler.relay = Relay()
+            handler.dbproxy_chunks = {}
+            handler.rejected_dbproxy_queries = set()
+            session = {"username": "Player", "irc_authenticated": True, "irc_nickname": "Player",
+                       "irc_ident": "1", "community": "native"}
+            handler._handle_line("JOIN #tribes", session, 1, True)
+            handler._handle_line("PRIVMSG #tribes :hello", session, 1, True)
+            handler._handle_line("PING :keepalive", session, 1, True)
+            handler._handle_line("dbqax 5 69 0 :1", session, 1, True)
+            self.assertEqual(handler.relay.lines, ["JOIN #tribes", "PRIVMSG #tribes :hello"])
+            self.assertIn(":wonemu.local PONG :keepalive\r\n", handler.request.sent)
+            self.assertTrue(any("DBMSG 5" in line for line in handler.request.sent))
+            emulator.log.close()
+        self.assertEqual(wonemu.irc_nickname("[TN] Lou Cypher!"), "[TN]_Lou_Cypher")
+
+    def test_session_backends_follow_irc_priority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory))
+            credentials = object()
+            # Without a chat server, TribesNext IRC serves community data and chat stays local.
+            self.assertEqual(emulator.session_backends("tribesnext", credentials),
+                             ("tribesnext", ("native", True)))
+            relaying = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory) / "c",
+                                       backends=[{"kind": "tribesnext", "auth": True, "master": True,
+                                                  "irc": "chat.example.net:6667"},
+                                                 {"kind": "native", "auth": True, "irc": True}])
+            self.assertEqual(relaying.session_backends("local"),
+                             ("native", ("tribesnext", "chat.example.net:6667")))
+            relaying.log.close()
+            # A native login cannot use the TribesNext robot, but still gets its chat.
+            self.assertEqual(emulator.session_backends("local")[0], "native")
+            no_tn_irc = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory) / "b",
+                                        backends=[{"kind": "tribesnext", "auth": True, "master": True},
+                                                  {"kind": "native", "auth": True, "irc": True}])
+            self.assertEqual(no_tn_irc.session_backends("tribesnext", credentials),
+                             ("native", ("native", True)))
+            self.assertEqual(no_tn_irc.auth_order, ("tribesnext", "native"))
+            self.assertEqual(no_tn_irc.master_sources, [("tribesnext", wonemu.TRIBESNEXT_MASTER_URL)])
+            emulator.log.close()
+            no_tn_irc.log.close()
+
+    def test_backends_parse_validate_and_map_legacy_master_sources(self):
+        self.assertEqual(wonemu.parse_backends(wonemu.format_backends(wonemu.default_backends())),
+                         wonemu.default_backends())
+        backends = wonemu.parse_backends('[{"kind":"torque","master":"192.0.2.9:28000"},'
+                                         '{"kind":"native","auth":true,"master":true,"irc":true}]')
+        self.assertEqual(wonemu.backends_master_sources(backends),
+                         [("torque", "192.0.2.9:28000"), ("lan", "")])
+        for bad in ('[{"kind":"gopher"}]', '[{"kind":"torque","auth":true,"master":"a:1"}]',
+                    '[{"kind":"native","auth":false}]', '[{"kind":"tribesnext","auth":true,"master":"ftp://x"}]',
+                    '{"kind":"native"}'):
+            with self.assertRaises(ValueError, msg=bad):
+                wonemu.parse_backends(bad)
+        legacy = wonemu.backends_from_master_sources([("lan", ""), ("torque", "192.0.2.9:28000")])
+        self.assertFalse(legacy[0]["master"])
+        self.assertTrue(legacy[0]["auth"] and legacy[0]["irc"])
+        self.assertEqual(legacy[2], {"kind": "torque", "master": "192.0.2.9:28000"})
     def test_capture_log_rotates_one_generation_when_oversized(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "traffic.jsonl"
@@ -271,8 +452,9 @@ class ProtocolTests(unittest.TestCase):
 
     def test_dbproxy_profile_and_membership_reads_use_tribesnext_response(self):
         with tempfile.TemporaryDirectory() as directory:
+            # Native IRC unchecked: TribesNext is the only community backend.
             emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
-                                       Path(directory))
+                                       Path(directory), backends=TRIBESNEXT_ONLY_IRC)
             credentials = object()
             session = {"username": "Player", "irc_authenticated": True,
                        "tribesnext_credentials": credentials, "auth_provider": "tribesnext"}
@@ -1305,10 +1487,18 @@ class ProtocolTests(unittest.TestCase):
             account_store = community_store.CommunityStore(Path(directory) / "community.sqlite3")
             account_store.reserve_local_account(
                 "WONEMUXPROBE", woncrypto.local_auth_user_id("WONEMUXPROBE"))
+            # TribesNext is first by default; with native first, the reserved
+            # local account enrolls this password.
+            default_order_result = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, account_store)
             local_result = wonemu.decode_login_envelope(
-                payload, {"auth": key}, private_store, account_store)
+                payload, {"auth": key}, private_store, account_store,
+                auth_order=("native", "tribesnext"))
             existing_local_result = wonemu.decode_login_envelope(
-                payload, {"auth": key}, private_store, account_store)
+                payload, {"auth": key}, private_store, account_store,
+                auth_order=("native", "tribesnext"))
+            native_only_result = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, None, auth_order=("native",))
             recovery_requests = []
             recovery_result = wonemu.decode_login_envelope(
                 payload, {"auth": key}, private_store, account_store,
@@ -1338,8 +1528,14 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["password_utf16_bytes"], 50)
         self.assertEqual(result["client_identifier"], "Tribes2Client")
         self.assertEqual(result["account_validation"], "valid")
+        self.assertEqual(default_order_result["credential_source"], "tribesnext")
+        self.assertFalse(default_order_result["account_enrolled"])
         self.assertEqual(local_result["account_validation"], "valid")
+        self.assertEqual(local_result["credential_source"], "local")
         self.assertTrue(local_result["account_enrolled"])
+        # With TribesNext unchecked for auth, its key files are never consulted.
+        self.assertEqual(native_only_result["account_validation"], "account_missing")
+        self.assertEqual(native_only_result["tribesnext_recovery"], "not_used")
         self.assertEqual(existing_local_result["account_validation"], "valid")
         self.assertFalse(existing_local_result["account_enrolled"])
         self.assertEqual(recovery_result["tribesnext_recovery"], "refreshed")
@@ -1551,7 +1747,9 @@ class ProtocolTests(unittest.TestCase):
 class NetworkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(self.temp.name))
+        # These tests log in over IRC; keep chat local so none reaches a real network.
+        self.emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(self.temp.name),
+                                        backends=NO_TRIBESNEXT_CHAT)
         self.emulator.start()
 
     def tearDown(self):
@@ -1578,7 +1776,8 @@ class NetworkTests(unittest.TestCase):
         private_store.with_name("public.store").write_text(
             f"{username}\t7654321\t10001\tabcdef\tsignature\n", encoding="ascii")
         emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
-                                   Path(temp.name), keys=keys, private_store=private_store)
+                                   Path(temp.name), keys=keys, private_store=private_store,
+                                   backends=NO_TRIBESNEXT_CHAT)
         emulator.start()
         emulator.register_auth_session("127.0.0.1", username, session_key, reply, client_key)
         try:

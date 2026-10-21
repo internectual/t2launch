@@ -71,16 +71,38 @@ class OptionTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad):
                 t2options.coerce(option, bad)
 
-    def test_master_sources_are_an_ordered_extensible_list(self):
-        option = t2options.BY_KEY["won.master_sources"]
-        self.assertEqual(t2options.coerce(option, "torque=192.0.2.9:28000,lan,lan"),
-                         (("torque", "192.0.2.9:28000"), ("lan", "")))
-        self.assertEqual(t2options.coerce(option, [["LAN", "ignored"]]), (("lan", ""),))
-        for bad in ("gopher=x", "torque=nohost", "tribesnext=ftp://x"):
+    def test_backend_kinds_match_wonemu(self):
+        import wonemu
+        self.assertEqual(t2options.BACKEND_KINDS, wonemu.BACKEND_KINDS)
+        self.assertEqual(list(t2options.DEFAULT_BACKENDS), wonemu.default_backends())
+        # What the launcher sends, wonemu accepts unchanged.
+        env = t2options.launch_env({"won.mode": "local"}, HOOKED)
+        self.assertEqual(wonemu.parse_backends(env["T2LAUNCH_WON_BACKENDS"]), wonemu.default_backends())
+
+    def test_backends_are_ordered_and_validated(self):
+        option = t2options.BY_KEY["won.backends"]
+        backends = t2options.coerce(option, [
+            {"kind": "native", "auth": True, "master": True, "irc": False},
+            {"kind": "tribesnext", "auth": False, "master": True, "irc": ""},
+            {"kind": "torque", "master": "192.0.2.9:28000"}])
+        self.assertEqual(backends, (
+            {"kind": "native", "auth": True, "master": True, "irc": False},
+            {"kind": "tribesnext", "auth": False, "master": "http://master.tribesnext.com", "irc": False},
+            {"kind": "torque", "master": "192.0.2.9:28000"}))
+        for bad in ([{"kind": "gopher"}], [{"kind": "native", "auth": False}],
+                    [{"kind": "native", "auth": True}, {"kind": "torque", "master": "nohost"}],
+                    [{"kind": "tribesnext", "auth": True, "master": "ftp://x"}]):
             with self.assertRaises(ValueError, msg=bad):
                 t2options.coerce(option, bad)
-        env = t2options.launch_env({"won.mode": "local"}, HOOKED)
-        self.assertEqual(env["T2LAUNCH_MASTER_SOURCES"], "tribesnext=http://master.tribesnext.com,lan")
+
+    def test_old_master_sources_migrate_to_backends(self):
+        options = t2options.migrate({"options": {"won.mode": "local", "won.master_sources": [
+            ["lan", ""], ["torque", "192.0.2.9:28000"]]}})
+        self.assertNotIn("won.master_sources", options)
+        backends = t2options.coerce(t2options.BY_KEY["won.backends"], options["won.backends"])
+        self.assertFalse(backends[0]["master"])
+        self.assertTrue(backends[0]["auth"])
+        self.assertEqual(backends[2], {"kind": "torque", "master": "192.0.2.9:28000"})
 
     def test_remote_mode_needs_endpoints_and_a_verifier(self):
         with self.assertRaisesRegex(ValueError, "host:port to connect to"):
@@ -96,17 +118,17 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(env["T2LAUNCH_WON_VERIFIER"], "/tmp/verifier.der")
         # Local-service settings do not leak into a remote launch.
         self.assertNotIn("T2LAUNCH_WON_BIND", env)
-        self.assertNotIn("T2LAUNCH_MASTER_SOURCES", env)
+        self.assertNotIn("T2LAUNCH_WON_BACKENDS", env)
         # TribesNext logins need the account's keys locally, so remote mode has none.
         self.assertFalse(t2options.effective(options, HOOKED)["hook.tribesnext"])
         self.assertTrue(t2options.effective(options, HOOKED)["hook.tribes_tab"])
 
     def test_launch_env_and_hook_config(self):
-        env = t2options.launch_env({"won.mode": "local", "won.master_sources": "lan",
+        env = t2options.launch_env({"won.mode": "local",
                                     "won.bind_address": "0.0.0.0", "won.base_port": 16000,
                                     "video.software_gl": True}, HOOKED)
         self.assertEqual(env["T2LAUNCH_WON_MODE"], "local")
-        self.assertEqual(env["T2LAUNCH_MASTER_SOURCES"], "lan")
+        self.assertIn('"kind":"tribesnext"', env["T2LAUNCH_WON_BACKENDS"])
         self.assertEqual(env["T2LAUNCH_WON_BIND"], "0.0.0.0")
         self.assertEqual(env["T2LAUNCH_WON_BASE_PORT"], "16000")
         self.assertEqual(env["T2LAUNCH_WON_ENDPOINTS"], "")

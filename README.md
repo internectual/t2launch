@@ -213,9 +213,10 @@ the other four always follow the directory port):
 
 The hook replaces the three Sierra bootstrap strings in the running client's
 memory before WON initialization, with the profile's **Game connects to**
-entries (`T2LAUNCH_WON_ENDPOINTS`, up to three `host:port` values of at most 27
-characters, the size of each original string). Left empty in local mode, they
-default to the listen address and port, `127.0.0.1:15104` unless changed. It checks the original
+field (`T2LAUNCH_WON_ENDPOINTS`): one `host:port`, optionally followed by up to
+two comma-separated fallbacks, each at most 27 characters, the size of the
+original strings. Left empty in local mode, it is the listen address and port,
+`127.0.0.1:15104` unless changed. It checks the original
 strings and restores page permissions afterward. The executable on disk is
 unchanged. The option is off by default; enabling it on an unsupported executable
 fails instead of attempting the patch.
@@ -237,16 +238,45 @@ another machine, and answers status and stop requests only for this machine,
 so a LAN-reachable instance cannot be stopped remotely. ("This machine" includes
 its own LAN address, which its local game uses when the service listens there.)
 
-**Master-server sources.** The emulator's master service answers the game's
-server-list queries by merging an ordered list of sources, each a kind and an
-address: `tribesnext` (an HTTP list service such as
-`http://master.tribesnext.com`), `lan` (game servers that heartbeat to this
-emulator), and `torque` (another Torque-protocol master server at `host:port`,
-queried read-only, such as a remote wonemu). The default is TribesNext followed
-by LAN. Local game servers' heartbeats are forwarded to each `tribesnext`
-source. On the command line, `--master-sources` (or `T2LAUNCH_MASTER_SOURCES`)
-takes `kind=address,...`; the older `--master-backend local|tribesnext|hybrid`
-still works. Further backends are added as new source kinds.
+**Backends.** In local mode the WON emulator tab lists wonemu's backends in
+priority order (↑/↓ to reorder) with a column per service, each with a
+checkbox and, where the service needs one, an address:
+
+| Backend | Auth | Master (server list) | IRC |
+|---|---|---|---|
+| TribesNext | the account's installed key files (this machine only) | HTTP list, `http://master.tribesnext.com` | community data through the robot API; with a chat server address, chat relayed to that IRC network |
+| Native | wonemu's own accounts | servers that heartbeat to this emulator | wonemu's community store and its own chat |
+| Torque master (add any number) | — | another Torque-protocol master, `host:port` | — |
+
+TribesNext is first by default, with every service checked, then Native. Tribes 2
+sees one login, one server list, and one community, whichever backends supply them:
+
+- **Auth** tries each checked backend in order; the first that accepts the
+  password logs the player in. A wrong password or unknown account falls through
+  to the next.
+- **Master** merges the server lists of every checked backend, in order. Local
+  game servers' heartbeats are forwarded to TribesNext when it is checked.
+- **IRC** serves a player's own data (buddies, T-Mail, history, memberships) from
+  the backend that logged them in, or the next checked backend that can serve
+  them: TribesNext community data needs a TribesNext login, native serves anyone.
+  Player and tribe searches merge every checked backend, and a name TribesNext
+  does not know opens its existing native profile. Chat goes to the first
+  checked backend that offers it. With a chat server entered in TribesNext's IRC
+  cell, wonemu connects each player to that IRC network under their account
+  name (as TribesNext's own client fix does), relays chat both ways, and keeps
+  DBProxy and the WON handshake local. If the chat server cannot be reached or
+  drops, the player gets a notice and chat falls back to wonemu's own. The
+  address is empty by default: the server TribesNext's published client fix
+  used, `irc.arloria.net:6667`, no longer resolves, so enter the current one to
+  turn the relay on.
+
+On the command line, `--backends` (or `T2LAUNCH_WON_BACKENDS`) takes the list as
+JSON, for example
+`[{"kind":"tribesnext","auth":true,"master":true,"irc":"chat.example.net:6667"},{"kind":"native","auth":true,"master":true,"irc":true}]`
+(`"irc": true` serves TribesNext community data without relaying chat).
+The older `--master-sources kind=address,...` and `--master-backend` options set
+only the master column. New backends are added as new kinds in `BACKEND_KINDS`
+(mirrored in `t2options.py`).
 
 The directory serves `/TitanServers/Auth`, `/Tribes2`, and
 `/TitanServers/DBProxy`, advertising the configured address (the listen

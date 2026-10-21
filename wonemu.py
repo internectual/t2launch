@@ -244,6 +244,108 @@ def format_master_sources(sources):
     return ",".join(kind if not address else f"{kind}={address}" for kind, address in sources)
 
 
+# Backends wonemu can use for each service it offers the game. A kind lists
+# the services it supports and how each one is addressed: None means the
+# service takes no address, "url" an http(s) URL, "endpoint" a host:port, and
+# "chat" an optional host:port (TribesNext IRC: checked serves community data;
+# an address also relays chat to that IRC network).
+# A profile's backends are an ordered list (priority and fallback order) of
+# {"kind": ..., "auth": bool, "master": False|True|address, "irc": ...}.
+BACKEND_KINDS = {
+    "tribesnext": {"auth": None, "master": "url", "irc": "chat"},
+    "native": {"auth": None, "master": None, "irc": None},
+    "torque": {"master": "endpoint"},
+}
+BACKEND_SERVICES = ("auth", "master", "irc")
+# The chat server TribesNext's published client fix used; it no longer
+# resolves, so chat relaying is off until a current server is configured.
+TRIBESNEXT_IRC_SERVER = "irc.arloria.net:6667"
+BACKEND_DEFAULT_ADDRESSES = {("tribesnext", "master"): TRIBESNEXT_MASTER_URL}
+
+
+def default_backends(tribesnext_url=TRIBESNEXT_MASTER_URL):
+    """TribesNext first for every service, then wonemu's native services."""
+    return [{"kind": "tribesnext", "auth": True, "master": tribesnext_url.rstrip("/"), "irc": True},
+            {"kind": "native", "auth": True, "master": True, "irc": True}]
+
+
+def parse_backends(spec, tribesnext_url=TRIBESNEXT_MASTER_URL):
+    """Validate a backend list (JSON text or a list) into canonical dicts."""
+    entries = json.loads(spec) if isinstance(spec, str) else spec
+    if not isinstance(entries, list):
+        raise ValueError("Backends must be a list")  # noqa: TRY004 (configuration errors are ValueError)
+    backends = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("kind") not in BACKEND_KINDS:
+            raise ValueError(f"Unknown backend: {entry!r}")
+        kind = entry["kind"]
+        backend = {"kind": kind}
+        for service in BACKEND_SERVICES:
+            value = entry.get(service, False)
+            if service not in BACKEND_KINDS[kind]:
+                if value:
+                    raise ValueError(f"The {kind} backend has no {service} service")
+                continue
+            address_type = BACKEND_KINDS[kind][service]
+            if not value:
+                backend[service] = False
+            elif address_type is None or (address_type == "chat" and
+                                          (value is True or not str(value).strip())):
+                backend[service] = True
+            else:
+                address = value if isinstance(value, str) and value.strip() else \
+                    BACKEND_DEFAULT_ADDRESSES.get((kind, service), "")
+                if kind == "tribesnext" and service == "master" and value is True:
+                    address = tribesnext_url
+                address = str(address).strip().rstrip("/")
+                if address_type == "url":
+                    if urllib.parse.urlsplit(address).scheme not in ("http", "https"):
+                        raise ValueError(f"The {kind} {service} service needs an http(s) URL")
+                else:
+                    host, port = parse_endpoint(address)
+                    address = f"{host}:{port}"
+                backend[service] = address
+        backends.append(backend)
+    if not any(backend.get("auth") for backend in backends):
+        raise ValueError("At least one backend must provide auth")
+    return backends
+
+
+def format_backends(backends):
+    return json.dumps(backends, separators=(",", ":"))
+
+
+def backends_master_sources(backends):
+    """The ordered master-server sources a backend list enables."""
+    sources = []
+    for backend in backends:
+        value = backend.get("master")
+        if not value:
+            continue
+        source = {"tribesnext": ("tribesnext", value), "native": ("lan", ""),
+                  "torque": ("torque", value)}[backend["kind"]]
+        if source not in sources:
+            sources.append(source)
+    return sources
+
+
+def backends_from_master_sources(sources, tribesnext_url=TRIBESNEXT_MASTER_URL):
+    """Backends equivalent to a master-source list, keeping default auth and IRC."""
+    backends = default_backends(tribesnext_url)
+    backends[0]["master"] = next((address for kind, address in sources if kind == "tribesnext"), False)
+    backends[1]["master"] = ("lan", "") in sources
+    backends += [{"kind": "torque", "master": address} for kind, address in sources if kind == "torque"]
+    return backends
+
+
+def session_community(session):
+    """A session's community backend; older sessions imply it from their login."""
+    community = session.get("community")
+    if community is None and "community" not in session:
+        community = "tribesnext" if session.get("auth_provider") == "tribesnext" else "native"
+    return community
+
+
 def parse_endpoint(text):
     """Parse "host:port", returning (host, port)."""
     host, separator, port_text = str(text).strip().rpartition(":")
@@ -364,7 +466,7 @@ def parse_login_payload(payload, session_key):
 
 
 def decode_login_envelope(payload, keys, private_store=None, account_store=None,
-                          refresh_tribesnext=None):
+                          refresh_tribesnext=None, auth_order=("tribesnext", "native")):
     reader = Reader(payload)
     if reader.take(5) != bytes.fromhex("05 0c 00 03 00"):
         raise ValueError("Not a native login request")
@@ -390,30 +492,30 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None,
     except (OSError, ValueError) as exc:
         result["login_data_error"] = str(exc)
     else:
+        # Try each auth backend in priority order; the first valid one wins.
+        # A wrong password or a missing account falls through to the next.
         account_enrolled = False
-        tribesnext_validation = "store_missing"
-        if account_store is not None and account_store.local_account_exists(fields["username"]):
-            account_validation, account_enrolled = account_store.verify_local_account(
-                fields["username"], fields["password"])
-            credential_source = "local"
-            # The same game login screen is used for WON and TribesNext. If the
-            # local profile password differs from the user's TribesNext password,
-            # accept the latter only when it unlocks that account's installed
-            # TribesNext private key.
-            if account_validation != "valid" and private_store:
+        tribesnext_validation = "not_used"
+        account_validation = "account_missing"
+        credential_source = "unknown"
+        for backend in auth_order:
+            if backend == "tribesnext":
                 tribesnext_validation = woncrypto.verify_private_store_password(
                     private_store, fields["username"], fields["password"])
-                if tribesnext_validation == "valid":
-                    account_validation = "valid"
-                    credential_source = "tribesnext"
-            elif private_store:
-                tribesnext_validation = woncrypto.verify_private_store_password(
-                    private_store, fields["username"], fields["password"])
-        else:
-            tribesnext_validation = woncrypto.verify_private_store_password(
-                private_store, fields["username"], fields["password"])
-            account_validation = tribesnext_validation
-            credential_source = "tribesnext" if account_validation == "valid" else "unknown"
+                outcome = tribesnext_validation
+            elif backend == "native" and account_store is not None and \
+                    account_store.local_account_exists(fields["username"]):
+                outcome, account_enrolled = account_store.verify_local_account(
+                    fields["username"], fields["password"])
+            else:
+                continue
+            if outcome == "valid":
+                account_validation = "valid"
+                credential_source = "tribesnext" if backend == "tribesnext" else "local"
+                break
+            # Report the most specific failure: a known account beats a missing one.
+            if account_validation in ("account_missing", "store_missing") or outcome == "invalid":
+                account_validation = outcome
         recovery_status = "not_configured"
         if tribesnext_validation != "valid":
             recovery_status = "not_used"
@@ -585,6 +687,123 @@ class DBProxyHandler(socketserver.BaseRequestHandler):
             emulator.log.event("connection_error", service="dbproxy", connection=connection, error=str(exc))
 
 
+# Chat commands relayed to an upstream IRC network when a session's chat
+# backend is remote (TribesNext). DBProxy, the WON certificate handshake, and
+# keepalive PINGs stay with wonemu.
+IRC_RELAY_COMMANDS = frozenset({"JOIN", "PART", "PRIVMSG", "NOTICE", "NAMES", "TOPIC", "WHO",
+                                "WHOIS", "AWAY", "MODE", "LIST", "INVITE", "KICK", "ISON"})
+# Upstream registration and MOTD numerics the game has no use for after its own login.
+IRC_RELAY_HIDDEN = frozenset({"001", "002", "003", "004", "005", "250", "251", "252", "253", "254",
+                              "255", "265", "266", "372", "375", "376", "422"})
+
+
+def irc_nickname(username):
+    """A player's nick on a public IRC network, as TribesNext's client fix forms it."""
+    nick = str(username).replace(" ", "_")
+    return "".join(c for c in nick if c not in "~@#$!+%/|^{&*()<>")[:30] or "Tribes2Player"
+
+
+class IRCRelay:
+    """One player's connection to an upstream IRC network, mirrored to the game."""
+
+    def __init__(self, handler, address, nickname, ident):
+        self.handler = handler
+        self.address = address
+        self.nickname = nickname
+        self.ident = ident
+        self.registered = False
+        self.closed = False
+        self.pending = []
+        self.lock = threading.Lock()
+        self.socket = None
+        self.endpoint = parse_endpoint(address)
+        # Connect on the relay thread so a slow chat server never stalls the
+        # game's login; client lines queue until registration.
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def send(self, line):
+        with self.lock:
+            if not self.closed and self.socket is not None:
+                self.socket.sendall(line.encode("utf-8") + b"\r\n")
+
+    def relay(self, line):
+        """Send a client chat line upstream, queueing it until registration."""
+        with self.lock:
+            if not self.registered:
+                if len(self.pending) < 50:
+                    self.pending.append(line)
+                return
+        self.send(line)
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            sock = self.socket
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _run(self):
+        buffer = b""
+        nick_attempts = 0
+        try:
+            sock = socket.create_connection(self.endpoint, timeout=10)
+            sock.settimeout(None)
+            with self.lock:
+                if self.closed:
+                    sock.close()
+                    return
+                self.socket = sock
+            self.send(f"NICK {self.nickname}")
+            self.send(f"USER {self.ident} 0 * :Tribes 2 player")
+            while True:
+                data = sock.recv(4096)
+                if not data:
+                    break
+                buffer += data
+                if len(buffer) > 65536:
+                    raise ValueError("Upstream IRC line exceeded limit")
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    raw = raw.rstrip(b"\r")
+                    text = raw.decode("utf-8", "replace")
+                    parts = text.split(" ")
+                    command = parts[1] if text.startswith(":") and len(parts) > 1 else parts[0]
+                    if command == "PING":
+                        self.send("PONG " + text.split(" ", 1)[1] if " " in text else "PONG")
+                        continue
+                    if command == "433" and not self.registered and nick_attempts < 3:
+                        nick_attempts += 1
+                        self.nickname = (self.nickname + "_")[:30]
+                        self.send(f"NICK {self.nickname}")
+                        continue
+                    if command == "001":
+                        with self.lock:
+                            self.registered = True
+                            pending, self.pending = self.pending, []
+                        upstream_nick = parts[2] if len(parts) > 2 else self.nickname
+                        if upstream_nick != self.handler.relay_nickname:
+                            self.handler.send_raw(f":{self.handler.relay_nickname}!{self.ident}@localhost "
+                                                  f"NICK :{upstream_nick}\r\n".encode())
+                            self.handler.relay_nickname = upstream_nick
+                        for line in pending:
+                            self.send(line)
+                    if command in IRC_RELAY_HIDDEN:
+                        continue
+                    self.handler.send_raw(raw + b"\r\n")
+        except (OSError, ValueError):
+            pass
+        finally:
+            was_open = not self.closed
+            self.close()
+            if was_open:
+                self.handler.relay_lost(self)
+
+
 class IRCHandler(socketserver.BaseRequestHandler):
     """Handle T2's certificate/challenge IRC login exchange."""
 
@@ -602,6 +821,8 @@ class IRCHandler(socketserver.BaseRequestHandler):
             return
 
         buffer = bytearray()
+        self.send_lock = threading.Lock()
+        self.relay = None
         self.dbproxy_chunks = {}
         self.rejected_dbproxy_queries = set()
         challenge_sent = False
@@ -647,12 +868,50 @@ class IRCHandler(socketserver.BaseRequestHandler):
             emulator.log.event("connection_error", service="irc", connection=connection,
                                error=str(exc))
         finally:
+            if self.relay is not None:
+                self.relay.close()
             if session.get("presence_registered"):
                 emulator.update_irc_presence(
                     emulator.auth_user_id(session["username"]), connection, False)
 
     def _send(self, line):
-        self.request.sendall(line.encode("utf-8"))
+        self.send_raw(line.encode("utf-8"))
+
+    def send_raw(self, data):
+        # The relay thread writes to the same client socket.
+        lock = getattr(self, "send_lock", None)
+        if lock is None:
+            self.request.sendall(data)
+            return
+        with lock:
+            self.request.sendall(data)
+
+    def start_chat_relay(self, session, connection):
+        chat = session.get("chat")
+        if not chat or chat[0] != "tribesnext":
+            return
+        emulator = self.server.emulator
+        self.relay_nickname = session["irc_nickname"]
+        try:
+            self.relay = IRCRelay(self, chat[1], irc_nickname(session["username"]), session["irc_ident"])
+        except ValueError as exc:
+            emulator.log.event("irc_relay_unavailable", connection=connection, server=chat[1],
+                               error=str(exc))
+            return
+        emulator.log.event("irc_relay_started", connection=connection, server=chat[1])
+
+    def relay_lost(self, relay):
+        if getattr(self, "relay", None) is not relay:
+            return
+        self.relay = None
+        self.server.emulator.log.event("irc_relay_closed", server=relay.address,
+                                       registered=relay.registered)
+        state = "Disconnected from" if relay.registered else "Could not reach"
+        try:
+            self._send(f":wonemu.local NOTICE {self.relay_nickname} :{state} TribesNext chat "
+                       f"({relay.address}); using local chat\r\n")
+        except OSError:
+            pass
 
     def _send_dbmsg(self, query_id, body):
         prefix = f":wonemu.local DBMSG {query_id} 0 :"
@@ -842,10 +1101,20 @@ class IRCHandler(socketserver.BaseRequestHandler):
             session["presence_registered"] = True
             emulator.log.event("irc_authenticated", connection=connection,
                                token_bytes=len(token))
+            self.start_chat_relay(session, connection)
             return
         if command == "PING":
             self._send(f":wonemu.local PONG :{arguments.lstrip(':')}\r\n")
-        elif command == "JOIN" and session.get("irc_authenticated"):
+            return
+        relay = getattr(self, "relay", None)
+        if relay is not None and session.get("irc_authenticated"):
+            if command in IRC_RELAY_COMMANDS:
+                relay.relay(line)
+                return
+            if command == "QUIT":
+                relay.relay(line)
+                relay.close()
+        if command == "JOIN" and session.get("irc_authenticated"):
             channel = arguments.split(" ", 1)[0]
             if channel:
                 nickname = session["irc_nickname"]
@@ -895,7 +1164,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                reason="malformed_dbproxy_query")
             return
 
-        if (session.get("auth_provider") == "tribesnext" and
+        if (session_community(session) == "tribesnext" and
                 (ordinal, array_query) not in TRIBESNEXT_ALLOWED_QUERIES):
             self._send_dbmsg(query_id,
                              "1\tTribesNext community operation unavailable\\S0\\S")
@@ -954,7 +1223,7 @@ class DBProxyQuery:
     def run(self):
         """Return ``(status, result, status_code, supported)`` for this query."""
         key = (self.ordinal, self.array_query)
-        if (self.session.get("auth_provider") == "tribesnext" and
+        if (session_community(self.session) == "tribesnext" and
                 key in self.ROBOT_HANDLERS):
             try:
                 if self.credentials is None:
@@ -1044,7 +1313,7 @@ class DBProxyQuery:
         return profile
 
     def tribesnext_profile(self, reference):
-        if self.session.get("auth_provider") != "tribesnext":
+        if session_community(self.session) != "tribesnext":
             return None
         credentials = self.session.get("tribesnext_credentials")
         if credentials is None:
@@ -1055,6 +1324,10 @@ class DBProxyQuery:
         if guid is False:
             return False
         if guid is None:
+            # With native community also checked, an unknown TribesNext name
+            # may be a native player: resolve it locally instead.
+            if self.emulator.merges_native_community(self.session):
+                return None
             return self.tribesnext_player_not_found
         try:
             profile = self.emulator.tribesnext_robot.user_view(credentials, guid)
@@ -1066,7 +1339,7 @@ class DBProxyQuery:
         return profile
 
     def tribesnext_search(self, method, search):
-        if self.session.get("auth_provider") != "tribesnext":
+        if session_community(self.session) != "tribesnext":
             return None
         credentials = self.session.get("tribesnext_credentials")
         if credentials is None:
@@ -1079,7 +1352,7 @@ class DBProxyQuery:
             return False
 
     def tribesnext_clan(self, reference):
-        if self.session.get("auth_provider") != "tribesnext":
+        if session_community(self.session) != "tribesnext":
             return None
         credentials = self.session.get("tribesnext_credentials")
         if credentials is None:
@@ -1093,6 +1366,8 @@ class DBProxyQuery:
                 match = next((clan for clan in matches
                               if clan["name"].casefold() == reference.casefold()), None)
                 if match is None:
+                    if self.emulator.merges_native_community(self.session):
+                        return None
                     return self.tribesnext_clan_not_found
                 clan_id = match["id"]
             return self.emulator.tribesnext_robot.clan_view(credentials, clan_id)
@@ -1123,7 +1398,7 @@ class DBProxyQuery:
                       if player["name"].casefold() == reference.casefold()), None)
         return int(match["guid"]) if match else None
 
-    # TribesNext robot translations (sessions with auth_provider == "tribesnext").
+    # TribesNext robot translations (sessions whose community backend is TribesNext).
 
     def tn_set_picture(self):
         graphic = self.arguments.strip()
@@ -1747,6 +2022,11 @@ class DBProxyQuery:
         if remote_profile is False or remote_profile is self.tribesnext_player_not_found:
             found = False
             local_account = session_account = legacy_account = False
+        elif remote_profile is None and session_community(self.session) == "tribesnext":
+            # TribesNext did not know the name and native community is also
+            # checked: show an existing native profile, never create one.
+            local_account = session_account = legacy_account = False
+            found = self.emulator.community.get_profile(requested) is not None
         else:
             local_account = self.emulator.community.local_account_exists(requested)
             session_account = requested.casefold() == self.session["username"].casefold()
@@ -1803,6 +2083,9 @@ class DBProxyQuery:
         search = raw_search.casefold()
         remote_matches = self.tribesnext_search(
             self.emulator.tribesnext_robot.user_search, raw_search)
+        merge = self.emulator.merges_native_community(self.session)
+        if remote_matches is False and merge:
+            remote_matches = []  # still list the native players
         if remote_matches is False:
             status, result, status_code = "1\tTribesNext search unavailable", "0", 1
         elif remote_matches is None:
@@ -1825,18 +2108,30 @@ class DBProxyQuery:
                                             str(profile["user_id"]))))
         else:
             matches = remote_matches[:self.limit]
-            result = str(len(matches))
-            status_code = 0
-            status = "0\t"
             self.rows.extend("\t".join((str(index), player["name"], player.get("tag", ""),
                                          player.get("append", "0"), str(player["guid"])))
                              for index, player in enumerate(matches))
+            if merge:
+                # Existing native profiles only; a search never creates records.
+                seen = {player["name"].casefold() for player in matches}
+                for profile in self.emulator.community.search_players(search, self.limit):
+                    if len(self.rows) >= self.limit or profile["display_name"].casefold() in seen:
+                        continue
+                    seen.add(profile["display_name"].casefold())
+                    self.rows.append("\t".join((str(len(self.rows)), profile["display_name"], "", "",
+                                                str(profile["user_id"]))))
+            result = str(len(self.rows))
+            status_code = 0
+            status = "0\t"
         return status, result, status_code
 
     def tribe_search(self):
         query_fields = self.arguments.split("\t")
         search = query_fields[0].strip() if query_fields else ""
         remote_matches = self.tribesnext_search(self.emulator.tribesnext_robot.clan_search, search)
+        merge = self.emulator.merges_native_community(self.session)
+        if remote_matches is False and merge:
+            remote_matches = []
         if remote_matches is False:
             status, result, status_code = "1\tTribesNext search unavailable", "0", 1
         else:
@@ -1844,6 +2139,15 @@ class DBProxyQuery:
                 matches = remote_matches[:self.limit]
                 self.rows.extend("\t".join((str(index), clan["name"], "", ""))
                                  for index, clan in enumerate(matches))
+                if merge:
+                    seen = {clan["name"].casefold() for clan in matches}
+                    for tribe in self.emulator.community.search_tribes(search, self.limit):
+                        if len(self.rows) >= self.limit or tribe["name"].casefold() in seen:
+                            continue
+                        seen.add(tribe["name"].casefold())
+                        self.rows.append("\t".join((str(len(self.rows)), tribe["name"], tribe["tag"],
+                                                    str(tribe["member_count"]))))
+                    matches = self.rows
             else:
                 matches = self.emulator.community.search_tribes(search, self.limit)
                 self.rows.extend("\t".join((str(index), tribe["name"], tribe["tag"],
@@ -2332,7 +2636,8 @@ class AuthHandler(socketserver.BaseRequestHandler):
                             payload, emulator.keys,
                             emulator.private_store if this_machine else None, emulator.community,
                             emulator.refresh_tribesnext_account
-                            if emulator.refresh_tribesnext and this_machine else None)
+                            if emulator.refresh_tribesnext and this_machine else None,
+                            emulator.auth_order)
                         reader = Reader(payload)
                         reader.take(5)
                         reader.take(2)
@@ -2429,7 +2734,7 @@ class Emulator:
     def __init__(self, ports=None, log_dir=LOG_DIR, empty=False, keys=None, private_store=None,
                  master_backend="local", tribesnext_master_url=TRIBESNEXT_MASTER_URL,
                  community_db=None, refresh_tribesnext=False, master_sources=None,
-                 bind_address=HOST, advertise_address=""):
+                 bind_address=HOST, advertise_address="", backends=None):
         self.ports = dict(ports or PORTS)
         self.bind_address = bind_address or "0.0.0.0"
         self.advertise_address = advertised_address(self.bind_address, advertise_address)
@@ -2448,11 +2753,18 @@ class Emulator:
         self.auth_session_lock = threading.RLock()
         self.irc_presence = {}
         self.irc_presence_lock = threading.RLock()
-        if master_sources is None:
-            if master_backend not in {"local", "tribesnext", "hybrid"}:
-                raise ValueError(f"Unknown master-server backend: {master_backend}")
-            master_sources = master_backend_sources(master_backend, tribesnext_master_url)
-        self.master_sources = list(master_sources)
+        if backends is None:
+            if master_sources is None:
+                if master_backend not in {"local", "tribesnext", "hybrid"}:
+                    raise ValueError(f"Unknown master-server backend: {master_backend}")
+                master_sources = master_backend_sources(master_backend, tribesnext_master_url)
+            backends = backends_from_master_sources(master_sources, tribesnext_master_url)
+        self.backends = parse_backends(backends, tribesnext_master_url)
+        self.master_sources = backends_master_sources(self.backends)
+        # Priority order for each service; see BACKEND_KINDS.
+        self.auth_order = tuple(backend["kind"] for backend in self.backends if backend.get("auth"))
+        self.irc_backends = tuple((backend["kind"], backend["irc"]) for backend in self.backends
+                                  if backend.get("irc"))
         own_hosts = {"localhost", "0.0.0.0", self.bind_address, self.advertise_address}
         for kind, address in self.master_sources:
             if kind == "torque":
@@ -2476,7 +2788,8 @@ class Emulator:
     def register_auth_session(self, peer_ip, username, session_key, auth1_reply, client_key,
                               tribesnext_credentials=None, auth_provider="local"):
         auth_provider = auth_provider or "local"
-        if auth_provider != "tribesnext":
+        community, chat = self.session_backends(auth_provider, tribesnext_credentials)
+        if community == "native":
             user_id = self.auth_user_id(username)
             self.community.ensure_profile(username, user_id)
         with self.auth_session_lock:
@@ -2487,8 +2800,30 @@ class Emulator:
                 "client_key": dict(client_key),
                 "tribesnext_credentials": tribesnext_credentials,
                 "auth_provider": auth_provider,
+                "community": community,
+                "chat": chat,
                 "created": time.time(),
             }
+
+    def session_backends(self, auth_provider, tribesnext_credentials=None):
+        """The community and chat backends for a login, in IRC priority order.
+
+        TribesNext community data needs a TribesNext login (the robot API acts
+        with the player's credentials); native community data serves anyone.
+        Chat goes to the first IRC backend that offers it; TribesNext chat is a
+        public IRC network, so it needs no TribesNext login.
+        """
+        community = next((kind for kind, _address in self.irc_backends
+                          if kind == "native" or (kind == "tribesnext" and auth_provider == "tribesnext"
+                                                  and tribesnext_credentials is not None)), None)
+        chat = next(((kind, address) for kind, address in self.irc_backends
+                     if kind == "native" or isinstance(address, str)), None)
+        return community, chat
+
+    def merges_native_community(self, session):
+        """Whether a TribesNext community session also sees native records."""
+        return (session_community(session) == "tribesnext" and
+                any(kind == "native" for kind, _address in self.irc_backends))
 
     def auth_info_tribes(self, username, auth_provider=None, tribesnext_credentials=None):
         """Return the memberships to embed in the Auth2 AuthInfo, best effort.
@@ -2610,7 +2945,7 @@ class Emulator:
                 "pid": os.getpid(),
                 "stage": AUTH_STAGE if self.keys else "directory + DBProxy + Torque master proxy",
                 "implementation_sha256": IMPLEMENTATION_SHA256,
-                "master_sources": self.master_backend,
+                "backends": format_backends(self.backends),
                 "bind_address": self.bind_address,
                 "advertise_address": self.advertise_address,
                 "refresh_tribesnext": self.refresh_tribesnext,
@@ -3003,7 +3338,7 @@ def ensure(args):
         "private_store_path_sha256": hashlib.sha256(str(private_store.resolve()).encode()).hexdigest(),
         "community_db_path_sha256": hashlib.sha256(
             str(community_db.expanduser().resolve()).encode()).hexdigest(),
-        "master_sources": format_master_sources(args.master_sources),
+        "backends": format_backends(args.backends),
         "bind_address": args.bind_address,
         "advertise_address": advertised_address(args.bind_address, args.advertise_address),
     }
@@ -3038,7 +3373,7 @@ def ensure(args):
                       "--auth-key-profile", args.auth_key_profile,
                       "--private-store", str(private_store),
                       "--community-db", str(community_db),
-                      "--master-sources", format_master_sources(args.master_sources),
+                      "--backends", format_backends(args.backends),
                       "--bind-address", args.bind_address]
         if args.advertise_address:
             child_args += ["--advertise-address", args.advertise_address]
@@ -3081,6 +3416,9 @@ def main():
                         help="legacy password-verification fallback (defaults to base/private.store beside the game binary)")
     parser.add_argument("--community-db", type=Path,
                         help="SQLite community profile database (defaults to community.sqlite3 under --log-dir)")
+    parser.add_argument("--backends", default=os.environ.get("T2LAUNCH_WON_BACKENDS", ""),
+                        help="ordered JSON list of backends, each {kind, auth, master, irc}; kinds: "
+                             + ", ".join(BACKEND_KINDS) + " (default: TribesNext, then native)")
     parser.add_argument("--master-sources", default=os.environ.get("T2LAUNCH_MASTER_SOURCES", ""),
                         help="ordered master-server sources, e.g. 'tribesnext=URL,lan,torque=HOST:PORT' "
                              "(kinds: " + ", ".join(MASTER_SOURCE_KINDS) + ")")
@@ -3113,9 +3451,14 @@ def main():
             if args.ports[service] == PORTS[service]:
                 args.ports[service] = args.base_port + offset
     try:
-        args.master_sources = (parse_master_sources(args.master_sources, args.tribesnext_master_url)
-                               if args.master_sources.strip() else
-                               master_backend_sources(args.master_backend, args.tribesnext_master_url))
+        if args.backends.strip():
+            args.backends = parse_backends(args.backends, args.tribesnext_master_url)
+        else:
+            # Older options set only the master column; auth and IRC keep defaults.
+            sources = (parse_master_sources(args.master_sources, args.tribesnext_master_url)
+                       if args.master_sources.strip() else
+                       master_backend_sources(args.master_backend, args.tribesnext_master_url))
+            args.backends = parse_backends(backends_from_master_sources(sources, args.tribesnext_master_url))
     except ValueError as exc:
         parser.error(str(exc))
     try:
@@ -3146,7 +3489,7 @@ def main():
         private_store = args.private_store or args.client_binary.expanduser().resolve().parent / "base/private.store"
         emulator = Emulator(args.ports, args.log_dir, args.empty_directory, keys, private_store,
                             args.master_backend, args.tribesnext_master_url, args.community_db,
-                            args.refresh_tribesnext, master_sources=args.master_sources,
+                            args.refresh_tribesnext, backends=args.backends,
                             bind_address=args.bind_address, advertise_address=args.advertise_address)
         def stop(_signum, _frame):
             emulator.stopped.set()
