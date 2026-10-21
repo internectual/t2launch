@@ -144,6 +144,15 @@ class CommunityStore:
                     PRIMARY KEY (owner_id, buddy_id)
                 )
             """)
+            # TribesNext has no player picture field; keep the chosen in-game
+            # texture here by certificate GUID instead of seeding a local profile.
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS tribesnext_pictures (
+                    guid INTEGER PRIMARY KEY,
+                    graphic TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS forums (
                     forum_id INTEGER PRIMARY KEY,
@@ -746,6 +755,21 @@ class CommunityStore:
                     SELECT user_id FROM profiles WHERE username = ? COLLATE NOCASE)
             """, (str(owner_username), str(blocked_username)))
         return cursor.rowcount > 0
+
+    def tribesnext_picture(self, guid):
+        with self.lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT graphic FROM tribesnext_pictures WHERE guid = ?", (int(guid),)
+            ).fetchone()
+        return row["graphic"] if row is not None else None
+
+    def set_tribesnext_picture(self, guid, graphic):
+        with self.lock, self._connection() as connection:
+            connection.execute("""
+                INSERT INTO tribesnext_pictures (guid, graphic, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(guid) DO UPDATE SET graphic = excluded.graphic,
+                                                updated_at = excluded.updated_at
+            """, (int(guid), str(graphic), int(time.time())))
 
     def list_buddies(self, owner_username):
         with self.lock, self._connection() as connection:

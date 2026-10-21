@@ -191,7 +191,10 @@ well. The current DBProxy subset includes player search/profile and profile
 updates, live IRC presence, tribe search/profile/roster, tribe creation and settings,
 membership roles, primary-tribe selection, invitations, and persistent buddy lists.
 For sessions authenticated with an installed TribesNext account, player/clan
-search, player/clan profiles, clan rosters, and profile membership reads use the TribesNext robot API; the
+search, player/clan profiles, clan rosters, profile membership reads, player history
+(`uhist`), and the buddy list (`robot_mail.php` `viewlist`/`addlist`/`dellist`) use the
+TribesNext robot API. TribesNext has no player picture, so a chosen picture is kept in the
+community store by certificate GUID (visible only on this machine). The
 unlocked account key is retained only in session memory. Local community data
 is used only for local-authenticated sessions. TribesNext-authenticated sessions
 do not fall back to local community records when a robot lookup is unavailable;

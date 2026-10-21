@@ -40,6 +40,10 @@ AUTH_STAGE = "directory + local-account Auth1 + IRC auth + SQLite community DB +
 LOG_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "t2launch/wonemu"
 PORTS = {"directory": 15104, "auth": 15105, "dbproxy": 15106, "irc": 15107, "master": 15108}
 TRIBESNEXT_MASTER_URL = "http://master.tribesnext.com"
+# Player history, buddy list, and picture queries answered from the TribesNext
+# robot API (or, for the picture it lacks, a GUID-keyed local record).
+TRIBESNEXT_ROBOT_QUERIES = frozenset({(5, True), (10, False), (11, False), (12, True),
+                                      (26, False), (31, False)})
 TORQUE_MASTER_PACKET_MAX = 1500
 TORQUE_MASTER_SERVER_SIZE = 6
 TORQUE_MASTER_MAX_SERVERS = (TORQUE_MASTER_PACKET_MAX - 12) // TORQUE_MASTER_SERVER_SIZE
@@ -799,11 +803,21 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                reason="malformed_dbproxy_query")
             return
 
+        if session.get("auth_provider") == "tribesnext" and (ordinal, array_query) == (1, True):
+            # TribesNext has no T-Mail (tribe invites live on the tribe profile), so
+            # the client's startup and periodic mail checks get an empty inbox.
+            self._send_dbmsg(query_id, "0\t\\S0\\S")
+            emulator.log.event("irc_dbproxy_query", connection=connection, query_id=query_id,
+                               ordinal=ordinal, array_query=array_query,
+                               argument_characters=len(query), supported=True,
+                               status=0, row_count=0)
+            return
+
         if session.get("auth_provider") == "tribesnext" and (
                 (ordinal, array_query) not in {
                     (3, True), (4, True), (4, False), (6, True), (13, True),
                     (22, False), (23, False), (69, False),
-                }):
+                } | TRIBESNEXT_ROBOT_QUERIES):
             self._send_dbmsg(query_id,
                              "1\tTribesNext community operation unavailable\\S0\\S")
             emulator.log.event("irc_dbproxy_query", connection=connection, query_id=query_id,
@@ -815,6 +829,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
         arguments = query.replace("\\n", "\n").replace("\\\\", "\\")
         rows = []
         tribesnext_clan_not_found = object()
+        tribesnext_player_not_found = object()
         try:
             max_rows = int(fields[2]) if len(fields) > 2 else 100
         except ValueError:
@@ -900,11 +915,13 @@ class IRCHandler(socketserver.BaseRequestHandler):
             credentials = session.get("tribesnext_credentials")
             if credentials is None:
                 return False
-            reference = str(reference).strip()
-            guid = (int(reference) if reference.isdecimal() else
-                    emulator.tribesnext_user_id(reference))
-            if guid is None:
+            # Searched players are not in the local public store; tribesnext_guid
+            # falls back to the robot's exact-name search.
+            guid = tribesnext_guid(reference)
+            if guid is False:
                 return False
+            if guid is None:
+                return tribesnext_player_not_found
             try:
                 profile = emulator.tribesnext_robot.user_view(credentials, guid)
             except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
@@ -957,7 +974,97 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     {name.casefold() for name in emulator.community.local_account_usernames()} |
                     {session["username"].casefold()})
 
-        if ordinal == 1 and array_query:
+        def tribesnext_guid(reference):
+            """Resolve a player name or GUID; None when unknown, False when unavailable."""
+            reference = str(reference).strip()
+            if reference.isdecimal():
+                return int(reference)
+            guid = emulator.tribesnext_user_id(reference)
+            if guid is not None:
+                return guid
+            matches = tribesnext_search(emulator.tribesnext_robot.user_search, reference)
+            if matches is False:
+                return False
+            match = next((player for player in matches or ()
+                          if player["name"].casefold() == reference.casefold()), None)
+            return int(match["guid"]) if match else None
+
+        if (session.get("auth_provider") == "tribesnext" and
+                (ordinal, array_query) in TRIBESNEXT_ROBOT_QUERIES):
+            robot = emulator.tribesnext_robot
+            credentials = session.get("tribesnext_credentials")
+            try:
+                if credentials is None:
+                    raise tribesnext.RobotAPIError("TribesNext session credentials unavailable")
+                own_guid = credentials.certificate.guid
+                if ordinal == 31:
+                    graphic = arguments.strip()
+                    if len(graphic) > 255 or any(character in graphic for character in "\t\r\n"):
+                        status, result, status_code = "1\tInvalid picture", "", 1
+                    else:
+                        emulator.community.set_tribesnext_picture(own_guid, graphic)
+                        status, result, status_code = "0\tUpdated", "", 0
+                elif ordinal == 12:
+                    target = arguments.strip()
+                    guid = (own_guid if not target or
+                            target.casefold() == session["username"].casefold()
+                            else tribesnext_guid(target))
+                    if guid is False:
+                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+                    if guid is None:
+                        status, result, status_code = "1\tPlayer not found", "0", 1
+                    else:
+                        # The robot lists oldest first; the Browser shows newest first.
+                        events = robot.user_history(credentials, guid)[::-1][:limit]
+                        for event in events:
+                            try:
+                                when = datetime.datetime.fromtimestamp(
+                                    int(event["time"])).strftime("%m/%d/%Y %H:%M")
+                            except (ValueError, OverflowError, OSError):
+                                when = ""
+                            rows.append(f"{when} {tribesnext.expand_history_event(event)}"
+                                        .strip())
+                        status, result, status_code = "0\t", str(len(rows)), 0
+                elif ordinal == 5:
+                    target = arguments.strip()
+                    # The robot only exposes the authenticated account's own list.
+                    buddies = ([] if target and target.casefold() != session["username"].casefold()
+                               else robot.buddy_list(credentials)[:limit])
+                    rows.extend("\t".join((buddy["name"], buddy["tag"], buddy["append"],
+                                            buddy["guid"], "")) for buddy in buddies)
+                    status, result, status_code = "0\t", str(len(rows)), 0
+                elif ordinal == 26:
+                    for buddy in robot.buddy_list(credentials):
+                        robot.remove_buddy(credentials, buddy["guid"])
+                    status, result, status_code = "0\tBuddy list cleared", "", 0
+                else:
+                    buddy_name = arguments.strip()
+                    if ordinal == 11:
+                        listed = next((buddy for buddy in robot.buddy_list(credentials)
+                                       if buddy["name"].casefold() == buddy_name.casefold()),
+                                      None)
+                        guid = int(listed["guid"]) if listed else None
+                    else:
+                        guid = tribesnext_guid(buddy_name)
+                    if guid is False:
+                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+                    if guid is None:
+                        status, result, status_code = (
+                            f"1\t{'Player' if ordinal == 10 else 'Buddy'} not found", "", 1)
+                    elif ordinal == 10:
+                        robot.add_buddy(credentials, guid)
+                        # The Browser reads the added name from result field 2.
+                        status, result, status_code = "0\tBuddy added", f"\t\t{buddy_name}", 0
+                    else:
+                        robot.remove_buddy(credentials, guid)
+                        status, result, status_code = "0\tBuddy removed", "", 0
+            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+                emulator.log.event("tribesnext_robot_unavailable", connection=connection,
+                                   ordinal=ordinal, array_query=array_query,
+                                   error=type(exc).__name__)
+                rows.clear()
+                status, result, status_code = "1\tTribesNext service unavailable", "0", 1
+        elif ordinal == 1 and array_query:
             try:
                 after_id = int(arguments.strip() or "0")
                 messages = emulator.community.inbox(session["username"], after_id, limit)
@@ -1276,6 +1383,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
             target = arguments.strip()
             remote_profile = tribesnext_profile(target)
             profile = (resolve_profile_reference(target) if remote_profile is None
+                       else None if remote_profile is tribesnext_player_not_found
                        else remote_profile)
             if profile is None:
                 status, result, status_code = "1\tPlayer not found", "0", 1
@@ -1325,7 +1433,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 # authenticated player's own Browser profile.
                 requested = session["username"]
             remote_profile = tribesnext_profile(requested)
-            if remote_profile is False:
+            if remote_profile is False or remote_profile is tribesnext_player_not_found:
                 found = False
                 local_account = session_account = legacy_account = False
             else:
@@ -1341,6 +1449,8 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                profile_found=found)
             if remote_profile is False:
                 status, result, status_code = "1\tTribesNext profile unavailable", "", 1
+            elif remote_profile is tribesnext_player_not_found:
+                status, result, status_code = "1\tPlayer not found", "", 1
             elif remote_profile is not None:
                 session["last_profile_username"] = requested
                 try:
@@ -1353,7 +1463,9 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                     remote_profile.get("append", "0"),
                                     str(remote_profile["guid"]), registered,
                                     remote_profile.get("online", "0"),
-                                    remote_profile.get("website", ""), ""))
+                                    remote_profile.get("website", ""),
+                                    emulator.community.tribesnext_picture(
+                                        remote_profile["guid"]) or ""))
                 result = remote_profile.get("info", "")
                 status_code = 0
             elif found:

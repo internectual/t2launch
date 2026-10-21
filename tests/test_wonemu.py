@@ -366,6 +366,11 @@ class ProtocolTests(unittest.TestCase):
             self.assertIn("TribesNext community operation unavailable", rejected_write)
 
             handler.request.sent.clear()
+            handler._handle_dbqax("17 C1 0 :0", session, 1)
+            self.assertEqual("".join(handler.request.sent),
+                             ":wonemu.local DBMSG 17 1 :0\t\\S0\\S\r\n")
+
+            handler.request.sent.clear()
             def unavailable_profile(supplied, guid):
                 raise tribesnext.RobotAPIError("offline")
 
@@ -374,6 +379,100 @@ class ProtocolTests(unittest.TestCase):
             unavailable_profile = "".join(handler.request.sent)
             self.assertIn("TribesNext profile unavailable", unavailable_profile)
             self.assertNotIn("authoritative text", unavailable_profile)
+
+    def test_dbproxy_history_buddies_and_picture_use_tribesnext_robot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            credentials = SimpleNamespace(certificate=SimpleNamespace(guid=123456))
+            session = {"username": "Player", "irc_authenticated": True,
+                       "tribesnext_credentials": credentials, "auth_provider": "tribesnext"}
+            emulator.community.ensure_profile = lambda *args, **kwargs: self.fail(
+                "TribesNext queries must not seed local profiles")
+            emulator.tribesnext_user_id = lambda username: None
+            robot = emulator.tribesnext_robot
+            buddies = [{"name": "Friend", "tag": "[F]", "append": "0", "guid": "654321"}]
+            changes = []
+            robot.buddy_list = lambda supplied: list(buddies)
+            robot.add_buddy = lambda supplied, guid: changes.append(("add", guid))
+            robot.remove_buddy = lambda supplied, guid: changes.append(("remove", guid))
+            robot.user_search = lambda supplied, search: [
+                {"index": "0", "name": "Friendly", "tag": "", "append": "0", "guid": "777"},
+                {"index": "1", "name": "Friend", "tag": "[F]", "append": "0", "guid": "654321"}]
+            history_guids = []
+
+            def user_history(supplied, guid):
+                history_guids.append(guid)
+                return [{"type": "JOIN", "time": "1200000000", "payload": "",
+                         "template": "@player joined @clan",
+                         "player": ["Player", "", "0", "123456"],
+                         "clan": ["77", "Old Clan", "", "0"]},
+                        {"type": "JOIN", "time": "1300000000", "payload": "",
+                         "template": "@player joined @clan",
+                         "player": ["Player", "", "0", "123456"],
+                         "clan": ["78", "New Clan", "", "0"]}]
+
+            robot.user_history = user_history
+            viewed_guids = []
+            robot.user_view = lambda supplied, guid: (
+                viewed_guids.append(guid) or {"guid": guid, "name": "Player", "memberships": []})
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+
+            def query(text):
+                handler.request.sent.clear()
+                handler._handle_dbqax(text, session, 1)
+                return "".join(handler.request.sent)
+
+            history = query("20 C12 0 :Player")
+            self.assertIn("DBMSG 20 1 :0\t\\S2\\S", history)
+            self.assertLess(history.index("New Clan"), history.index("Old Clan"))
+            self.assertEqual(history_guids, [123456])
+            query("21 C12 0 :Friend")
+            self.assertEqual(history_guids, [123456, 654321])
+            self.assertIn("Player not found", query("22 C12 0 :Nobody"))
+
+            buddy_list = query("23 C5 0 :Player")
+            self.assertIn("Friend\t[F]\t0\t654321\t", buddy_list)
+            self.assertIn(":0\t\\S1\\S", query("24 C5 0 :Player"))
+            self.assertIn(":0\t\\S0\\S", query("25 C5 0 :Somebody Else"))
+
+            self.assertIn("Friend", query("26 10 0 :Friend"))
+            self.assertIn("Buddy removed", query("27 11 0 :friend"))
+            self.assertIn("Buddy not found", query("28 11 0 :Stranger"))
+            self.assertIn("Buddy list cleared", query("29 26 0 :clearBuddy"))
+            self.assertEqual(changes, [("add", 654321), ("remove", 654321),
+                                       ("remove", "654321")])
+
+            self.assertIn("Updated", query("30 31 0 :texticons/twb/twb_Blaster.jpg"))
+            self.assertEqual(emulator.community.tribesnext_picture(123456),
+                             "texticons/twb/twb_Blaster.jpg")
+            self.assertIn("twb_Blaster.jpg", query("31 23 0 :123456"))
+
+            # A searched player is not in the local public store; the profile and
+            # membership views resolve the name through the robot's player search.
+            viewed_guids.clear()
+            self.assertIn("DBMSG 40 1 :0\t", query("40 23 0 :Friend"))
+            self.assertIn(":0\t\\S0\\S", query("41 C13 0 :Friend"))
+            self.assertEqual(viewed_guids, [654321, 654321])
+            self.assertIn("Player not found", query("42 23 0 :Nobody"))
+            self.assertIn("Player not found", query("43 C13 0 :Nobody"))
+            self.assertNotIn("unavailable", query("44 23 0 :Nobody"))
+
+            def offline(*args):
+                raise tribesnext.RobotAPIError("offline")
+
+            robot.buddy_list = offline
+            self.assertIn("TribesNext service unavailable", query("32 C5 0 :Player"))
 
     def test_tribesnext_auth_session_does_not_create_local_profile(self):
         with tempfile.TemporaryDirectory() as directory:

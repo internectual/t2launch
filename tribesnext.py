@@ -119,6 +119,79 @@ def parse_robot_search(lines, record_type):
     return matches
 
 
+def _raise_robot_error(lines, fallback):
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) >= 2 and fields[0] == "ERR":
+            raise RobotAPIError(" ".join(fields[2:]) or fallback)
+
+
+def _robot_player(fields):
+    """Return a padded ``name, tag, append, guid`` robot player quad."""
+    return (list(fields[:4]) + ["", "", "", ""])[:4]
+
+
+def parse_robot_history(lines):
+    """Parse ``uhist`` ``PHIST`` rows into events, oldest first."""
+    _raise_robot_error(lines, "TribesNext history lookup failed")
+    events = {}
+    for line in lines:
+        fields = line.split("\t")
+        if fields[0] != "PHIST" or len(fields) < 7:
+            continue
+        index = int(_robot_decimal(fields[2], "history index"))
+        events[index] = {
+            "type": fields[3], "time": fields[4], "payload": _robot_unescape(fields[5]),
+            "template": fields[6], "player": _robot_player(fields[7:11]),
+            "clan": _robot_player(fields[11:15]),
+        }
+    return [events[index] for index in sorted(events)]
+
+
+_HISTORY_TOKEN = re.compile(r"@[0-9a-z@;^]*")
+_LEADING_NUMBER = re.compile(r"\s*[-+]?(\d+\.?\d*|\.\d+)")
+
+
+def _torque_true(value):
+    match = _LEADING_NUMBER.match(value)
+    return bool(match) and float(match.group(0)) != 0
+
+
+def expand_history_event(event):
+    """Render a history event as text, like the TribesNext client's template expander."""
+    def player_text(player):
+        name, tag, append = player[0], player[1], player[2]
+        if not tag:
+            return name
+        return name + tag if append == "1" else tag + name
+
+    def yes_no(value):
+        return "YES" if _torque_true(value) else "NO"
+
+    payload = event["payload"]
+    values = {"@player": player_text(event["player"]), "@clan": event["clan"][1],
+              "@player1": "", "@player2": "", "@payload": payload,
+              "@payload^": yes_no(payload)}
+    for index, field in enumerate(payload.split("\t")):
+        values[f"@payload;{index}"] = field
+        values[f"@payload;{index}^"] = yes_no(field)
+    return _HISTORY_TOKEN.sub(lambda match: values.get(match.group(0), ""), event["template"])
+
+
+def parse_robot_list(lines, list_name):
+    """Parse ``viewlist`` ``LIST`` rows (buddy or ignore) into players."""
+    _raise_robot_error(lines, "TribesNext list lookup failed")
+    players = {}
+    for line in lines:
+        fields = line.split("\t")
+        if fields[0] != "LIST" or len(fields) < 7 or fields[1] != list_name:
+            continue
+        index = int(_robot_decimal(fields[2], "list index"))
+        players[index] = {"name": fields[3], "tag": fields[4], "append": fields[5],
+                          "guid": _robot_decimal(fields[6], "player GUID")}
+    return [players[index] for index in sorted(players)]
+
+
 def parse_robot_clan(lines):
     """Parse a TribesNext robot ``cview`` response including its roster."""
     clan = {"members": []}
@@ -257,13 +330,19 @@ class RobotClient:
         self._sessions.pop(certificate.guid, None)
         return self._start_session(credentials)
 
-    def browser_get(self, credentials, method, **args):
+    def _session_get(self, endpoint, credentials, method, **args):
         with self._lock:
             session = self._ensure_session(credentials)
             params = {"guid": str(credentials.certificate.guid), "uuid": session["uuid"],
                       "method": str(method)}
             params.update({key: str(value) for key, value in args.items() if value is not None})
-            return self._request("robot_browser.php", params)
+            return self._request(endpoint, params)
+
+    def browser_get(self, credentials, method, **args):
+        return self._session_get("robot_browser.php", credentials, method, **args)
+
+    def mail_get(self, credentials, method, **args):
+        return self._session_get("robot_mail.php", credentials, method, **args)
 
     def browser_post(self, credentials, method, **fields):
         with self._lock:
@@ -285,6 +364,22 @@ class RobotClient:
     def user_view(self, credentials, guid):
         lines = self.browser_get(credentials, "uview", a0=guid)
         return parse_robot_profile(lines)
+
+    def user_history(self, credentials, guid):
+        """Return a player's clan history events from the official ``uhist`` method."""
+        return parse_robot_history(self.browser_get(credentials, "uhist", a0=guid))
+
+    def buddy_list(self, credentials):
+        """Return the authenticated account's buddy list from the mail robot."""
+        return parse_robot_list(self.mail_get(credentials, "viewlist", list="buddy"), "buddy")
+
+    def add_buddy(self, credentials, guid):
+        _raise_robot_error(self.mail_get(credentials, "addlist", list="buddy", target=guid),
+                           "TribesNext buddy list update failed")
+
+    def remove_buddy(self, credentials, guid):
+        _raise_robot_error(self.mail_get(credentials, "dellist", list="buddy", target=guid),
+                           "TribesNext buddy list update failed")
 
     def clan_view(self, credentials, clan_id):
         """Return clan details and roster from the official robot API."""

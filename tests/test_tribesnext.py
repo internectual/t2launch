@@ -152,6 +152,49 @@ class RobotClientTests(unittest.TestCase):
         with self.assertRaisesRegex(tribesnext.RobotAPIError, "no usable profile"):
             tribesnext.parse_robot_profile(["TIMEOUT"])
 
+    def test_user_history_parses_phist_rows_and_expands_templates(self):
+        events = tribesnext.parse_robot_history([
+            "",
+            ("PHIST\t42\t1\tRANK\t1300000000\t4\\tFounder\t@player ranked @payload;0"
+             " (@payload;1)\tLou\t[ABC]\t1\t42\t77\tExample Clan\t[ABC]\t1"),
+            ("PHIST\t42\t0\tJOIN\t1200000000\t0\t@player joined @clan, admin @payload^"
+             "\tLou\t[ABC]\t0\t42\t77\tExample Clan\t[ABC]\t0"),
+        ])
+        self.assertEqual([event["type"] for event in events], ["JOIN", "RANK"])
+        self.assertEqual(tribesnext.expand_history_event(events[0]),
+                         "[ABC]Lou joined Example Clan, admin NO")
+        self.assertEqual(tribesnext.expand_history_event(events[1]),
+                         "Lou[ABC] ranked 4 (Founder)")
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "UNAUTHENTICATED"):
+            tribesnext.parse_robot_history(["ERR\tBROWSER\tUNAUTHENTICATED"])
+
+    def test_buddy_list_uses_mail_robot_and_parses_list_rows(self):
+        client = tribesnext.RobotClient()
+        client._sessions[42] = {"uuid": "session-token", "refreshed_at": 10**20}
+        calls = []
+
+        def request(endpoint, params=None, **kwargs):
+            calls.append((endpoint, params))
+            if params["method"] == "viewlist":
+                return ["", "LIST\tbuddy\t1\tSecond\t\t0\t99",
+                        "LIST\tignore\t0\tIgnored\t\t0\t7", "LIST\tbuddy\t0\tFirst\t[T]\t1\t98"]
+            return [""]
+
+        client._request = request
+        self.assertEqual(client.buddy_list(self.credentials), [
+            {"name": "First", "tag": "[T]", "append": "1", "guid": "98"},
+            {"name": "Second", "tag": "", "append": "0", "guid": "99"}])
+        client.add_buddy(self.credentials, 98)
+        client.remove_buddy(self.credentials, 99)
+        self.assertEqual([(endpoint, params["method"], params.get("target"))
+                          for endpoint, params in calls], [
+            ("robot_mail.php", "viewlist", None), ("robot_mail.php", "addlist", "98"),
+            ("robot_mail.php", "dellist", "99")])
+        self.assertTrue(all(params["list"] == "buddy" for _, params in calls))
+        client._request = lambda *args, **kwargs: ["ERR\tMAIL\tUNAUTHENTICATED"]
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "UNAUTHENTICATED"):
+            client.add_buddy(self.credentials, 98)
+
     def test_user_and_clan_search_rows_parse_official_fields(self):
         self.assertEqual(tribesnext.parse_robot_search([
             "SEARCH\tLou\t0\tLouCypher\t[ABC]\t1\t42"], "user"),
