@@ -366,11 +366,6 @@ class ProtocolTests(unittest.TestCase):
             self.assertIn("TribesNext community operation unavailable", rejected_write)
 
             handler.request.sent.clear()
-            handler._handle_dbqax("17 C1 0 :0", session, 1)
-            self.assertEqual("".join(handler.request.sent),
-                             ":wonemu.local DBMSG 17 1 :0\t\\S0\\S\r\n")
-
-            handler.request.sent.clear()
             def unavailable_profile(supplied, guid):
                 raise tribesnext.RobotAPIError("offline")
 
@@ -473,6 +468,168 @@ class ProtocolTests(unittest.TestCase):
 
             robot.buddy_list = offline
             self.assertIn("TribesNext service unavailable", query("32 C5 0 :Player"))
+
+    def test_dbproxy_tmail_and_block_list_use_tribesnext_mail_robot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            credentials = SimpleNamespace(certificate=SimpleNamespace(guid=123456))
+            session = {"username": "Player", "irc_authenticated": True,
+                       "tribesnext_credentials": credentials, "auth_provider": "tribesnext"}
+            emulator.community.ensure_profile = lambda *args, **kwargs: self.fail(
+                "TribesNext mail must not seed local profiles")
+            emulator.community.inbox = lambda *args, **kwargs: self.fail(
+                "TribesNext mail must not read the local mailbox")
+            emulator.tribesnext_user_id = lambda username: None
+            robot = emulator.tribesnext_robot
+            requests = []
+
+            def mail_get(supplied, method, **args):
+                requests.append((method, args))
+                if method == "box" and args["box"] == "inbox":
+                    # Newest first, as the robot sorts by sent time.
+                    return ["MSG\t12\tinbox\tfalse\tmessage\t1300000000",
+                            "SBJ\t12\tNew\\tsubject", "SNDR\t12\tFriend\t[F]\t0\t654321",
+                            "MSG\t11\tinbox\ttrue\tmessage\t1200000000",
+                            "SBJ\t11\tOlder", "SNDR\t11\tFriend\t[F]\t0\t654321",
+                            "MSG\t10\tinbox\ttrue\tmessage\t1100000000",
+                            "SBJ\t10\tSeen", "SNDR\t10\tFriend\t[F]\t0\t654321"]
+                if method == "box":
+                    return [""]
+                if method == "read":
+                    message_id = args["id"]
+                    return [f"MSG2\t{message_id}\tfalse\tmessage\t1300000000",
+                            f"SBJ\t{message_id}\tSubject {message_id}",
+                            f"SNDR\t{message_id}\tFriend\t[F]\t0\t654321",
+                            f"TO\t{message_id}\t0\tPlayer\t\t0\t123456",
+                            f"CC\t{message_id}\t0\tOther\t\t0\t777",
+                            f"BDY\t{message_id}\tline one\\nline two"]
+                if method == "viewlist":
+                    return ["LIST\tignore\t0\tPest\t\t0\t999"]
+                return [""]
+
+            posts = []
+            robot.mail_get = mail_get
+            robot.mail_post = lambda supplied, method, **fields: (
+                posts.append((method, fields)) or ["SUCCESS\t13"])
+            robot.user_search = lambda supplied, search: [
+                {"index": "0", "name": search, "tag": "", "append": "0",
+                 "guid": {"Friend": "654321", "Other": "777", "Pest": "999"}.get(search, "1")}
+                for _ in [0] if search in {"Friend", "Other", "Pest"}]
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+
+            def query(text):
+                handler.request.sent.clear()
+                handler._handle_dbqax(text, session, 1)
+                return "".join(handler.request.sent)
+
+            inbox = query("50 C1 0 :10")
+            self.assertIn("DBMSG 50 1 :0\t\\S2\\S", inbox)
+            self.assertNotIn("Subject 10", inbox)
+            self.assertLess(inbox.index("Subject 11"), inbox.index("Subject 12"))
+            self.assertIn("12\tFriend\t[F]\t0\t654321\tPlayer\t\t0\t123456\t", inbox)
+            self.assertIn("\t0\t0\t0\tPlayer\tOther\tSubject 12\t2\tline one\\nline two", inbox)
+            self.assertIn("\t0\t0\t1\tPlayer\tOther\tSubject 11\t", inbox)
+            self.assertEqual(requests[0], ("box", {"box": "inbox", "first": 0,
+                                                   "last": wonemu.TRIBESNEXT_MAIL_PAGE,
+                                                   "since": 11}))
+            self.assertEqual([args["id"] for method, args in requests if method == "read"],
+                             [11, 12])
+            self.assertIn("You have no deleted messages", query("51 C14 100 :getDeletedMail"))
+
+            self.assertIn("Mail sent", query("52 5 0 :Friend, Other\t\tHello\tbody\ttext"))
+            self.assertEqual(posts, [("send", {"subject": "Hello", "contents": "body\ttext",
+                                               "to": "654321,777", "cc": "654321"})])
+            self.assertIn("Player not found: Nobody", query("53 5 0 :Nobody\t\tHello\tbody"))
+            self.assertIn("A To recipient is required", query("54 5 0 :\tFriend\tHello\tbody"))
+            robot.mail_post = lambda *args, **kwargs: ["ERR\tMAIL\tINVALID_SBJ"]
+            self.assertIn("A subject is required", query("55 5 0 :Friend\t\t\tbody"))
+
+            requests.clear()
+            self.assertIn("Updated", query("56 6 0 :12"))
+            self.assertIn("Updated", query("57 7 0 :12"))
+            self.assertIn("Updated", query("58 35 0 :12"))
+            self.assertIn("Mail message not found", query("59 6 0 :bogus"))
+            self.assertEqual(requests, [("delete", {"id": 12, "set": 1}),
+                                        ("read", {"id": 12})])
+
+            self.assertIn("Pest\t\t0\t999\t0", query("60 C2 0 :"))
+            requests.clear()
+            self.assertIn("Sender blocked", query("61 9 0 :Friend"))
+            self.assertIn("Block removed", query("62 8 0 :pest"))
+            self.assertIn("Blocked sender not found", query("63 8 0 :Friend"))
+            self.assertEqual([(method, args.get("target")) for method, args in requests
+                              if method != "viewlist"],
+                             [("addlist", 654321), ("dellist", 999)])
+
+    def test_tribesnext_invite_mail_links_and_answers_use_robot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            credentials = SimpleNamespace(certificate=SimpleNamespace(guid=123456))
+            session = {"username": "Player", "irc_authenticated": True,
+                       "tribesnext_credentials": credentials, "auth_provider": "tribesnext"}
+            future = int(time.time()) + 86400
+            message = {"id": 5, "type": "invite", "deleted": False, "time": "1300000000",
+                       "subject": "Invitation to: Live Clan", "to": [], "cc": [],
+                       "sender": ["Leader", "[LC]", "0", "654321"],
+                       "body": json.dumps({"sguid": "654321", "clanid": 77,
+                                           "expire": future})}
+            header = {"id": 5, "read": False, "time": "1300000000", "type": "invite"}
+            recipient = ("Player", "", "0", "123456")
+            row = wonemu.tribesnext_mail_row(header, message, recipient)
+            self.assertIn("[LC]Leader has invited you to join Live Clan.", row)
+            self.assertIn("<a:acceptinvite\t77\tPlayer>Accept invitation</a>", row)
+            self.assertIn("<a:rejectinvite\t77\tPlayer>Reject invitation</a>", row)
+            message["body"] = json.dumps({"sguid": "654321", "clanid": 77, "expire": 1400000000})
+            expired = wonemu.tribesnext_mail_row(header, message, recipient)
+            self.assertIn("This invitation expired on", expired)
+            self.assertNotIn("acceptinvite", expired)
+            message["body"] = "not json"
+            self.assertIn("\tnot json", wonemu.tribesnext_mail_row(header, message, recipient))
+
+            robot = emulator.tribesnext_robot
+            answers = []
+            robot.browser_get = lambda supplied, method, **args: (
+                answers.append((method, args)) or ["ACCEPTED\t77"])
+            robot.clan_search = lambda supplied, search: [
+                {"index": "0", "id": "78", "name": "Other Clan"}]
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+
+            def query(text):
+                handler.request.sent.clear()
+                handler._handle_dbqax(text, session, 1)
+                return "".join(handler.request.sent)
+
+            self.assertIn("DBMSG 70 1 :0\t\\S0\\S", query("70 C10 20 :Live Clan"))
+            self.assertIn("Invitation updated", query("71 28 0 :accept\t77\tPlayer"))
+            self.assertIn("Invitation updated", query("72 28 0 :reject\tother clan\tPlayer"))
+            self.assertIn("Tribe not found", query("73 28 0 :accept\tMissing\tPlayer"))
+            self.assertIn("cannot be retracted", query("74 28 0 :cancel\t77\tPlayer"))
+            self.assertEqual(answers, [("uaccept", {"a0": 77}), ("ureject", {"a0": 78})])
+            robot.browser_get = lambda *args, **kwargs: [
+                "ERR\tBROWSER\tNo valid invitation found."]
+            self.assertIn("No valid invitation found.", query("75 28 0 :accept\t77\tPlayer"))
 
     def test_tribesnext_auth_session_does_not_create_local_profile(self):
         with tempfile.TemporaryDirectory() as directory:

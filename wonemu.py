@@ -40,10 +40,16 @@ AUTH_STAGE = "directory + local-account Auth1 + IRC auth + SQLite community DB +
 LOG_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "t2launch/wonemu"
 PORTS = {"directory": 15104, "auth": 15105, "dbproxy": 15106, "irc": 15107, "master": 15108}
 TRIBESNEXT_MASTER_URL = "http://master.tribesnext.com"
-# Player history, buddy list, and picture queries answered from the TribesNext
-# robot API (or, for the picture it lacks, a GUID-keyed local record).
+# Player history, buddy list, T-Mail, and block list queries answered from the
+# TribesNext robot API (or, for the picture it lacks, a GUID-keyed local record).
 TRIBESNEXT_ROBOT_QUERIES = frozenset({(5, True), (10, False), (11, False), (12, True),
-                                      (26, False), (31, False)})
+                                      (26, False), (31, False),
+                                      (1, True), (14, True), (5, False), (6, False),
+                                      (7, False), (35, False), (2, True), (8, False),
+                                      (9, False), (10, True), (28, False)})
+# Each new message costs one robot read, so a mailbox poll fetches at most this
+# many (the TribesNext client's own chunk size).
+TRIBESNEXT_MAIL_PAGE = 25
 TORQUE_MASTER_PACKET_MAX = 1500
 TORQUE_MASTER_SERVER_SIZE = 6
 TORQUE_MASTER_MAX_SERVERS = (TORQUE_MASTER_PACKET_MAX - 12) // TORQUE_MASTER_SERVER_SIZE
@@ -803,16 +809,6 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                reason="malformed_dbproxy_query")
             return
 
-        if session.get("auth_provider") == "tribesnext" and (ordinal, array_query) == (1, True):
-            # TribesNext has no T-Mail (tribe invites live on the tribe profile), so
-            # the client's startup and periodic mail checks get an empty inbox.
-            self._send_dbmsg(query_id, "0\t\\S0\\S")
-            emulator.log.event("irc_dbproxy_query", connection=connection, query_id=query_id,
-                               ordinal=ordinal, array_query=array_query,
-                               argument_characters=len(query), supported=True,
-                               status=0, row_count=0)
-            return
-
         if session.get("auth_provider") == "tribesnext" and (
                 (ordinal, array_query) not in {
                     (3, True), (4, True), (4, False), (6, True), (13, True),
@@ -993,6 +989,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 (ordinal, array_query) in TRIBESNEXT_ROBOT_QUERIES):
             robot = emulator.tribesnext_robot
             credentials = session.get("tribesnext_credentials")
+            supported = True
             try:
                 if credentials is None:
                     raise tribesnext.RobotAPIError("TribesNext session credentials unavailable")
@@ -1025,7 +1022,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                             rows.append(f"{when} {tribesnext.expand_history_event(event)}"
                                         .strip())
                         status, result, status_code = "0\t", str(len(rows)), 0
-                elif ordinal == 5:
+                elif ordinal == 5 and array_query:
                     target = arguments.strip()
                     # The robot only exposes the authenticated account's own list.
                     buddies = ([] if target and target.casefold() != session["username"].casefold()
@@ -1037,7 +1034,30 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     for buddy in robot.buddy_list(credentials):
                         robot.remove_buddy(credentials, buddy["guid"])
                     status, result, status_code = "0\tBuddy list cleared", "", 0
-                else:
+                elif ordinal == 10 and array_query:
+                    # Tribe OPTIONS: the client draws the page itself once the query succeeds.
+                    status, result, status_code = "0\t", "0", 0
+                elif ordinal == 28:
+                    query_fields = arguments.split("\t")
+                    action = query_fields[0].strip().casefold()
+                    tribe = query_fields[1].strip() if len(query_fields) > 1 else ""
+                    if action not in {"accept", "reject"}:
+                        status, result, status_code = (
+                            "1\tTribesNext invitations cannot be retracted here", "", 1)
+                    else:
+                        # Invite mail links carry the clan ID; other links carry the name.
+                        clan_id = (int(tribe) if tribe.isdecimal() else next(
+                            (int(clan["id"]) for clan in robot.clan_search(credentials, tribe)
+                             if clan["name"].casefold() == tribe.casefold()), None))
+                        if clan_id is None:
+                            status, result, status_code = "1\tTribe not found", "", 1
+                        else:
+                            try:
+                                robot.answer_invite(credentials, clan_id, action == "accept")
+                                status, result, status_code = "0\tInvitation updated", "", 0
+                            except tribesnext.RobotAPIError as exc:
+                                status, result, status_code = f"1\t{exc}", "", 1
+                elif ordinal in {10, 11}:
                     buddy_name = arguments.strip()
                     if ordinal == 11:
                         listed = next((buddy for buddy in robot.buddy_list(credentials)
@@ -1058,6 +1078,92 @@ class IRCHandler(socketserver.BaseRequestHandler):
                     else:
                         robot.remove_buddy(credentials, guid)
                         status, result, status_code = "0\tBuddy removed", "", 0
+                elif ordinal in {1, 14}:
+                    # Stock T-Mail caches whole messages, so every new header needs a
+                    # robot read for its body (which also marks it read on TribesNext).
+                    if ordinal == 1:
+                        after = arguments.strip()
+                        after_id = int(after) if after.isdecimal() else 0
+                        headers = [header for header in robot.mailbox(
+                            credentials, "inbox", 0, TRIBESNEXT_MAIL_PAGE, since=after_id + 1)
+                            if header["id"] > after_id]
+                    else:
+                        headers = robot.mailbox(credentials, "deleted", 0, TRIBESNEXT_MAIL_PAGE)
+                    recipient = (session["username"], "", "0", str(own_guid))
+                    # The client advances its last-seen ID row by row, so send oldest first.
+                    for header in sorted(headers, key=lambda header: header["id"])[:limit]:
+                        rows.append(tribesnext_mail_row(
+                            header, robot.read_message(credentials, header["id"]), recipient))
+                    status = ("0\t\tYou have no deleted messages." if ordinal == 14 and not rows
+                              else "0\t")
+                    result, status_code = str(len(rows)), 0
+                elif ordinal == 5:
+                    query_fields = arguments.split("\t")
+                    if len(query_fields) < 4:
+                        status, result, status_code = "1\tInvalid mail request", "", 1
+                    else:
+                        recipients, missing = ([], []), None
+                        for field, guids in zip(query_fields[:2], recipients):
+                            for name in (name.strip() for name in field.split(",")):
+                                if not name:
+                                    continue
+                                guid = tribesnext_guid(name)
+                                if guid is False:
+                                    raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+                                if guid is None:
+                                    missing = missing or name
+                                else:
+                                    guids.append(guid)
+                        if missing:
+                            status, result, status_code = f"1\tPlayer not found: {missing}", "", 1
+                        elif not recipients[0]:
+                            status, result, status_code = "1\tA To recipient is required", "", 1
+                        else:
+                            try:
+                                robot.send_mail(credentials, query_fields[2],
+                                                "\t".join(query_fields[3:]), *recipients)
+                                status, status_code = "0\tMail sent", 0
+                                result = str(len(recipients[0]) + len(recipients[1]))
+                            except tribesnext.RobotAPIError as exc:
+                                status, result, status_code = f"1\t{exc}", "", 1
+                elif ordinal in {6, 7, 35}:
+                    message_id = arguments.strip()
+                    if not message_id.isdecimal():
+                        status, result, status_code = "1\tMail message not found", "", 1
+                    else:
+                        if ordinal == 6:
+                            robot.delete_message(credentials, int(message_id))
+                        elif ordinal == 7:
+                            robot.read_message(credentials, int(message_id))
+                        # 35 (remove from Deleted) has no robot method; TribesNext purges
+                        # deleted messages itself.
+                        status, result, status_code = "0\tUpdated", "", 0
+                elif ordinal == 2:
+                    blocked = robot.player_list(credentials, "ignore")[:limit]
+                    rows.extend("\t".join((player["name"], player["tag"], player["append"],
+                                            player["guid"], "0")) for player in blocked)
+                    status, result, status_code = "0\t", str(len(rows)), 0
+                else:
+                    blocked_name = arguments.strip()
+                    if ordinal == 8:
+                        listed = next((player for player in robot.player_list(credentials, "ignore")
+                                       if player["name"].casefold() == blocked_name.casefold()),
+                                      None)
+                        guid = int(listed["guid"]) if listed else None
+                    else:
+                        guid = tribesnext_guid(blocked_name)
+                    if guid is False:
+                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+                    if guid is None:
+                        status, result, status_code = (
+                            f"1\t{'Blocked sender' if ordinal == 8 else 'Player'} not found",
+                            "", 1)
+                    elif ordinal == 9:
+                        robot.add_list_player(credentials, "ignore", guid)
+                        status, result, status_code = "0\tSender blocked", "", 0
+                    else:
+                        robot.remove_list_player(credentials, "ignore", guid)
+                        status, result, status_code = "0\tBlock removed", "", 0
             except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
                 emulator.log.event("tribesnext_robot_unavailable", connection=connection,
                                    ordinal=ordinal, array_query=array_query,
@@ -1797,6 +1903,53 @@ class IRCHandler(socketserver.BaseRequestHandler):
                            ordinal=ordinal, array_query=array_query,
                            argument_characters=len(arguments), supported=supported,
                            status=status_code, row_count=len(rows))
+
+
+def tribesnext_invite_body(message, subject, recipient_name):
+    """Render a TribesNext invite's JSON body as text with stock accept/reject links."""
+    try:
+        invite = json.loads(message["body"])
+        clan_id = int(invite["clanid"])
+        expires = int(invite["expire"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    sender_name, sender_tag, sender_append = message["sender"][:3]
+    sender = sender_name + sender_tag if sender_append == "1" else sender_tag + sender_name
+    clan = subject.removeprefix("Invitation to:").strip() or "a tribe"
+    try:
+        until = datetime.datetime.fromtimestamp(expires).strftime("%m/%d/%Y %H:%M")
+    except (ValueError, OverflowError, OSError):
+        return None
+    text = f"{sender} has invited you to join {clan}.\n\n"
+    if expires <= time.time():
+        return text + f"This invitation expired on {until}."
+    # acceptinvite/rejectinvite are the stock Browser links; they send query 28.
+    return (text + f"This invitation is valid until {until}.\n\n"
+            f"<a:acceptinvite\t{clan_id}\t{recipient_name}>Accept invitation</a>     "
+            f"<a:rejectinvite\t{clan_id}\t{recipient_name}>Reject invitation</a>")
+
+
+def tribesnext_mail_row(header, message, recipient):
+    """Format a robot message as a stock T-Mail row (the field order of mail_row)."""
+    try:
+        created = datetime.datetime.fromtimestamp(
+            int(message.get("time") or header["time"])).strftime("%m/%d/%Y %H:%M")
+    except (ValueError, OverflowError, OSError):
+        created = ""
+    recipient_guid = recipient[3]
+    is_cc = (any(player[3] == recipient_guid for player in message["cc"]) and
+             not any(player[3] == recipient_guid for player in message["to"]))
+    # The client splits rows on tabs and messages into newline records.
+    subject = " ".join(message["subject"].split())
+    body = message["body"]
+    if message.get("type", header.get("type")) == "invite":
+        body = tribesnext_invite_body(message, subject, recipient[0]) or body
+    return "\t".join((str(header["id"]), *message["sender"], *recipient, created,
+                      str(int(is_cc)), str(int(message.get("deleted", False))),
+                      str(int(header["read"])),
+                      ",".join(player[0] for player in message["to"]),
+                      ",".join(player[0] for player in message["cc"]),
+                      subject, str(max(1, len(body.splitlines()))), body))
 
 
 class AuthHandler(socketserver.BaseRequestHandler):

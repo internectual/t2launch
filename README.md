@@ -192,8 +192,12 @@ updates, live IRC presence, tribe search/profile/roster, tribe creation and sett
 membership roles, primary-tribe selection, invitations, and persistent buddy lists.
 For sessions authenticated with an installed TribesNext account, player/clan
 search, player/clan profiles, clan rosters, profile membership reads, player history
-(`uhist`), and the buddy list (`robot_mail.php` `viewlist`/`addlist`/`dellist`) use the
-TribesNext robot API. TribesNext has no player picture, so a chosen picture is kept in the
+(`uhist`), the buddy and block lists (`robot_mail.php` `viewlist`/`addlist`/`dellist`), and
+T-Mail (`box`/`read`/`send`/`delete`) use the TribesNext robot API. The stock client caches
+whole messages, so each inbox poll reads the bodies of up to 25 new messages, which marks them
+read on TribesNext. TribesNext delivers clan invitations as `invite` T-Mail with a JSON body;
+these are rendered with the stock accept/reject links, which answer through `uaccept`/`ureject`.
+TribesNext drops mail sent to yourself. TribesNext has no player picture, so a chosen picture is kept in the
 community store by certificate GUID (visible only on this machine). The
 unlocked account key is retained only in session memory. Local community data
 is used only for local-authenticated sessions. TribesNext-authenticated sessions

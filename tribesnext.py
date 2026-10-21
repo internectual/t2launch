@@ -192,6 +192,74 @@ def parse_robot_list(lines, list_name):
     return [players[index] for index in sorted(players)]
 
 
+def parse_robot_mailbox(lines):
+    """Parse a mail robot ``box`` listing (MSG/SBJ/SNDR rows) into message headers."""
+    _raise_robot_error(lines, "TribesNext mailbox lookup failed")
+    headers = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        if fields[0] == "MSG" and len(fields) >= 6:
+            message_id = int(_robot_decimal(fields[1], "message ID"))
+            headers.setdefault(message_id, {"id": message_id, "subject": "",
+                                            "sender": _robot_player(())}).update({
+                "box": fields[2], "read": fields[3] == "true", "type": fields[4],
+                "time": fields[5]})
+        elif fields[0] in {"SBJ", "SNDR"} and fields[1].isdecimal():
+            header = headers.get(int(fields[1]))
+            if header is None:
+                continue
+            if fields[0] == "SBJ":
+                header["subject"] = _robot_unescape(fields[2])
+            else:
+                header["sender"] = _robot_player(fields[2:6])
+    return [header for header in headers.values() if "time" in header]
+
+
+def parse_robot_message(lines):
+    """Parse a mail robot ``read`` response into a full message."""
+    _raise_robot_error(lines, "TribesNext message read failed")
+    message = {"subject": "", "body": "", "sender": _robot_player(()), "to": {}, "cc": {}}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        kind = fields[0]
+        if kind == "MSG2" and len(fields) >= 5:
+            message.update({"id": int(_robot_decimal(fields[1], "message ID")),
+                            "deleted": fields[2] == "true", "type": fields[3],
+                            "time": fields[4]})
+        elif kind == "SBJ":
+            message["subject"] = _robot_unescape(fields[2])
+        elif kind == "BDY":
+            message["body"] = _robot_unescape(fields[2])
+        elif kind == "SNDR":
+            message["sender"] = _robot_player(fields[2:6])
+        elif kind in {"TO", "CC"} and len(fields) >= 4 and fields[2].isdecimal():
+            message[kind.lower()][int(fields[2])] = _robot_player(fields[3:7])
+    if "id" not in message:
+        raise RobotAPIError("TribesNext robot returned no usable message")
+    for key in ("to", "cc"):
+        message[key] = [message[key][index] for index in sorted(message[key])]
+    return message
+
+
+_MAIL_ERRORS = {"INVALID_RECIP": "Invalid recipient", "INVALID_SBJ": "A subject is required",
+                "INVALID_BODY": "A message body is required"}
+
+
+def parse_robot_mail_send(lines):
+    """Return the new message ID from a mail robot ``send`` response."""
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) >= 3 and fields[0] == "ERR":
+            raise RobotAPIError(_MAIL_ERRORS.get(fields[2], " ".join(fields[2:])))
+        if fields[0] == "SUCCESS" and len(fields) >= 2:
+            return int(_robot_decimal(fields[1], "message ID"))
+    raise RobotAPIError("TribesNext robot did not confirm the sent message")
+
+
 def parse_robot_clan(lines):
     """Parse a TribesNext robot ``cview`` response including its roster."""
     clan = {"members": []}
@@ -345,6 +413,12 @@ class RobotClient:
         return self._session_get("robot_mail.php", credentials, method, **args)
 
     def browser_post(self, credentials, method, **fields):
+        return self._session_post("robot_browser.php", credentials, method, **fields)
+
+    def mail_post(self, credentials, method, **fields):
+        return self._session_post("robot_mail.php", credentials, method, **fields)
+
+    def _session_post(self, endpoint, credentials, method, **fields):
         with self._lock:
             session = self._ensure_session(credentials)
             boundary = "---------------------------" + secrets.token_hex(12)
@@ -358,7 +432,7 @@ class RobotClient:
                                f"{value}\r\n").encode())
             chunks.append(f"--{boundary}--\r\n".encode("ascii"))
             return self._request(
-                "robot_browser.php", body=b"".join(chunks),
+                endpoint, body=b"".join(chunks),
                 content_type=f"multipart/form-data; boundary={boundary}")
 
     def user_view(self, credentials, guid):
@@ -369,17 +443,57 @@ class RobotClient:
         """Return a player's clan history events from the official ``uhist`` method."""
         return parse_robot_history(self.browser_get(credentials, "uhist", a0=guid))
 
+    def player_list(self, credentials, list_name):
+        """Return the account's ``buddy`` or ``ignore`` list from the mail robot."""
+        return parse_robot_list(self.mail_get(credentials, "viewlist", list=list_name),
+                                list_name)
+
+    def add_list_player(self, credentials, list_name, guid):
+        _raise_robot_error(self.mail_get(credentials, "addlist", list=list_name, target=guid),
+                           f"TribesNext {list_name} list update failed")
+
+    def remove_list_player(self, credentials, list_name, guid):
+        _raise_robot_error(self.mail_get(credentials, "dellist", list=list_name, target=guid),
+                           f"TribesNext {list_name} list update failed")
+
     def buddy_list(self, credentials):
-        """Return the authenticated account's buddy list from the mail robot."""
-        return parse_robot_list(self.mail_get(credentials, "viewlist", list="buddy"), "buddy")
+        return self.player_list(credentials, "buddy")
 
     def add_buddy(self, credentials, guid):
-        _raise_robot_error(self.mail_get(credentials, "addlist", list="buddy", target=guid),
-                           "TribesNext buddy list update failed")
+        self.add_list_player(credentials, "buddy", guid)
 
     def remove_buddy(self, credentials, guid):
-        _raise_robot_error(self.mail_get(credentials, "dellist", list="buddy", target=guid),
-                           "TribesNext buddy list update failed")
+        self.remove_list_player(credentials, "buddy", guid)
+
+    def answer_invite(self, credentials, clan_id, accept):
+        """Accept or reject a clan invitation (``uaccept``/``ureject``)."""
+        _raise_robot_error(self.browser_get(credentials, "uaccept" if accept else "ureject",
+                                            a0=clan_id),
+                           "TribesNext invitation response failed")
+
+    def mailbox(self, credentials, box, first, last, since=0):
+        """Return message headers for ``inbox`` or ``deleted``, newest first."""
+        return parse_robot_mailbox(self.mail_get(credentials, "box", box=box, first=first,
+                                                 last=last, since=since))
+
+    def read_message(self, credentials, message_id):
+        """Return a full message; the robot marks it read as a side effect."""
+        return parse_robot_message(self.mail_get(credentials, "read", id=message_id))
+
+    def delete_message(self, credentials, message_id, deleted=True):
+        _raise_robot_error(self.mail_get(credentials, "delete", id=message_id,
+                                         set=int(bool(deleted))),
+                           "TribesNext message delete failed")
+
+    def send_mail(self, credentials, subject, contents, to_guids, cc_guids):
+        """Send a message by recipient GUID and return its message ID."""
+        to_guids = [str(guid) for guid in to_guids]
+        # The robot rejects an empty CC list (explode() yields one blank GUID), and
+        # its sender drops a CC recipient already on To, so repeat one To GUID.
+        cc_guids = [str(guid) for guid in cc_guids] or to_guids[:1]
+        return parse_robot_mail_send(self.mail_post(
+            credentials, "send", subject=subject, contents=contents,
+            to=",".join(to_guids), cc=",".join(cc_guids)))
 
     def clan_view(self, credentials, clan_id):
         """Return clan details and roster from the official robot API."""

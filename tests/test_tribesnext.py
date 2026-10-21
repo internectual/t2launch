@@ -195,6 +195,32 @@ class RobotClientTests(unittest.TestCase):
         with self.assertRaisesRegex(tribesnext.RobotAPIError, "UNAUTHENTICATED"):
             client.add_buddy(self.credentials, 98)
 
+    def test_mail_robot_box_read_and_send_parse_official_rows(self):
+        self.assertEqual(tribesnext.parse_robot_mailbox([
+            "", "MSG\t7\tinbox\tfalse\tinvite\t1300000000", "SBJ\t7\tJoin\\tus",
+            "SNDR\t7\tLou\t[ABC]\t1\t42", "SBJ\t99\torphan"]), [
+            {"id": 7, "box": "inbox", "read": False, "type": "invite", "time": "1300000000",
+             "subject": "Join\tus", "sender": ["Lou", "[ABC]", "1", "42"]}])
+        message = tribesnext.parse_robot_message([
+            "MSG2\t7\ttrue\tmessage\t1300000000", "SBJ\t7\tHi", "SNDR\t7\tLou\t\t0\t42",
+            "TO\t7\t1\tSecond\t\t0\t44", "TO\t7\t0\tFirst\t\t0\t43", "BDY\t7\ta\\nb\\\\c"])
+        self.assertEqual(message["body"], "a\nb\\c")
+        self.assertTrue(message["deleted"])
+        self.assertEqual([player[0] for player in message["to"]], ["First", "Second"])
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "READ"):
+            tribesnext.parse_robot_message(["ERR\tMAIL\tREAD\t7"])
+        self.assertEqual(tribesnext.parse_robot_mail_send(["", "SUCCESS\t8"]), 8)
+        with self.assertRaisesRegex(tribesnext.RobotAPIError, "Invalid recipient"):
+            tribesnext.parse_robot_mail_send(["ERR\tMAIL\tINVALID_RECIP"])
+
+        client = tribesnext.RobotClient()
+        sent = []
+        client.mail_post = lambda credentials, method, **fields: (
+            sent.append(fields) or ["SUCCESS\t9"])
+        self.assertEqual(client.send_mail(self.credentials, "S", "B", [43, 44], []), 9)
+        self.assertEqual(sent[0]["to"], "43,44")
+        self.assertEqual(sent[0]["cc"], "43")
+
     def test_user_and_clan_search_rows_parse_official_fields(self):
         self.assertEqual(tribesnext.parse_robot_search([
             "SEARCH\tLou\t0\tLouCypher\t[ABC]\t1\t42"], "user"),
