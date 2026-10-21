@@ -27,6 +27,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import ClassVar
 
 import community_store
 import tribesnext
@@ -40,13 +41,6 @@ AUTH_STAGE = "directory + local-account Auth1 + IRC auth + SQLite community DB +
 LOG_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "t2launch/wonemu"
 PORTS = {"directory": 15104, "auth": 15105, "dbproxy": 15106, "irc": 15107, "master": 15108}
 TRIBESNEXT_MASTER_URL = "http://master.tribesnext.com"
-# Player history, buddy list, T-Mail, and block list queries answered from the
-# TribesNext robot API (or, for the picture it lacks, a GUID-keyed local record).
-TRIBESNEXT_ROBOT_QUERIES = frozenset({(5, True), (10, False), (11, False), (12, True),
-                                      (26, False), (31, False),
-                                      (1, True), (14, True), (5, False), (6, False),
-                                      (7, False), (35, False), (2, True), (8, False),
-                                      (9, False), (10, True), (28, False)})
 # Each new message costs one robot read, so a mailbox poll fetches at most this
 # many (the TribesNext client's own chunk size).
 TRIBESNEXT_MAIL_PAGE = 25
@@ -814,11 +808,8 @@ class IRCHandler(socketserver.BaseRequestHandler):
                                reason="malformed_dbproxy_query")
             return
 
-        if session.get("auth_provider") == "tribesnext" and (
-                (ordinal, array_query) not in {
-                    (3, True), (4, True), (4, False), (6, True), (13, True),
-                    (22, False), (23, False), (69, False),
-                } | TRIBESNEXT_ROBOT_QUERIES):
+        if (session.get("auth_provider") == "tribesnext" and
+                (ordinal, array_query) not in TRIBESNEXT_ALLOWED_QUERIES):
             self._send_dbmsg(query_id,
                              "1\tTribesNext community operation unavailable\\S0\\S")
             emulator.log.event("irc_dbproxy_query", connection=connection, query_id=query_id,
@@ -828,1074 +819,15 @@ class IRCHandler(socketserver.BaseRequestHandler):
             return
 
         arguments = query.replace("\\n", "\n").replace("\\\\", "\\")
-        rows = []
-        tribesnext_clan_not_found = object()
-        tribesnext_player_not_found = object()
         try:
             max_rows = int(fields[2]) if len(fields) > 2 else 100
         except ValueError:
             max_rows = 100
         limit = 100 if max_rows <= 0 else min(max_rows, 100)
-        supported = ordinal in {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-                                15, 16, 17, 18, 19, 20, 21, 22, 23, 26, 34, 62,
-                                66, 67, 68, 100,
-                                24, 25, 27, 28, 29, 30, 31, 32, 33, 69}
-
-        def require_tribe_admin(tribe_name, minimum_access=2):
-            membership = emulator.community.membership(tribe_name, session["username"])
-            if membership is None or membership["access"] < minimum_access:
-                raise ValueError("Tribe administrator access required")
-            return membership
-
-        def require_forum_access(forum_id):
-            forum = emulator.community.ensure_forum(forum_id)
-            if forum["tribe_id"]:
-                tribe = emulator.community.tribe_by_id(forum["tribe_id"])
-                if tribe is None or emulator.community.membership(
-                        tribe["name"], session["username"]) is None:
-                    raise ValueError("Tribe membership required for this forum")
-            return forum
-
-        def require_forum_moderator(forum_id):
-            forum = require_forum_access(forum_id)
-            if not forum["tribe_id"]:
-                raise ValueError("Forum moderator access required")
-            tribe = emulator.community.tribe_by_id(forum["tribe_id"])
-            membership = (emulator.community.membership(tribe["name"], session["username"])
-                          if tribe else None)
-            if membership is None or membership["access"] < 3:
-                raise ValueError("Tribe moderator access required")
-            return forum
-
-        def mail_row(message):
-            # Quads follow the stock getTextName order: name, tag, append, id.
-            sender_quad = (message["sender_name"], message["sender_tag"],
-                           str(message["sender_appending"]), str(message["sender_id"]))
-            recipient_quad = (message["recipient_name"], message["recipient_tag"],
-                              str(message["recipient_appending"]), str(message["recipient_id"]))
-            body_count = max(1, len(message["body"].splitlines()))
-            created = datetime.datetime.fromtimestamp(message["created_at"]).strftime(
-                "%m/%d/%Y %H:%M")
-            return "\t".join((str(message["mail_id"]), *sender_quad, *recipient_quad,
-                               created, str(message["is_cc"]),
-                               str(message["is_deleted"]), str(message["is_read"]),
-                               message["to_list"], message["cc_list"], message["subject"],
-                               str(body_count), message["body"]))
-
-        def resolve_profile(username):
-            username = str(username).strip()
-            profile = emulator.community.get_profile(username)
-            if profile is None and username.isdecimal():
-                profile = emulator.community.get_profile_by_user_id(int(username))
-            if profile is None and (emulator.community.local_account_exists(username) or
-                                    woncrypto.private_store_contains(emulator.private_store, username)):
-                profile = emulator.community.ensure_profile(
-                    username, emulator.auth_user_id(username))
-            return profile
-
-        def resolve_profile_reference(reference):
-            reference = str(reference).strip()
-            profile = resolve_profile(reference) if reference else None
-            if profile is None and (not reference or reference.isdecimal()):
-                # Some legacy profile tabs pass a numeric profile metadata field
-                # rather than the account name/ID. Reuse the profile most
-                # recently returned on this authenticated IRC session.
-                last_profile = session.get("last_profile_username")
-                fallback = last_profile or session["username"]
-                profile = emulator.community.get_profile(
-                    fallback, emulator.auth_user_id(fallback))
-                if profile is not None:
-                    emulator.log.event(
-                        "irc_profile_reference_fallback", connection=connection,
-                        target_characters=len(reference), target_numeric=reference.isdecimal(),
-                        profile_found=True)
-            return profile
-
-        def tribesnext_profile(reference):
-            if session.get("auth_provider") != "tribesnext":
-                return None
-            credentials = session.get("tribesnext_credentials")
-            if credentials is None:
-                return False
-            # Searched players are not in the local public store; tribesnext_guid
-            # falls back to the robot's exact-name search.
-            guid = tribesnext_guid(reference)
-            if guid is False:
-                return False
-            if guid is None:
-                return tribesnext_player_not_found
-            try:
-                profile = emulator.tribesnext_robot.user_view(credentials, guid)
-            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
-                emulator.log.event("tribesnext_profile_unavailable", connection=connection,
-                                   guid=guid, error=type(exc).__name__)
-                return False
-            profile["guid"] = guid
-            return profile
-
-        def tribesnext_search(method, search):
-            if session.get("auth_provider") != "tribesnext":
-                return None
-            credentials = session.get("tribesnext_credentials")
-            if credentials is None:
-                return False
-            try:
-                return method(credentials, search)
-            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
-                emulator.log.event("tribesnext_search_unavailable", connection=connection,
-                                   search_characters=len(search), error=type(exc).__name__)
-                return False
-
-        def tribesnext_clan(reference):
-            if session.get("auth_provider") != "tribesnext":
-                return None
-            credentials = session.get("tribesnext_credentials")
-            if credentials is None:
-                return False
-            reference = str(reference).strip()
-            try:
-                if reference.isdecimal():
-                    clan_id = reference
-                else:
-                    matches = emulator.tribesnext_robot.clan_search(credentials, reference)
-                    match = next((clan for clan in matches
-                                  if clan["name"].casefold() == reference.casefold()), None)
-                    if match is None:
-                        return tribesnext_clan_not_found
-                    clan_id = match["id"]
-                return emulator.tribesnext_robot.clan_view(credentials, clan_id)
-            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
-                emulator.log.event("tribesnext_clan_unavailable", connection=connection,
-                                   reference_characters=len(reference),
-                                   error=type(exc).__name__)
-                return False
-
-        def known_account_names():
-            return ({name.casefold() for name in
-                     woncrypto.private_store_usernames(emulator.private_store)} |
-                    {name.casefold() for name in emulator.community.local_account_usernames()} |
-                    {session["username"].casefold()})
-
-        def tribesnext_guid(reference):
-            """Resolve a player name or GUID; None when unknown, False when unavailable."""
-            reference = str(reference).strip()
-            if reference.isdecimal():
-                return int(reference)
-            guid = emulator.tribesnext_user_id(reference)
-            if guid is not None:
-                return guid
-            matches = tribesnext_search(emulator.tribesnext_robot.user_search, reference)
-            if matches is False:
-                return False
-            match = next((player for player in matches or ()
-                          if player["name"].casefold() == reference.casefold()), None)
-            return int(match["guid"]) if match else None
-
-        if (session.get("auth_provider") == "tribesnext" and
-                (ordinal, array_query) in TRIBESNEXT_ROBOT_QUERIES):
-            robot = emulator.tribesnext_robot
-            credentials = session.get("tribesnext_credentials")
-            supported = True
-            try:
-                if credentials is None:
-                    raise tribesnext.RobotAPIError("TribesNext session credentials unavailable")
-                own_guid = credentials.certificate.guid
-                if ordinal == 31:
-                    graphic = arguments.strip()
-                    if len(graphic) > 255 or any(character in graphic for character in "\t\r\n"):
-                        status, result, status_code = "1\tInvalid picture", "", 1
-                    else:
-                        emulator.community.set_tribesnext_picture(own_guid, graphic)
-                        status, result, status_code = "0\tUpdated", "", 0
-                elif ordinal == 12:
-                    target = arguments.strip()
-                    guid = (own_guid if not target or
-                            target.casefold() == session["username"].casefold()
-                            else tribesnext_guid(target))
-                    if guid is False:
-                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
-                    if guid is None:
-                        status, result, status_code = "1\tPlayer not found", "0", 1
-                    else:
-                        # The robot lists oldest first; the Browser shows newest first.
-                        events = robot.user_history(credentials, guid)[::-1][:limit]
-                        for event in events:
-                            try:
-                                when = datetime.datetime.fromtimestamp(
-                                    int(event["time"])).strftime("%m/%d/%Y %H:%M")
-                            except (ValueError, OverflowError, OSError):
-                                when = ""
-                            rows.append(f"{when} {tribesnext.expand_history_event(event)}"
-                                        .strip())
-                        status, result, status_code = "0\t", str(len(rows)), 0
-                elif ordinal == 5 and array_query:
-                    target = arguments.strip()
-                    # The robot only exposes the authenticated account's own list.
-                    buddies = ([] if target and target.casefold() != session["username"].casefold()
-                               else robot.buddy_list(credentials)[:limit])
-                    rows.extend("\t".join((buddy["name"], buddy["tag"], buddy["append"],
-                                            buddy["guid"], "")) for buddy in buddies)
-                    status, result, status_code = "0\t", str(len(rows)), 0
-                elif ordinal == 26:
-                    for buddy in robot.buddy_list(credentials):
-                        robot.remove_buddy(credentials, buddy["guid"])
-                    status, result, status_code = "0\tBuddy list cleared", "", 0
-                elif ordinal == 10 and array_query:
-                    # Tribe OPTIONS: the client draws the page itself once the query succeeds.
-                    status, result, status_code = "0\t", "0", 0
-                elif ordinal == 28:
-                    query_fields = arguments.split("\t")
-                    action = query_fields[0].strip().casefold()
-                    tribe = query_fields[1].strip() if len(query_fields) > 1 else ""
-                    if action not in {"accept", "reject"}:
-                        status, result, status_code = (
-                            "1\tTribesNext invitations cannot be retracted here", "", 1)
-                    else:
-                        # Invite mail links carry the clan ID; other links carry the name.
-                        clan_id = (int(tribe) if tribe.isdecimal() else next(
-                            (int(clan["id"]) for clan in robot.clan_search(credentials, tribe)
-                             if clan["name"].casefold() == tribe.casefold()), None))
-                        if clan_id is None:
-                            status, result, status_code = "1\tTribe not found", "", 1
-                        else:
-                            try:
-                                robot.answer_invite(credentials, clan_id, action == "accept")
-                                status, result, status_code = "0\tInvitation updated", "", 0
-                            except tribesnext.RobotAPIError as exc:
-                                status, result, status_code = f"1\t{exc}", "", 1
-                elif ordinal in {10, 11}:
-                    buddy_name = arguments.strip()
-                    if ordinal == 11:
-                        listed = next((buddy for buddy in robot.buddy_list(credentials)
-                                       if buddy["name"].casefold() == buddy_name.casefold()),
-                                      None)
-                        guid = int(listed["guid"]) if listed else None
-                    else:
-                        guid = tribesnext_guid(buddy_name)
-                    if guid is False:
-                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
-                    if guid is None:
-                        status, result, status_code = (
-                            f"1\t{'Player' if ordinal == 10 else 'Buddy'} not found", "", 1)
-                    elif ordinal == 10:
-                        robot.add_buddy(credentials, guid)
-                        # The Browser reads the added name from result field 2.
-                        status, result, status_code = "0\tBuddy added", f"\t\t{buddy_name}", 0
-                    else:
-                        robot.remove_buddy(credentials, guid)
-                        status, result, status_code = "0\tBuddy removed", "", 0
-                elif ordinal in {1, 14}:
-                    # Stock T-Mail caches whole messages, so every new header needs a
-                    # robot read for its body (which also marks it read on TribesNext).
-                    if ordinal == 1:
-                        after = arguments.strip()
-                        after_id = int(after) if after.isdecimal() else 0
-                        headers = [header for header in robot.mailbox(
-                            credentials, "inbox", 0, TRIBESNEXT_MAIL_PAGE, since=after_id + 1)
-                            if header["id"] > after_id]
-                    else:
-                        headers = robot.mailbox(credentials, "deleted", 0, TRIBESNEXT_MAIL_PAGE)
-                    recipient = (session["username"], "", "0", str(own_guid))
-                    # The client advances its last-seen ID row by row, so send oldest first.
-                    for header in sorted(headers, key=lambda header: header["id"])[:limit]:
-                        rows.append(tribesnext_mail_row(
-                            header, robot.read_message(credentials, header["id"]), recipient))
-                    status = ("0\t\tYou have no deleted messages." if ordinal == 14 and not rows
-                              else "0\t")
-                    result, status_code = str(len(rows)), 0
-                elif ordinal == 5:
-                    query_fields = arguments.split("\t")
-                    if len(query_fields) < 4:
-                        status, result, status_code = "1\tInvalid mail request", "", 1
-                    else:
-                        recipients, missing = ([], []), None
-                        for field, guids in zip(query_fields[:2], recipients):
-                            for name in (name.strip() for name in field.split(",")):
-                                if not name:
-                                    continue
-                                guid = tribesnext_guid(name)
-                                if guid is False:
-                                    raise tribesnext.RobotAPIError("TribesNext player lookup failed")
-                                if guid is None:
-                                    missing = missing or name
-                                else:
-                                    guids.append(guid)
-                        if missing:
-                            status, result, status_code = f"1\tPlayer not found: {missing}", "", 1
-                        elif not recipients[0]:
-                            status, result, status_code = "1\tA To recipient is required", "", 1
-                        else:
-                            try:
-                                robot.send_mail(credentials, query_fields[2],
-                                                "\t".join(query_fields[3:]), *recipients)
-                                status, status_code = "0\tMail sent", 0
-                                result = str(len(recipients[0]) + len(recipients[1]))
-                            except tribesnext.RobotAPIError as exc:
-                                status, result, status_code = f"1\t{exc}", "", 1
-                elif ordinal in {6, 7, 35}:
-                    message_id = arguments.strip()
-                    if not message_id.isdecimal():
-                        status, result, status_code = "1\tMail message not found", "", 1
-                    else:
-                        if ordinal == 6:
-                            robot.delete_message(credentials, int(message_id))
-                        elif ordinal == 7:
-                            robot.read_message(credentials, int(message_id))
-                        # 35 (remove from Deleted) has no robot method; TribesNext purges
-                        # deleted messages itself.
-                        status, result, status_code = "0\tUpdated", "", 0
-                elif ordinal == 2:
-                    blocked = robot.player_list(credentials, "ignore")[:limit]
-                    rows.extend("\t".join((player["name"], player["tag"], player["append"],
-                                            player["guid"], "0")) for player in blocked)
-                    status, result, status_code = "0\t", str(len(rows)), 0
-                else:
-                    blocked_name = arguments.strip()
-                    if ordinal == 8:
-                        listed = next((player for player in robot.player_list(credentials, "ignore")
-                                       if player["name"].casefold() == blocked_name.casefold()),
-                                      None)
-                        guid = int(listed["guid"]) if listed else None
-                    else:
-                        guid = tribesnext_guid(blocked_name)
-                    if guid is False:
-                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
-                    if guid is None:
-                        status, result, status_code = (
-                            f"1\t{'Blocked sender' if ordinal == 8 else 'Player'} not found",
-                            "", 1)
-                    elif ordinal == 9:
-                        robot.add_list_player(credentials, "ignore", guid)
-                        status, result, status_code = "0\tSender blocked", "", 0
-                    else:
-                        robot.remove_list_player(credentials, "ignore", guid)
-                        status, result, status_code = "0\tBlock removed", "", 0
-            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
-                emulator.log.event("tribesnext_robot_unavailable", connection=connection,
-                                   ordinal=ordinal, array_query=array_query,
-                                   error=type(exc).__name__)
-                rows.clear()
-                status, result, status_code = "1\tTribesNext service unavailable", "0", 1
-        elif ordinal == 1 and array_query:
-            try:
-                after_id = int(arguments.strip() or "0")
-                messages = emulator.community.inbox(session["username"], after_id, limit)
-                status, status_code = "0\t", 0
-                result = str(len(messages))
-                for message in messages:
-                    rows.append(mail_row(message))
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "0", 1
-        elif ordinal in {6, 7} and not array_query:
-            try:
-                mail_id = int(arguments.strip())
-                if not emulator.community.update_mail(
-                        session["username"], mail_id,
-                        is_deleted=True if ordinal == 6 else None,
-                        is_read=True if ordinal == 7 else None):
-                    raise ValueError("Mail message not found")
-                status, result, status_code = "0\tUpdated", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 5 and not array_query:
-            query_fields = arguments.split("\t")
-            if len(query_fields) < 4:
-                status, result, status_code = "1\tInvalid mail request", "", 1
-            else:
-                to_names = [name.strip() for name in query_fields[0].split(",") if name.strip()]
-                cc_names = [name.strip() for name in query_fields[1].split(",") if name.strip()]
-                recipients = [(name, False) for name in to_names]
-                recipients.extend((name, True) for name in cc_names)
-                try:
-                    known_names = known_account_names()
-                    for name, _ in recipients:
-                        if name.casefold() not in known_names:
-                            raise ValueError(f"Player not found: {name}")
-                        emulator.community.ensure_profile(name, emulator.auth_user_id(name))
-                    count = emulator.community.send_mail(
-                        session["username"], emulator.auth_user_id(session["username"]),
-                        recipients, query_fields[2], "\t".join(query_fields[3:]),
-                        ", ".join(to_names), ", ".join(cc_names))
-                    status, result, status_code = "0\tMail sent", str(count), 0
-                except ValueError as exc:
-                    status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 0 and not array_query:
-            status, result, status_code = "0\t", "Welcome to the local Tribes 2 community server.", 0
-        elif ordinal in {0, 100} and array_query:
-            query_fields = arguments.split("\t")
-            try:
-                if ordinal == 100:
-                    category_id = int(query_fields[-1]) if query_fields and query_fields[-1] else 105
-                    session["news_category"] = category_id
-                else:
-                    category_id = int(session.get("news_category", 105))
-                page = int(fields[2]) if len(fields) > 2 else 0
-                page = max(0, min(page, 100))
-                articles, total = emulator.community.list_news(category_id, page * 23, 23)
-                status, result, status_code = f"0\t\t{total}\t0", str(total), 0
-                for index, article in enumerate(articles):
-                    created = datetime.datetime.fromtimestamp(article["created_at"]).strftime(
-                        "%m/%d/%Y %H:%M")
-                    row = [str(index), str(article["article_id"]), str(article["article_id"]),
-                           "1", created, str(article["updated_at"]), str(article["author_id"]),
-                           "", article["author_name"], str(article["author_id"]),
-                           article["author_tag"], str(article["author_appending"]),
-                           str(article["category_id"]), article["title"], article["body"]]
-                    rows.append("\t".join(row))
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "0", 1
-        elif ordinal == 1 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                if len(query_fields) < 3:
-                    raise ValueError("Invalid news post request")
-                article_id = emulator.community.post_news(
-                    query_fields[0], session["username"],
-                    emulator.auth_user_id(session["username"]),
-                    query_fields[1], "\t".join(query_fields[2:]))
-                status, result, status_code = "0\tArticle submitted", str(article_id), 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 2 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                if len(query_fields) < 6 or not emulator.community.edit_news(
-                        int(query_fields[1]), session["username"], int(query_fields[4]),
-                        query_fields[5], "\t".join(query_fields[6:])):
-                    raise ValueError("Article not found or not owned by this account")
-                status, result, status_code = "0\tArticle updated", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 2 and array_query:
-            blocked = emulator.community.email_block_list(session["username"])[:limit]
-            status, result, status_code = "0\t", str(len(blocked)), 0
-            rows.extend("\t".join((entry["username"], entry["tag"],
-                                    str(entry["appending"]), str(entry["user_id"]),
-                                    str(entry["blocked_count"]))) for entry in blocked)
-        elif ordinal == 5 and array_query:
-            target = arguments.strip() or session["username"]
-            profile = resolve_profile_reference(target)
-            if profile is None:
-                status, result, status_code = "1\tPlayer not found", "0", 1
-            else:
-                buddies = emulator.community.list_buddies(profile["username"])[:limit]
-                status, result, status_code = "0\t", str(len(buddies)), 0
-                rows.extend("\t".join((buddy["display_name"], buddy["tag"],
-                                        str(buddy["appending"]), str(buddy["user_id"]), ""))
-                            for buddy in buddies)
-        elif ordinal == 10 and array_query:
-            tribe_name = arguments.strip()
-            if emulator.community.get_tribe(tribe_name) is None:
-                status, result, status_code = "1\tTribe not found", "0", 1
-            else:
-                # Tribe security-action rules are not persisted by this local
-                # backend yet. Return a valid empty array instead of an
-                # unsupported-query error for the tribe Options pane.
-                status, result, status_code = "0\t", "0", 0
-        elif ordinal in {10, 11} and not array_query:
-            buddy_name = arguments.strip()
-            try:
-                known_names = known_account_names()
-                if buddy_name.casefold() not in known_names:
-                    raise ValueError("Player not found")
-                if ordinal == 10:
-                    emulator.community.add_buddy(
-                        session["username"], emulator.auth_user_id(session["username"]),
-                        buddy_name, emulator.auth_user_id(buddy_name))
-                    status, result = "0\tBuddy added", ""
-                else:
-                    if not emulator.community.remove_buddy(session["username"], buddy_name):
-                        raise ValueError("Buddy not found")
-                    status, result = "0\tBuddy removed", ""
-                status_code = 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 11 and array_query:
-            tribe_name = arguments.strip()
-            try:
-                require_tribe_admin(tribe_name)
-                invitations = emulator.community.list_invitations(tribe_name)[:limit]
-                status, result, status_code = "0\t", str(len(invitations)), 0
-                for invitation in invitations:
-                    if invitation["status"] == "requested":
-                        inviter_quad = ("", "0", "", "0")
-                    else:
-                        inviter_quad = (invitation["inviter_name"] or "",
-                                        str(invitation["inviter_id"] or 0),
-                                        invitation["inviter_tag"] or "",
-                                        str(invitation["inviter_appending"] or 0))
-                    invitee_quad = (invitation["invited_name"], str(invitation["invited_id"]),
-                                    invitation["invited_tag"],
-                                    str(invitation["invited_appending"]))
-                    invite_date = datetime.datetime.fromtimestamp(
-                        invitation["created_at"]).strftime("%m/%d/%Y %H:%M")
-                    rows.append("\t".join((str(invitation["invite_id"]), invite_date,
-                                            *inviter_quad, *invitee_quad,
-                                            str(int(invitation["status"] == "requested")), "0")))
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "0", 1
-        elif ordinal == 26 and not array_query:
-            emulator.community.clear_buddies(session["username"])
-            status, result, status_code = "0\tBuddy list cleared", "", 0
-        elif ordinal == 14 and array_query:
-            messages = emulator.community.inbox(
-                session["username"], 0, limit, include_deleted=True, deleted_only=True)
-            status, status_code = "0\t", 0
-            result = str(len(messages))
-            rows.extend(mail_row(message) for message in messages)
-        elif ordinal == 3 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                if not query_fields or not emulator.community.delete_news(
-                        int(query_fields[0]), session["username"]):
-                    raise ValueError("Article not found or not owned by this account")
-                status, result, status_code = "0\tArticle deleted", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal in {8, 9} and not array_query:
-            blocked_name = arguments.strip()
-            try:
-                known_names = known_account_names()
-                if blocked_name.casefold() not in known_names:
-                    raise ValueError("Player not found")
-                emulator.community.ensure_profile(
-                    blocked_name, emulator.auth_user_id(blocked_name))
-                if ordinal == 9:
-                    emulator.community.set_email_block(session["username"], blocked_name)
-                    status, result = "0\tSender blocked", ""
-                else:
-                    if not emulator.community.remove_email_block(session["username"], blocked_name):
-                        raise ValueError("Blocked sender not found")
-                    status, result = "0\tBlock removed", ""
-                status_code = 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 7 and array_query:
-            forums = emulator.community.forum_list(session["username"])[:limit]
-            status, status_code = "0\t", 0
-            result = str(len(forums))
-            rows.extend("\t".join((str(forum["forum_id"]), forum["name"],
-                                    str(forum["flags"]), str(forum["tribe_id"])))
-                        for forum in forums)
-        elif ordinal == 8 and array_query:
-            try:
-                forum_id = int(arguments.strip())
-                page = int(fields[2]) if len(fields) > 2 else 0
-                page = page if 0 <= page <= 5 else 0
-                require_forum_access(forum_id)
-                topics = emulator.community.list_forum_topics(forum_id, page * 60, 60)
-                all_topics = emulator.community.list_forum_topics(forum_id, 0, 100)
-                status, status_code = "0\t", 0
-                result = str(len(all_topics))
-                for topic in topics:
-                    created = datetime.datetime.fromtimestamp(topic["created_at"]).strftime(
-                        "%m/%d/%Y %H:%M")
-                    row = ["", str(topic["topic_id"]), topic["subject"],
-                           str(topic["post_count"]), "", "", created, "",
-                           topic["author_name"], "", "", "", "0", str(topic["locked"]),
-                           str(topic["update_id"])]
-                    rows.append("\t".join(row))
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "0", 1
-        elif ordinal == 9 and array_query:
-            query_fields = arguments.split("\t")
-            try:
-                topic_id = int(query_fields[0])
-                after_update_id = int(query_fields[1]) if len(query_fields) > 1 else 0
-                forum = emulator.community.forum_for_topic(topic_id)
-                if forum is None:
-                    raise ValueError("Forum topic not found")
-                require_forum_access(forum["forum_id"])
-                posts = emulator.community.list_forum_posts(topic_id, after_update_id, limit)
-                status, status_code = "0\t", 0
-                result = str(len(posts))
-                for post in posts:
-                    created = datetime.datetime.fromtimestamp(post["created_at"]).strftime(
-                        "%m/%d/%Y %H:%M")
-                    row = [str(int(post["author_name"].casefold() == session["username"].casefold())),
-                           "", str(post["post_id"]), str(post["parent_id"]),
-                           str(post["update_id"]), post["author_name"],
-                           str(post["author_id"]), post["author_tag"],
-                           str(post["author_appending"]), "", created, "",
-                           str(post["is_deleted"]), post["subject"], post["body"]]
-                    rows.append("\t".join(row))
-            except (IndexError, ValueError) as exc:
-                status, result, status_code = f"1\t{exc}", "0", 1
-        elif ordinal in {66, 67} and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                topic_id = int(query_fields[0])
-                forum = emulator.community.forum_for_topic(topic_id)
-                if forum is None:
-                    raise ValueError("Forum topic not found")
-                require_forum_moderator(forum["forum_id"])
-                reason = "\t".join(query_fields[1:]) if ordinal == 66 else ""
-                emulator.community.set_forum_topic_locked(topic_id, ordinal == 66, reason)
-                status, result, status_code = (
-                    ("0\tTopic locked", "", 0) if ordinal == 66 else
-                    ("0\tTopic unlocked", "", 0))
-            except (IndexError, ValueError) as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 68 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                topic_id = int(query_fields[0])
-                target_forum_id = int(query_fields[1])
-                source_forum = emulator.community.forum_for_topic(topic_id)
-                if source_forum is None:
-                    raise ValueError("Forum topic not found")
-                require_forum_moderator(source_forum["forum_id"])
-                if target_forum_id < 0:
-                    require_forum_moderator(target_forum_id)
-                emulator.community.move_forum_topic(topic_id, target_forum_id)
-                status, result, status_code = "0\tTopic moved", "", 0
-            except (IndexError, ValueError) as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 62 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                if len(query_fields) < 2 or query_fields[0].strip() != "0":
-                    raise ValueError("Unsupported topic moderation action")
-                topic_id = int(query_fields[1])
-                forum = emulator.community.forum_for_topic(topic_id)
-                if forum is None:
-                    raise ValueError("Forum topic not found")
-                require_forum_moderator(forum["forum_id"])
-                if not emulator.community.delete_forum_topic(topic_id):
-                    raise ValueError("Forum topic not found")
-                status, result, status_code = "0\tTopic removed", "", 0
-            except (IndexError, ValueError) as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 12 and array_query:
-            target = arguments.strip()
-            profile = resolve_profile_reference(target)
-            if profile is None:
-                status, result, status_code = "1\tPlayer not found", "0", 1
-            else:
-                created = datetime.datetime.fromtimestamp(profile["registered_at"]).strftime(
-                    "%m/%d/%Y %H:%M")
-                status, result, status_code = "0\t", "1", 0
-                rows.append(f"Local community profile first seen on {created}.")
-        elif ordinal == 12 and not array_query:
-            query_fields = arguments.split("\t")
-            if len(query_fields) < 5:
-                status, result, status_code = "1\tInvalid forum post request", "", 1
-            else:
-                try:
-                    require_forum_access(int(query_fields[0]))
-                    created = emulator.community.create_forum_post(
-                        int(query_fields[0]), int(query_fields[1] or "0"),
-                        int(query_fields[2] or "0"), session["username"],
-                        emulator.auth_user_id(session["username"]),
-                        query_fields[3], "\t".join(query_fields[4:]))
-                    status, result, status_code = "0\tPost created", str(created["post_id"]), 0
-                except (ValueError, IndexError) as exc:
-                    status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 13 and array_query:
-            target = arguments.strip()
-            remote_profile = tribesnext_profile(target)
-            profile = (resolve_profile_reference(target) if remote_profile is None
-                       else None if remote_profile is tribesnext_player_not_found
-                       else remote_profile)
-            if profile is None:
-                status, result, status_code = "1\tPlayer not found", "0", 1
-            elif profile is False:
-                status, result, status_code = "1\tTribesNext profile unavailable", "0", 1
-            else:
-                if "memberships" in profile:
-                    tribes = robot_memberships(profile["memberships"][:limit])
-                else:
-                    tribes = community_memberships(
-                        emulator.community.list_profile_tribes(profile["username"], limit))
-                rows.extend("\t".join((tribe["name"], tribe["tag"], str(tribe["id"]),
-                                        str(tribe["rank"]), str(int(tribe["rank"] >= 2)),
-                                        tribe["title"]))
-                            for tribe in tribes)
-                status, result, status_code = "0\t", str(len(tribes)), 0
-        elif ordinal == 13 and not array_query:
-            query_fields = arguments.split("\t")
-            try:
-                post_id = int(query_fields[0])
-                forum = emulator.community.forum_for_post(post_id)
-                if forum is None:
-                    raise ValueError("Forum post not found")
-                require_forum_access(forum["forum_id"])
-                if len(query_fields) < 3 or not emulator.community.edit_forum_post(
-                        post_id, session["username"], query_fields[1], "\t".join(query_fields[2:])):
-                    raise ValueError("Forum post not found or not owned by this account")
-                status, result, status_code = "0\tPost updated", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 14 and not array_query:
-            try:
-                post_id = int(arguments.strip())
-                forum = emulator.community.forum_for_post(post_id)
-                if forum is None:
-                    raise ValueError("Forum post not found")
-                require_forum_access(forum["forum_id"])
-                if not emulator.community.delete_forum_post(post_id, session["username"]):
-                    raise ValueError("Forum post not found or not owned by this account")
-                status, result, status_code = "0\tPost removed", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 23:
-            requested = arguments.split("\t", 1)[0].strip()
-            if not requested:
-                # A missing local AuthInfo display name should still open the
-                # authenticated player's own Browser profile.
-                requested = session["username"]
-            remote_profile = tribesnext_profile(requested)
-            if remote_profile is False or remote_profile is tribesnext_player_not_found:
-                found = False
-                local_account = session_account = legacy_account = False
-            else:
-                local_account = emulator.community.local_account_exists(requested)
-                session_account = requested.casefold() == session["username"].casefold()
-                legacy_account = woncrypto.private_store_contains(emulator.private_store, requested)
-                found = remote_profile is not None or local_account or session_account or legacy_account
-            emulator.log.event("irc_profile_lookup", connection=connection,
-                               requested_characters=len(requested),
-                               matches_session=session_account,
-                               local_account=local_account,
-                               legacy_account=legacy_account,
-                               profile_found=found)
-            if remote_profile is False:
-                status, result, status_code = "1\tTribesNext profile unavailable", "", 1
-            elif remote_profile is tribesnext_player_not_found:
-                status, result, status_code = "1\tPlayer not found", "", 1
-            elif remote_profile is not None:
-                session["last_profile_username"] = requested
-                try:
-                    created = int(remote_profile.get("creation", "0"))
-                    registered = datetime.datetime.fromtimestamp(created).strftime("%m/%d/%Y")
-                except (ValueError, OverflowError, OSError):
-                    registered = ""
-                status = "\t".join(("0", "", remote_profile.get("name", requested),
-                                    remote_profile.get("tag", ""),
-                                    remote_profile.get("append", "0"),
-                                    str(remote_profile["guid"]), registered,
-                                    remote_profile.get("online", "0"),
-                                    remote_profile.get("website", ""),
-                                    emulator.community.tribesnext_picture(
-                                        remote_profile["guid"]) or ""))
-                result = remote_profile.get("info", "")
-                status_code = 0
-            elif found:
-                profile = emulator.community.get_profile(
-                    requested, emulator.auth_user_id(requested))
-                session["last_profile_username"] = profile["username"]
-                registered = datetime.datetime.fromtimestamp(
-                    profile["registered_at"]).strftime("%m/%d/%Y")
-                status = "\t".join(("0", "", profile["display_name"], profile["tag"],
-                                      str(profile["appending"]), str(profile["user_id"]),
-                                      registered, "1", profile["url"],
-                                      profile["graphic"]))
-                result = profile["description"]
-                status_code = 0
-            else:
-                status = "1\tPlayer not found"
-                result = ""
-                status_code = 1
-        elif ordinal == 3 and array_query:
-            query_fields = arguments.split("\t")
-            raw_search = query_fields[0].strip() if query_fields else ""
-            search = raw_search.casefold()
-            remote_matches = tribesnext_search(
-                emulator.tribesnext_robot.user_search, raw_search)
-            if remote_matches is False:
-                status, result, status_code = "1\tTribesNext search unavailable", "0", 1
-            elif remote_matches is None:
-                known = {profile["username"].casefold()
-                         for profile in emulator.community.search_players("", 100)}
-                all_names = (set(woncrypto.private_store_usernames(emulator.private_store)) |
-                             set(emulator.community.local_account_usernames()))
-                for name in all_names:
-                    if (name.casefold() not in known and search in name.casefold()):
-                        emulator.community.ensure_profile(name, emulator.auth_user_id(name))
-                        known.add(name.casefold())
-                matches = emulator.community.search_players(search, limit)
-                result = str(len(matches))
-                status_code = 0
-                status = "0\t"
-                for index, profile in enumerate(matches):
-                    # The T2 browser consumes display name from column 0 and
-                    # stable WON user ID from column 3 of each result row.
-                    rows.append("\t".join((str(index), profile["display_name"], "", "",
-                                           str(profile["user_id"]))))
-            else:
-                matches = remote_matches[:limit]
-                result = str(len(matches))
-                status_code = 0
-                status = "0\t"
-                rows.extend("\t".join((str(index), player["name"], player.get("tag", ""),
-                                        player.get("append", "0"), str(player["guid"])))
-                            for index, player in enumerate(matches))
-        elif ordinal == 4:
-            query_fields = arguments.split("\t")
-            search = query_fields[0].strip() if query_fields else ""
-            remote_matches = tribesnext_search(emulator.tribesnext_robot.clan_search, search)
-            if remote_matches is False:
-                status, result, status_code = "1\tTribesNext search unavailable", "0", 1
-            else:
-                if remote_matches is not None:
-                    matches = remote_matches[:limit]
-                    rows.extend("\t".join((str(index), clan["name"], "", ""))
-                                for index, clan in enumerate(matches))
-                else:
-                    matches = emulator.community.search_tribes(search, limit)
-                    rows.extend("\t".join((str(index), tribe["name"], tribe["tag"],
-                                            str(tribe["member_count"])))
-                                for index, tribe in enumerate(matches))
-                result = str(len(matches))
-                status_code = 0
-                status = "0\t"
-        elif ordinal == 6:
-            tribe_name = arguments.split("\t", 1)[0].strip()
-            remote_clan = tribesnext_clan(tribe_name)
-            if remote_clan is False:
-                members = []
-                status, result, status_code = "1\tTribesNext clan unavailable", "0", 1
-            elif remote_clan is tribesnext_clan_not_found:
-                members = []
-                status, result, status_code = "1\tTribe not found", "0", 1
-            elif remote_clan is not None:
-                members = remote_clan["members"][:limit]
-                rows.extend("\t".join((member["name"], member.get("tag", ""),
-                                        member.get("append", "0"), member["guid"],
-                                        member["title"], member["rank"], "", "",
-                                        str(int(int(member["rank"]) >= 2)),
-                                        member["online"])) for member in members)
-            else:
-                members = emulator.community.list_tribe_members(tribe_name, limit)
-                online = emulator.online_user_ids()
-                rows.extend("\t".join([
-                    member["display_name"], "", "", str(member["user_id"]), member["title"],
-                    str(member["access"]), str(member["joined_at"]), "",
-                    str(int(member["access"] >= 2)), str(int(member["user_id"] in online)),
-                ]) for member in members)
-            if remote_clan is not False:
-                result = str(len(members))
-                status_code = 0
-                status = "0\t"
-        elif ordinal == 15 and array_query:
-            links = (("Tribes 2 Home Page", "www.tribes2.com"),
-                     ("T2 Technical Information", "sierrastudios.com/games/tribes2/support"))
-            links = links[:limit]
-            status, result, status_code = "0\t", str(len(links)), 0
-            rows.extend(f"0\t{name}\t{address}" for name, address in links)
-        elif ordinal == 15 and not array_query:
-            query_fields = arguments.split("\t")
-            if len(query_fields) < 3:
-                status, result, status_code = "1\tInvalid tribe description update", "", 1
-            else:
-                tribe_name = query_fields[0]
-                description = "\t".join(query_fields[2:])
-                try:
-                    require_tribe_admin(tribe_name)
-                    emulator.community.update_tribe(tribe_name, description=description)
-                    status, result, status_code = "0\tUpdated", "", 0
-                except ValueError as exc:
-                    status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 16:
-            query_fields = arguments.split("\t")
-            if len(query_fields) < 6:
-                status, result, status_code = "1\tInvalid tribe creation request", "", 1
-            else:
-                description = "\t".join(query_fields[5:])
-                try:
-                    emulator.community.create_tribe(
-                        query_fields[0], query_fields[1], query_fields[2], query_fields[3],
-                        description, session["username"],
-                        emulator.auth_user_id(session["username"]))
-                    status, result, status_code = "0\tCreated", "", 0
-                except ValueError as exc:
-                    status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 22:
-            tribe_name = arguments.split("\t", 1)[0].strip()
-            remote_clan = tribesnext_clan(tribe_name)
-            tribe = emulator.community.get_tribe(tribe_name) if remote_clan is None else None
-            if remote_clan is False:
-                status, result, status_code = "1\tTribesNext clan unavailable", "", 1
-            elif remote_clan is tribesnext_clan_not_found:
-                status, result, status_code = "1\tTribe not found", "", 1
-            elif remote_clan is not None:
-                status = "\t".join(("0", "", str(remote_clan.get("id", "")),
-                                    remote_clan["name"], remote_clan.get("tag", ""),
-                                    remote_clan.get("append", "0"),
-                                    remote_clan.get("recruiting", "0"),
-                                    remote_clan.get("picture", "")))
-                result, status_code = remote_clan.get("info", ""), 0
-            elif tribe is None:
-                status, result, status_code = "1\tTribe not found", "", 1
-            else:
-                status = "\t".join(("0", "", str(tribe["tribe_id"]), tribe["name"],
-                                     tribe["tag"], str(tribe["appending"]),
-                                     str(tribe["recruiting"]), tribe["graphic"]))
-                result, status_code = tribe["description"], 0
-        elif ordinal == 18:
-            tribe_name = arguments.split("\t", 1)[0].strip()
-            try:
-                require_tribe_admin(tribe_name, minimum_access=4)
-                if not emulator.community.delete_tribe(tribe_name):
-                    raise ValueError("Tribe not found")
-                status, result, status_code = "0\tTribe deleted", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 19:
-            query_fields = arguments.split("\t")
-            tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
-            member_name = query_fields[0].strip() if query_fields else ""
-            try:
-                actor = require_tribe_admin(tribe_name)
-                target = emulator.community.membership(tribe_name, member_name)
-                if target is None:
-                    raise ValueError("Tribe member not found")
-                if (target["user_id"] == actor["user_id"] or
-                        target["access"] >= actor["access"]):
-                    raise ValueError("Cannot remove an equal- or higher-ranked tribe member")
-                if not emulator.community.remove_membership(tribe_name, member_name):
-                    raise ValueError("Tribe member not found")
-                status, result, status_code = "0\tMember removed", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 20:
-            query_fields = arguments.split("\t")
-            action = query_fields[0].strip().casefold() if query_fields else ""
-            tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
-            value = query_fields[2].strip() if len(query_fields) > 2 else "0"
-            tribe_field = {"recruiting": "recruiting", "appending": "appending"}.get(action)
-            try:
-                if tribe_field is None:
-                    raise ValueError("Unknown tribe setting")
-                require_tribe_admin(tribe_name)
-                emulator.community.update_tribe(tribe_name, **{tribe_field: int(value != "0")})
-                status, result, status_code = "0\tUpdated", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 21:
-            query_fields = arguments.split("\t")
-            tribe_name = query_fields[0].strip() if query_fields else ""
-            member_name = query_fields[1].strip() if len(query_fields) > 1 else ""
-            title = query_fields[2] if len(query_fields) > 2 else ""
-            try:
-                access = int(query_fields[3]) if len(query_fields) > 3 else 0
-                actor = require_tribe_admin(tribe_name, minimum_access=3)
-                target = emulator.community.membership(tribe_name, member_name)
-                if target is None:
-                    raise ValueError("Tribe membership not found")
-                if access < 0 or access > 4:
-                    raise ValueError("Tribe rank must be between 0 and 4")
-                is_self = target["user_id"] == actor["user_id"]
-                if ((not is_self and target["access"] >= actor["access"]) or
-                        access > actor["access"] or (not is_self and access >= actor["access"])):
-                    raise ValueError("Cannot modify an equal- or higher-ranked tribe member")
-                emulator.community.update_membership(tribe_name, member_name,
-                                                     title=title, access=access)
-                status, result, status_code = "0\tMember profile updated", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 24:
-            tribe_name = arguments.split("\t", 1)[0].strip()
-            if emulator.community.remove_membership(tribe_name, session["username"]):
-                status, result, status_code = "0\tMembership removed", "", 0
-            else:
-                status, result, status_code = "1\tTribe membership not found", "", 1
-        elif ordinal == 25:
-            primary_tribe = arguments.split("\t", 1)[0].strip()
-            if primary_tribe.casefold() == "none":
-                primary_tribe = ""
-            elif emulator.community.membership(primary_tribe, session["username"]) is None:
-                status, result, status_code = "1\tTribe membership not found", "", 1
-                primary_tribe = None
-            if primary_tribe is not None:
-                emulator.community.update_profile(session["username"],
-                                                  emulator.auth_user_id(session["username"]),
-                                                  primary_tribe=primary_tribe)
-                status, result, status_code = "0\tPrimary tribe updated", primary_tribe, 0
-        elif ordinal == 27:
-            query_fields = arguments.split("\t")
-            tribe_name = query_fields[0].strip() if query_fields else ""
-            invited_name = query_fields[1].strip() if len(query_fields) > 1 else ""
-            try:
-                require_tribe_admin(tribe_name)
-                if (invited_name.casefold() != session["username"].casefold() and
-                        not emulator.community.local_account_exists(invited_name) and
-                        not woncrypto.private_store_contains(emulator.private_store, invited_name)):
-                    raise ValueError("Player not found")
-                emulator.community.invite(tribe_name, invited_name,
-                                          emulator.auth_user_id(invited_name),
-                                          session["username"],
-                                          emulator.auth_user_id(session["username"]))
-                status, result, status_code = "0\tInvitation sent", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 28:
-            query_fields = arguments.split("\t")
-            action = query_fields[0].strip().casefold() if query_fields else ""
-            tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
-            target_name = query_fields[2].strip() if len(query_fields) > 2 else session["username"]
-            try:
-                if action == "cancel":
-                    require_tribe_admin(tribe_name)
-                    expected_status = ("pending", "requested")
-                elif target_name.casefold() != session["username"].casefold():
-                    require_tribe_admin(tribe_name)
-                    expected_status = "requested"
-                else:
-                    expected_status = "pending"
-                result = emulator.community.respond_to_invite(
-                    action, tribe_name, target_name,
-                    emulator.auth_user_id(target_name), expected_status)
-                status, status_code = "0\tInvitation updated", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 34 and not array_query:
-            tribe_name = arguments.strip()
-            try:
-                emulator.community.request_invitation(
-                    tribe_name, session["username"],
-                    emulator.auth_user_id(session["username"]))
-                status, result, status_code = "0\tInvitation request sent", "", 0
-            except ValueError as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal in {29, 30}:
-            query_fields = arguments.split("\t")
-            try:
-                if ordinal == 29:
-                    tribe_name = query_fields[0].strip()
-                    graphic = "\t".join(query_fields[1:])
-                else:
-                    tribe = emulator.community.tribe_by_id(int(query_fields[0]))
-                    if tribe is None:
-                        raise ValueError("Tribe not found")
-                    tribe_name = tribe["name"]
-                    graphic = None
-                require_tribe_admin(tribe_name, minimum_access=3)
-                if ordinal == 29:
-                    emulator.community.update_tribe(tribe_name, graphic=graphic)
-                else:
-                    emulator.community.update_tribe(tribe_name, tag="\t".join(query_fields[1:]))
-                status, result, status_code = "0\tUpdated", "", 0
-            except (ValueError, IndexError) as exc:
-                status, result, status_code = f"1\t{exc}", "", 1
-        elif ordinal == 69:
-            online = emulator.online_user_ids()
-            result = "".join("1" if user_id.isdecimal() and int(user_id) in online else "0"
-                             for user_id in arguments.split("\t")) if arguments else ""
-            status_code = 0
-            status = "0\t"
-        elif ordinal in {17, 31, 32, 33}:
-            field = {17: "description", 31: "graphic", 32: "url", 33: "display_name"}[ordinal]
-            emulator.community.update_profile(
-                session["username"], emulator.auth_user_id(session["username"]),
-                **{field: arguments})
-            result = ""
-            status_code = 0
-            status = "0\tUpdated"
-        else:
-            status = f"1\tUnsupported DBProxy query {ordinal}"
-            result = ""
-            status_code = 1
+        dbproxy_query = DBProxyQuery(emulator, session, connection, arguments, fields,
+                                     ordinal, array_query, limit)
+        status, result, status_code, supported = dbproxy_query.run()
+        rows = dbproxy_query.rows
 
         def escape(value):
             # The client unescapes slash pairs before splitting on the reserved \S token.
@@ -1909,6 +841,1315 @@ class IRCHandler(socketserver.BaseRequestHandler):
                            ordinal=ordinal, array_query=array_query,
                            argument_characters=len(arguments), supported=supported,
                            status=status_code, row_count=len(rows))
+
+
+class DBProxyQuery:
+    """One authenticated DBProxy query, dispatched on ``(ordinal, array_query)``."""
+
+    tribesnext_clan_not_found = object()
+    tribesnext_player_not_found = object()
+
+    def __init__(self, emulator, session, connection, arguments, fields, ordinal,
+                 array_query, limit):
+        self.emulator = emulator
+        self.session = session
+        self.connection = connection
+        self.arguments = arguments
+        self.fields = fields
+        self.ordinal = ordinal
+        self.array_query = array_query
+        self.limit = limit
+        self.rows = []
+        self.robot = emulator.tribesnext_robot
+        self.credentials = session.get("tribesnext_credentials")
+        self.own_guid = None
+
+    def run(self):
+        """Return ``(status, result, status_code, supported)`` for this query."""
+        key = (self.ordinal, self.array_query)
+        if (self.session.get("auth_provider") == "tribesnext" and
+                key in self.ROBOT_HANDLERS):
+            try:
+                if self.credentials is None:
+                    raise tribesnext.RobotAPIError("TribesNext session credentials unavailable")
+                self.own_guid = self.credentials.certificate.guid
+                return (*self.ROBOT_HANDLERS[key](self), True)
+            except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+                self.emulator.log.event("tribesnext_robot_unavailable",
+                                        connection=self.connection, ordinal=self.ordinal,
+                                        array_query=self.array_query,
+                                        error=type(exc).__name__)
+                self.rows.clear()
+                return "1\tTribesNext service unavailable", "0", 1, True
+        handler = self.LOCAL_HANDLERS.get(key)
+        if handler is None:
+            return f"1\tUnsupported DBProxy query {self.ordinal}", "", 1, False
+        return (*handler(self), True)
+
+    def require_tribe_admin(self, tribe_name, minimum_access=2):
+        membership = self.emulator.community.membership(tribe_name, self.session["username"])
+        if membership is None or membership["access"] < minimum_access:
+            raise ValueError("Tribe administrator access required")
+        return membership
+
+    def require_forum_access(self, forum_id):
+        forum = self.emulator.community.ensure_forum(forum_id)
+        if forum["tribe_id"]:
+            tribe = self.emulator.community.tribe_by_id(forum["tribe_id"])
+            if tribe is None or self.emulator.community.membership(
+                    tribe["name"], self.session["username"]) is None:
+                raise ValueError("Tribe membership required for this forum")
+        return forum
+
+    def require_forum_moderator(self, forum_id):
+        forum = self.require_forum_access(forum_id)
+        if not forum["tribe_id"]:
+            raise ValueError("Forum moderator access required")
+        tribe = self.emulator.community.tribe_by_id(forum["tribe_id"])
+        membership = (self.emulator.community.membership(tribe["name"], self.session["username"])
+                      if tribe else None)
+        if membership is None or membership["access"] < 3:
+            raise ValueError("Tribe moderator access required")
+        return forum
+
+    def mail_row(self, message):
+        # Quads follow the stock getTextName order: name, tag, append, id.
+        sender_quad = (message["sender_name"], message["sender_tag"],
+                       str(message["sender_appending"]), str(message["sender_id"]))
+        recipient_quad = (message["recipient_name"], message["recipient_tag"],
+                          str(message["recipient_appending"]), str(message["recipient_id"]))
+        body_count = max(1, len(message["body"].splitlines()))
+        created = datetime.datetime.fromtimestamp(message["created_at"]).strftime(
+            "%m/%d/%Y %H:%M")
+        return "\t".join((str(message["mail_id"]), *sender_quad, *recipient_quad,
+                           created, str(message["is_cc"]),
+                           str(message["is_deleted"]), str(message["is_read"]),
+                           message["to_list"], message["cc_list"], message["subject"],
+                           str(body_count), message["body"]))
+
+    def resolve_profile(self, username):
+        username = str(username).strip()
+        profile = self.emulator.community.get_profile(username)
+        if profile is None and username.isdecimal():
+            profile = self.emulator.community.get_profile_by_user_id(int(username))
+        if profile is None and (self.emulator.community.local_account_exists(username) or
+                                woncrypto.private_store_contains(self.emulator.private_store, username)):
+            profile = self.emulator.community.ensure_profile(
+                username, self.emulator.auth_user_id(username))
+        return profile
+
+    def resolve_profile_reference(self, reference):
+        reference = str(reference).strip()
+        profile = self.resolve_profile(reference) if reference else None
+        if profile is None and (not reference or reference.isdecimal()):
+            # Some legacy profile tabs pass a numeric profile metadata field
+            # rather than the account name/ID. Reuse the profile most
+            # recently returned on this authenticated IRC session.
+            last_profile = self.session.get("last_profile_username")
+            fallback = last_profile or self.session["username"]
+            profile = self.emulator.community.get_profile(
+                fallback, self.emulator.auth_user_id(fallback))
+            if profile is not None:
+                self.emulator.log.event(
+                    "irc_profile_reference_fallback", connection=self.connection,
+                    target_characters=len(reference), target_numeric=reference.isdecimal(),
+                    profile_found=True)
+        return profile
+
+    def tribesnext_profile(self, reference):
+        if self.session.get("auth_provider") != "tribesnext":
+            return None
+        credentials = self.session.get("tribesnext_credentials")
+        if credentials is None:
+            return False
+        # Searched players are not in the local public store; tribesnext_guid
+        # falls back to the robot's exact-name search.
+        guid = self.tribesnext_guid(reference)
+        if guid is False:
+            return False
+        if guid is None:
+            return self.tribesnext_player_not_found
+        try:
+            profile = self.emulator.tribesnext_robot.user_view(credentials, guid)
+        except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+            self.emulator.log.event("tribesnext_profile_unavailable", connection=self.connection,
+                                    guid=guid, error=type(exc).__name__)
+            return False
+        profile["guid"] = guid
+        return profile
+
+    def tribesnext_search(self, method, search):
+        if self.session.get("auth_provider") != "tribesnext":
+            return None
+        credentials = self.session.get("tribesnext_credentials")
+        if credentials is None:
+            return False
+        try:
+            return method(credentials, search)
+        except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+            self.emulator.log.event("tribesnext_search_unavailable", connection=self.connection,
+                                    search_characters=len(search), error=type(exc).__name__)
+            return False
+
+    def tribesnext_clan(self, reference):
+        if self.session.get("auth_provider") != "tribesnext":
+            return None
+        credentials = self.session.get("tribesnext_credentials")
+        if credentials is None:
+            return False
+        reference = str(reference).strip()
+        try:
+            if reference.isdecimal():
+                clan_id = reference
+            else:
+                matches = self.emulator.tribesnext_robot.clan_search(credentials, reference)
+                match = next((clan for clan in matches
+                              if clan["name"].casefold() == reference.casefold()), None)
+                if match is None:
+                    return self.tribesnext_clan_not_found
+                clan_id = match["id"]
+            return self.emulator.tribesnext_robot.clan_view(credentials, clan_id)
+        except (OSError, ValueError, tribesnext.RobotAPIError) as exc:
+            self.emulator.log.event("tribesnext_clan_unavailable", connection=self.connection,
+                                    reference_characters=len(reference),
+                                    error=type(exc).__name__)
+            return False
+
+    def known_account_names(self):
+        return ({name.casefold() for name in
+                 woncrypto.private_store_usernames(self.emulator.private_store)} |
+                {name.casefold() for name in self.emulator.community.local_account_usernames()} |
+                {self.session["username"].casefold()})
+
+    def tribesnext_guid(self, reference):
+        """Resolve a player name or GUID; None when unknown, False when unavailable."""
+        reference = str(reference).strip()
+        if reference.isdecimal():
+            return int(reference)
+        guid = self.emulator.tribesnext_user_id(reference)
+        if guid is not None:
+            return guid
+        matches = self.tribesnext_search(self.emulator.tribesnext_robot.user_search, reference)
+        if matches is False:
+            return False
+        match = next((player for player in matches or ()
+                      if player["name"].casefold() == reference.casefold()), None)
+        return int(match["guid"]) if match else None
+
+    # TribesNext robot translations (sessions with auth_provider == "tribesnext").
+
+    def tn_set_picture(self):
+        graphic = self.arguments.strip()
+        if len(graphic) > 255 or any(character in graphic for character in "\t\r\n"):
+            status, result, status_code = "1\tInvalid picture", "", 1
+        else:
+            self.emulator.community.set_tribesnext_picture(self.own_guid, graphic)
+            status, result, status_code = "0\tUpdated", "", 0
+        return status, result, status_code
+
+    def tn_history(self):
+        target = self.arguments.strip()
+        guid = (self.own_guid if not target or
+                target.casefold() == self.session["username"].casefold()
+                else self.tribesnext_guid(target))
+        if guid is False:
+            raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+        if guid is None:
+            status, result, status_code = "1\tPlayer not found", "0", 1
+        else:
+            # The robot lists oldest first; the Browser shows newest first.
+            events = self.robot.user_history(self.credentials, guid)[::-1][:self.limit]
+            for event in events:
+                try:
+                    when = datetime.datetime.fromtimestamp(
+                        int(event["time"])).strftime("%m/%d/%Y %H:%M")
+                except (ValueError, OverflowError, OSError):
+                    when = ""
+                self.rows.append(f"{when} {tribesnext.expand_history_event(event)}"
+                                 .strip())
+            status, result, status_code = "0\t", str(len(self.rows)), 0
+        return status, result, status_code
+
+    def tn_buddy_list(self):
+        target = self.arguments.strip()
+        # The robot only exposes the authenticated account's own list.
+        buddies = ([] if target and target.casefold() != self.session["username"].casefold()
+                   else self.robot.buddy_list(self.credentials)[:self.limit])
+        self.rows.extend("\t".join((buddy["name"], buddy["tag"], buddy["append"],
+                                     buddy["guid"], "")) for buddy in buddies)
+        status, result, status_code = "0\t", str(len(self.rows)), 0
+        return status, result, status_code
+
+    def tn_clear_buddies(self):
+        for buddy in self.robot.buddy_list(self.credentials):
+            self.robot.remove_buddy(self.credentials, buddy["guid"])
+        status, result, status_code = "0\tBuddy list cleared", "", 0
+        return status, result, status_code
+
+    def tn_tribe_options(self):
+        # Tribe OPTIONS: the client draws the page itself once the query succeeds.
+        status, result, status_code = "0\t", "0", 0
+        return status, result, status_code
+
+    def tn_answer_invite(self):
+        query_fields = self.arguments.split("\t")
+        action = query_fields[0].strip().casefold()
+        tribe = query_fields[1].strip() if len(query_fields) > 1 else ""
+        if action not in {"accept", "reject"}:
+            status, result, status_code = (
+                "1\tTribesNext invitations cannot be retracted here", "", 1)
+        else:
+            # Invite mail links carry the clan ID; other links carry the name.
+            clan_id = (int(tribe) if tribe.isdecimal() else next(
+                (int(clan["id"]) for clan in self.robot.clan_search(self.credentials, tribe)
+                 if clan["name"].casefold() == tribe.casefold()), None))
+            if clan_id is None:
+                status, result, status_code = "1\tTribe not found", "", 1
+            else:
+                try:
+                    self.robot.answer_invite(self.credentials, clan_id, action == "accept")
+                    status, result, status_code = "0\tInvitation updated", "", 0
+                except tribesnext.RobotAPIError as exc:
+                    status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tn_change_buddy(self):
+        buddy_name = self.arguments.strip()
+        if self.ordinal == 11:
+            listed = next((buddy for buddy in self.robot.buddy_list(self.credentials)
+                           if buddy["name"].casefold() == buddy_name.casefold()),
+                          None)
+            guid = int(listed["guid"]) if listed else None
+        else:
+            guid = self.tribesnext_guid(buddy_name)
+        if guid is False:
+            raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+        if guid is None:
+            status, result, status_code = (
+                f"1\t{'Player' if self.ordinal == 10 else 'Buddy'} not found", "", 1)
+        elif self.ordinal == 10:
+            self.robot.add_buddy(self.credentials, guid)
+            # The Browser reads the added name from result field 2.
+            status, result, status_code = "0\tBuddy added", f"\t\t{buddy_name}", 0
+        else:
+            self.robot.remove_buddy(self.credentials, guid)
+            status, result, status_code = "0\tBuddy removed", "", 0
+        return status, result, status_code
+
+    def tn_mailbox(self):
+        # Stock T-Mail caches whole messages, so every new header needs a
+        # robot read for its body (which also marks it read on TribesNext).
+        if self.ordinal == 1:
+            after = self.arguments.strip()
+            after_id = int(after) if after.isdecimal() else 0
+            headers = [header for header in self.robot.mailbox(
+                self.credentials, "inbox", 0, TRIBESNEXT_MAIL_PAGE, since=after_id + 1)
+                if header["id"] > after_id]
+        else:
+            headers = self.robot.mailbox(self.credentials, "deleted", 0, TRIBESNEXT_MAIL_PAGE)
+        recipient = (self.session["username"], "", "0", str(self.own_guid))
+        # The client advances its last-seen ID row by row, so send oldest first.
+        for header in sorted(headers, key=lambda header: header["id"])[:self.limit]:
+            self.rows.append(tribesnext_mail_row(
+                header, self.robot.read_message(self.credentials, header["id"]), recipient))
+        status = ("0\t\tYou have no deleted messages." if self.ordinal == 14 and not self.rows
+                  else "0\t")
+        result, status_code = str(len(self.rows)), 0
+        return status, result, status_code
+
+    def tn_send_mail(self):
+        query_fields = self.arguments.split("\t")
+        if len(query_fields) < 4:
+            status, result, status_code = "1\tInvalid mail request", "", 1
+        else:
+            recipients, missing = ([], []), None
+            for field, guids in zip(query_fields[:2], recipients):
+                for name in (name.strip() for name in field.split(",")):
+                    if not name:
+                        continue
+                    guid = self.tribesnext_guid(name)
+                    if guid is False:
+                        raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+                    if guid is None:
+                        missing = missing or name
+                    else:
+                        guids.append(guid)
+            if missing:
+                status, result, status_code = f"1\tPlayer not found: {missing}", "", 1
+            elif not recipients[0]:
+                status, result, status_code = "1\tA To recipient is required", "", 1
+            else:
+                try:
+                    self.robot.send_mail(self.credentials, query_fields[2],
+                                         "\t".join(query_fields[3:]), *recipients)
+                    status, status_code = "0\tMail sent", 0
+                    result = str(len(recipients[0]) + len(recipients[1]))
+                except tribesnext.RobotAPIError as exc:
+                    status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tn_update_mail(self):
+        message_id = self.arguments.strip()
+        if not message_id.isdecimal():
+            status, result, status_code = "1\tMail message not found", "", 1
+        else:
+            if self.ordinal == 6:
+                self.robot.delete_message(self.credentials, int(message_id))
+            elif self.ordinal == 7:
+                self.robot.read_message(self.credentials, int(message_id))
+            # 35 (remove from Deleted) has no robot method; TribesNext purges
+            # deleted messages itself.
+            status, result, status_code = "0\tUpdated", "", 0
+        return status, result, status_code
+
+    def tn_block_list(self):
+        blocked = self.robot.player_list(self.credentials, "ignore")[:self.limit]
+        self.rows.extend("\t".join((player["name"], player["tag"], player["append"],
+                                     player["guid"], "0")) for player in blocked)
+        status, result, status_code = "0\t", str(len(self.rows)), 0
+        return status, result, status_code
+
+    def tn_change_block(self):
+        blocked_name = self.arguments.strip()
+        if self.ordinal == 8:
+            listed = next((player for player in self.robot.player_list(self.credentials, "ignore")
+                           if player["name"].casefold() == blocked_name.casefold()),
+                          None)
+            guid = int(listed["guid"]) if listed else None
+        else:
+            guid = self.tribesnext_guid(blocked_name)
+        if guid is False:
+            raise tribesnext.RobotAPIError("TribesNext player lookup failed")
+        if guid is None:
+            status, result, status_code = (
+                f"1\t{'Blocked sender' if self.ordinal == 8 else 'Player'} not found",
+                "", 1)
+        elif self.ordinal == 9:
+            self.robot.add_list_player(self.credentials, "ignore", guid)
+            status, result, status_code = "0\tSender blocked", "", 0
+        else:
+            self.robot.remove_list_player(self.credentials, "ignore", guid)
+            status, result, status_code = "0\tBlock removed", "", 0
+        return status, result, status_code
+
+    # Local community backend.
+
+    def inbox(self):
+        try:
+            after_id = int(self.arguments.strip() or "0")
+            messages = self.emulator.community.inbox(self.session["username"], after_id, self.limit)
+            status, status_code = "0\t", 0
+            result = str(len(messages))
+            for message in messages:
+                self.rows.append(self.mail_row(message))
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "0", 1
+        return status, result, status_code
+
+    def update_mail(self):
+        try:
+            mail_id = int(self.arguments.strip())
+            if not self.emulator.community.update_mail(
+                    self.session["username"], mail_id,
+                    is_deleted=True if self.ordinal == 6 else None,
+                    is_read=True if self.ordinal == 7 else None):
+                raise ValueError("Mail message not found")
+            status, result, status_code = "0\tUpdated", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def send_mail(self):
+        query_fields = self.arguments.split("\t")
+        if len(query_fields) < 4:
+            status, result, status_code = "1\tInvalid mail request", "", 1
+        else:
+            to_names = [name.strip() for name in query_fields[0].split(",") if name.strip()]
+            cc_names = [name.strip() for name in query_fields[1].split(",") if name.strip()]
+            recipients = [(name, False) for name in to_names]
+            recipients.extend((name, True) for name in cc_names)
+            try:
+                known_names = self.known_account_names()
+                for name, _ in recipients:
+                    if name.casefold() not in known_names:
+                        raise ValueError(f"Player not found: {name}")
+                    self.emulator.community.ensure_profile(name, self.emulator.auth_user_id(name))
+                count = self.emulator.community.send_mail(
+                    self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+                    recipients, query_fields[2], "\t".join(query_fields[3:]),
+                    ", ".join(to_names), ", ".join(cc_names))
+                status, result, status_code = "0\tMail sent", str(count), 0
+            except ValueError as exc:
+                status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def welcome(self):
+        status, result, status_code = "0\t", "Welcome to the local Tribes 2 community server.", 0
+        return status, result, status_code
+
+    def news(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if self.ordinal == 100:
+                category_id = int(query_fields[-1]) if query_fields and query_fields[-1] else 105
+                self.session["news_category"] = category_id
+            else:
+                category_id = int(self.session.get("news_category", 105))
+            page = int(self.fields[2]) if len(self.fields) > 2 else 0
+            page = max(0, min(page, 100))
+            articles, total = self.emulator.community.list_news(category_id, page * 23, 23)
+            status, result, status_code = f"0\t\t{total}\t0", str(total), 0
+            for index, article in enumerate(articles):
+                created = datetime.datetime.fromtimestamp(article["created_at"]).strftime(
+                    "%m/%d/%Y %H:%M")
+                row = [str(index), str(article["article_id"]), str(article["article_id"]),
+                       "1", created, str(article["updated_at"]), str(article["author_id"]),
+                       "", article["author_name"], str(article["author_id"]),
+                       article["author_tag"], str(article["author_appending"]),
+                       str(article["category_id"]), article["title"], article["body"]]
+                self.rows.append("\t".join(row))
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "0", 1
+        return status, result, status_code
+
+    def post_news(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if len(query_fields) < 3:
+                raise ValueError("Invalid news post request")
+            article_id = self.emulator.community.post_news(
+                query_fields[0], self.session["username"],
+                self.emulator.auth_user_id(self.session["username"]),
+                query_fields[1], "\t".join(query_fields[2:]))
+            status, result, status_code = "0\tArticle submitted", str(article_id), 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def edit_news(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if len(query_fields) < 6 or not self.emulator.community.edit_news(
+                    int(query_fields[1]), self.session["username"], int(query_fields[4]),
+                    query_fields[5], "\t".join(query_fields[6:])):
+                raise ValueError("Article not found or not owned by this account")
+            status, result, status_code = "0\tArticle updated", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def block_list(self):
+        blocked = self.emulator.community.email_block_list(self.session["username"])[:self.limit]
+        status, result, status_code = "0\t", str(len(blocked)), 0
+        self.rows.extend("\t".join((entry["username"], entry["tag"],
+                                     str(entry["appending"]), str(entry["user_id"]),
+                                     str(entry["blocked_count"]))) for entry in blocked)
+        return status, result, status_code
+
+    def buddy_list(self):
+        target = self.arguments.strip() or self.session["username"]
+        profile = self.resolve_profile_reference(target)
+        if profile is None:
+            status, result, status_code = "1\tPlayer not found", "0", 1
+        else:
+            buddies = self.emulator.community.list_buddies(profile["username"])[:self.limit]
+            status, result, status_code = "0\t", str(len(buddies)), 0
+            self.rows.extend("\t".join((buddy["display_name"], buddy["tag"],
+                                         str(buddy["appending"]), str(buddy["user_id"]), ""))
+                             for buddy in buddies)
+        return status, result, status_code
+
+    def tribe_options(self):
+        tribe_name = self.arguments.strip()
+        if self.emulator.community.get_tribe(tribe_name) is None:
+            status, result, status_code = "1\tTribe not found", "0", 1
+        else:
+            # Tribe security-action rules are not persisted by this local
+            # backend yet. Return a valid empty array instead of an
+            # unsupported-query error for the tribe Options pane.
+            status, result, status_code = "0\t", "0", 0
+        return status, result, status_code
+
+    def change_buddy(self):
+        buddy_name = self.arguments.strip()
+        try:
+            known_names = self.known_account_names()
+            if buddy_name.casefold() not in known_names:
+                raise ValueError("Player not found")
+            if self.ordinal == 10:
+                self.emulator.community.add_buddy(
+                    self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+                    buddy_name, self.emulator.auth_user_id(buddy_name))
+                status, result = "0\tBuddy added", ""
+            else:
+                if not self.emulator.community.remove_buddy(self.session["username"], buddy_name):
+                    raise ValueError("Buddy not found")
+                status, result = "0\tBuddy removed", ""
+            status_code = 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tribe_invitations(self):
+        tribe_name = self.arguments.strip()
+        try:
+            self.require_tribe_admin(tribe_name)
+            invitations = self.emulator.community.list_invitations(tribe_name)[:self.limit]
+            status, result, status_code = "0\t", str(len(invitations)), 0
+            for invitation in invitations:
+                if invitation["status"] == "requested":
+                    inviter_quad = ("", "0", "", "0")
+                else:
+                    inviter_quad = (invitation["inviter_name"] or "",
+                                    str(invitation["inviter_id"] or 0),
+                                    invitation["inviter_tag"] or "",
+                                    str(invitation["inviter_appending"] or 0))
+                invitee_quad = (invitation["invited_name"], str(invitation["invited_id"]),
+                                invitation["invited_tag"],
+                                str(invitation["invited_appending"]))
+                invite_date = datetime.datetime.fromtimestamp(
+                    invitation["created_at"]).strftime("%m/%d/%Y %H:%M")
+                self.rows.append("\t".join((str(invitation["invite_id"]), invite_date,
+                                             *inviter_quad, *invitee_quad,
+                                             str(int(invitation["status"] == "requested")), "0")))
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "0", 1
+        return status, result, status_code
+
+    def clear_buddies(self):
+        self.emulator.community.clear_buddies(self.session["username"])
+        status, result, status_code = "0\tBuddy list cleared", "", 0
+        return status, result, status_code
+
+    def deleted_mail(self):
+        messages = self.emulator.community.inbox(
+            self.session["username"], 0, self.limit, include_deleted=True, deleted_only=True)
+        status, status_code = "0\t", 0
+        result = str(len(messages))
+        self.rows.extend(self.mail_row(message) for message in messages)
+        return status, result, status_code
+
+    def delete_news(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if not query_fields or not self.emulator.community.delete_news(
+                    int(query_fields[0]), self.session["username"]):
+                raise ValueError("Article not found or not owned by this account")
+            status, result, status_code = "0\tArticle deleted", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def change_block(self):
+        blocked_name = self.arguments.strip()
+        try:
+            known_names = self.known_account_names()
+            if blocked_name.casefold() not in known_names:
+                raise ValueError("Player not found")
+            self.emulator.community.ensure_profile(
+                blocked_name, self.emulator.auth_user_id(blocked_name))
+            if self.ordinal == 9:
+                self.emulator.community.set_email_block(self.session["username"], blocked_name)
+                status, result = "0\tSender blocked", ""
+            else:
+                if not self.emulator.community.remove_email_block(self.session["username"], blocked_name):
+                    raise ValueError("Blocked sender not found")
+                status, result = "0\tBlock removed", ""
+            status_code = 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def forums(self):
+        forums = self.emulator.community.forum_list(self.session["username"])[:self.limit]
+        status, status_code = "0\t", 0
+        result = str(len(forums))
+        self.rows.extend("\t".join((str(forum["forum_id"]), forum["name"],
+                                     str(forum["flags"]), str(forum["tribe_id"])))
+                         for forum in forums)
+        return status, result, status_code
+
+    def forum_topics(self):
+        try:
+            forum_id = int(self.arguments.strip())
+            page = int(self.fields[2]) if len(self.fields) > 2 else 0
+            page = page if 0 <= page <= 5 else 0
+            self.require_forum_access(forum_id)
+            topics = self.emulator.community.list_forum_topics(forum_id, page * 60, 60)
+            all_topics = self.emulator.community.list_forum_topics(forum_id, 0, 100)
+            status, status_code = "0\t", 0
+            result = str(len(all_topics))
+            for topic in topics:
+                created = datetime.datetime.fromtimestamp(topic["created_at"]).strftime(
+                    "%m/%d/%Y %H:%M")
+                row = ["", str(topic["topic_id"]), topic["subject"],
+                       str(topic["post_count"]), "", "", created, "",
+                       topic["author_name"], "", "", "", "0", str(topic["locked"]),
+                       str(topic["update_id"])]
+                self.rows.append("\t".join(row))
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "0", 1
+        return status, result, status_code
+
+    def forum_posts(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            topic_id = int(query_fields[0])
+            after_update_id = int(query_fields[1]) if len(query_fields) > 1 else 0
+            forum = self.emulator.community.forum_for_topic(topic_id)
+            if forum is None:
+                raise ValueError("Forum topic not found")
+            self.require_forum_access(forum["forum_id"])
+            posts = self.emulator.community.list_forum_posts(topic_id, after_update_id, self.limit)
+            status, status_code = "0\t", 0
+            result = str(len(posts))
+            for post in posts:
+                created = datetime.datetime.fromtimestamp(post["created_at"]).strftime(
+                    "%m/%d/%Y %H:%M")
+                row = [str(int(post["author_name"].casefold() == self.session["username"].casefold())),
+                       "", str(post["post_id"]), str(post["parent_id"]),
+                       str(post["update_id"]), post["author_name"],
+                       str(post["author_id"]), post["author_tag"],
+                       str(post["author_appending"]), "", created, "",
+                       str(post["is_deleted"]), post["subject"], post["body"]]
+                self.rows.append("\t".join(row))
+        except (IndexError, ValueError) as exc:
+            status, result, status_code = f"1\t{exc}", "0", 1
+        return status, result, status_code
+
+    def lock_topic(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            topic_id = int(query_fields[0])
+            forum = self.emulator.community.forum_for_topic(topic_id)
+            if forum is None:
+                raise ValueError("Forum topic not found")
+            self.require_forum_moderator(forum["forum_id"])
+            reason = "\t".join(query_fields[1:]) if self.ordinal == 66 else ""
+            self.emulator.community.set_forum_topic_locked(topic_id, self.ordinal == 66, reason)
+            status, result, status_code = (
+                ("0\tTopic locked", "", 0) if self.ordinal == 66 else
+                ("0\tTopic unlocked", "", 0))
+        except (IndexError, ValueError) as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def move_topic(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            topic_id = int(query_fields[0])
+            target_forum_id = int(query_fields[1])
+            source_forum = self.emulator.community.forum_for_topic(topic_id)
+            if source_forum is None:
+                raise ValueError("Forum topic not found")
+            self.require_forum_moderator(source_forum["forum_id"])
+            if target_forum_id < 0:
+                self.require_forum_moderator(target_forum_id)
+            self.emulator.community.move_forum_topic(topic_id, target_forum_id)
+            status, result, status_code = "0\tTopic moved", "", 0
+        except (IndexError, ValueError) as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def remove_topic(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if len(query_fields) < 2 or query_fields[0].strip() != "0":
+                raise ValueError("Unsupported topic moderation action")
+            topic_id = int(query_fields[1])
+            forum = self.emulator.community.forum_for_topic(topic_id)
+            if forum is None:
+                raise ValueError("Forum topic not found")
+            self.require_forum_moderator(forum["forum_id"])
+            if not self.emulator.community.delete_forum_topic(topic_id):
+                raise ValueError("Forum topic not found")
+            status, result, status_code = "0\tTopic removed", "", 0
+        except (IndexError, ValueError) as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def history(self):
+        target = self.arguments.strip()
+        profile = self.resolve_profile_reference(target)
+        if profile is None:
+            status, result, status_code = "1\tPlayer not found", "0", 1
+        else:
+            created = datetime.datetime.fromtimestamp(profile["registered_at"]).strftime(
+                "%m/%d/%Y %H:%M")
+            status, result, status_code = "0\t", "1", 0
+            self.rows.append(f"Local community profile first seen on {created}.")
+        return status, result, status_code
+
+    def create_forum_post(self):
+        query_fields = self.arguments.split("\t")
+        if len(query_fields) < 5:
+            status, result, status_code = "1\tInvalid forum post request", "", 1
+        else:
+            try:
+                self.require_forum_access(int(query_fields[0]))
+                created = self.emulator.community.create_forum_post(
+                    int(query_fields[0]), int(query_fields[1] or "0"),
+                    int(query_fields[2] or "0"), self.session["username"],
+                    self.emulator.auth_user_id(self.session["username"]),
+                    query_fields[3], "\t".join(query_fields[4:]))
+                status, result, status_code = "0\tPost created", str(created["post_id"]), 0
+            except (ValueError, IndexError) as exc:
+                status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def memberships(self):
+        target = self.arguments.strip()
+        remote_profile = self.tribesnext_profile(target)
+        profile = (self.resolve_profile_reference(target) if remote_profile is None
+                   else None if remote_profile is self.tribesnext_player_not_found
+                   else remote_profile)
+        if profile is None:
+            status, result, status_code = "1\tPlayer not found", "0", 1
+        elif profile is False:
+            status, result, status_code = "1\tTribesNext profile unavailable", "0", 1
+        else:
+            if "memberships" in profile:
+                tribes = robot_memberships(profile["memberships"][:self.limit])
+            else:
+                tribes = community_memberships(
+                    self.emulator.community.list_profile_tribes(profile["username"], self.limit))
+            self.rows.extend("\t".join((tribe["name"], tribe["tag"], str(tribe["id"]),
+                                         str(tribe["rank"]), str(int(tribe["rank"] >= 2)),
+                                         tribe["title"]))
+                             for tribe in tribes)
+            status, result, status_code = "0\t", str(len(tribes)), 0
+        return status, result, status_code
+
+    def edit_forum_post(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            post_id = int(query_fields[0])
+            forum = self.emulator.community.forum_for_post(post_id)
+            if forum is None:
+                raise ValueError("Forum post not found")
+            self.require_forum_access(forum["forum_id"])
+            if len(query_fields) < 3 or not self.emulator.community.edit_forum_post(
+                    post_id, self.session["username"], query_fields[1], "\t".join(query_fields[2:])):
+                raise ValueError("Forum post not found or not owned by this account")
+            status, result, status_code = "0\tPost updated", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def delete_forum_post(self):
+        try:
+            post_id = int(self.arguments.strip())
+            forum = self.emulator.community.forum_for_post(post_id)
+            if forum is None:
+                raise ValueError("Forum post not found")
+            self.require_forum_access(forum["forum_id"])
+            if not self.emulator.community.delete_forum_post(post_id, self.session["username"]):
+                raise ValueError("Forum post not found or not owned by this account")
+            status, result, status_code = "0\tPost removed", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def player_profile(self):
+        requested = self.arguments.split("\t", 1)[0].strip()
+        if not requested:
+            # A missing local AuthInfo display name should still open the
+            # authenticated player's own Browser profile.
+            requested = self.session["username"]
+        remote_profile = self.tribesnext_profile(requested)
+        if remote_profile is False or remote_profile is self.tribesnext_player_not_found:
+            found = False
+            local_account = session_account = legacy_account = False
+        else:
+            local_account = self.emulator.community.local_account_exists(requested)
+            session_account = requested.casefold() == self.session["username"].casefold()
+            legacy_account = woncrypto.private_store_contains(self.emulator.private_store, requested)
+            found = remote_profile is not None or local_account or session_account or legacy_account
+        self.emulator.log.event("irc_profile_lookup", connection=self.connection,
+                                requested_characters=len(requested),
+                                matches_session=session_account,
+                                local_account=local_account,
+                                legacy_account=legacy_account,
+                                profile_found=found)
+        if remote_profile is False:
+            status, result, status_code = "1\tTribesNext profile unavailable", "", 1
+        elif remote_profile is self.tribesnext_player_not_found:
+            status, result, status_code = "1\tPlayer not found", "", 1
+        elif remote_profile is not None:
+            self.session["last_profile_username"] = requested
+            try:
+                created = int(remote_profile.get("creation", "0"))
+                registered = datetime.datetime.fromtimestamp(created).strftime("%m/%d/%Y")
+            except (ValueError, OverflowError, OSError):
+                registered = ""
+            status = "\t".join(("0", "", remote_profile.get("name", requested),
+                                remote_profile.get("tag", ""),
+                                remote_profile.get("append", "0"),
+                                str(remote_profile["guid"]), registered,
+                                remote_profile.get("online", "0"),
+                                remote_profile.get("website", ""),
+                                self.emulator.community.tribesnext_picture(
+                                    remote_profile["guid"]) or ""))
+            result = remote_profile.get("info", "")
+            status_code = 0
+        elif found:
+            profile = self.emulator.community.get_profile(
+                requested, self.emulator.auth_user_id(requested))
+            self.session["last_profile_username"] = profile["username"]
+            registered = datetime.datetime.fromtimestamp(
+                profile["registered_at"]).strftime("%m/%d/%Y")
+            status = "\t".join(("0", "", profile["display_name"], profile["tag"],
+                                  str(profile["appending"]), str(profile["user_id"]),
+                                  registered, "1", profile["url"],
+                                  profile["graphic"]))
+            result = profile["description"]
+            status_code = 0
+        else:
+            status = "1\tPlayer not found"
+            result = ""
+            status_code = 1
+        return status, result, status_code
+
+    def player_search(self):
+        query_fields = self.arguments.split("\t")
+        raw_search = query_fields[0].strip() if query_fields else ""
+        search = raw_search.casefold()
+        remote_matches = self.tribesnext_search(
+            self.emulator.tribesnext_robot.user_search, raw_search)
+        if remote_matches is False:
+            status, result, status_code = "1\tTribesNext search unavailable", "0", 1
+        elif remote_matches is None:
+            known = {profile["username"].casefold()
+                     for profile in self.emulator.community.search_players("", 100)}
+            all_names = (set(woncrypto.private_store_usernames(self.emulator.private_store)) |
+                         set(self.emulator.community.local_account_usernames()))
+            for name in all_names:
+                if (name.casefold() not in known and search in name.casefold()):
+                    self.emulator.community.ensure_profile(name, self.emulator.auth_user_id(name))
+                    known.add(name.casefold())
+            matches = self.emulator.community.search_players(search, self.limit)
+            result = str(len(matches))
+            status_code = 0
+            status = "0\t"
+            for index, profile in enumerate(matches):
+                # The T2 browser consumes display name from column 0 and
+                # stable WON user ID from column 3 of each result row.
+                self.rows.append("\t".join((str(index), profile["display_name"], "", "",
+                                            str(profile["user_id"]))))
+        else:
+            matches = remote_matches[:self.limit]
+            result = str(len(matches))
+            status_code = 0
+            status = "0\t"
+            self.rows.extend("\t".join((str(index), player["name"], player.get("tag", ""),
+                                         player.get("append", "0"), str(player["guid"])))
+                             for index, player in enumerate(matches))
+        return status, result, status_code
+
+    def tribe_search(self):
+        query_fields = self.arguments.split("\t")
+        search = query_fields[0].strip() if query_fields else ""
+        remote_matches = self.tribesnext_search(self.emulator.tribesnext_robot.clan_search, search)
+        if remote_matches is False:
+            status, result, status_code = "1\tTribesNext search unavailable", "0", 1
+        else:
+            if remote_matches is not None:
+                matches = remote_matches[:self.limit]
+                self.rows.extend("\t".join((str(index), clan["name"], "", ""))
+                                 for index, clan in enumerate(matches))
+            else:
+                matches = self.emulator.community.search_tribes(search, self.limit)
+                self.rows.extend("\t".join((str(index), tribe["name"], tribe["tag"],
+                                             str(tribe["member_count"])))
+                                 for index, tribe in enumerate(matches))
+            result = str(len(matches))
+            status_code = 0
+            status = "0\t"
+        return status, result, status_code
+
+    def tribe_members(self):
+        tribe_name = self.arguments.split("\t", 1)[0].strip()
+        remote_clan = self.tribesnext_clan(tribe_name)
+        if remote_clan is False:
+            members = []
+            status, result, status_code = "1\tTribesNext clan unavailable", "0", 1
+        elif remote_clan is self.tribesnext_clan_not_found:
+            members = []
+            status, result, status_code = "1\tTribe not found", "0", 1
+        elif remote_clan is not None:
+            members = remote_clan["members"][:self.limit]
+            self.rows.extend("\t".join((member["name"], member.get("tag", ""),
+                                         member.get("append", "0"), member["guid"],
+                                         member["title"], member["rank"], "", "",
+                                         str(int(int(member["rank"]) >= 2)),
+                                         member["online"])) for member in members)
+        else:
+            members = self.emulator.community.list_tribe_members(tribe_name, self.limit)
+            online = self.emulator.online_user_ids()
+            self.rows.extend("\t".join([
+                member["display_name"], "", "", str(member["user_id"]), member["title"],
+                str(member["access"]), str(member["joined_at"]), "",
+                str(int(member["access"] >= 2)), str(int(member["user_id"] in online)),
+            ]) for member in members)
+        if remote_clan is not False:
+            result = str(len(members))
+            status_code = 0
+            status = "0\t"
+        return status, result, status_code
+
+    def links(self):
+        links = (("Tribes 2 Home Page", "www.tribes2.com"),
+                 ("T2 Technical Information", "sierrastudios.com/games/tribes2/support"))
+        links = links[:self.limit]
+        status, result, status_code = "0\t", str(len(links)), 0
+        self.rows.extend(f"0\t{name}\t{address}" for name, address in links)
+        return status, result, status_code
+
+    def tribe_description(self):
+        query_fields = self.arguments.split("\t")
+        if len(query_fields) < 3:
+            status, result, status_code = "1\tInvalid tribe description update", "", 1
+        else:
+            tribe_name = query_fields[0]
+            description = "\t".join(query_fields[2:])
+            try:
+                self.require_tribe_admin(tribe_name)
+                self.emulator.community.update_tribe(tribe_name, description=description)
+                status, result, status_code = "0\tUpdated", "", 0
+            except ValueError as exc:
+                status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def create_tribe(self):
+        query_fields = self.arguments.split("\t")
+        if len(query_fields) < 6:
+            status, result, status_code = "1\tInvalid tribe creation request", "", 1
+        else:
+            description = "\t".join(query_fields[5:])
+            try:
+                self.emulator.community.create_tribe(
+                    query_fields[0], query_fields[1], query_fields[2], query_fields[3],
+                    description, self.session["username"],
+                    self.emulator.auth_user_id(self.session["username"]))
+                status, result, status_code = "0\tCreated", "", 0
+            except ValueError as exc:
+                status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tribe_profile(self):
+        tribe_name = self.arguments.split("\t", 1)[0].strip()
+        remote_clan = self.tribesnext_clan(tribe_name)
+        tribe = self.emulator.community.get_tribe(tribe_name) if remote_clan is None else None
+        if remote_clan is False:
+            status, result, status_code = "1\tTribesNext clan unavailable", "", 1
+        elif remote_clan is self.tribesnext_clan_not_found:
+            status, result, status_code = "1\tTribe not found", "", 1
+        elif remote_clan is not None:
+            status = "\t".join(("0", "", str(remote_clan.get("id", "")),
+                                remote_clan["name"], remote_clan.get("tag", ""),
+                                remote_clan.get("append", "0"),
+                                remote_clan.get("recruiting", "0"),
+                                remote_clan.get("picture", "")))
+            result, status_code = remote_clan.get("info", ""), 0
+        elif tribe is None:
+            status, result, status_code = "1\tTribe not found", "", 1
+        else:
+            status = "\t".join(("0", "", str(tribe["tribe_id"]), tribe["name"],
+                                 tribe["tag"], str(tribe["appending"]),
+                                 str(tribe["recruiting"]), tribe["graphic"]))
+            result, status_code = tribe["description"], 0
+        return status, result, status_code
+
+    def delete_tribe(self):
+        tribe_name = self.arguments.split("\t", 1)[0].strip()
+        try:
+            self.require_tribe_admin(tribe_name, minimum_access=4)
+            if not self.emulator.community.delete_tribe(tribe_name):
+                raise ValueError("Tribe not found")
+            status, result, status_code = "0\tTribe deleted", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def remove_tribe_member(self):
+        query_fields = self.arguments.split("\t")
+        tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
+        member_name = query_fields[0].strip() if query_fields else ""
+        try:
+            actor = self.require_tribe_admin(tribe_name)
+            target = self.emulator.community.membership(tribe_name, member_name)
+            if target is None:
+                raise ValueError("Tribe member not found")
+            if (target["user_id"] == actor["user_id"] or
+                    target["access"] >= actor["access"]):
+                raise ValueError("Cannot remove an equal- or higher-ranked tribe member")
+            if not self.emulator.community.remove_membership(tribe_name, member_name):
+                raise ValueError("Tribe member not found")
+            status, result, status_code = "0\tMember removed", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tribe_setting(self):
+        query_fields = self.arguments.split("\t")
+        action = query_fields[0].strip().casefold() if query_fields else ""
+        tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
+        value = query_fields[2].strip() if len(query_fields) > 2 else "0"
+        tribe_field = {"recruiting": "recruiting", "appending": "appending"}.get(action)
+        try:
+            if tribe_field is None:
+                raise ValueError("Unknown tribe setting")
+            self.require_tribe_admin(tribe_name)
+            self.emulator.community.update_tribe(tribe_name, **{tribe_field: int(value != "0")})
+            status, result, status_code = "0\tUpdated", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def update_tribe_member(self):
+        query_fields = self.arguments.split("\t")
+        tribe_name = query_fields[0].strip() if query_fields else ""
+        member_name = query_fields[1].strip() if len(query_fields) > 1 else ""
+        title = query_fields[2] if len(query_fields) > 2 else ""
+        try:
+            access = int(query_fields[3]) if len(query_fields) > 3 else 0
+            actor = self.require_tribe_admin(tribe_name, minimum_access=3)
+            target = self.emulator.community.membership(tribe_name, member_name)
+            if target is None:
+                raise ValueError("Tribe membership not found")
+            if access < 0 or access > 4:
+                raise ValueError("Tribe rank must be between 0 and 4")
+            is_self = target["user_id"] == actor["user_id"]
+            if ((not is_self and target["access"] >= actor["access"]) or
+                    access > actor["access"] or (not is_self and access >= actor["access"])):
+                raise ValueError("Cannot modify an equal- or higher-ranked tribe member")
+            self.emulator.community.update_membership(tribe_name, member_name,
+                                                      title=title, access=access)
+            status, result, status_code = "0\tMember profile updated", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def leave_tribe(self):
+        tribe_name = self.arguments.split("\t", 1)[0].strip()
+        if self.emulator.community.remove_membership(tribe_name, self.session["username"]):
+            status, result, status_code = "0\tMembership removed", "", 0
+        else:
+            status, result, status_code = "1\tTribe membership not found", "", 1
+        return status, result, status_code
+
+    def primary_tribe(self):
+        primary_tribe = self.arguments.split("\t", 1)[0].strip()
+        if primary_tribe.casefold() == "none":
+            primary_tribe = ""
+        elif self.emulator.community.membership(primary_tribe, self.session["username"]) is None:
+            status, result, status_code = "1\tTribe membership not found", "", 1
+            primary_tribe = None
+        if primary_tribe is not None:
+            self.emulator.community.update_profile(self.session["username"],
+                                                   self.emulator.auth_user_id(self.session["username"]),
+                                                   primary_tribe=primary_tribe)
+            status, result, status_code = "0\tPrimary tribe updated", primary_tribe, 0
+        return status, result, status_code
+
+    def invite(self):
+        query_fields = self.arguments.split("\t")
+        tribe_name = query_fields[0].strip() if query_fields else ""
+        invited_name = query_fields[1].strip() if len(query_fields) > 1 else ""
+        try:
+            self.require_tribe_admin(tribe_name)
+            if (invited_name.casefold() != self.session["username"].casefold() and
+                    not self.emulator.community.local_account_exists(invited_name) and
+                    not woncrypto.private_store_contains(self.emulator.private_store, invited_name)):
+                raise ValueError("Player not found")
+            self.emulator.community.invite(tribe_name, invited_name,
+                                           self.emulator.auth_user_id(invited_name),
+                                           self.session["username"],
+                                           self.emulator.auth_user_id(self.session["username"]))
+            status, result, status_code = "0\tInvitation sent", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def answer_invite(self):
+        query_fields = self.arguments.split("\t")
+        action = query_fields[0].strip().casefold() if query_fields else ""
+        tribe_name = query_fields[1].strip() if len(query_fields) > 1 else ""
+        target_name = query_fields[2].strip() if len(query_fields) > 2 else self.session["username"]
+        try:
+            if action == "cancel":
+                self.require_tribe_admin(tribe_name)
+                expected_status = ("pending", "requested")
+            elif target_name.casefold() != self.session["username"].casefold():
+                self.require_tribe_admin(tribe_name)
+                expected_status = "requested"
+            else:
+                expected_status = "pending"
+            result = self.emulator.community.respond_to_invite(
+                action, tribe_name, target_name,
+                self.emulator.auth_user_id(target_name), expected_status)
+            status, status_code = "0\tInvitation updated", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def request_invitation(self):
+        tribe_name = self.arguments.strip()
+        try:
+            self.emulator.community.request_invitation(
+                tribe_name, self.session["username"],
+                self.emulator.auth_user_id(self.session["username"]))
+            status, result, status_code = "0\tInvitation request sent", "", 0
+        except ValueError as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def tribe_graphic_or_tag(self):
+        query_fields = self.arguments.split("\t")
+        try:
+            if self.ordinal == 29:
+                tribe_name = query_fields[0].strip()
+                graphic = "\t".join(query_fields[1:])
+            else:
+                tribe = self.emulator.community.tribe_by_id(int(query_fields[0]))
+                if tribe is None:
+                    raise ValueError("Tribe not found")
+                tribe_name = tribe["name"]
+                graphic = None
+            self.require_tribe_admin(tribe_name, minimum_access=3)
+            if self.ordinal == 29:
+                self.emulator.community.update_tribe(tribe_name, graphic=graphic)
+            else:
+                self.emulator.community.update_tribe(tribe_name, tag="\t".join(query_fields[1:]))
+            status, result, status_code = "0\tUpdated", "", 0
+        except (ValueError, IndexError) as exc:
+            status, result, status_code = f"1\t{exc}", "", 1
+        return status, result, status_code
+
+    def online_status(self):
+        online = self.emulator.online_user_ids()
+        result = "".join("1" if user_id.isdecimal() and int(user_id) in online else "0"
+                         for user_id in self.arguments.split("\t")) if self.arguments else ""
+        status_code = 0
+        status = "0\t"
+        return status, result, status_code
+
+    def profile_field(self):
+        field = {17: "description", 31: "graphic", 32: "url", 33: "display_name"}[self.ordinal]
+        self.emulator.community.update_profile(
+            self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+            **{field: self.arguments})
+        result = ""
+        status_code = 0
+        status = "0\tUpdated"
+        return status, result, status_code
+
+    ROBOT_HANDLERS: ClassVar[dict] = {
+        (1, True): tn_mailbox,
+        (2, True): tn_block_list,
+        (5, False): tn_send_mail,
+        (5, True): tn_buddy_list,
+        (6, False): tn_update_mail,
+        (7, False): tn_update_mail,
+        (8, False): tn_change_block,
+        (9, False): tn_change_block,
+        (10, False): tn_change_buddy,
+        (10, True): tn_tribe_options,
+        (11, False): tn_change_buddy,
+        (12, True): tn_history,
+        (14, True): tn_mailbox,
+        (26, False): tn_clear_buddies,
+        (28, False): tn_answer_invite,
+        (31, False): tn_set_picture,
+        (35, False): tn_update_mail,
+    }
+
+    LOCAL_HANDLERS: ClassVar[dict] = {
+        (0, False): welcome,
+        (0, True): news,
+        (1, False): post_news,
+        (1, True): inbox,
+        (2, False): edit_news,
+        (2, True): block_list,
+        (3, False): delete_news,
+        (3, True): player_search,
+        (4, False): tribe_search,
+        (4, True): tribe_search,
+        (5, False): send_mail,
+        (5, True): buddy_list,
+        (6, False): update_mail,
+        (6, True): tribe_members,
+        (7, False): update_mail,
+        (7, True): forums,
+        (8, False): change_block,
+        (8, True): forum_topics,
+        (9, False): change_block,
+        (9, True): forum_posts,
+        (10, False): change_buddy,
+        (10, True): tribe_options,
+        (11, False): change_buddy,
+        (11, True): tribe_invitations,
+        (12, False): create_forum_post,
+        (12, True): history,
+        (13, False): edit_forum_post,
+        (13, True): memberships,
+        (14, False): delete_forum_post,
+        (14, True): deleted_mail,
+        (15, False): tribe_description,
+        (15, True): links,
+        (16, False): create_tribe,
+        (16, True): create_tribe,
+        (17, False): profile_field,
+        (17, True): profile_field,
+        (18, False): delete_tribe,
+        (18, True): delete_tribe,
+        (19, False): remove_tribe_member,
+        (19, True): remove_tribe_member,
+        (20, False): tribe_setting,
+        (20, True): tribe_setting,
+        (21, False): update_tribe_member,
+        (21, True): update_tribe_member,
+        (22, False): tribe_profile,
+        (22, True): tribe_profile,
+        (23, False): player_profile,
+        (23, True): player_profile,
+        (24, False): leave_tribe,
+        (24, True): leave_tribe,
+        (25, False): primary_tribe,
+        (25, True): primary_tribe,
+        (26, False): clear_buddies,
+        (27, False): invite,
+        (27, True): invite,
+        (28, False): answer_invite,
+        (28, True): answer_invite,
+        (29, False): tribe_graphic_or_tag,
+        (29, True): tribe_graphic_or_tag,
+        (30, False): tribe_graphic_or_tag,
+        (30, True): tribe_graphic_or_tag,
+        (31, False): profile_field,
+        (31, True): profile_field,
+        (32, False): profile_field,
+        (32, True): profile_field,
+        (33, False): profile_field,
+        (33, True): profile_field,
+        (34, False): request_invitation,
+        (62, False): remove_topic,
+        (66, False): lock_topic,
+        (67, False): lock_topic,
+        (68, False): move_topic,
+        (69, False): online_status,
+        (69, True): online_status,
+        (100, True): news,
+    }
+
+# Player history, buddy list, T-Mail, and block list queries answered from the
+# TribesNext robot API (or, for the picture it lacks, a GUID-keyed local record).
+TRIBESNEXT_ROBOT_QUERIES = frozenset(DBProxyQuery.ROBOT_HANDLERS)
+# Everything a TribesNext session may query; the rest is refused as unavailable.
+TRIBESNEXT_ALLOWED_QUERIES = TRIBESNEXT_ROBOT_QUERIES | frozenset({
+    (3, True), (4, True), (4, False), (6, True), (13, True),
+    (22, False), (23, False), (69, False),
+})
 
 
 def tribesnext_invite_body(message, subject, recipient_name):
