@@ -282,6 +282,8 @@ def parse_backends(spec, tribesnext_url=TRIBESNEXT_MASTER_URL):
         backend = {"kind": kind}
         for service in BACKEND_SERVICES:
             value = entry.get(service, False)
+            if value == "":
+                value = True  # checked with no address
             if service not in BACKEND_KINDS[kind]:
                 if value:
                     raise ValueError(f"The {kind} backend has no {service} service")

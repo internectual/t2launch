@@ -277,10 +277,10 @@ class BackendsEdit(QWidget):
             for service, (box, field) in cells.items():
                 if not box.isChecked():
                     backend[service] = False
-                elif field is None:
-                    backend[service] = True
                 else:
-                    backend[service] = field.text().strip()
+                    # An empty address still means checked: the default URL,
+                    # or for TribesNext IRC, community data without a chat relay.
+                    backend[service] = (field.text().strip() if field is not None else "") or True
 
     def value(self):
         self.capture()

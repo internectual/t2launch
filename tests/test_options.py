@@ -83,12 +83,16 @@ class OptionTests(unittest.TestCase):
         option = t2options.BY_KEY["won.backends"]
         backends = t2options.coerce(option, [
             {"kind": "native", "auth": True, "master": True, "irc": False},
-            {"kind": "tribesnext", "auth": False, "master": True, "irc": ""},
+            {"kind": "tribesnext", "auth": False, "master": True, "irc": False},
             {"kind": "torque", "master": "192.0.2.9:28000"}])
         self.assertEqual(backends, (
             {"kind": "native", "auth": True, "master": True, "irc": False},
             {"kind": "tribesnext", "auth": False, "master": "http://master.tribesnext.com", "irc": False},
             {"kind": "torque", "master": "192.0.2.9:28000"}))
+        # A checked cell with an empty address (as older launchers saved it) stays checked.
+        checked = t2options.coerce(option, [{"kind": "tribesnext", "auth": True, "master": "", "irc": ""}])
+        self.assertEqual(checked[0]["irc"], True)
+        self.assertEqual(checked[0]["master"], "http://master.tribesnext.com")
         for bad in ([{"kind": "gopher"}], [{"kind": "native", "auth": False}],
                     [{"kind": "native", "auth": True}, {"kind": "torque", "master": "nohost"}],
                     [{"kind": "tribesnext", "auth": True, "master": "ftp://x"}]):

@@ -214,6 +214,8 @@ def _coerce_backends(option, value):
         backend = {"kind": kind}
         for service, address_type in BACKEND_KINDS[kind].items():
             enabled = entry.get(service, False)
+            if enabled == "":
+                enabled = True  # checked with no address (an unchecked cell saves False)
             if not enabled:
                 backend[service] = False
             elif address_type is None or (address_type == "chat" and
