@@ -362,10 +362,15 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None,
 
 
 class CaptureLog:
+    MAX_BYTES = 5 * 1024 * 1024
+
     def __init__(self, path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.parent.chmod(0o700)
+        # Keep one previous generation; the log is diagnostic, not an archive.
+        if path.exists() and path.stat().st_size > self.MAX_BYTES:
+            path.replace(path.with_name(path.name + ".1"))
         fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         os.chmod(path, 0o600)
         self.stream = os.fdopen(fd, "a", encoding="utf-8", buffering=1)
@@ -863,10 +868,11 @@ class IRCHandler(socketserver.BaseRequestHandler):
             return forum
 
         def mail_row(message):
-            sender_quad = (message["sender_name"], str(message["sender_id"]),
-                           message["sender_tag"], str(message["sender_appending"]))
-            recipient_quad = (message["recipient_name"], str(message["recipient_id"]),
-                              message["recipient_tag"], str(message["recipient_appending"]))
+            # Quads follow the stock getTextName order: name, tag, append, id.
+            sender_quad = (message["sender_name"], message["sender_tag"],
+                           str(message["sender_appending"]), str(message["sender_id"]))
+            recipient_quad = (message["recipient_name"], message["recipient_tag"],
+                              str(message["recipient_appending"]), str(message["recipient_id"]))
             body_count = max(1, len(message["body"].splitlines()))
             created = datetime.datetime.fromtimestamp(message["created_at"]).strftime(
                 "%m/%d/%Y %H:%M")

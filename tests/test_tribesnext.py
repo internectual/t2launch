@@ -195,6 +195,28 @@ class RobotClientTests(unittest.TestCase):
         with self.assertRaisesRegex(tribesnext.RobotAPIError, "UNAUTHENTICATED"):
             client.add_buddy(self.credentials, 98)
 
+    def test_dropped_robot_session_logs_in_again_and_retries_once(self):
+        client = tribesnext.RobotClient()
+        client._sessions[42] = {"uuid": "stale", "refreshed_at": 10**20}
+        uuids = []
+
+        def request(endpoint, params=None, **kwargs):
+            uuids.append(params["uuid"])
+            if params["uuid"] == "stale":
+                return ["ERR\tMAIL\tUNAUTHENTICATED"]
+            return [""]
+
+        def start_session(credentials):
+            session = {"uuid": "fresh", "refreshed_at": 10**20}
+            client._sessions[credentials.certificate.guid] = session
+            return session
+
+        client._request = request
+        client._start_session = start_session
+        client.add_buddy(self.credentials, 98)
+        client.add_buddy(self.credentials, 99)
+        self.assertEqual(uuids, ["stale", "fresh", "fresh"])
+
     def test_mail_robot_box_read_and_send_parse_official_rows(self):
         self.assertEqual(tribesnext.parse_robot_mailbox([
             "", "MSG\t7\tinbox\tfalse\tinvite\t1300000000", "SBJ\t7\tJoin\\tus",

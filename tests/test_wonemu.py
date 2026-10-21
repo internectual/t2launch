@@ -151,6 +151,22 @@ def read_dbmsg(stream):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_capture_log_rotates_one_generation_when_oversized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "traffic.jsonl"
+            path.write_text("old\n" * 10, encoding="utf-8")
+            original_limit = wonemu.CaptureLog.MAX_BYTES
+            wonemu.CaptureLog.MAX_BYTES = 8
+            try:
+                log = wonemu.CaptureLog(path)
+                log.event("fresh")
+                log.close()
+            finally:
+                wonemu.CaptureLog.MAX_BYTES = original_limit
+            self.assertEqual(path.with_name("traffic.jsonl.1").read_text(), "old\n" * 10)
+            self.assertEqual(json.loads(path.read_text())["event"], "fresh")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
     def test_auth_user_id_prefers_the_installed_tribes2_certificate_guid(self):
         with tempfile.TemporaryDirectory() as directory:
             private_store = Path(directory) / "private.store"
@@ -932,6 +948,31 @@ class ProtocolTests(unittest.TestCase):
             tribe = store.get_tribe("#t2scripting")
             self.assertEqual(tribe["name"], "#t2scripting")
             self.assertEqual(tribe["tag"], ".cs")
+
+    def test_dbproxy_local_inbox_rows_use_stock_name_quad_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
+                                       Path(directory))
+            emulator.community.ensure_profile("Sender", 101)
+            emulator.community.ensure_profile("Player", 102)
+            emulator.community.send_mail("Sender", 101, [("Player", False)], "Hello",
+                                         "Body", "Player")
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+            handler.request = Request()
+            handler._handle_dbqax("5 C1 10 :0", {"username": "Player",
+                                                 "irc_authenticated": True}, 1)
+            reply = "".join(handler.request.sent)
+            # getTextName reads name, tag, append, id for both quads.
+            self.assertRegex(reply, r"\d+\tSender\t[^\t]*\t\d\t101\tPlayer\t[^\t]*\t\d\t102\t")
 
     def test_community_store_mail_send_and_inbox_cursor(self):
         with tempfile.TemporaryDirectory() as directory:

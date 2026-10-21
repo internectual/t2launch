@@ -484,24 +484,6 @@ if [[ "$WONEMU" == "1" ]]; then
         -e "T2LAUNCH_WON_VERIFIER=/home/loki/wonemu-verifier.der")
 fi
 
-RSA_PROXY_PORT=18765
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "WARNING: python3 not found — RSA proxy will not start"
-else
-    if python3 -c 'import socket; s=socket.create_connection(("127.0.0.1",18765),0.2); s.close()' >/dev/null 2>&1; then
-        echo "Reusing RSA proxy on 127.0.0.1:$RSA_PROXY_PORT"
-    else
-        python3 "$ROOT_DIR/rsa_proxy.py" "$RSA_PROXY_PORT" &
-        RSA_PROXY_PID=$!
-        sleep 0.5
-        if ! kill -0 "$RSA_PROXY_PID" 2>/dev/null; then
-            echo "ERROR: RSA proxy failed to start" >&2
-            exit 1
-        fi
-        echo "RSA proxy started (PID: $RSA_PROXY_PID) on port $RSA_PROXY_PORT"
-    fi
-fi
-
 # shellcheck disable=SC2016 # The script passed to bash is interpreted inside the container.
 "${GAMESCOPE_CMD[@]}" docker run \
     --rm \
@@ -536,9 +518,3 @@ fi
         exec "${STRACE[@]}" env LD_PRELOAD="$T2_GAME_PRELOAD" "$GAME_BINARY" "$@"
     ' \
     _ "${GAME_ARGS[@]}"
-
-# Cleanup RSA proxy on exit
-if [[ -n "$RSA_PROXY_PID" ]]; then
-    kill "$RSA_PROXY_PID" 2>/dev/null || true
-    echo "RSA proxy stopped"
-fi

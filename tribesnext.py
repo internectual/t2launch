@@ -24,8 +24,8 @@ from woncrypto import _rc4_drop2048, verify_private_store_password
 
 MAX_CERT_BYTES = 20_000
 MAX_RSA_HEX_CHARS = 2048
-AUTH_LOOKUP_URL = "http://www.tribesnext.com/auth"
-ROBOT_BASE_URL = "http://tribesnext.thyth.com/tn/robot/"
+AUTH_LOOKUP_URL = "https://www.tribesnext.com/auth"
+ROBOT_BASE_URL = "https://tribesnext.thyth.com/tn/robot/"
 ROBOT_SESSION_REFRESH_SECONDS = 10 * 60
 ROBOT_HTTP_MAX_BYTES = 2_000_000
 _HEX = re.compile(r"^[0-9a-fA-F]+$")
@@ -398,13 +398,27 @@ class RobotClient:
         self._sessions.pop(certificate.guid, None)
         return self._start_session(credentials)
 
-    def _session_get(self, endpoint, credentials, method, **args):
+    def _session_call(self, credentials, send):
+        """Run ``send(session)``, re-logging in once if the server dropped the UUID."""
         with self._lock:
-            session = self._ensure_session(credentials)
+            lines = send(self._ensure_session(credentials))
+            if not any(line.split("\t")[:1] == ["ERR"] and line.endswith("\tUNAUTHENTICATED")
+                       for line in lines):
+                return lines
+            self._sessions.pop(credentials.certificate.guid, None)
+            try:
+                session = self._start_session(credentials)
+            except RobotAPIError:
+                return lines
+            return send(session)
+
+    def _session_get(self, endpoint, credentials, method, **args):
+        def send(session):
             params = {"guid": str(credentials.certificate.guid), "uuid": session["uuid"],
                       "method": str(method)}
             params.update({key: str(value) for key, value in args.items() if value is not None})
             return self._request(endpoint, params)
+        return self._session_call(credentials, send)
 
     def browser_get(self, credentials, method, **args):
         return self._session_get("robot_browser.php", credentials, method, **args)
@@ -419,8 +433,7 @@ class RobotClient:
         return self._session_post("robot_mail.php", credentials, method, **fields)
 
     def _session_post(self, endpoint, credentials, method, **fields):
-        with self._lock:
-            session = self._ensure_session(credentials)
+        def send(session):
             boundary = "---------------------------" + secrets.token_hex(12)
             values = {"guid": str(credentials.certificate.guid), "uuid": session["uuid"],
                       "method": str(method)}
@@ -434,6 +447,7 @@ class RobotClient:
             return self._request(
                 endpoint, body=b"".join(chunks),
                 content_type=f"multipart/form-data; boundary={boundary}")
+        return self._session_call(credentials, send)
 
     def user_view(self, credentials, guid):
         lines = self.browser_get(credentials, "uview", a0=guid)
