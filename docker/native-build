@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Build the Tribes 2 support binaries for a native (no-Docker) launch with the
+# host's 32-bit toolchain: the hook, the RSA helper, and the stack-realignment
+# audit module. Output goes to games/tribes2/native/ by default.
+set -Eeuo pipefail
+
+DOCKER_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_DIR="$(cd "$DOCKER_DIR/.." && pwd)"
+OUT_DIR="${1:-$REPO_DIR/games/tribes2/native}"
+mkdir -p "$OUT_DIR"
+STAGE="$(mktemp -d "$OUT_DIR/.build.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+
+# The game calls these with the 4-byte stack alignment of 2001-era code, so the
+# binaries realign their own frames before using SSE.
+CFLAGS=(-m32 -O2 -std=c99 -mstackrealign)
+if ! gcc "${CFLAGS[@]}" -shared -fPIC -o "$STAGE/t2_realign.so" "$REPO_DIR/t2_realign.c" -pthread; then
+    echo "ERROR: 32-bit build failed. Install the 32-bit C runtime:" >&2
+    echo "  Arch/CachyOS:  sudo pacman -S --needed lib32-glibc lib32-gcc-libs" >&2
+    echo "  Debian/Ubuntu: sudo apt install gcc-multilib" >&2
+    exit 1
+fi
+gcc "${CFLAGS[@]}" -shared -fPIC -o "$STAGE/t2_hook.so" "$REPO_DIR/t2_hook.c" -pthread -ldl
+if ! gcc "${CFLAGS[@]}" -o "$STAGE/rsa_helper" "$REPO_DIR/rsa_helper.c" -lgmp; then
+    echo "ERROR: rsa_helper needs 32-bit GMP:" >&2
+    echo "  Arch/CachyOS:  sudo pacman -S --needed lib32-gmp" >&2
+    echo "  Debian/Ubuntu: sudo apt install libgmp-dev:i386" >&2
+    exit 1
+fi
+mv -f "$STAGE/t2_realign.so" "$STAGE/t2_hook.so" "$STAGE/rsa_helper" "$OUT_DIR/"
+echo "Built native Tribes 2 support binaries in $OUT_DIR"

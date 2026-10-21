@@ -551,14 +551,34 @@ static int is_supported_game(void) {
         readable_range(CONSOLE_GLOBAL, sizeof(uint32_t), &protection);
 }
 
+/* Files the hook reads live beside the game. Docker runs from /home/loki/game;
+   a native launch runs from its runtime directory. T2LAUNCH_GAME_DIR overrides
+   the working directory captured on first use. */
+static const char *game_path(char *buffer, size_t size, const char *relative) {
+    static char game_dir[4096];
+    if (!game_dir[0]) {
+        const char *configured = getenv("T2LAUNCH_GAME_DIR");
+        if (configured && configured[0] && strlen(configured) < sizeof(game_dir))
+            snprintf(game_dir, sizeof(game_dir), "%s", configured);
+        else if (!getcwd(game_dir, sizeof(game_dir)))
+            snprintf(game_dir, sizeof(game_dir), ".");
+    }
+    if ((size_t)snprintf(buffer, size, "%s/%s", game_dir, relative) >= size) buffer[0] = 0;
+    return buffer;
+}
+
 /* In opt-in connection-trace mode, record resolver hostnames without logging
-   packet contents or credentials. The trace mount is provided by asgard-run. */
+   packet contents or credentials. T2LAUNCH_TRACE_DIR defaults to asgard-run's trace mount. */
 static int is_won_bootstrap_host(const char *node);
 
 static void trace_resolver_name(const char *node, const char *service) {
     const char *enabled = getenv("TRACE_CONNECTS");
     if (!enabled || strcmp(enabled, "1") != 0 || !node || !*node) return;
-    FILE *file = fopen("/home/loki/t2trace/tribes2-dns.log", "a");
+    const char *trace_dir = getenv("T2LAUNCH_TRACE_DIR");
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/tribes2-dns.log",
+             trace_dir && trace_dir[0] ? trace_dir : "/home/loki/t2trace");
+    FILE *file = fopen(path, "a");
     if (!file) return;
     fprintf(file, "%s%s%s -> %s\n", node, service ? ":" : "",
             service ? service : "",
@@ -600,6 +620,75 @@ struct hostent *gethostbyname(const char *name) {
     if (!real_gethostbyname) return NULL;
     if (is_won_bootstrap_host(name)) name = "127.0.0.1";
     return real_gethostbyname(name);
+}
+
+/* The client joins threads it created detached when it shuts down. LinuxThreads
+   answered EINVAL; NPTL dereferences the handle of a thread that has already
+   exited and freed its descriptor, which crashes on modern glibc. Record the
+   joinable threads and refuse joins on anything else, as LinuxThreads did. */
+#define JOINABLE_THREAD_LIMIT 256
+static pthread_mutex_t joinable_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t joinable_threads[JOINABLE_THREAD_LIMIT];
+static int joinable_count;
+static int joinable_overflow;
+
+static int take_joinable_thread(pthread_t thread) {
+    int found = 0;
+    pthread_mutex_lock(&joinable_lock);
+    for (int i = 0; i < joinable_count; i++) {
+        if (pthread_equal(joinable_threads[i], thread)) {
+            joinable_threads[i] = joinable_threads[--joinable_count];
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&joinable_lock);
+    return found;
+}
+
+typedef int (*pthread_create_t)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+typedef int (*pthread_join_t)(pthread_t, void **);
+typedef int (*pthread_detach_t)(pthread_t);
+
+int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                   void *(*start)(void *), void *arg) {
+    static pthread_create_t real_create;
+    if (!real_create) {
+        /* The client imports pthread_create@GLIBC_2.1. */
+        real_create = (pthread_create_t)dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.1");
+        if (!real_create) real_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
+        if (!real_create) return EAGAIN;
+    }
+    int result = real_create(thread, attr, start, arg);
+    int detached = 0;
+    if (attr && pthread_attr_getdetachstate(attr, &detached) != 0) detached = 0;
+    if (result == 0 && detached != PTHREAD_CREATE_DETACHED) {
+        pthread_mutex_lock(&joinable_lock);
+        if (joinable_count < JOINABLE_THREAD_LIMIT) joinable_threads[joinable_count++] = *thread;
+        else joinable_overflow = 1;
+        pthread_mutex_unlock(&joinable_lock);
+    }
+    return result;
+}
+
+int pthread_join(pthread_t thread, void **value) {
+    static pthread_join_t real_join;
+    if (!real_join) real_join = (pthread_join_t)dlsym(RTLD_NEXT, "pthread_join");
+    if (!real_join) return ESRCH;
+    /* Past the table limit untracked threads may be joinable, so trust the caller. */
+    if (!take_joinable_thread(thread) && !joinable_overflow) {
+        fprintf(stderr, "[t2_hook] Refused pthread_join on a detached or unknown thread\n");
+        return EINVAL;
+    }
+    return real_join(thread, value);
+}
+
+int pthread_detach(pthread_t thread) {
+    static pthread_detach_t real_detach;
+    if (!real_detach) real_detach = (pthread_detach_t)dlsym(RTLD_NEXT, "pthread_detach");
+    if (!real_detach) return ESRCH;
+    take_joinable_thread(thread);
+    return real_detach(thread);
 }
 
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
@@ -785,7 +874,14 @@ static const char* hook_sha1_cb(void *obj, S32 argc, const char **argv) {
 static int run_rsa_helper(const char *base, const char *exp, const char *mod,
                           char *result, size_t result_size) {
     int input_pipe[2], output_pipe[2];
-    if (access("/home/loki/game/rsa_helper", X_OK) != 0) return 0;
+    char helper[4096];
+    const char *configured = getenv("T2LAUNCH_RSA_HELPER");
+    if (configured && configured[0] && strlen(configured) < sizeof(helper))
+        snprintf(helper, sizeof(helper), "%s", configured);
+    else
+        game_path(helper, sizeof(helper), "rsa_helper");
+    if (!helper[0] || access(helper, X_OK) != 0)
+        return 0;
     if (pipe(input_pipe) != 0) return 0;
     if (pipe(output_pipe) != 0) {
         close(input_pipe[0]); close(input_pipe[1]);
@@ -797,7 +893,7 @@ static int run_rsa_helper(const char *base, const char *exp, const char *mod,
         dup2(input_pipe[0], STDIN_FILENO);
         dup2(output_pipe[1], STDOUT_FILENO);
         close(input_pipe[0]); close(output_pipe[1]);
-        char *args[] = {"/home/loki/game/rsa_helper", "--stdin", NULL};
+        char *args[] = {helper, "--stdin", NULL};
         execv(args[0], args);
         _exit(1);
     }
@@ -951,6 +1047,7 @@ static const char* hook_tn_unlock_cb(void *obj, S32 argc, const char **argv) {
     uint8_t decoded_store[8192], cipher[4096], plaintext[4096];
     char key[41];
     char private_hex[8193], check_hash[41];
+    char store_path[4096];
     FILE *file = NULL;
     int ok = 0;
     const char *failure_reason = "stored credentials are invalid";
@@ -963,7 +1060,7 @@ static const char* hook_tn_unlock_cb(void *obj, S32 argc, const char **argv) {
     tribesnext_certificate[0] = 0;
     tribesnext_modulus[0] = tribesnext_exponent[0] = tribesnext_private_exponent[0] = 0;
 
-    file = fopen("/home/loki/game/base/public.store", "r");
+    file = fopen(game_path(store_path, sizeof(store_path), "base/public.store"), "r");
     if (!file) { failure_reason = "public.store is unavailable"; goto cleanup; }
     while (fgets(line, sizeof(line), file)) {
         char *tab = strchr(line, '\t');
@@ -1000,7 +1097,7 @@ static const char* hook_tn_unlock_cb(void *obj, S32 argc, const char **argv) {
     snprintf(tribesnext_exponent, sizeof(tribesnext_exponent), "%s", fields[2]);
     snprintf(tribesnext_modulus, sizeof(tribesnext_modulus), "%s", fields[3]);
 
-    file = fopen("/home/loki/game/base/private.store", "r");
+    file = fopen(game_path(store_path, sizeof(store_path), "base/private.store"), "r");
     if (!file) { failure_reason = "private.store is unavailable"; goto cleanup; }
     private_entry[0] = 0;
     while (fgets(line, sizeof(line), file)) {
@@ -1079,10 +1176,11 @@ static int reload_tribesnext_certificate(void) {
     static char line[32768];
     static char copy[20001];
     static char fields[5][4097];
+    char store_path[4096];
     FILE *file;
     if (!tribesnext_username[0] || !tribesnext_modulus[0] || !tribesnext_exponent[0])
         return 0;
-    file = fopen("/home/loki/game/base/public.store", "r");
+    file = fopen(game_path(store_path, sizeof(store_path), "base/public.store"), "r");
     if (!file) return 0;
     line[0] = 0;
     while (fgets(line, sizeof(line), file)) {
@@ -1300,6 +1398,8 @@ static void __attribute__((constructor)) init(void) {
     if (!is_game_process()) return;
     game_main_thread = pthread_self();
     hook_started_at = time(NULL);
+    char startup_dir[4096];
+    game_path(startup_dir, sizeof(startup_dir), "");  /* capture cwd before the game can chdir */
     const char *won = getenv("T2LAUNCH_WONEMU");
     if (!is_supported_game()) {
         fprintf(stderr, "[t2_hook] Unsupported client: console address check failed\n");

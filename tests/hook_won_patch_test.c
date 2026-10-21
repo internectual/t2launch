@@ -57,6 +57,13 @@ int main(void) {
     assert(readable_range((uintptr_t)a, 15, &protection));
     assert(protection == PROT_READ);
     munmap(mapping, size);
+    char path[64];
+    setenv("T2LAUNCH_GAME_DIR", "/games/t2", 1);
+    assert(strcmp(game_path(path, sizeof(path), "base/public.store"),
+                  "/games/t2/base/public.store") == 0);
+    char tiny[8];
+    assert(game_path(tiny, sizeof(tiny), "rsa_helper")[0] == 0);
+
     puts("Hook mode enumeration and WON patch: host modes preserved, replacement and permissions passed");
     return 0;
 }

@@ -71,6 +71,7 @@ def read_settings():
         "game_directory": settings.get("game_directory", str(Path.home() / "t2-linux")),
         "profiles": profiles,
         "load_hook": bool(settings.get("load_hook", True)),
+        "native": bool(settings.get("native", False)),
         "monitor": settings.get("monitor", ""),
         "autolaunch_profile": settings.get("autolaunch_profile", ""),
         "autolaunch_delay": int(settings.get("autolaunch_delay", 10)),
@@ -257,6 +258,11 @@ class SettingsDialog(QDialog):
         self.load_hook = QCheckBox("Load t2_hook.so (LD_PRELOAD)")
         self.load_hook.setChecked(app.settings["load_hook"])
         general_form.addRow(self.load_hook)
+        self.native = QCheckBox("Run without Docker (host 32-bit libraries)")
+        self.native.setToolTip("Needs lib32-glibc, lib32-mesa, lib32-libx11, lib32-libxrandr, "
+                               "lib32-freetype2, lib32-glu, lib32-libpulse, and lib32-gmp.")
+        self.native.setChecked(app.settings["native"])
+        general_form.addRow(self.native)
         self.monitor = QComboBox()
         self.monitor.addItem("Default display", "")
         for screen in QApplication.screens():
@@ -410,6 +416,7 @@ class SettingsDialog(QDialog):
                 "game_directory": self.game_path.text().strip(),
                 "profiles": sorted(self.profiles, key=lambda p: p["name"].casefold()),
                 "load_hook": self.load_hook.isChecked(),
+                "native": self.native.isChecked(),
                 "monitor": self.monitor.currentData() or "",
                 "autolaunch_profile": selected_auto,
                 "autolaunch_delay": self.delay.value(),
@@ -511,6 +518,7 @@ class Launcher(QApplication):
         env = QProcessEnvironment.systemEnvironment()
         env.insert("T2LAUNCH_LOAD_HOOK", "1" if self.settings["load_hook"] else "0")
         env.insert("T2LAUNCH_WONEMU", "1" if profile.get("wonemu", False) else "0")
+        env.insert("T2LAUNCH_NATIVE", "1" if self.settings["native"] else "0")
         monitor = self.settings.get("monitor", "")
         env.insert("T2LAUNCH_MONITOR", monitor)
         screen_index = next((i for i, screen in enumerate(QApplication.screens()) if screen.name() == monitor), 0)
@@ -523,7 +531,8 @@ class Launcher(QApplication):
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
         append_launch_diagnostic(
             f"launch requested; wonemu={int(bool(profile.get('wonemu')))} "
-            f"hook={int(bool(self.settings['load_hook']))}")
+            f"hook={int(bool(self.settings['load_hook']))} "
+            f"native={int(bool(self.settings['native']))}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))
         process.errorOccurred.connect(lambda error, p=process: self.launch_error(p, error))

@@ -32,6 +32,7 @@ trap cleanup EXIT
 if [[ -d "$GAME_SOURCE" ]]; then
     mkdir -p "$DOCKER_DIR/build"
     cp -a "$GAME_SOURCE"/. "$DOCKER_DIR/build"/
+    rm -rf "$DOCKER_DIR/build/native"  # host-built binaries for native launches
 else
     echo "No bundled game files at $GAME_SOURCE; image will use a runtime game-folder mount."
     mkdir -p "$DOCKER_DIR/build"

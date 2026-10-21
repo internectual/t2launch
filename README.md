@@ -21,11 +21,13 @@ t2launch/
 │   ├── asgard-run             # Launch script
 │   ├── config/tribes2.cfg     # Per-game config (LD_PRELOAD, etc.)
 │   ├── asgard-build           # Build image and compile hook
+│   ├── native-build           # Compile hook/helpers with the host 32-bit toolchain
 │   ├── alsa-pulse.conf        # Route ALSA audio through PulseAudio/PipeWire
 │   ├── window_resize.sh       # Follow game mode and selected display
 │   └── compat-libs/           # Loki-era compatibility libraries
 ├── games/tribes2/             # Generated hook/helper overlays
 ├── t2_hook.c                  # LD_PRELOAD hook and runtime game patches
+├── t2_realign.c               # LD_AUDIT stack-realignment shim for native launches
 ├── wonemu.py                  # Local WON/Auth/IRC/master services
 ├── tribesnext.py              # TribesNext certificate/challenge helpers
 ├── woncrypto.py               # WON wire-format crypto
@@ -264,6 +266,30 @@ arbitrary process on that port.
 
 Protocol checks: `python3 -m unittest discover -s tests -v`.
 
+### Native launch (no Docker)
+
+Tick **Run without Docker** in Settings, or set `T2LAUNCH_NATIVE=1`:
+
+```bash
+T2LAUNCH_NATIVE=1 ./docker/asgard-run tribes2 /path/to/your/t2-linux
+```
+
+The game then runs on the host's 32-bit libraries plus the bundled Loki-era
+libraries in `docker/compat-libs`. Neither the game binary nor any game file is
+modified. On Arch/CachyOS the multilib packages needed are:
+
+```bash
+sudo pacman -S --needed lib32-glibc lib32-gcc-libs lib32-mesa lib32-glu lib32-libx11 \
+    lib32-libxext lib32-libxrandr lib32-freetype2 lib32-libpulse lib32-gmp
+```
+
+The first native launch compiles `t2_hook.so`, `rsa_helper`, and
+`t2_realign.so` into `games/tribes2/native/` with `gcc -m32`
+(`./docker/native-build`), and rebuilds them when their sources change. The
+launcher checks that every library the game links resolves before starting it.
+Native launches use software GL by default; set `T2LAUNCH_SOFTWARE_GL=0` to try
+the hardware driver (see *Native runtime* below for why it flickers).
+
 ### Prerequisites
 
 - Docker installed and running
@@ -364,6 +390,38 @@ LD_PRELOAD=/home/loki/game/t2_hook.so:/usr/lib/i386-linux-gnu/pulseaudio/libpuls
 The hook toggle removes only `t2_hook.so`; `libpthread` and SDL remain available
 for the legacy game runtime. It registers fourteen native commands and installs the
 Player TRIBES-tab override at runtime after the Community Browser control exists.
+
+### Native runtime
+
+Docker supplies nothing the host cannot: a 32-bit userland, the
+`docker/compat-libs` files, and a few environment settings. Three differences
+from the Xenial image matter on a current distribution:
+
+- **Stack alignment.** Tribes 2 and its Loki libraries keep the 4-byte stack
+  alignment of 2001 compilers; current 32-bit libraries assume 16 bytes and
+  use SSE stores such as `movaps` on stack slots. The first crash is in
+  libX11's `_XSend`, reached from the bundled SDL's `XSync`. `t2_realign.so`
+  is an `LD_AUDIT` module: when an old object binds a function in a modern
+  system library (including through `dlsym` and `glXGetProcAddress`), it
+  returns a thunk that realigns the stack and copies sixteen argument words.
+  glibc's core libraries are excluded so `setjmp` and friends never run in an
+  extra frame. The native hook and helpers are built with `-mstackrealign`.
+- **Joining detached threads.** At shutdown and while loading missions the
+  client joins threads it created detached. LinuxThreads returned `EINVAL`;
+  NPTL reads the freed thread descriptor. The hook interposes
+  `pthread_create`, `pthread_detach`, and `pthread_join`, and refuses joins on
+  threads it did not record as joinable.
+- **Back-buffer contents.** Torque's GUI redraws only dirty regions and assumes
+  the back buffer still holds the previous frame. Current hardware drivers do
+  not preserve it, which shows as flicker and ghost cursors; software GL copies
+  on swap and draws cleanly.
+
+`MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` are set
+as in the image, and `padsp` (`lib32-libpulse`) provides the OSS `/dev/dsp`
+device that Loki OpenAL opens. The hook reads `base/*.store` from
+`T2LAUNCH_GAME_DIR` (default: the startup working directory) and runs the RSA
+helper from `T2LAUNCH_RSA_HELPER`, so nothing is copied into the game folder;
+the Docker-only `base/fonts` overlay is not applied natively.
 
 ### Key Binary Addresses (Tribes 2 Linux #25034)
 
