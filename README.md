@@ -270,12 +270,14 @@ Protocol checks: `python3 -m unittest discover -s tests -v`.
 
 ### Native launch (no Docker)
 
-The desktop launcher runs natively by default (**Run without Docker** in
-Settings). From the command line, set `T2LAUNCH_NATIVE=1`:
+Both the desktop launcher (**Run without Docker** in Settings) and
+`asgard-run` launch natively by default:
 
 ```bash
-T2LAUNCH_NATIVE=1 ./docker/asgard-run tribes2 /path/to/your/t2-linux
+./docker/asgard-run tribes2 /path/to/your/t2-linux
 ```
+
+Untick the setting, or set `T2LAUNCH_NATIVE=0`, to use the Docker image.
 
 The game then runs on the host's 32-bit libraries plus the bundled Loki-era
 libraries in `docker/compat-libs`. Neither the game binary nor any game file is
@@ -297,11 +299,15 @@ the redraw off.
 
 ### Prerequisites
 
-- Docker installed and running
+- For native launches: the 32-bit packages listed under *Native launch*
+- For Docker launches (`T2LAUNCH_NATIVE=0`): Docker installed and running
 - Your own Tribes 2 Linux game files (from Loki Software release)
 - TribesNext account credentials
 
 ### Build the image and hook
+
+Native launches build their binaries automatically (`./docker/native-build`).
+For Docker launches:
 
 ```bash
 ./docker/asgard-build tribes2

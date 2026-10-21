@@ -39,9 +39,9 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$ROOT_DIR/.." && pwd)"
 GAMES_DIR="$REPO_DIR/games"
 
-# T2LAUNCH_NATIVE=1 runs the game on the host's 32-bit libraries instead of
-# the Docker image (see native_launch below).
-NATIVE="${T2LAUNCH_NATIVE:-0}"
+# By default the game runs on the host's 32-bit libraries (see native_launch
+# below); T2LAUNCH_NATIVE=0 runs it in the Docker image instead.
+NATIVE="${T2LAUNCH_NATIVE:-1}"
 
 # Preflight: Docker is the only hard requirement of a container launch.
 if [[ "$NATIVE" != "1" ]] && ! command -v docker >/dev/null 2>&1; then
