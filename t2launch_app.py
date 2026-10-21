@@ -71,7 +71,7 @@ def read_settings():
         "game_directory": settings.get("game_directory", str(Path.home() / "t2-linux")),
         "profiles": profiles,
         "load_hook": bool(settings.get("load_hook", True)),
-        "native": bool(settings.get("native", False)),
+        "native": bool(settings.get("native", True)),
         "monitor": settings.get("monitor", ""),
         "autolaunch_profile": settings.get("autolaunch_profile", ""),
         "autolaunch_delay": int(settings.get("autolaunch_delay", 10)),

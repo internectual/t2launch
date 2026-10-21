@@ -89,7 +89,9 @@ archives on disk are modified.
 ### Desktop launcher
 
 T2Launch provides a system-tray desktop app for running the native client with
-saved profiles. It builds and runs the Docker image from this checkout; no files
+saved profiles. By default it runs the game natively on the host's 32-bit
+libraries (see *Native launch* below); with **Run without Docker** unticked it
+builds and runs the Docker image from this checkout instead. No files
 are downloaded from the original `tribes-2-docker` project.
 
 Install the desktop app and start it:
@@ -268,7 +270,8 @@ Protocol checks: `python3 -m unittest discover -s tests -v`.
 
 ### Native launch (no Docker)
 
-Tick **Run without Docker** in Settings, or set `T2LAUNCH_NATIVE=1`:
+The desktop launcher runs natively by default (**Run without Docker** in
+Settings). From the command line, set `T2LAUNCH_NATIVE=1`:
 
 ```bash
 T2LAUNCH_NATIVE=1 ./docker/asgard-run tribes2 /path/to/your/t2-linux
