@@ -119,8 +119,11 @@ sudo pacman -Syu --needed \
 | `xdotool`, `xorg-xrandr` | keeping the window on the selected monitor and mode |
 
 `gamescope` and `strace` are optional (for `USE_GAMESCOPE=1` and
-`T2LAUNCH_TRACE_CONNECTS=1`). The launcher reports any missing 32-bit library
-by name before it starts the game.
+`T2LAUNCH_TRACE_CONNECTS=1`). `install.sh` checks for each of these (32-bit
+libraries through the `ldconfig` cache, the compiler with a trial `gcc -m32`
+build) and prints one install command for whatever is missing; it still
+installs the launcher. The launcher also reports any missing 32-bit library by
+name before it starts the game.
 
 Debian/Ubuntu and Fedora are untested but supported by the launcher. The game
 starts through `/lib/ld-linux.so.2`, which each distribution's 32-bit C library

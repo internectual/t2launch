@@ -345,30 +345,8 @@ if [[ "$WONEMU" == "1" ]]; then
     GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
 fi
 
-# True when $1 is a 32-bit ELF file (EI_CLASS 1). Distributions keep 64-bit
-# copies under some of the same names, e.g. Arch's /usr/lib/pulseaudio.
-is_elf32() {
-    [[ -f "$1" && "$(od -An -tx1 -j4 -N1 "$1" 2>/dev/null | tr -d ' ')" == "01" ]]
-}
-
-# Print an install hint for this distribution family: install_hint ARCH DEBIAN FEDORA
-install_hint() {
-    local family=""
-    if [[ -r /etc/os-release ]]; then
-        # shellcheck source=/dev/null
-        family=$(. /etc/os-release && echo "${ID:-} ${ID_LIKE:-}")
-    fi
-    case " $family " in
-        *" arch "*) echo "  sudo pacman -S --needed $1" >&2 ;;
-        *" debian "*|*" ubuntu "*)
-            echo "  sudo dpkg --add-architecture i386 && sudo apt update && sudo apt install $2" >&2 ;;
-        *" fedora "*|*" rhel "*) echo "  sudo dnf install $3" >&2 ;;
-        *)
-            echo "  Arch:          sudo pacman -S --needed $1" >&2
-            echo "  Debian/Ubuntu: sudo apt install $2  (after dpkg --add-architecture i386)" >&2
-            echo "  Fedora:        sudo dnf install $3" >&2 ;;
-    esac
-}
+# shellcheck source=runtime/common.sh
+. "$ROOT_DIR/common.sh"
 
 # Run on the host's 32-bit libraries. Tribes 2 and its Loki libraries predate
 # the 16-byte stack alignment that current 32-bit builds assume, so the
@@ -378,13 +356,9 @@ launch_game() {
     local support_dir="$GAMES_DIR/$GAME_NAME" compat_dir="$ROOT_DIR/compat-libs"
     # The kernel starts the game through its PT_INTERP path, /lib/ld-linux.so.2,
     # which Arch (lib32-glibc), Debian (libc6:i386), and Fedora (glibc.i686) all
-    # provide. libpulsedsp.so lives under each distribution's 32-bit libdir.
-    local loader="/lib/ld-linux.so.2" pulse_dsp="" candidate
-    for candidate in /usr/lib32/pulseaudio/libpulsedsp.so \
-                     /usr/lib/i386-linux-gnu/pulseaudio/libpulsedsp.so \
-                     /usr/lib/pulseaudio/libpulsedsp.so; do
-        if is_elf32 "$candidate"; then pulse_dsp="$candidate"; break; fi
-    done
+    # provide.
+    local loader="/lib/ld-linux.so.2" pulse_dsp
+    pulse_dsp=$(find_pulse_dsp) || pulse_dsp=""
     if [[ -z "$HOST_GAME_PATH" ]]; then
         echo "ERROR: choose your Tribes 2 game folder (the one containing tribes2.dynamic)." >&2
         exit 2
