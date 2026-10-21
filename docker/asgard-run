@@ -244,11 +244,7 @@ if [[ -f "$ROOT_DIR/config/$GAME_NAME.cfg" ]]; then
     source "$ROOT_DIR/config/$GAME_NAME.cfg"
 fi
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
-if [[ "$NATIVE" == "1" ]]; then
-    # Modern Mesa does not preserve the back buffer that Torque's partial GUI
-    # redraws rely on; software GL copies on swap and draws cleanly.
-    SOFTWARE_GL="${T2LAUNCH_SOFTWARE_GL:-1}"
-fi
+SOFTWARE_GL="${T2LAUNCH_SOFTWARE_GL:-$SOFTWARE_GL}"
 T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
 WONEMU="${T2LAUNCH_WONEMU:-0}"
 if [[ "$WONEMU" == "1" && "$LOAD_HOOK" != "1" ]]; then
@@ -286,6 +282,15 @@ if [[ "$TRACE_CONNECTS" == "1" ]]; then
 fi
 if [[ "$SOFTWARE_GL" == "1" ]]; then
     GAME_ENV+=(LIBGL_ALWAYS_SOFTWARE=1)
+fi
+# Hardware GL does not preserve the back buffer that Torque's partial GUI
+# redraws rely on, so redraw the whole canvas each frame there by default.
+FULL_REDRAW="${T2LAUNCH_FULL_REDRAW:-}"
+if [[ -z "$FULL_REDRAW" && "$NATIVE" == "1" && "$SOFTWARE_GL" != "1" ]]; then
+    FULL_REDRAW=1
+fi
+if [[ "$FULL_REDRAW" == "1" ]]; then
+    GAME_ENV+=(T2LAUNCH_FULL_REDRAW=1)
 fi
 if [[ "${USE_SDL_X11_NODIRECTCOLOR:-0}" == "1" ]]; then
     GAME_ENV+=(SDL_VIDEO_X11_NODIRECTCOLOR=1)

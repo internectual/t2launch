@@ -287,8 +287,9 @@ The first native launch compiles `t2_hook.so`, `rsa_helper`, and
 `t2_realign.so` into `games/tribes2/native/` with `gcc -m32`
 (`./docker/native-build`), and rebuilds them when their sources change. The
 launcher checks that every library the game links resolves before starting it.
-Native launches use software GL by default; set `T2LAUNCH_SOFTWARE_GL=0` to try
-the hardware driver (see *Native runtime* below for why it flickers).
+Native launches use the hardware GL driver and redraw the whole GUI canvas
+every frame (see *Native runtime* below); set `T2LAUNCH_SOFTWARE_GL=1` for
+software GL, or `T2LAUNCH_FULL_REDRAW=0`/`1` to override the redraw.
 
 ### Prerequisites
 
@@ -413,8 +414,10 @@ from the Xenial image matter on a current distribution:
   threads it did not record as joinable.
 - **Back-buffer contents.** Torque's GUI redraws only dirty regions and assumes
   the back buffer still holds the previous frame. Current hardware drivers do
-  not preserve it, which shows as flicker and ghost cursors; software GL copies
-  on swap and draws cleanly.
+  not preserve it, which shows as flicker and ghost cursors. With hardware GL
+  the hook calls `Canvas.reset()` after every swap (`T2LAUNCH_FULL_REDRAW=1`),
+  marking the whole canvas dirty so each frame is drawn in full; software GL
+  copies on swap and does not need it.
 
 `MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` are set
 as in the image, and `padsp` (`lib32-libpulse`) provides the OSS `/dev/dsp`

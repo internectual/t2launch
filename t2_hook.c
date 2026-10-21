@@ -722,6 +722,19 @@ void SDL_GL_SwapBuffers(void) {
             Con__evaluate("if (isObject(Canvas)) Canvas.repaint();", 0, NULL, 0);
     }
 
+    /* Torque redraws only dirty GUI regions and expects the back buffer to keep
+       the previous frame; hardware drivers hand back undefined or older
+       buffers, which shows as flicker and ghost cursors. Canvas.reset() marks
+       the whole canvas dirty so the next frame is drawn in full. */
+    static int full_redraw = -1;
+    if (full_redraw < 0) {
+        const char *setting = getenv("T2LAUNCH_FULL_REDRAW");
+        full_redraw = setting && strcmp(setting, "1") == 0;
+        if (full_redraw) fprintf(stderr, "[t2_hook] Full canvas redraw every frame enabled\n");
+    }
+    if (full_redraw)
+        Con__evaluate("if (isObject(Canvas)) Canvas.reset();", 0, NULL, 0);
+
     /* Named, newline-separated scripts let Torque report "<file> Line: N"
        instead of an unattributed "Syntax error in input." */
     if (!tribesnext_runtime_installed) {
