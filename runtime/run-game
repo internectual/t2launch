@@ -203,9 +203,6 @@ if [[ -n "$HOST_GAME_PATH" && -d "$HOST_GAME_PATH" ]]; then
 fi
 
 # Defaults (can be overridden by the per-game config, e.g. tribes2.cfg)
-GAMESCOPE_WIDTH=${GAMESCOPE_WIDTH:-1280}
-GAMESCOPE_HEIGHT=${GAMESCOPE_HEIGHT:-1024}
-USE_GAMESCOPE=${USE_GAMESCOPE:-1}
 USE_PADSP=${USE_PADSP:-1}
 SOFTWARE_GL=${SOFTWARE_GL:-1}
 MESA_YEAR=${MESA_YEAR:-}
@@ -287,8 +284,7 @@ for game_arg in "${GAME_ARGS[@]}"; do
             ;;
     esac
 done
-if [[ "$USE_GAMESCOPE" != "1" ]] &&
-   [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" || -n "$T2LAUNCH_MONITOR" ]]; then
+if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" || -n "$T2LAUNCH_MONITOR" ]]; then
     SDL_FULLSCREEN_HEAD="${T2LAUNCH_MONITOR_INDEX:-0}"
     if [[ -n "$T2LAUNCH_MONITOR" ]] && command -v xrandr >/dev/null 2>&1 &&
        command -v python3 >/dev/null 2>&1; then
@@ -312,29 +308,14 @@ if result.returncode == 0:
     T2_SDL_HEAD_LOG=$SDL_FULLSCREEN_HEAD
     unset SDL_FULLSCREEN_HEAD XRANDR_HEAD
 fi
-if [[ "$USE_GAMESCOPE" != "1" ]]; then
-    # SDL 1.2 disables XRandR enumeration by default. Enable it so the hook can
-    # query real host modes for both windowed listings and fullscreen selection.
-    GAME_ENV+=(SDL_VIDEO_X11_XRANDR=1)
-fi
+# SDL 1.2 disables XRandR enumeration by default. Enable it so the hook can
+# query real host modes for both windowed listings and fullscreen selection.
+GAME_ENV+=(SDL_VIDEO_X11_XRANDR=1)
 GAME_ENV+=("T2LAUNCH_MONITOR_NAME=$T2LAUNCH_MONITOR"
           "T2LAUNCH_FORCE_FULLSCREEN=$GAME_FULLSCREEN_REQUESTED"
           "T2LAUNCH_FORCE_WINDOWED=$GAME_WINDOWED_REQUESTED")
-echo "[t2launch] Gamescope=$USE_GAMESCOPE fullscreen=$GAME_FULLSCREEN_REQUESTED windowed=$GAME_WINDOWED_REQUESTED monitor=${T2LAUNCH_MONITOR:-default} SDL_HEAD=${T2_SDL_HEAD_LOG:-default}"
+echo "[t2launch] fullscreen=$GAME_FULLSCREEN_REQUESTED windowed=$GAME_WINDOWED_REQUESTED monitor=${T2LAUNCH_MONITOR:-default} SDL_HEAD=${T2_SDL_HEAD_LOG:-default}"
 unset game_arg GAME_FULLSCREEN_REQUESTED GAME_WINDOWED_REQUESTED T2_SDL_HEAD_LOG
-
-GAMESCOPE_CMD=()
-if [[ "$USE_GAMESCOPE" == "1" ]]; then
-    if command -v gamescope >/dev/null 2>&1; then
-        GAMESCOPE_CMD=(gamescope -w "$GAMESCOPE_WIDTH" -h "$GAMESCOPE_HEIGHT")
-        if [[ -n "${T2LAUNCH_MONITOR_INDEX:-}" ]]; then
-            GAMESCOPE_CMD+=(--display-index "$T2LAUNCH_MONITOR_INDEX")
-        fi
-        GAMESCOPE_CMD+=(--)
-    else
-        echo "NOTE: gamescope not installed — launching directly; SDL fullscreen monitor selection may still apply."
-    fi
-fi
 
 # The game is an X11 app. On Wayland it draws via XWayland; if DISPLAY is unset,
 # fall back to :0 so it still has somewhere to connect.
@@ -459,7 +440,7 @@ launch_game() {
     echo "[t2launch] Launching from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
     # LD_AUDIT and LD_PRELOAD are set only on the game itself, not the helpers.
     # shellcheck disable=SC2016 # The script is interpreted by the child bash.
-    exec "${GAMESCOPE_CMD[@]}" env "${GAME_ENV[@]}" bash --norc -c '
+    exec env "${GAME_ENV[@]}" bash --norc -c '
         cd "$T2_GAME_DIR"
         if [ -n "$PRE_LAUNCH" ]; then eval "$PRE_LAUNCH"; fi
         if [ "$USE_GAME_WINDOW_RESIZE" = "1" ]; then
