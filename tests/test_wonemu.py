@@ -204,6 +204,7 @@ class ProtocolTests(unittest.TestCase):
         listener.bind((wonemu.HOST, 0))
         listener.listen(1)
         received = queue.Queue()
+        queued = threading.Event()
 
         def upstream():
             conn, _ = listener.accept()
@@ -215,6 +216,9 @@ class ProtocolTests(unittest.TestCase):
                     if len(lines) == 2:
                         conn.sendall(b":srv 433 * Lou_Cypher :Nickname is already in use\r\n")
                 received.put(lines)
+                # Register only once the test has queued its lines; otherwise a
+                # slow test thread would send them after registration instead.
+                queued.wait(5)
                 conn.sendall(b":srv 001 Lou_Cypher_ :Welcome\r\n:srv 375 x :MOTD\r\nPING :tok\r\n")
                 received.put([stream.readline().decode().strip() for _ in range(3)])  # queued + PONG
                 conn.sendall(b":Other!u@h PRIVMSG #tribes :hello\r\n")
@@ -240,6 +244,7 @@ class ProtocolTests(unittest.TestCase):
                                 wonemu.irc_nickname("Lou Cypher"), "4242")
         relay.relay("JOIN #tribes")
         relay.relay("PRIVMSG #tribes :hi")
+        queued.set()
         self.assertEqual(received.get(timeout=5), ["NICK Lou_Cypher", "USER 4242 0 * :Tribes 2 player",
                                                    "NICK Lou_Cypher_"])
         # 001 arrives first, so the queued lines are flushed before the PING is answered.
