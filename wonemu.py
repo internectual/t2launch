@@ -2857,6 +2857,13 @@ class AuthHandler(socketserver.BaseRequestHandler):
                                         login_username, decoded_login["password"])
                                 except (OSError, ValueError, UnicodeError):
                                     tribesnext_credentials = None
+                                if tribesnext_credentials is not None:
+                                    # The client uppercases the login name; the game
+                                    # shows the name the account was registered with.
+                                    login_username = tribesnext_credentials.certificate.username
+                            elif auth_provider == "local":
+                                login_username = (emulator.community.local_account_name(login_username)
+                                                  or login_username)
                         except (OSError, ValueError) as exc:
                             emulator.log.event("auth_challenge_error", connection=connection, error=str(exc))
                         else:

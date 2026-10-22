@@ -1625,6 +1625,76 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(tribesnext_password_result["credential_source"], "tribesnext")
         self.assertFalse(tribesnext_password_result["account_enrolled"])
 
+    def fixture_login(self, emulator):
+        """Replay the captured WONEMUXPROBE login; return the Auth1 reply."""
+        with socket.create_connection((wonemu.HOST, emulator.ports["auth"]), timeout=2) as conn:
+            conn.sendall(wonemu.frame(bytes.fromhex("05 0c 00 01 00")))
+            wonemu.recv_frame(conn)
+            conn.sendall(wonemu.frame(
+                bytes.fromhex("05 0c 00 03 00") + struct.pack("<HH", 1, len(SMALL_AUTH_ENCRYPTED_KEY)) +
+                SMALL_AUTH_ENCRYPTED_KEY + struct.pack("<H", len(SMALL_AUTH_ENCRYPTED_DATA)) +
+                SMALL_AUTH_ENCRYPTED_DATA))
+            self.assertEqual(struct.unpack_from("<BHH", wonemu.recv_frame(conn)), (5, 12, 4))
+            response_cipher = woncrypto.encrypt_won_crypt_transform(bytes.fromhex("0102030405060708"), b"\0")
+            conn.sendall(wonemu.frame(bytes.fromhex("05 0c 00 05 00") +
+                                      struct.pack("<H", len(response_cipher)) + response_cipher))
+            return wonemu.recv_frame(conn)
+
+    def test_native_login_uses_the_stored_account_name(self):
+        game_binary = Path.home() / "t2-linux/tribes2.dynamic"
+        root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))
+        auth_key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                    "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator(
+                {service: 0 for service in wonemu.PORTS}, Path(directory),
+                keys={"root": root_key, "auth": auth_key},
+                backends=[{"kind": "native", "auth": True, "master": False, "irc": False}])
+            emulator.community.create_local_account("WonemuxProbe", 4242, "probe_not_a_real_password")
+            emulator.start()
+            try:
+                reply = self.fixture_login(emulator)
+                self.assertEqual(struct.unpack_from("<BHHh", reply), (5, 12, 6, 0))
+                self.assertIn(wonemu.wide("WonemuxProbe"), reply)
+                self.assertNotIn(wonemu.wide("WONEMUXPROBE"), reply)
+                self.assertEqual(emulator.auth_session_for_peer("127.0.0.1")["username"], "WonemuxProbe")
+            finally:
+                emulator.close()
+
+    def test_tribesnext_login_uses_the_certificate_name_not_the_uppercased_login(self):
+        game_binary = Path.home() / "t2-linux/tribes2.dynamic"
+        root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))
+        auth_key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                    "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        # A textbook RSA key is enough for unlock_account's round-trip check.
+        modulus, exponent, private_exponent = 3233, 17, 2753
+        private_hex = format(private_exponent, "x").zfill(4)
+        nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
+        rc4_key = hashlib.sha1(("probe_not_a_real_password" + nonce).encode("ascii")).hexdigest().encode("ascii")
+        encrypted_private = woncrypto._rc4_drop2048(rc4_key, bytes.fromhex(private_hex)).hex()
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            private_store.write_text(f"WonemuxProbe\t{nonce}:{encrypted_private}\n", encoding="ascii")
+            (Path(directory) / "public.store").write_text(
+                f"WonemuxProbe\t4242\t{exponent:x}\t{modulus:x}\t1\n", encoding="ascii")
+            emulator = wonemu.Emulator(
+                {service: 0 for service in wonemu.PORTS}, Path(directory),
+                keys={"root": root_key, "auth": auth_key}, private_store=private_store,
+                backends=NO_TRIBESNEXT_CHAT)
+            emulator.tribesnext_robot = SimpleNamespace(user_view=lambda *args: {"memberships": []})
+            emulator.start()
+            try:
+                reply = self.fixture_login(emulator)
+                self.assertEqual(struct.unpack_from("<BHHh", reply), (5, 12, 6, 0))
+                # The Auth2 identity and AuthInfo warrior name carry the account's own case.
+                self.assertIn(wonemu.wide("WonemuxProbe"), reply)
+                self.assertNotIn(wonemu.wide("WONEMUXPROBE"), reply)
+                session = emulator.auth_session_for_peer("127.0.0.1")
+                self.assertEqual(session["username"], "WonemuxProbe")
+                self.assertEqual(session["tribesnext_credentials"].certificate.guid, 4242)
+            finally:
+                emulator.close()
+
     def test_valid_private_store_login_gets_signed_auth1_success_reply(self):
         game_binary = Path.home() / "t2-linux/tribes2.dynamic"
         root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))

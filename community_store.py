@@ -353,6 +353,14 @@ class CommunityStore:
                 (str(username),)).fetchone()
         return row is not None
 
+    def local_account_name(self, username):
+        """The account's name as created, or None; lookups ignore case."""
+        with self.lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT username FROM auth_accounts WHERE username = ? COLLATE NOCASE",
+                (str(username),)).fetchone()
+        return row["username"] if row is not None else None
+
     def local_account_usernames(self):
         with self.lock, self._connection() as connection:
             rows = connection.execute(
