@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -88,6 +89,11 @@ def recv_frame(conn):
     if not 4 < length <= MAX_FRAME:
         raise ValueError(f"Invalid frame length: {length}")
     return recv_exact(conn, length - 4)
+
+
+def digest(data):
+    """Log fields for a frame: its size and hash, never its bytes."""
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
 
 class Reader:
@@ -468,7 +474,8 @@ def parse_login_payload(payload, session_key):
 
 
 def decode_login_envelope(payload, keys, private_store=None, account_store=None,
-                          refresh_tribesnext=None, auth_order=("tribesnext", "native")):
+                          refresh_tribesnext=None, auth_order=("tribesnext", "native"),
+                          recover_tribesnext=None):
     reader = Reader(payload)
     if reader.take(5) != bytes.fromhex("05 0c 00 03 00"):
         raise ValueError("Not a native login request")
@@ -500,10 +507,19 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None,
         tribesnext_validation = "not_used"
         account_validation = "account_missing"
         credential_source = "unknown"
+        recovery_status = "not_configured"
         for backend in auth_order:
             if backend == "tribesnext":
                 tribesnext_validation = woncrypto.verify_private_store_password(
                     private_store, fields["username"], fields["password"])
+                # An account not installed here is fetched from TribesNext
+                # with the name and password, then checked like any other.
+                if (tribesnext_validation in ("account_missing", "store_missing") and
+                        recover_tribesnext is not None):
+                    recovery_status = recover_tribesnext(fields["username"], fields["password"])
+                    if recovery_status == "refreshed":
+                        tribesnext_validation = woncrypto.verify_private_store_password(
+                            private_store, fields["username"], fields["password"])
                 outcome = tribesnext_validation
             elif backend == "native" and account_store is not None and \
                     account_store.local_account_exists(fields["username"]):
@@ -518,10 +534,10 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None,
             # Report the most specific failure: a known account beats a missing one.
             if account_validation in ("account_missing", "store_missing") or outcome == "invalid":
                 account_validation = outcome
-        recovery_status = "not_configured"
         if tribesnext_validation != "valid":
-            recovery_status = "not_used"
-        elif refresh_tribesnext is not None:
+            if recovery_status == "not_configured":
+                recovery_status = "not_used"
+        elif recovery_status != "refreshed" and refresh_tribesnext is not None:
             try:
                 recovery_status = refresh_tribesnext(fields["username"], fields["password"])
             except (OSError, ValueError, UnicodeError):
@@ -604,7 +620,7 @@ class DirectoryHandler(socketserver.BaseRequestHandler):
                     emulator.stopped.set()
                     break
                 emulator.log.event("received", service="directory", connection=connection,
-                                   peer=list(self.client_address), frame_hex=frame(payload).hex())
+                                   peer=list(self.client_address), **digest(payload))
                 try:
                     request = decode_getdir(payload)
                 except ValueError as exc:
@@ -614,7 +630,7 @@ class DirectoryHandler(socketserver.BaseRequestHandler):
                 reply = getdir_response(request, emulator.records)
                 conn.sendall(reply)
                 emulator.log.event("sent", service="directory", connection=connection,
-                                   path=request["path"], frames_hex=reply.hex(),
+                                   path=request["path"], **digest(reply),
                                    entities=emulator.records.get(request["path"], []))
                 print(f"[wonemu] GetDir {request['path']} flags={request['flags']:#010x} "
                       f"→ {len(emulator.records.get(request['path'], []))} service(s)", flush=True)
@@ -637,56 +653,227 @@ class CaptureHandler(socketserver.BaseRequestHandler):
                 if not chunk:
                     break
                 data.extend(chunk)
-                emulator.log.event("received", service=service, connection=connection, chunk_hex=chunk.hex())
+                emulator.log.event("received", service=service, connection=connection, **digest(chunk))
         except TimeoutError:
             pass
         except OSError as exc:
             emulator.log.event("connection_error", service=service, connection=connection, error=str(exc))
-        emulator.log.event("capture_only", service=service, connection=connection, bytes=len(data), data_hex=data.hex())
+        emulator.log.event("capture_only", service=service, connection=connection, **digest(data))
         print(f"[wonemu] {service}: captured {len(data)} bytes; handler not implemented", flush=True)
 
 
+# WON DBProxy (service 14) as the stock #25034 login screen uses it. Replies
+# share one envelope: u8 5 | u16 14 | u16 message | u16 sub | i16 status |
+# u16 length + text | u8 0x80 | body. Account requests are 1002 with a sub
+# type; the reply's sub type is the request's plus one.
+DBPROXY_SERVICE = 14
+DBPROXY_KEY_REQUEST = 2      # reply 3 carries u16 length + DER public key
+DBPROXY_SESSION_KEY = 4      # ElGamal-wrapped Blowfish key for message 5
+DBPROXY_ENCRYPTED = 5        # CryptTransform(1002 request), answered in the clear
+DBPROXY_REQUEST = 1002
+DBPROXY_CREATE_ACCOUNT = 2
+DBPROXY_UPDATE_ACCOUNT = 4
+DBPROXY_ACCOUNT_INFO = 6
+DBPROXY_PASSWORD_EMAIL = 8
+DBPROXY_LOGIN_NAME_EMAIL = 14
+DBPROXY_ACCOUNT_LOOKUP = 16
+# Status codes console_start.cs turns into its own messages.
+DBPROXY_DB_ERROR = -2800
+DBPROXY_NO_MODULE = -2802
+DBPROXY_USER_EXISTS = -2803
+DBPROXY_INVALID_USERNAME = -2804
+DBPROXY_USER_DOES_NOT_EXIST = -2806
+DBPROXY_INVALID_CDKEY = -2807
+# A code console_start.cs does not name, so it shows "Error - <text>".
+DBPROXY_SHOW_TEXT = -2801
+DBPROXY_PRODUCT_DATA = 0x62  # data object: u8-length CD key, u8-length warrior name
+DBPROXY_SEND_INFO = 1        # data object: the "send me information" checkbox
+PEER_SESSION_SECONDS = 60 * 60
+
+
+def dbproxy_reply(message, sub, status=0, text="", body=b""):
+    text = str(text).encode("ascii", "replace")
+    return (struct.pack("<BHHHhH", 5, DBPROXY_SERVICE, message, sub, status, len(text)) +
+            text + b"\x80" + body)
+
+
+def read_won_data_objects(reader):
+    """WON data objects: kind 1 is u16 key + bool; kind 2 is u16 key + blob."""
+    flags, blobs = {}, {}
+    for _ in range(reader.number("<H")):
+        kind = reader.number("<H")
+        data = Reader(reader.take(reader.number("<H")))
+        key = data.number("<H")
+        if kind == 1:
+            flags[key] = bool(data.number("<B")) if data.offset < len(data.data) else None
+        elif kind == 2:
+            blobs[key] = data.take(len(data.data) - data.offset)
+    return flags, blobs
+
+
+def won_data_flags(flags):
+    return struct.pack("<H", len(flags)) + b"".join(
+        struct.pack("<HHHB", 1, 3, key, 1 if value else 0) for key, value in flags.items())
+
+
+def _ascii_field(reader):
+    return reader.take(reader.number("<H")).decode("ascii")
+
+
+def parse_dbproxy_create_account(message):
+    reader = Reader(message[7:])
+    fields = {"login": reader.wide(), "password": reader.wide(), "email": _ascii_field(reader)}
+    flags, blobs = read_won_data_objects(reader)
+    product = Reader(blobs.get(DBPROXY_PRODUCT_DATA, b""))
+    fields["cd_key"] = product.take(product.number("<B")).decode("ascii")
+    fields["warrior"] = product.take(product.number("<B")).decode("latin-1")
+    fields["send_info"] = bool(flags.get(DBPROXY_SEND_INFO))
+    return fields
+
+
+def parse_dbproxy_update_account(message):
+    reader = Reader(message[7:])
+    fields = {"password": reader.wide(), "email": _ascii_field(reader)}
+    flags, _blobs = read_won_data_objects(reader)
+    fields["send_info"] = bool(flags.get(DBPROXY_SEND_INFO))
+    return fields
+
+
+def account_info_body(email, send_info):
+    email = str(email).encode("ascii", "replace")[:255]
+    return struct.pack("<B", len(email)) + email + won_data_flags({DBPROXY_SEND_INFO: send_info})
+
+
 class DBProxyHandler(socketserver.BaseRequestHandler):
-    """Handle the documented WON DBProxy account-name lookup operation."""
+    """WON DBProxy: account lookup, the stock Create Account and Edit Account
+    dialogs, and the forgotten login/password fetches."""
 
     def handle(self):
         emulator = self.server.emulator
-        connection = next(emulator.connections)
+        self.connection = next(emulator.connections)
+        self.wrapped_key = None
+        self.challenge = None
         self.request.settimeout(10)
-        emulator.log.event("connected", service="dbproxy", connection=connection,
+        emulator.log.event("connected", service="dbproxy", connection=self.connection,
                            peer=list(self.client_address))
         try:
             while True:
                 payload = recv_frame(self.request)
                 if payload is None:
                     break
-                reader = Reader(payload)
-                header = reader.number("<B")
-                service = reader.number("<H")
-                message = reader.number("<H")
-                submessage = reader.number("<H")
-                if (header, service, message, submessage) != (5, 14, 1002, 16):
-                    emulator.log.event("unhandled", service="dbproxy", connection=connection,
-                                       header=header, message_type=message, submessage_type=submessage,
-                                       payload_bytes=len(payload), payload_sha256=hashlib.sha256(payload).hexdigest())
+                reply = self.dispatch(payload)
+                if reply is None:
+                    emulator.log.event("unhandled", service="dbproxy", connection=self.connection,
+                                       header=payload[0], payload_bytes=len(payload),
+                                       payload_sha256=hashlib.sha256(payload).hexdigest())
                     break
-                username = reader.wide()
-                if reader.offset != len(payload):
-                    raise ValueError("Trailing bytes in DBProxy account-name request")
+                if reply:
+                    self.request.sendall(frame(reply))
+        except (OSError, ValueError, struct.error) as exc:
+            emulator.log.event("connection_error", service="dbproxy", connection=self.connection,
+                               error=str(exc))
 
-                account_found = (emulator.community.local_account_exists(username) or
-                                 woncrypto.private_store_contains(emulator.private_store, username))
-                status = 0 if account_found else -1
-                error = b"" if account_found else b"User not found"
-                reply = (struct.pack("<BHHHhH", 5, 14, 1002, 17, status, len(error)) +
-                         error + b"\x80")
-                if account_found:
-                    reply += struct.pack("<I", emulator.auth_user_id(username))
-                self.request.sendall(frame(reply))
-                emulator.log.event("dbproxy_account_lookup", connection=connection,
-                                   account_found=account_found, status=status)
-        except (OSError, ValueError) as exc:
-            emulator.log.event("connection_error", service="dbproxy", connection=connection, error=str(exc))
+    def dispatch(self, payload):
+        """Return the reply, b"" to send nothing, or None for an unknown message."""
+        emulator = self.server.emulator
+        if payload[:1] == b"\xcb":
+            return self.peer_auth(payload)
+        if payload[:1] == bytes([woncrypto.WON_PEER_ENCRYPTED]):
+            return self.peer_message(payload)
+        header, service, message = struct.unpack_from("<BHH", payload)
+        if (header, service) != (5, DBPROXY_SERVICE):
+            return None
+        if message == DBPROXY_KEY_REQUEST and emulator.dbproxy_key:
+            key = woncrypto.public_key(emulator.dbproxy_key)
+            return struct.pack("<BHHHhHBH", 5, DBPROXY_SERVICE, 3, 0, 0, 0, 0x80, len(key)) + key
+        if message == DBPROXY_SESSION_KEY and emulator.dbproxy_key:
+            reader = Reader(payload[7:])
+            self.wrapped_key = reader.take(reader.number("<H"))
+            return b""
+        if message == DBPROXY_ENCRYPTED and self.wrapped_key is not None:
+            _key, request = woncrypto.decrypt_won_login_data(
+                emulator.dbproxy_key, self.wrapped_key, payload[7:])
+            return self.account_request(request, encrypted=True)
+        if message == DBPROXY_REQUEST:
+            return self.account_request(payload)
+        return None
+
+    def account_request(self, message, encrypted=False, peer=None):
+        emulator = self.server.emulator
+        header, service, request, sub = struct.unpack_from("<BHHH", message)
+        if (header, service, request) != (5, DBPROXY_SERVICE, DBPROXY_REQUEST):
+            return None
+        this_machine = from_this_machine(self.request, self.client_address)
+        body = b""
+        if sub == DBPROXY_ACCOUNT_LOOKUP:
+            username = Reader(message[7:]).wide()
+            account_found = emulator.account_exists(username)
+            status, text = (0, "") if account_found else (-1, "User not found")
+            if account_found:
+                body = struct.pack("<I", emulator.auth_user_id(username))
+            emulator.log.event("dbproxy_account_lookup", connection=self.connection,
+                               account_found=account_found, status=status)
+        elif sub == DBPROXY_CREATE_ACCOUNT and encrypted:
+            status, text = emulator.create_stock_account(
+                parse_dbproxy_create_account(message), this_machine)
+        elif sub == DBPROXY_ACCOUNT_INFO and peer:
+            info = emulator.community.account_info(peer["username"]) or {}
+            status, text = 0, ""
+            body = account_info_body(info.get("email", ""), info.get("send_info", 0))
+        elif sub == DBPROXY_UPDATE_ACCOUNT and peer:
+            status, text = emulator.update_stock_account(peer, parse_dbproxy_update_account(message))
+        elif sub == DBPROXY_PASSWORD_EMAIL:
+            username = Reader(message[7:]).wide()
+            # No mail is ever sent; say whether the name exists, nothing more.
+            status = (DBPROXY_NO_MODULE if emulator.account_exists(username)
+                      else DBPROXY_USER_DOES_NOT_EXIST)
+            text = ""
+        elif sub == DBPROXY_LOGIN_NAME_EMAIL:
+            status, text = DBPROXY_NO_MODULE, ""
+        else:
+            return None
+        emulator.log.event("dbproxy_account_request", connection=self.connection, sub=sub,
+                           status=status, encrypted=encrypted or peer is not None)
+        return dbproxy_reply(DBPROXY_REQUEST, sub + 1, status, text, body)
+
+    def peer_auth(self, payload):
+        """Peer authentication with the Auth1 session of this client's address."""
+        emulator = self.server.emulator
+        _type, subtype = struct.unpack_from("<II", payload)
+        session = emulator.auth_session_for_peer(self.client_address[0])
+        if session is None or not emulator.dbproxy_key:
+            return None
+        client_key = woncrypto.auth1_login_material(session["auth1_reply"])["client_key"]
+        if subtype == 0x32:
+            # The challenge becomes this session's Blowfish key.
+            self.challenge = secrets.token_bytes(8)
+            now = int(time.time())
+            certificate = woncrypto.auth1_certificate_for(
+                emulator.keys["auth"], emulator.dbproxy_key, 1, now, now + 86400)
+            return woncrypto.won_peer_challenge(client_key, self.challenge, certificate)
+        if subtype == 0x34 and self.challenge:
+            secret = woncrypto.won_peer_response_secret(payload, emulator.dbproxy_key, self.challenge)
+            emulator.open_peer_session(self.client_address[0], self.challenge, session)
+            emulator.log.event("dbproxy_peer_authenticated", connection=self.connection)
+            return woncrypto.won_peer_complete(client_key, secret)
+        return None
+
+    def peer_message(self, payload):
+        emulator = self.server.emulator
+        peer = emulator.peer_session(self.client_address[0])
+        if peer is None:
+            return None
+        session_id, sequence, message = woncrypto.decrypt_won_peer_message(peer["key"], payload)
+        with emulator.auth_session_lock:
+            if sequence <= peer["client_sequence"]:
+                raise ValueError("Out-of-order DBProxy peer message")
+            peer["client_sequence"] = sequence
+            peer["server_sequence"] += 1
+            reply_sequence = peer["server_sequence"]
+        reply = self.account_request(message, peer=peer)
+        if reply is None:
+            return None
+        return woncrypto.encrypt_won_peer_message(peer["key"], session_id, reply_sequence, reply)
 
 
 # Chat commands relayed to an upstream IRC network when a session's chat
@@ -2609,7 +2796,7 @@ class AuthHandler(socketserver.BaseRequestHandler):
                 payload = recv_frame(self.request)
                 if payload is None:
                     break
-                emulator.log.event("received", service="auth", connection=connection, frame_hex=frame(payload).hex())
+                emulator.log.event("received", service="auth", connection=connection, **digest(payload))
                 if len(payload) < 5:
                     raise ValueError("Truncated authentication header")
                 header, service, message = struct.unpack_from("<BHH", payload)
@@ -2620,13 +2807,13 @@ class AuthHandler(socketserver.BaseRequestHandler):
                     reply = frame(struct.pack("<BHHhH", 5, 12, 2, 0, len(block)) + block)
                     self.request.sendall(reply)
                     emulator.log.event("sent", service="auth", connection=connection, message=2,
-                                       frame_hex=reply.hex(), key_block_id=1)
+                                       key_block_id=1, **digest(reply))
                     print("[wonemu] auth: sent signed public-key block", flush=True)
                     continue
 
                 if (header, service, message) == (5, 12, 3):
                     emulator.log.event("capture_only", service="auth", connection=connection,
-                                       bytes=len(payload) + 4, data_hex=frame(payload).hex(), message=message)
+                                       message=message, **digest(payload))
                     login = None
                     encrypted_key = None
                     encrypted_data = None
@@ -2639,7 +2826,9 @@ class AuthHandler(socketserver.BaseRequestHandler):
                             emulator.private_store if this_machine else None, emulator.community,
                             emulator.refresh_tribesnext_account
                             if emulator.refresh_tribesnext and this_machine else None,
-                            emulator.auth_order)
+                            emulator.auth_order,
+                            emulator.recover_tribesnext_account
+                            if this_machine and emulator.private_store else None)
                         reader = Reader(payload)
                         reader.take(5)
                         reader.take(2)
@@ -2676,13 +2865,13 @@ class AuthHandler(socketserver.BaseRequestHandler):
                             reply = frame(struct.pack("<BHHH", 5, 12, 4, len(cipher)) + cipher)
                             self.request.sendall(reply)
                             emulator.log.event("sent", service="auth", connection=connection, message=4,
-                                               encrypted_challenge_bytes=len(cipher), frame_hex=reply.hex())
+                                               encrypted_challenge_bytes=len(cipher))
                             print("[wonemu] auth: sent encrypted challenge for local account", flush=True)
                             continue
                     rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
                     self.request.sendall(rejection)
                     emulator.log.event("sent", service="auth", connection=connection,
-                                       message=6, status=-1, frame_hex=rejection.hex())
+                                       message=6, status=-1)
                     outcome = login.get("account_validation", "not_decoded") if login else "not_decoded"
                     print(f"[wonemu] auth: explicit rejection; account validation={outcome}", flush=True)
                     break
@@ -2714,12 +2903,12 @@ class AuthHandler(socketserver.BaseRequestHandler):
                         rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
                         self.request.sendall(rejection)
                         emulator.log.event("sent", service="auth", connection=connection,
-                                           message=6, status=-1, frame_hex=rejection.hex())
+                                           message=6, status=-1)
                         print("[wonemu] auth: challenge response rejected", flush=True)
                     break
 
                 emulator.log.event("capture_only", service="auth", connection=connection,
-                                   bytes=len(payload) + 4, data_hex=frame(payload).hex(), message=message)
+                                   message=message, **digest(payload))
                 print(f"[wonemu] auth: captured message {message} ({len(payload) + 4} bytes); handler not implemented", flush=True)
                 break
         except (OSError, ValueError) as exc:
@@ -2736,7 +2925,7 @@ class Emulator:
     def __init__(self, ports=None, log_dir=LOG_DIR, empty=False, keys=None, private_store=None,
                  master_backend="local", tribesnext_master_url=TRIBESNEXT_MASTER_URL,
                  community_db=None, refresh_tribesnext=False, master_sources=None,
-                 bind_address=HOST, advertise_address="", backends=None):
+                 bind_address=HOST, advertise_address="", backends=None, account_creation=True):
         self.ports = dict(ports or PORTS)
         self.bind_address = bind_address or "0.0.0.0"
         self.advertise_address = advertised_address(self.bind_address, advertise_address)
@@ -2744,10 +2933,17 @@ class Emulator:
                         else directory_records(self.ports, self.advertise_address))
         self.empty = empty
         self.keys = keys
+        # DBProxy's own key, certified by the auth key for peer authentication.
+        self.dbproxy_key = woncrypto.make_key(keys["auth"]) if keys else None
+        self.peer_sessions = {}
+        self.account_creation = bool(account_creation)
         self.private_store = Path(private_store) if private_store is not None else None
         self.public_store = self.private_store.with_name("public.store") if self.private_store else None
         self.tribesnext_robot = tribesnext.RobotClient()
         self.refresh_tribesnext = bool(refresh_tribesnext)
+        self.recovery_secret = secrets.token_bytes(32)
+        self.recovery_failures = {}
+        self.recovery_lock = threading.Lock()
         self.community = community_store.CommunityStore(
             community_db or (Path(log_dir) / "community.sqlite3"))
         self.community_db_path = self.community.path
@@ -2912,6 +3108,91 @@ class Emulator:
                 return None
             return dict(session)
 
+    def open_peer_session(self, peer_ip, key, auth_session):
+        """A DBProxy peer-auth session; the client reuses it on later connections."""
+        with self.auth_session_lock:
+            self.peer_sessions[peer_ip] = {
+                "key": bytes(key), "username": auth_session["username"],
+                "auth_provider": auth_session["auth_provider"],
+                "client_sequence": 0, "server_sequence": 0, "created": time.time()}
+
+    def peer_session(self, peer_ip):
+        with self.auth_session_lock:
+            peer = self.peer_sessions.get(peer_ip)
+            if peer is not None and time.time() - peer["created"] > PEER_SESSION_SECONDS:
+                del self.peer_sessions[peer_ip]
+                peer = None
+            return peer
+
+    def account_exists(self, username):
+        return (self.community.local_account_exists(username) or
+                woncrypto.private_store_contains(self.private_store, username))
+
+    def create_stock_account(self, fields, this_machine):
+        """Create Account from the stock dialog; returns a DBProxy status and text."""
+        if not self.account_creation:
+            return DBPROXY_SHOW_TEXT, "Account creation is turned off on this server."
+        if not woncrypto.cd_key_is_valid(fields["cd_key"]):
+            return DBPROXY_INVALID_CDKEY, ""
+        # The client uppercases the login name; keep the warrior name's
+        # capitalization when the two are the same name.
+        username = (fields["warrior"] if fields["warrior"].casefold() == fields["login"].casefold()
+                    else fields["login"])
+        # TribesNext keys are only installed for, and used by, this machine.
+        backends = [kind for kind in self.auth_order
+                    if kind == "native" or (kind == "tribesnext" and this_machine and self.private_store)]
+        if not backends:
+            return DBPROXY_SHOW_TEXT, "This server cannot create accounts for another machine."
+        if self.account_exists(username):
+            return DBPROXY_USER_EXISTS, ""
+        provider = backends[0]
+        try:
+            if provider == "tribesnext":
+                tribesnext.create_account(username, fields["password"], self.public_store,
+                                          self.private_store)
+            else:
+                user_id = woncrypto.local_auth_user_id(username)
+                self.community.create_local_account(username, user_id, fields["password"])
+                if fields["warrior"] != username:
+                    self.community.update_profile(username, user_id, display_name=fields["warrior"])
+        except tribesnext.AccountServerError as exc:
+            self.log.event("account_created", provider=provider, result=exc.code)
+            if exc.code == "TAKEN":
+                return DBPROXY_USER_EXISTS, ""
+            if exc.code in ("TOOSHORT", "TOOLONG", "INVALID", "INVALIDNAME"):
+                return DBPROXY_INVALID_USERNAME, ""
+            return DBPROXY_SHOW_TEXT, str(exc)
+        except ValueError as exc:
+            self.log.event("account_created", provider=provider, result="rejected")
+            return DBPROXY_SHOW_TEXT, str(exc)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            self.log.event("account_created", provider=provider, result="failed",
+                           error_type=type(exc).__name__)
+            return DBPROXY_DB_ERROR, type(exc).__name__
+        self.community.set_account_info(username, provider, fields["email"], fields["send_info"])
+        self.log.event("account_created", provider=provider, result="created")
+        return 0, ""
+
+    def update_stock_account(self, peer, fields):
+        """Edit Account's Update for the peer session's own account."""
+        username = peer["username"]
+        if peer["auth_provider"] == "tribesnext":
+            # TribesNext has no password change, and re-encrypting only this
+            # machine's private.store would split it from RECOVER elsewhere.
+            if woncrypto.verify_private_store_password(
+                    self.private_store, username, fields["password"]) != "valid":
+                return DBPROXY_SHOW_TEXT, ("TribesNext passwords can't be changed in the game. "
+                                           "Nothing was updated.")
+            provider = "tribesnext"
+        else:
+            status, _enrolled = self.community.verify_local_account(username, fields["password"])
+            if status != "valid":
+                self.community.set_local_password(username, fields["password"])
+            provider = "native"
+        self.community.set_account_info(username, provider, fields["email"], fields["send_info"])
+        self.log.event("account_updated", provider=provider)
+        return 0, ""
+
     def update_irc_presence(self, user_id, connection, online):
         with self.irc_presence_lock:
             connections = self.irc_presence.setdefault(int(user_id), set())
@@ -2921,6 +3202,28 @@ class Emulator:
                 connections.discard(connection)
                 if not connections:
                     self.irc_presence.pop(int(user_id), None)
+
+    RECOVERY_FAILURE_SECONDS = 5 * 60
+
+    def recover_tribesnext_account(self, username, password):
+        """Install a TribesNext account missing here; failures are not retried for a while."""
+        # Keyed by name and an HMAC of the password under a per-process
+        # secret, so a typo followed by the right password is not blocked.
+        attempt = (username.casefold(),
+                   hmac.new(self.recovery_secret, password.encode("utf-8", "replace"),
+                            hashlib.sha256).digest())
+        now = time.monotonic()
+        with self.recovery_lock:
+            self.recovery_failures = {key: until for key, until in self.recovery_failures.items()
+                                      if until > now}
+            if attempt in self.recovery_failures:
+                self.log.event("tribesnext_recovery", result="recently_failed")
+                return "recently_failed"
+        result = self.refresh_tribesnext_account(username, password)
+        if result != "refreshed":
+            with self.recovery_lock:
+                self.recovery_failures[attempt] = now + self.RECOVERY_FAILURE_SECONDS
+        return result
 
     def refresh_tribesnext_account(self, username, password):
         if not self.private_store:
@@ -2951,6 +3254,7 @@ class Emulator:
                 "bind_address": self.bind_address,
                 "advertise_address": self.advertise_address,
                 "refresh_tribesnext": self.refresh_tribesnext,
+                "account_creation": self.account_creation,
                 "verifier_sha256": hashlib.sha256(woncrypto.public_key(self.keys["root"])).hexdigest() if self.keys else None,
                 "auth_key_sha256": hashlib.sha256(woncrypto.public_key(self.keys["auth"])).hexdigest() if self.keys else None,
                 "private_store_path_sha256": hashlib.sha256(str(self.private_store.resolve()).encode()).hexdigest()
@@ -3337,6 +3641,7 @@ def ensure(args):
         "auth_key_sha256": hashlib.sha256(woncrypto.public_key(keys["auth"])).hexdigest(),
         "implementation_sha256": IMPLEMENTATION_SHA256,
         "refresh_tribesnext": args.refresh_tribesnext,
+        "account_creation": args.account_creation,
         "private_store_path_sha256": hashlib.sha256(str(private_store.resolve()).encode()).hexdigest(),
         "community_db_path_sha256": hashlib.sha256(
             str(community_db.expanduser().resolve()).encode()).hexdigest(),
@@ -3383,6 +3688,8 @@ def ensure(args):
             child_args += [f"--{service}-port", str(port)]
         if args.refresh_tribesnext:
             child_args.append("--refresh-tribesnext")
+        if not args.account_creation:
+            child_args.append("--no-account-creation")
         process = subprocess.Popen(child_args,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     for _ in range(50):
@@ -3408,6 +3715,8 @@ def main():
     actions.add_argument("--stop", action="store_true", help="stop the identified local wonemu service")
     actions.add_argument("--reserve-local-account", metavar="USERNAME",
                          help="reserve a local login; the first game login enrolls its password")
+    actions.add_argument("--generate-cd-key", action="store_true",
+                         help="print a CD key that the game's Create Account dialog accepts")
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--client-binary", type=Path, default=Path.home() / "t2-linux/tribes2.dynamic",
                         help="client from which to recover the public cryptographic parameters")
@@ -3441,6 +3750,9 @@ def main():
     parser.add_argument("--refresh-tribesnext", action="store_true",
                         default=os.environ.get("T2LAUNCH_REFRESH_TRIBESNEXT", "0") == "1",
                         help="refresh existing TribesNext certificate/key from the official account server on login")
+    parser.add_argument("--no-account-creation", dest="account_creation", action="store_false",
+                        default=os.environ.get("T2LAUNCH_WON_ACCOUNT_CREATION", "1") != "0",
+                        help="refuse the game's Create Account dialog")
     parser.add_argument("--empty-directory", action="store_true", help="serve successful queries with no entities")
     for service, port in PORTS.items():
         parser.add_argument(f"--{service}-port", type=int, default=port)
@@ -3464,6 +3776,9 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     try:
+        if args.generate_cd_key:
+            print(woncrypto.generate_cd_key())
+            return 0
         if args.reserve_local_account:
             community_db = args.community_db or (args.log_dir / "community.sqlite3")
             store = community_store.CommunityStore(community_db)
@@ -3492,7 +3807,8 @@ def main():
         emulator = Emulator(args.ports, args.log_dir, args.empty_directory, keys, private_store,
                             args.master_backend, args.tribesnext_master_url, args.community_db,
                             args.refresh_tribesnext, backends=args.backends,
-                            bind_address=args.bind_address, advertise_address=args.advertise_address)
+                            bind_address=args.bind_address, advertise_address=args.advertise_address,
+                            account_creation=args.account_creation)
         def stop(_signum, _frame):
             emulator.stopped.set()
         signal.signal(signal.SIGTERM, stop)

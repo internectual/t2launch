@@ -15,8 +15,10 @@ No game file, script, or archive is modified on disk.
 
 - TribesNext login and joining TribesNext servers, using your existing
   `public.store` / `private.store` account files
-- TribesNext account creation (`NAME`/`SIGN` protocol) with GMP-backed key
-  generation
+- Account creation and Edit Account from the game's own dialogs, for
+  TribesNext or the emulator's own accounts, with a CD key generator
+- TribesNext accounts follow you: logging in on a new machine fetches the
+  account from TribesNext
 - A local WON emulator: login, server list (TribesNext plus LAN/other Torque
   masters), buddies, T-Mail, tribes, player profiles, news, and chat
 - Optional remote mode, so several machines can share one emulator
@@ -185,7 +187,9 @@ from the TrueType files in your install's `base/fonts/` (the Loki release ships
 Arial and Verdana there). It aborts if Arial is missing, so keep that folder
 intact; no font files come from this repository.
 
-## TribesNext accounts
+## Accounts
+
+### TribesNext login
 
 Log in with your TribesNext name and password. The hook watches the login
 fields in memory, verifies the password against the encrypted key in
@@ -199,25 +203,55 @@ The published TribesNext source does not include the production
 certificate-signing key, so T2Launch sends the official AuthServer certificate
 unchanged and leaves its issuer signature to the game server.
 
-Routine logins use the installed key files and do not contact TribesNext's
-account-recovery service. To refresh an account's stores explicitly, start the
-emulator with `--refresh-tribesnext` or set `T2LAUNCH_REFRESH_TRIBESNEXT=1`;
-the public and private stores are updated atomically, without creating or
-renaming an account.
+### Creating an account in the game
 
-To create a new account:
+With WON emulation on, the stock **Create New Account** button works. The new
+account goes to the first checked Auth backend (see [Backends](#backends)):
+
+- **TribesNext** (the default): registered with the official TribesNext
+  account server and installed in `base/public.store` and
+  `base/private.store`, exactly as `tribesnext.py create-account` does below.
+  Only possible on the machine running the emulator; another machine gets a
+  Native account instead.
+- **Native**: an account in the emulator's own database.
+
+The game uppercases the login name before sending it, so the account takes its
+capitalization from the warrior name when the two are the same name. TribesNext
+accounts have a single name; a different warrior name is ignored for them.
+
+The dialog asks for a CD key and checks it itself, offline, before sending
+anything. Use your own key or generate one:
 
 ```bash
-python3 tribesnext.py create-account NAME
+python3 wonemu.py --generate-cd-key
 ```
 
-This checks that the name is available, generates a 1024-bit key from
-`/dev/urandom` with GMP, submits the signed registration, and installs the
-returned certificate and password-encrypted private exponent in the game's
-`base/public.store` and `base/private.store`. The password is prompted for and
-is never sent to the authentication server. Use `--game-dir` for a game
-directory other than `~/t2-linux`; `--key-bits` allows the legacy 512/768-bit
-sizes.
+Nothing verifies keys any more, and the emulator discards the key after
+checking its format; account keys always come from `/dev/urandom`. Turn the
+dialog off with the **Allow account creation** profile option
+(`T2LAUNCH_WON_ACCOUNT_CREATION=0`).
+
+### Logging in on another machine
+
+Logging in with a TribesNext name that is not installed on this machine fetches
+it from TribesNext (`RECOVER`, using the name and password) and installs it, so
+an existing account works on a fresh install. A failed lookup is not retried for
+five minutes with the same name and password. Routine logins of an installed
+account do not contact TribesNext; to refresh its stores anyway, start the
+emulator with `--refresh-tribesnext` or set `T2LAUNCH_REFRESH_TRIBESNEXT=1`.
+
+### Edit Account and forgotten passwords
+
+**Edit Account** shows and updates the account's email and "send me
+information" setting, which are kept on this machine, and changes Native
+passwords. TribesNext has no way to change a password: the stock dialog reports
+an error if the password is changed, and saves nothing.
+
+The emulator cannot send email and TribesNext has no password reset, so the
+"email me my login info" requests always fail; a login name that does not exist
+gets the stock "No such login name" message.
+
+### Creating an account from the shell
 
 ## WON emulator
 
@@ -326,9 +360,10 @@ compatible HTTP list.
 ### Local accounts
 
 Native accounts are stored in `community.sqlite3` as salted PBKDF2 password
-hashes, independent of Sierra/WON signing keys and `private.store`. Reserve a
-name, then enter it and a password in the game's online login screen; the first
-login sets the password:
+hashes, independent of Sierra/WON signing keys and `private.store`. Create one
+with the game's **Create New Account** dialog when Native is the first checked
+Auth backend (see [Accounts](#accounts)), or reserve a name and enter it with a
+password in the game's online login screen; the first login sets the password:
 
 ```bash
 python3 wonemu.py --reserve-local-account NAME
@@ -384,11 +419,12 @@ State and logs are in `${XDG_STATE_HOME:-~/.local/state}/t2launch/wonemu/`:
 | `keys.json` | the generated private root and auth keys |
 | `verifier.der` | the public verifier that remote clients need |
 | `community.sqlite3` | accounts and community data (`--community-db` moves it) |
-| `traffic.jsonl` | decoded directory queries, auth message metadata, encrypted bytes, and response hashes |
+| `traffic.jsonl` | decoded directory queries and message metadata; frames appear only as a size and SHA-256 |
 | `wonemu.log` | stdout/stderr when started by the launcher |
 
-Credentials and decrypted payloads are never logged; decrypted auth payloads
-appear only as a length and SHA-256.
+No frame is logged as bytes, encrypted or not: an encrypted login could be
+decrypted with `keys.json`. Credentials, emails, and CD keys never reach the
+logs.
 
 Other options: `--auth-port`, `--dbproxy-port`, and so on move individual
 listeners; `--auth-key-profile native` uses the client's embedded 2048-bit
@@ -600,6 +636,22 @@ Auth1 key and includes the signed Auth2 certificate. It validates the known
 CB34 proof encoding, with a loopback-only path for legacy CB34 layouts bound to
 a verified Auth1 session. DBProxy requests arrive as chunked `DBQA` messages
 and long results go out as `DBMSG` continuations.
+
+### DBProxy account messages
+
+The login screen's account dialogs talk to the DBProxy port (service 14).
+Requests are message 1002 with a sub type; the reply's sub type is one higher,
+and every reply is `status | u16-length text | 0x80 | body`. A status from the
+stock script's list (`-2803` name taken, `-2804` bad name, `-2806` no such name,
+`-2807` bad CD key) shows its own message; another code with text shows
+`Error - <text>`.
+
+| Sub | Dialog | Transport |
+|-----|--------|-----------|
+| 2 | Create Account: login, password, email, flags, CD key and warrior name | Message 2 fetches DBProxy's public key (reply 3), message 4 sends an ElGamal-wrapped Blowfish key, message 5 carries the encrypted request; the reply is in the clear |
+| 6 / 4 | Edit Account: fetch email and "send info", then update password, email, flag | Peer authentication (`0xCB` 0x32–0x35, as for IRC, with a DBProxy certificate signed by the auth key), then `0x0C \| u16 id \| CryptTransform(u16 sequence \| message)` keyed by the 0x33 challenge, on later connections too |
+| 8 / 14 | Email my password (by login name) / my login name (by email) | In the clear; their failures carry no text |
+| 16 | Account-name lookup | In the clear |
 
 ## Credits
 

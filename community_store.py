@@ -70,6 +70,18 @@ class CommunityStore:
                     created_at INTEGER NOT NULL
                 )
             """)
+            # Stock Create/Edit Account fields. TribesNext stores neither, so
+            # its accounts keep them here too (visible only on this machine).
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS account_info (
+                    username TEXT PRIMARY KEY COLLATE NOCASE,
+                    provider TEXT NOT NULL,
+                    email TEXT NOT NULL DEFAULT '',
+                    send_info INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS tribes (
                     tribe_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -305,14 +317,18 @@ class CommunityStore:
                 raise ValueError("A local account with this username already exists")
         return self.get_profile(username)
 
-    def create_local_account(self, username, user_id, password):
-        username = self._validate_local_username(username)
+    @staticmethod
+    def _new_password_hash(password):
         password_bytes = str(password).encode("utf-8")
         if not password_bytes or len(password_bytes) > 1024:
             raise ValueError("Local password must contain 1 to 1024 UTF-8 bytes")
         salt = secrets.token_bytes(16)
-        password_hash = hashlib.pbkdf2_hmac(
+        return salt, hashlib.pbkdf2_hmac(
             "sha256", password_bytes, salt, LOCAL_PASSWORD_ITERATIONS, dklen=32)
+
+    def create_local_account(self, username, user_id, password):
+        username = self._validate_local_username(username)
+        salt, password_hash = self._new_password_hash(password)
         now = int(time.time())
         with self.lock, self._connection() as connection:
             connection.execute("""
@@ -369,6 +385,45 @@ class CommunityStore:
                 "sha256", password_bytes, bytes(row["salt"]), iterations, dklen=32)
             return ("valid" if hmac.compare_digest(password_hash, bytes(row["password_hash"]))
                     else "invalid"), False
+
+    def set_local_password(self, username, password):
+        salt, password_hash = self._new_password_hash(password)
+        with self.lock, self._connection() as connection:
+            cursor = connection.execute("""
+                UPDATE auth_accounts SET salt = ?, password_hash = ?, iterations = ?
+                WHERE username = ? COLLATE NOCASE
+            """, (salt, password_hash, LOCAL_PASSWORD_ITERATIONS, str(username)))
+            if cursor.rowcount == 0:
+                raise ValueError("No local account with this username")
+
+    def set_account_info(self, username, provider, email, send_info):
+        email = str(email).strip()
+        if len(email) > 255 or any(ord(character) < 32 for character in email):
+            raise ValueError("Email must be at most 255 printable characters")
+        now = int(time.time())
+        with self.lock, self._connection() as connection:
+            connection.execute("""
+                INSERT INTO account_info (username, provider, email, send_info,
+                                          created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    provider = excluded.provider, email = excluded.email,
+                    send_info = excluded.send_info, updated_at = excluded.updated_at
+            """, (str(username), str(provider), email, 1 if send_info else 0, now, now))
+
+    def account_info(self, username):
+        with self.lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM account_info WHERE username = ? COLLATE NOCASE",
+                (str(username),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def usernames_for_email(self, email):
+        with self.lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT username FROM account_info WHERE email = ? COLLATE NOCASE "
+                "ORDER BY lower(username)", (str(email).strip(),)).fetchall()
+        return tuple(row["username"] for row in rows)
 
     def get_profile(self, username, user_id=None):
         row = None

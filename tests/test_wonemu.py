@@ -411,6 +411,24 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             woncrypto.t2_auth_info_blob("Player", [dict(tribe, rank=10, title="t" * 41)])
 
+    def test_generated_cd_keys_pass_the_clients_offline_check(self):
+        keys = {woncrypto.generate_cd_key() for _ in range(200)}
+        self.assertGreater(len(keys), 190)
+        for key in keys:
+            self.assertRegex(key, r"^([A-Z0-9]{4}-){4}[0-9]{4}$")
+            self.assertTrue(woncrypto.cd_key_is_valid(key))
+            # buildCDKey() uppercases; the client also skips spaces and tabs.
+            self.assertTrue(woncrypto.cd_key_is_valid(key.lower().replace("-", " ")))
+        # The check byte is 8 bits, so about 1 key in 256 also fits another product.
+        self.assertLess(sum(woncrypto.cd_key_is_valid(key, product="Homeworld") for key in keys), 10)
+        key = next(iter(keys))
+        # The third group's vowel holds bits 30-31, inside check byte 3 only.
+        vowel = key[11]
+        for other in woncrypto.CD_KEY_ALPHABETS["V"].replace(vowel, ""):
+            self.assertFalse(woncrypto.cd_key_is_valid(key[:11] + other + key[12:]))
+        for bad in ("", key[:-1], key + "2", key.replace(key[0], "E", 1), key[:-1] + "1"):
+            self.assertFalse(woncrypto.cd_key_is_valid(bad))
+
     def test_auth_info_tribes_come_from_the_login_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS},
@@ -1463,6 +1481,55 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(fields["extension_bytes"], len(extension))
         self.assertNotIn("extension", fields)
 
+    def test_missing_tribesnext_account_is_recovered_before_login(self):
+        key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4, "x": SMALL_AUTH_X,
+               "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        payload = (bytes.fromhex("05 0c 00 03 00") + struct.pack("<HH", 1, len(SMALL_AUTH_ENCRYPTED_KEY)) +
+                   SMALL_AUTH_ENCRYPTED_KEY + struct.pack("<H", len(SMALL_AUTH_ENCRYPTED_DATA)) +
+                   SMALL_AUTH_ENCRYPTED_DATA)
+        private_hex = "00112233445566778899aabbccddeeff"
+        nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
+        rc4_key = hashlib.sha1(("probe_not_a_real_password" + nonce).encode("ascii")).hexdigest().encode("ascii")
+        store_line = f"WONEMUXPROBE\t{nonce}:{woncrypto._rc4_drop2048(rc4_key, bytes.fromhex(private_hex)).hex()}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            requests = []
+
+            def recover(name, password):
+                requests.append((name, password))
+                private_store.write_text(store_line, encoding="ascii")
+                return "refreshed"
+
+            recovered = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, recover_tribesnext=recover)
+            installed = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store, recover_tribesnext=recover)
+            private_store.unlink()
+            failed = wonemu.decode_login_envelope(
+                payload, {"auth": key}, private_store,
+                recover_tribesnext=lambda name, password: "failed")
+
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory),
+                                       private_store=private_store)
+            attempts = []
+            emulator.refresh_tribesnext_account = (
+                lambda name, password: attempts.append(password) or "failed")
+            first = emulator.recover_tribesnext_account("Probe", "wrong")
+            repeated = emulator.recover_tribesnext_account("PROBE", "wrong")
+            corrected = emulator.recover_tribesnext_account("Probe", "right")
+            emulator.log.close()
+            log_text = (Path(directory) / "traffic.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(requests, [("WONEMUXPROBE", "probe_not_a_real_password")])
+        self.assertEqual((recovered["account_validation"], recovered["credential_source"],
+                          recovered["tribesnext_recovery"]), ("valid", "tribesnext", "refreshed"))
+        # Once installed, logging in does not contact TribesNext again.
+        self.assertEqual(installed["tribesnext_recovery"], "not_configured")
+        self.assertNotEqual(failed["account_validation"], "valid")
+        self.assertEqual(failed["tribesnext_recovery"], "failed")
+        self.assertEqual((first, repeated, corrected), ("failed", "recently_failed", "failed"))
+        self.assertEqual(attempts, ["wrong", "right"])
+        self.assertNotIn("wrong", log_text)
+
     def test_real_client_small_group_login_decrypts_without_logging_credentials(self):
         # Deterministic Loki #25034 probe capture. The local compatibility auth
         # group keeps this legacy client's BigInteger multiply below its
@@ -2434,7 +2501,14 @@ class NetworkTests(unittest.TestCase):
             if any(event["event"] == "capture_only" for event in captured):
                 break
             time.sleep(0.01)
-        self.assertTrue(any(event.get("data_hex") == "0800000070726f6265" for event in captured))
+        # Frames are logged by size and hash only; their bytes never reach the log.
+        sent = b"\x08\x00\x00\x00probe"
+        self.assertTrue(any(event["event"] == "capture_only" and event.get("bytes") == len(sent) and
+                            event.get("sha256") == hashlib.sha256(sent).hexdigest()
+                            for event in captured))
+        log_text = (Path(self.temp.name) / "traffic.jsonl").read_text()
+        self.assertNotIn(b"probe".hex(), log_text)
+        self.assertNotIn("_hex", log_text)
 
     def test_invalid_frame_length_closes_connection(self):
         with self.connect() as conn:
@@ -2460,6 +2534,194 @@ class NetworkTests(unittest.TestCase):
         finally:
             emulator.close()
             temp.cleanup()
+
+
+class StockAccountDialogTests(unittest.TestCase):
+    """DBProxy exchanges captured from the stock #25034 login screen."""
+
+    AUTH_KEY = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.keys = {"root": self.AUTH_KEY, "auth": self.AUTH_KEY}
+        self.emulator = wonemu.Emulator(
+            {service: 0 for service in wonemu.PORTS}, Path(self.temp.name), keys=self.keys,
+            backends=[{"kind": "native", "auth": True, "master": False, "irc": False}])
+        self.emulator.start()
+
+    def tearDown(self):
+        self.emulator.close()
+        self.temp.cleanup()
+
+    def dbproxy(self):
+        return socket.create_connection((wonemu.HOST, self.emulator.ports["dbproxy"]), timeout=5)
+
+    @staticmethod
+    def exchange(conn, payload):
+        conn.sendall(wonemu.frame(payload))
+        return wonemu.recv_frame(conn)
+
+    @staticmethod
+    def reply_status(reply, sub):
+        header, service, message, reply_sub, status, length = struct.unpack_from("<BHHHhH", reply)
+        assert (header, service, message, reply_sub) == (5, 14, 1002, sub), reply[:7].hex()
+        text = reply[11:11 + length].decode("ascii")
+        assert reply[11 + length] == 0x80
+        return status, text, reply[12 + length:]
+
+    @staticmethod
+    def create_message(login, password, email, cd_key, warrior, send_info):
+        product = (struct.pack("<H", 0x62) + bytes([len(cd_key)]) + cd_key.encode() +
+                   bytes([len(warrior)]) + warrior.encode())
+        return (bytes.fromhex("05 0e00 ea03 0200") + wonemu.wide(login) + wonemu.wide(password) +
+                struct.pack("<H", len(email)) + email.encode() + struct.pack("<H", 2) +
+                struct.pack("<HHHB", 1, 3, 1, int(send_info)) +
+                struct.pack("<HH", 2, len(product)) + product)
+
+    def create(self, message):
+        """Key request, wrapped session key, then the encrypted request, as the client sends them."""
+        with self.dbproxy() as conn:
+            reply = self.exchange(conn, bytes.fromhex("05 0e00 0200 0100"))
+            self.assertEqual(struct.unpack_from("<BHHHhHB", reply), (5, 14, 3, 0, 0, 0, 0x80))
+            length, = struct.unpack_from("<H", reply, 12)
+            server_key = woncrypto.read_der_public(reply[14:14 + length])
+            session_key = bytes.fromhex("1122334455667788")
+            wrapped = woncrypto.encrypt_elgamal_challenge(server_key, session_key)
+            conn.sendall(wonemu.frame(struct.pack("<BHHHH", 5, 14, 4, 1, len(wrapped)) + wrapped))
+            return self.exchange(conn, struct.pack("<BHHH", 5, 14, 5, 1) +
+                                 woncrypto.encrypt_won_crypt_transform(session_key, message))
+
+    def peer_login(self, username, password):
+        """Auth1 session, then the 0x32/0x33/0x34/0x35 peer exchange; returns the session key."""
+        client_key = woncrypto.make_key(self.AUTH_KEY)
+        reply = woncrypto.auth1_login_reply(self.keys, bytes(8), username, client_key=client_key)
+        self.emulator.register_auth_session(wonemu.HOST, username, bytes(8), reply, client_key)
+        with self.dbproxy() as conn:
+            challenge_message = self.exchange(
+                conn, struct.pack("<II", 0xcb, 0x32) + bytes.fromhex("0201 0000 0000"))
+            challenge = woncrypto.decrypt_won_irc_challenge(
+                woncrypto.encode_won_token(challenge_message), client_key)
+            certificate = challenge["context"]
+            signature_bytes = 2 * ((self.AUTH_KEY["q"].bit_length() + 7) // 8)
+            self.assertTrue(woncrypto.verify(self.AUTH_KEY, certificate[:-signature_bytes],
+                                             certificate[-signature_bytes:]))
+            key_length, = struct.unpack_from("<H", certificate, 20)
+            server_key = woncrypto.read_der_public(certificate[22:22 + key_length])
+            secret = bytes.fromhex("a1a2a3a4a5a6a7a8")
+            proof = woncrypto.encrypt_elgamal_challenge(
+                server_key, struct.pack("<H", len(challenge["challenge"])) + challenge["challenge"] + secret)
+            complete = self.exchange(conn, struct.pack("<IIH", 0xcb, 0x34, len(proof)) + proof)
+            self.assertEqual(struct.unpack_from("<II", complete), (0xcb, 0x35))
+        return challenge["challenge"]
+
+    def peer_request(self, key, sequence, message):
+        # A new connection each time: the client reuses the session across them.
+        with self.dbproxy() as conn:
+            reply = self.exchange(conn, woncrypto.encrypt_won_peer_message(key, 0, sequence, message))
+        _session, reply_sequence, plain = woncrypto.decrypt_won_peer_message(key, reply)
+        self.assertEqual(reply_sequence, sequence)
+        return plain
+
+    def test_create_account_registers_a_native_account(self):
+        key = woncrypto.generate_cd_key()
+        reply = self.create(self.create_message(
+            "NEWPROBE", "probe-pass-1", "newprobe@example.invalid", key, "NewProbe", True))
+        self.assertEqual(self.reply_status(reply, 3), (0, "", b""))
+        community = self.emulator.community
+        self.assertEqual(community.verify_local_account("newprobe", "probe-pass-1"), ("valid", False))
+        info = community.account_info("NEWPROBE")
+        # The login name arrives uppercased; the warrior name keeps its case.
+        self.assertEqual((info["username"], info["provider"], info["email"], info["send_info"]),
+                         ("NewProbe", "native", "newprobe@example.invalid", 1))
+        again = self.create(self.create_message(
+            "NEWPROBE", "other-pass", "x@example.invalid", key, "NewProbe", False))
+        self.assertEqual(self.reply_status(again, 3)[0], wonemu.DBPROXY_USER_EXISTS)
+        bad_key = self.create(self.create_message(
+            "OTHER", "probe-pass-1", "o@example.invalid", "AAAA-AAAA-AAAA-AAAA-AAAA", "Other", False))
+        self.assertEqual(self.reply_status(bad_key, 3)[0], wonemu.DBPROXY_INVALID_CDKEY)
+        self.emulator.log.close()
+        log_text = (Path(self.temp.name) / "traffic.jsonl").read_text()
+        for secret in ("probe-pass-1", "newprobe@example.invalid", key):
+            self.assertNotIn(secret, log_text)
+
+    def test_edit_account_shows_and_updates_the_logged_in_account(self):
+        community = self.emulator.community
+        community.create_local_account("Editor", 4242, "old-pass")
+        community.set_account_info("Editor", "native", "old@example.invalid", True)
+        key = self.peer_login("Editor", "old-pass")
+        info = self.peer_request(key, 1, bytes.fromhex("05 0e00 ea03 0600 0100 0100 0200 0100"))
+        status, _text, body = self.reply_status(info, 7)
+        self.assertEqual(status, 0)
+        self.assertEqual(body, bytes([19]) + b"old@example.invalid" +
+                         struct.pack("<HHHHB", 1, 1, 3, 1, 1))
+        update = (bytes.fromhex("05 0e00 ea03 0400") + wonemu.wide("new-pass") +
+                  struct.pack("<H", 19) + b"new@example.invalid" + struct.pack("<HHHHB", 1, 1, 3, 1, 0))
+        self.assertEqual(self.reply_status(self.peer_request(key, 2, update), 5)[0], 0)
+        self.assertEqual(community.verify_local_account("Editor", "new-pass"), ("valid", False))
+        self.assertEqual(community.verify_local_account("Editor", "old-pass"), ("invalid", False))
+        self.assertEqual(community.account_info("Editor")["email"], "new@example.invalid")
+        self.assertEqual(community.account_info("Editor")["send_info"], 0)
+        # Replayed or reordered messages are refused.
+        with self.dbproxy() as conn:
+            conn.sendall(wonemu.frame(woncrypto.encrypt_won_peer_message(key, 0, 2, update)))
+            self.assertIsNone(wonemu.recv_frame(conn))
+
+    def test_email_fetches_report_codes_the_stock_script_knows(self):
+        self.emulator.community.create_local_account("Known", 77, "pass-known")
+        with self.dbproxy() as conn:
+            known = self.exchange(conn, bytes.fromhex("05 0e00 ea03 0800") + wonemu.wide("KNOWN") + bytes(2))
+            unknown = self.exchange(conn, bytes.fromhex("05 0e00 ea03 0800") + wonemu.wide("NOBODY") + bytes(2))
+            by_email = self.exchange(conn, bytes.fromhex("05 0e00 ea03 0e00") +
+                                     struct.pack("<H", 9) + b"a@b.c.def" + bytes(2))
+        self.assertEqual(self.reply_status(known, 9)[0], wonemu.DBPROXY_NO_MODULE)
+        self.assertEqual(self.reply_status(unknown, 9)[0], wonemu.DBPROXY_USER_DOES_NOT_EXIST)
+        self.assertEqual(self.reply_status(by_email, 15)[0], wonemu.DBPROXY_NO_MODULE)
+
+    def test_tribesnext_creation_maps_server_answers_and_stays_on_this_machine(self):
+        emulator = self.emulator
+        emulator.auth_order = ("tribesnext", "native")
+        emulator.private_store = Path(self.temp.name) / "private.store"
+        emulator.public_store = Path(self.temp.name) / "public.store"
+        fields = {"login": "TNPROBE", "password": "probe-pass-1", "email": "t@example.invalid",
+                  "cd_key": woncrypto.generate_cd_key(), "warrior": "TnProbe", "send_info": False}
+        calls = []
+        original = tribesnext.create_account
+        try:
+            tribesnext.create_account = lambda *args, **kwargs: (_ for _ in ()).throw(
+                tribesnext.AccountServerError("Account name is already taken", "TAKEN"))
+            self.assertEqual(emulator.create_stock_account(fields, True)[0], wonemu.DBPROXY_USER_EXISTS)
+            tribesnext.create_account = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("down"))
+            self.assertEqual(emulator.create_stock_account(fields, True), (wonemu.DBPROXY_DB_ERROR, "OSError"))
+            tribesnext.create_account = lambda name, password, *args, **kwargs: calls.append(name)
+            self.assertEqual(emulator.create_stock_account(fields, True), (0, ""))
+            # Another machine never gets a TribesNext account; it gets a native one.
+            remote = dict(fields, login="REMOTE", warrior="Remote")
+            self.assertEqual(emulator.create_stock_account(remote, False), (0, ""))
+        finally:
+            tribesnext.create_account = original
+        self.assertEqual(calls, ["TnProbe"])
+        self.assertEqual(emulator.community.account_info("TnProbe")["provider"], "tribesnext")
+        self.assertEqual(emulator.community.account_info("Remote")["provider"], "native")
+        emulator.account_creation = False
+        self.assertEqual(emulator.create_stock_account(dict(fields, login="LATE", warrior="Late"), True)[0],
+                         wonemu.DBPROXY_SHOW_TEXT)
+
+    def test_tribesnext_password_cannot_change_from_edit_account(self):
+        private_hex = "00112233445566778899aabbccddeeff"
+        nonce = hashlib.sha1(private_hex.encode("ascii")).hexdigest()
+        rc4_key = hashlib.sha1(("tn-pass" + nonce).encode("ascii")).hexdigest().encode("ascii")
+        store = Path(self.temp.name) / "private.store"
+        store.write_text(f"TnUser\t{nonce}:{woncrypto._rc4_drop2048(rc4_key, bytes.fromhex(private_hex)).hex()}\n",
+                         encoding="ascii")
+        self.emulator.private_store = store
+        peer = {"username": "TnUser", "auth_provider": "tribesnext"}
+        changed = {"password": "different", "email": "x@example.invalid", "send_info": True}
+        same = dict(changed, password="tn-pass")
+        self.assertEqual(self.emulator.update_stock_account(peer, changed)[0], wonemu.DBPROXY_SHOW_TEXT)
+        self.assertIsNone(self.emulator.community.account_info("TnUser"))
+        self.assertEqual(self.emulator.update_stock_account(peer, same), (0, ""))
+        self.assertEqual(self.emulator.community.account_info("TnUser")["email"], "x@example.invalid")
 
 
 if __name__ == "__main__":

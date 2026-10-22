@@ -101,6 +101,11 @@ OPTIONS = (
            requires=(("won.mode", ("local",)),),
            help="Re-download this account's certificate and key from the TribesNext "
                 "account server at each login."),
+    Option("won.account_creation", "Local service", "Allow account creation", "bool",
+           True, tab="won", env="T2LAUNCH_WON_ACCOUNT_CREATION",
+           requires=(("won.mode", ("local",)),),
+           help="Let the game's Create Account dialog register accounts with the first "
+                "checked Auth backend: TribesNext (this machine only) or Native."),
     Option("won.auth_key_profile", "Local service", "Auth key profile", "choice", "compat",
            tab="won", choices=("compat", "native"), env="T2LAUNCH_AUTH_KEY_PROFILE", advanced=True,
            requires=(("won.mode", ("local",)),),

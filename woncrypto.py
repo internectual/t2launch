@@ -378,6 +378,65 @@ def private_store_usernames(path):
                  if "\t" in line and line.split("\t", 1)[0])
 
 
+# WON ClientCDKey, checked offline by the client before account creation
+# (Loki #25034: parse 0x836bbf0, check 0x836baac). Each pattern letter encodes
+# bits LSB-first into 8 bytes: C a consonant (4 bits), V a vowel (2), N a
+# digit 2-9 (3). Byte 3 must equal bits 4-11 of a CRC-16 (poly 0x8005, MSB
+# first, initial 0) over the product name, bytes 0-2, and bytes 4-7.
+CD_KEY_PATTERN = "CVCNCVCNCVCNCVCNNNNN"
+CD_KEY_ALPHABETS = {"C": "BCDFGJLMNPRSTWXZ", "V": "AEUY", "N": "23456789"}
+CD_KEY_BITS = {"C": 4, "V": 2, "N": 3}
+CD_KEY_SEPARATORS = "- \t"
+
+
+def _crc16_8005(data, crc=0):
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x8005 if crc & 0x8000 else crc << 1) & 0xFFFF
+    return crc
+
+
+def _cd_key_check_byte(raw, product):
+    crc = _crc16_8005(product.encode("ascii"))
+    crc = _crc16_8005(raw[:3] + raw[4:], crc)
+    return (crc >> 4) & 0xFF
+
+
+def _decode_cd_key(key):
+    text = "".join(char for char in str(key) if char not in CD_KEY_SEPARATORS).upper()
+    if len(text) != len(CD_KEY_PATTERN):
+        return None
+    value = position = 0
+    for char, kind in zip(text, CD_KEY_PATTERN):
+        index = CD_KEY_ALPHABETS[kind].find(char)
+        if index < 0:
+            return None
+        value |= index << position
+        position += CD_KEY_BITS[kind]
+    return value.to_bytes(8, "little")
+
+
+def cd_key_is_valid(key, product="Tribes2"):
+    """Apply the client's offline CD key check; no server ever verifies keys."""
+    raw = _decode_cd_key(key)
+    return raw is not None and raw[3] == _cd_key_check_byte(raw, product)
+
+
+def generate_cd_key(product="Tribes2"):
+    """Return a random key in the stock dialog's XXXX-XXXX-XXXX-XXXX-XXXX form."""
+    raw = bytearray(secrets.token_bytes(8))
+    raw[3] = _cd_key_check_byte(bytes(raw), product)
+    value = int.from_bytes(raw, "little")
+    chars = []
+    for kind in CD_KEY_PATTERN:
+        bits = CD_KEY_BITS[kind]
+        chars.append(CD_KEY_ALPHABETS[kind][value & ((1 << bits) - 1)])
+        value >>= bits
+    text = "".join(chars)
+    return "-".join(text[i:i + 4] for i in range(0, len(text), 4))
+
+
 # Limits enforced by the client's AuthInfo parser (Loki #25034, 0x8348fcc).
 # The parser has no tribe-count check; its stack record holds ten tribes.
 T2_AUTH_INFO_MAX_TRIBES = 10
@@ -417,6 +476,14 @@ def t2_auth_info_blob(warrior, tribes=()):
     return blob + _auth_info_string(warrior, T2_AUTH_INFO_MAX_WARRIOR, "warrior name")
 
 
+def auth1_certificate_for(auth_key, key, user_id, now, expires, community_id=1, trust_level=1):
+    """Auth1Certificate: family/times, user/community/trust, ElGamal public key."""
+    encoded_key = public_key(key)
+    body = (struct.pack("<HIIIIHH", 1, now, expires, user_id, community_id,
+                        trust_level, len(encoded_key)) + encoded_key)
+    return body + sign(auth_key, body)
+
+
 def auth1_login_reply(keys, session_key, username, now=None, client_key=None,
                       return_client_key=False, user_id=None, tribes=()):
     """Build a signed, local-realm Auth1 success reply for a verified account.
@@ -446,11 +513,9 @@ def auth1_login_reply(keys, session_key, username, now=None, client_key=None,
         raise ValueError("Invalid Auth1 client key")
     encoded_key = public_key(client_key)
 
-    # Auth1Certificate: family/times, user/community/trust, ElGamal public key.
-    auth1_body = (struct.pack("<HIIIIHH", 1, now, expires, user_id, community_id,
-                              trust_level, len(encoded_key)) + encoded_key)
+    auth1_certificate = auth1_certificate_for(auth_key, client_key, user_id, now, expires,
+                                              community_id, trust_level)
     certificate_signer = auth_key
-    auth1_certificate = auth1_body + sign(certificate_signer, auth1_body)
 
     # Auth2Certificate data: type 0 is the account identity; type 1 is the
     # per-community blob that WONGetAuthInfo() reads from the first community.
@@ -569,31 +634,76 @@ def auth1_login_material(reply):
     return {"client_key": client_key, "auth2_certificate": auth2_certificate}
 
 
-def build_won_irc_cb33(reply, challenge):
-    """Build a CB33 IRC challenge encrypted to the Auth1 client key."""
+def won_peer_challenge(client_key, challenge, certificate):
+    """Peer-auth 0x33: a challenge encrypted to the client, plus our certificate."""
     challenge = bytes(challenge)
     if len(challenge) > 0xffff:
-        raise ValueError("WON IRC challenge is too long")
-    material = auth1_login_material(reply)
+        raise ValueError("WON peer challenge is too long")
     encrypted = encrypt_elgamal_challenge(
-        material["client_key"], struct.pack("<H", len(challenge)) + challenge)
-    context = material["auth2_certificate"]
-    message = (struct.pack("<IIH", 0xcb, 0x33, len(encrypted)) + encrypted +
-               struct.pack("<H", len(context)) + context)
-    return encode_won_token(message)
+        client_key, struct.pack("<H", len(challenge)) + challenge)
+    return (struct.pack("<IIH", 0xcb, 0x33, len(encrypted)) + encrypted +
+            struct.pack("<H", len(certificate)) + certificate)
+
+
+def won_peer_complete(client_key, secret):
+    """Peer-auth 0x35: return the client's secret, encrypted to the client."""
+    secret = bytes(secret)
+    if not secret or len(secret) > 0xffff:
+        raise ValueError("Invalid WON peer secret")
+    encrypted = encrypt_elgamal_challenge(client_key, struct.pack("<H", len(secret)) + secret)
+    return struct.pack("<IIHH", 0xcb, 0x35, 0, len(encrypted)) + encrypted + struct.pack("<H", 0)
+
+
+def won_peer_response_secret(message, server_key, challenge):
+    """Peer-auth 0x34: the client's secret, if it echoes our challenge."""
+    if len(message) < 10 or struct.unpack_from("<II", message) != (0xcb, 0x34):
+        raise ValueError("Expected a WON peer-auth 0x34 response")
+    length, = struct.unpack_from("<H", message, 8)
+    if length != len(message) - 10:
+        raise ValueError("Invalid WON peer-auth 0x34 ciphertext length")
+    plaintext = decrypt_elgamal_challenge_chunks(server_key, message[10:])
+    if len(plaintext) < 2:
+        raise ValueError("Truncated WON peer-auth 0x34 proof")
+    echoed_length, = struct.unpack_from("<H", plaintext)
+    echoed = plaintext[2:2 + echoed_length]
+    secret = plaintext[2 + echoed_length:]
+    if echoed != bytes(challenge) or not 1 <= len(secret) <= 56:
+        raise ValueError("WON peer-auth 0x34 does not answer the challenge")
+    return secret
+
+
+# After peer auth, each message travels as 0x0C | u16 client session id |
+# CryptTransform(u16 sequence | message), keyed by the 0x33 challenge. Both
+# sides number their own messages from 1.
+WON_PEER_ENCRYPTED = 0x0C
+
+
+def decrypt_won_peer_message(key, payload):
+    if len(payload) < 3 or payload[0] != WON_PEER_ENCRYPTED:
+        raise ValueError("Not a WON encrypted peer message")
+    session_id, = struct.unpack_from("<H", payload, 1)
+    plaintext = decrypt_won_crypt_transform(key, payload[3:])
+    if len(plaintext) < 2:
+        raise ValueError("Truncated WON encrypted peer message")
+    sequence, = struct.unpack_from("<H", plaintext)
+    return session_id, sequence, plaintext[2:]
+
+
+def encrypt_won_peer_message(key, session_id, sequence, message):
+    return (struct.pack("<BH", WON_PEER_ENCRYPTED, session_id) +
+            encrypt_won_crypt_transform(key, struct.pack("<H", sequence) + message))
+
+
+def build_won_irc_cb33(reply, challenge):
+    """Build a CB33 IRC challenge encrypted to the Auth1 client key."""
+    material = auth1_login_material(reply)
+    return encode_won_token(won_peer_challenge(
+        material["client_key"], challenge, material["auth2_certificate"]))
 
 
 def build_won_irc_cb35(reply, session_key):
     """Build the CB35 final reply by returning the Auth1 session-key challenge."""
-    session_key = bytes(session_key)
-    if not session_key or len(session_key) > 0xffff:
-        raise ValueError("Invalid WON IRC session-key challenge")
-    client_key = auth1_login_material(reply)["client_key"]
-    encrypted = encrypt_elgamal_challenge(
-        client_key, struct.pack("<H", len(session_key)) + session_key)
-    message = (struct.pack("<IIHH", 0xcb, 0x35, 0, len(encrypted)) + encrypted +
-               struct.pack("<H", 0))
-    return encode_won_token(message)
+    return encode_won_token(won_peer_complete(auth1_login_material(reply)["client_key"], session_key))
 
 
 class _BlowfishKey(ctypes.Structure):

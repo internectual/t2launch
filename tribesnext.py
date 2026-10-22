@@ -47,6 +47,14 @@ class AccountCredentials:
     private_exponent: int
 
 
+class AccountServerError(ValueError):
+    """The TribesNext auth server refused a request; ``code`` is its status word."""
+
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
 class RobotAPIError(ValueError):
     """A TribesNext robot endpoint returned an unusable response."""
 
@@ -773,7 +781,8 @@ def create_account(username: str, password: str, public_store, private_store,
                   "TOOLONG": "Account name is too long",
                   "INVALID": "Account name is not accepted",
                   "TAKEN": "Account name is already taken"}
-        raise ValueError(errors.get(name_status, "Authentication server name check failed"))
+        raise AccountServerError(
+            errors.get(name_status, "Authentication server name check failed"), name_status)
 
     exponent, modulus, private_exponent = generate_account_key(rsa_helper, key_bits)
     exponent_hex = format(exponent, "x")
@@ -798,7 +807,8 @@ def create_account(username: str, password: str, public_store, private_store,
         errors = {"REJECTED": "Authentication server rejected this registration",
                   "INVALIDNAME": "Authentication server rejected the account name",
                   "SIGNERROR": "Authentication server rejected the signed request"}
-        raise ValueError(errors.get(status, "Malformed account registration response")) from exc
+        raise AccountServerError(
+            errors.get(status, "Malformed account registration response"), status) from exc
     if (certificate.username.casefold() != username.casefold() or
             certificate.exponent != exponent or certificate.modulus != modulus):
         raise ValueError("Authentication server returned a certificate for a different key")
