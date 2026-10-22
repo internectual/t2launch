@@ -48,12 +48,10 @@ static char tribesnext_exponent[2049];
 static char tribesnext_private_exponent[4097];
 static char tribesnext_username[128];
 static char tribesnext_password[512];
-static int won_redirected = 0;
 static time_t hook_started_at = 0;
 static time_t last_shell_audio_setup = 0;
 static int sdl_gl_swap_hook_reported = 0;
 static volatile unsigned int video_mode_repaint_frames = 0;
-static volatile int won_patch_pending = 0;
 static volatile int xrandr_mode_list_reported = 0;
 
 /* ── Hook options ─────────────────────────────────────────────────────────
@@ -957,12 +955,6 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         real_sdl_set_video_mode = (sdl_set_video_mode_t)dlsym(
             RTLD_NEXT, "SDL_SetVideoMode");
     if (!real_sdl_set_video_mode) return NULL;
-    if (won_patch_pending && !won_redirected) {
-        won_redirected = redirect_won_bootstrap();
-        if (!won_redirected) _exit(1);
-        won_patch_pending = 0;
-        fprintf(stderr, "[t2_hook] WON bootstrap redirected before video-mode initialization\n");
-    }
     void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
     if (surface && width > 0 && height > 0) {
         __sync_lock_test_and_set(&video_mode_repaint_frames, 120);
@@ -1605,10 +1597,9 @@ static void __attribute__((constructor)) init(void) {
     }
     if (won && strcmp(won, "1") == 0) {
         /* The client copies the embedded verifier during its own global
-           initialization, before SDL_SetVideoMode. Install our verifier now;
-           keep only the endpoint rewrite deferred to the video-mode hook. */
-        if (!install_won_verifier()) _exit(1);
-        won_patch_pending = 1;
+           initialization, and console_start.cs calls WONInit(), which reads
+           the bootstrap strings, before createCanvas(). Patch both now. */
+        if (!install_won_verifier() || !redirect_won_bootstrap()) _exit(1);
     }
     pthread_once(&hook_options_once, load_hook_options);
     fprintf(stderr, "[t2_hook] Console command registration deferred to the game thread\n");
