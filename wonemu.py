@@ -2779,6 +2779,11 @@ def tribesnext_mail_row(header, message, recipient):
                       subject, str(max(1, len(body.splitlines()))), body))
 
 
+# Auth1 failures the stock script answers with "check your login name and
+# password": WS_AuthServ_UserNotFound and WS_AuthServ_BadPassword.
+AUTH_REJECTION_STATUS = {"account_missing": -1506, "store_missing": -1506, "invalid": -1507}
+
+
 class AuthHandler(socketserver.BaseRequestHandler):
     def handle(self):
         emulator = self.server.emulator
@@ -2875,11 +2880,12 @@ class AuthHandler(socketserver.BaseRequestHandler):
                                                encrypted_challenge_bytes=len(cipher))
                             print("[wonemu] auth: sent encrypted challenge for local account", flush=True)
                             continue
-                    rejection = frame(struct.pack("<BHHh", 5, 12, 6, -1))
+                    outcome = login.get("account_validation", "not_decoded") if login else "not_decoded"
+                    status = AUTH_REJECTION_STATUS.get(outcome, -1)
+                    rejection = frame(struct.pack("<BHHh", 5, 12, 6, status))
                     self.request.sendall(rejection)
                     emulator.log.event("sent", service="auth", connection=connection,
-                                       message=6, status=-1)
-                    outcome = login.get("account_validation", "not_decoded") if login else "not_decoded"
+                                       message=6, status=status)
                     print(f"[wonemu] auth: explicit rejection; account validation={outcome}", flush=True)
                     break
 

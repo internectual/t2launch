@@ -1640,6 +1640,35 @@ class ProtocolTests(unittest.TestCase):
                                       struct.pack("<H", len(response_cipher)) + response_cipher))
             return wonemu.recv_frame(conn)
 
+    def test_failed_logins_get_the_stock_name_and_password_codes(self):
+        auth_key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4,
+                    "x": SMALL_AUTH_X, "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        game_binary = Path.home() / "t2-linux/tribes2.dynamic"
+        root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))
+        login = (bytes.fromhex("05 0c 00 03 00") + struct.pack("<HH", 1, len(SMALL_AUTH_ENCRYPTED_KEY)) +
+                 SMALL_AUTH_ENCRYPTED_KEY + struct.pack("<H", len(SMALL_AUTH_ENCRYPTED_DATA)) +
+                 SMALL_AUTH_ENCRYPTED_DATA)
+        statuses = []
+        for password in (None, "a-different-password"):
+            with tempfile.TemporaryDirectory() as directory:
+                emulator = wonemu.Emulator(
+                    {service: 0 for service in wonemu.PORTS}, Path(directory),
+                    keys={"root": root_key, "auth": auth_key},
+                    backends=[{"kind": "native", "auth": True, "master": False, "irc": False}])
+                if password:
+                    emulator.community.create_local_account("WonemuxProbe", 4242, password)
+                emulator.start()
+                try:
+                    with socket.create_connection((wonemu.HOST, emulator.ports["auth"]), timeout=2) as conn:
+                        conn.sendall(wonemu.frame(bytes.fromhex("05 0c 00 01 00")))
+                        wonemu.recv_frame(conn)
+                        conn.sendall(wonemu.frame(login))
+                        statuses.append(struct.unpack_from("<BHHh", wonemu.recv_frame(conn)))
+                finally:
+                    emulator.close()
+        # WS_AuthServ_UserNotFound, then WS_AuthServ_BadPassword.
+        self.assertEqual(statuses, [(5, 12, 6, -1506), (5, 12, 6, -1507)])
+
     def test_native_login_uses_the_stored_account_name(self):
         game_binary = Path.home() / "t2-linux/tribes2.dynamic"
         root_key = woncrypto.make_key(woncrypto.verifier_parameters(game_binary))
