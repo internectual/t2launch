@@ -199,6 +199,12 @@ or included in diagnostics; the temporary C password buffer is cleared after
 verification, and challenge input reaches `rsa_helper` over a pipe, not its
 command line.
 
+The game sends the login name in capitals, whatever you type. With WON
+emulation the emulator answers with the account's own name (a TribesNext
+account's certificate name, or a Native account's name as created), so players
+appear as registered rather than in capitals. A wrong password or unknown name
+gets the game's own "Please check your login name and password" message.
+
 The published TribesNext source does not include the production
 certificate-signing key, so T2Launch sends the official AuthServer certificate
 unchanged and leaves its issuer signature to the game server.
@@ -280,7 +286,8 @@ directory; the other four ports always follow it:
 | UDP 15108 | Torque master protocol and TribesNext list proxy |
 
 The hook points the game at the emulator by replacing the three Sierra
-bootstrap strings in the running client's memory before WON initialization.
+bootstrap strings in the running client's memory when it loads, before
+`console_start.cs` calls `WONInit()`.
 They come from the profile's **Game connects to** field
 (`T2LAUNCH_WON_ENDPOINTS`): one `host:port`, optionally followed by up to two
 comma-separated fallbacks, each at most 27 characters (the size of the original
@@ -627,8 +634,11 @@ safe-prime group to avoid a legacy-client overflow in its 2048-bit ElGamal
 output. Message 3 is decoded through the ElGamal wrapper and Blowfish
 login-data transform; a valid account completes the encrypted message-4/5
 challenge and receives a signed Auth1/Auth2 certificate reply with an encrypted
-session-key confirmation, while unknown accounts and bad passwords get a native
-AuthComplete failure.
+session-key confirmation. The reply carries the account's registered name, not
+the client's uppercased login name. An unknown account gets message 6 with
+`WS_AuthServ_UserNotFound` (-1506) and a wrong password
+`WS_AuthServ_BadPassword` (-1507), which the stock script shows as "check your
+login name and password"; a malformed exchange gets -1.
 
 Auth1 sessions are cached in memory for the IRC listener, whose
 `CERT`/`CHALLENGE`/`CHALRESP` exchange encrypts CB33/CB35 with the client's
