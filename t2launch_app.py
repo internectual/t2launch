@@ -31,29 +31,38 @@ RUNTIME = ROOT / "runtime"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "t2launch"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
-# Tribes 2 command-line options. Each argument that takes values has its own
-# enable checkbox and the correct number of value fields.
-BOOL_OPTIONS = [
-    ("-dedicated", "Dedicated server"), ("-nonpure", "Non-pure server"),
-    ("-host", "Host game"), ("-demo", "Demo mode"), ("-show", "TSShow"),
-    ("-con", "Console mode"), ("-prepbuild", "Prepare/build scripts"),
-    ("-quit", "Quit after startup"), ("-nologin", "Offline (skip login)"),
-    ("-online", "Launcher / TribesNext mode"),
-    ("--nosound", "Disable sound"), ("--fullscreen", "Fullscreen"),
-    ("--windowed", "Windowed"),
-    ("-s", "Disable sound (short form)"), ("-f", "Fullscreen (short form)"),
-    ("-w", "Windowed (short form)"),
+# Tribes 2 command-line options, as console_start.cs parses them. Each argument
+# that takes values has an enable checkbox and one field per value, hinted with
+# what that value is. Advanced options stay hidden unless asked for or set.
+BOOL_OPTIONS = [  # (flag, label, advanced)
+    ("-dedicated", "Dedicated server", False), ("-nonpure", "Non-pure server", True),
+    ("-host", "Host game", False), ("-demo", "Demo mode", True), ("-show", "TSShow", True),
+    ("-con", "Console mode", True), ("-prepbuild", "Prepare/build scripts", True),
+    ("-quit", "Quit after startup", True), ("-nologin", "Offline (skip login)", False),
+    ("-online", "Launcher / TribesNext mode", False),
+    ("--nosound", "Disable sound", False), ("--fullscreen", "Fullscreen", False),
+    ("--windowed", "Windowed", False),
+    ("-s", "Disable sound (short form)", True), ("-f", "Fullscreen (short form)", True),
+    ("-w", "Windowed (short form)", True),
 ]
-VALUE_OPTIONS = [
-    ("-mod", "Mod", 1), ("-clientprefs", "Client prefs file", 1),
-    ("-serverprefs", "Server prefs file", 1), ("-mission", "Mission", 2),
-    ("-telnetParams", "Telnet parameters", 3), ("-connect", "Connect address", 1),
-    ("-password", "Server password", 1), ("-jload", "Load journal", 1),
-    ("-jsave", "Save journal", 1), ("-jplay", "Play journal", 1),
-    ("-navBuild", "Navigation build", 2), ("-spnBuild", "SPN build", 2),
-    ("-login", "Login credentials", 2), ("-bot", "Bot count", 1),
-    ("-light", "Light mission", 1), ("--gllibrary", "OpenGL library", 1),
-    ("-g", "OpenGL library (short form)", 1),
+VALUE_OPTIONS = [  # (option, label, a hint per value, advanced)
+    ("-mod", "Mod", ("mod name, e.g. Classic",), False),
+    ("-clientprefs", "Client prefs file", ("prefs file, e.g. prefs/ClientPrefs.cs",), True),
+    ("-serverprefs", "Server prefs file", ("prefs file, e.g. prefs/ServerPrefs.cs",), True),
+    ("-mission", "Mission", ("mission name", "mission type, e.g. CTF"), False),
+    ("-telnetParams", "Telnet parameters", ("port", "password", "listen-only password"), True),
+    ("-connect", "Connect address", ("server address, e.g. 1.2.3.4:28000",), False),
+    ("-password", "Server password", ("server password",), False),
+    ("-jload", "Load journal", ("journal file",), True),
+    ("-jsave", "Save journal", ("journal file",), True),
+    ("-jplay", "Play journal", ("journal file",), True),
+    ("-navBuild", "Navigation build", ("mission name", "mission type"), True),
+    ("-spnBuild", "SPN build", ("mission name", "mission type"), True),
+    ("-login", "Login credentials", ("login name", "password"), False),
+    ("-bot", "Bot count", ("number of bots",), False),
+    ("-light", "Light mission", ("mission name",), True),
+    ("--gllibrary", "OpenGL library", ("library path, e.g. libGL.so.1",), True),
+    ("-g", "OpenGL library (short form)", ("library path, e.g. libGL.so.1",), True),
 ]
 
 
@@ -118,10 +127,11 @@ def redact_launch_secrets(text, secrets_to_redact):
 def profile_arguments(profile):
     args = []
     flags = profile.get("flags", {})
-    for flag, _label in BOOL_OPTIONS:
+    for flag, _label, _advanced in BOOL_OPTIONS:
         if flags.get(flag):
             args.append(flag)
-    for option, _label, count in VALUE_OPTIONS:
+    for option, _label, hints, _advanced in VALUE_OPTIONS:
+        count = len(hints)
         values = profile.get("values", {}).get(option, [])
         if values:
             if len(values) < count or any(not value.strip() for value in values[:count]):
@@ -314,34 +324,41 @@ class ProfileEditor(QWidget):
         scroll.setWidgetResizable(True)
         body = QWidget()
         form = QFormLayout(body)
+        self.game_form = form
+        self.advanced_game_rows = []  # (row widget, is-set check)
         self.flag_boxes = {}
         saved_flags = profile.get("flags", {})
-        for flag, label in BOOL_OPTIONS:
+        for flag, label, advanced in BOOL_OPTIONS:
             checkbox = QCheckBox(f"{label} ({flag})")
             checkbox.setChecked(bool(saved_flags.get(flag, False)))
             self.flag_boxes[flag] = checkbox
             form.addRow(checkbox)
+            if advanced:
+                self.advanced_game_rows.append((checkbox, checkbox.isChecked))
         self.value_boxes = {}
         saved_values = profile.get("values", {})
-        for option, label, count in VALUE_OPTIONS:
+        for option, label, hints, advanced in VALUE_OPTIONS:
             container = QWidget()
             row = QHBoxLayout(container)
             row.setContentsMargins(0, 0, 0, 0)
             enabled = QCheckBox(f"{label} ({option})")
             fields = []
-            old = saved_values.get(option, [""] * count)
-            for index in range(count):
+            old = saved_values.get(option, [""] * len(hints))
+            for index, hint in enumerate(hints):
                 field = QLineEdit(old[index] if index < len(old) else "")
-                field.setPlaceholderText("value" if count == 1 else ("mission" if index == 0 else "type" if option in ("-mission", "-navBuild", "-spnBuild") else f"value {index + 1}"))
+                field.setPlaceholderText(hint)
                 row.addWidget(field)
                 fields.append(field)
             enabled.setChecked(bool(old and old[0]))
             row.insertWidget(0, enabled)
             self.value_boxes[option] = (enabled, fields)
             form.addRow(container)
+            if advanced:
+                self.advanced_game_rows.append((container, enabled.isChecked))
         self.positional = QLineEdit(profile.get("positional", ""))
         self.positional.setPlaceholderText("Optional .dif interior file")
         form.addRow("Interior file", self.positional)
+        self.advanced_game_rows.append((self.positional, lambda: bool(self.positional.text().strip())))
         self.custom = QLineEdit(profile.get("custom", ""))
         self.custom.setPlaceholderText("Additional arguments, e.g. -mod Classic -nologin")
         form.addRow("Custom options", self.custom)
@@ -405,7 +422,15 @@ class ProfileEditor(QWidget):
                       "backends": "changed"}.get(t2options.BY_KEY[key].kind, "textChanged")
             getattr(widget, signal).connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_options)
+        self.show_advanced.toggled.connect(self.refresh_game_rows)
         self.refresh_options()
+        self.refresh_game_rows()
+
+    def refresh_game_rows(self, *_args):
+        """Show advanced Game options when asked, and any that are already set."""
+        show_advanced = self.show_advanced.isChecked()
+        for row, is_set in self.advanced_game_rows:
+            self.game_form.setRowVisible(row, show_advanced or is_set())
 
     @staticmethod
     def _option_widget(option, value):
@@ -544,18 +569,19 @@ class SettingsDialog(QDialog):
         for profile in self.profiles:
             self.profile_list.addItem(profile.get("name", "Profile"))
         self.profile_list.currentRowChanged.connect(self.show_profile)
-        profile_buttons = QVBoxLayout()
         add = QPushButton("Add profile")
         remove = QPushButton("Remove profile")
         add.clicked.connect(self.add_profile)
         remove.clicked.connect(self.remove_profile)
+        profile_buttons = QHBoxLayout()
         profile_buttons.addWidget(add)
         profile_buttons.addWidget(remove)
-        profile_buttons.addStretch()
+        profile_column = QVBoxLayout()
+        profile_column.addWidget(self.profile_list, 1)
+        profile_column.addLayout(profile_buttons)
         self.profile_widget = QWidget()
         self.profile_widget_layout = QVBoxLayout(self.profile_widget)
-        profile_group.addWidget(self.profile_list)
-        profile_group.addLayout(profile_buttons)
+        profile_group.addLayout(profile_column)
         profile_group.addWidget(self.profile_widget, 1)
         root_layout.addLayout(profile_group, 1)
 
@@ -576,7 +602,9 @@ class SettingsDialog(QDialog):
             self.profiles[row] = self.profile_editor.save_to()
 
     def show_profile(self, row):
+        show_advanced = False
         if self.profile_editor:
+            show_advanced = self.profile_editor.show_advanced.isChecked()
             self.commit_editor()
             self.profile_editor.deleteLater()
         while self.profile_widget_layout.count():
@@ -589,6 +617,8 @@ class SettingsDialog(QDialog):
             self.profile_editor = ProfileEditor(
                 self.profiles[row], self.update_profile_name,
                 lambda: {"launcher.load_hook": self.load_hook.isChecked()})
+            # Keep "Show advanced options" as it was when switching profiles.
+            self.profile_editor.show_advanced.setChecked(show_advanced)
             self.profile_widget_layout.addWidget(self.profile_editor)
 
     def update_profile_name(self):
