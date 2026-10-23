@@ -177,6 +177,15 @@ OPTIONS = (
            help="Prove your TribesNext account in the connection handshake, as the QoL client "
                 "does, so servers that require it ($Host::RequireAuth) let you in. Replaces the "
                 "WON certificate in the handshake; the game still connects at protocol 51."),
+    # Discord
+    Option("discord.presence", "Discord", "Show what you're playing in Discord", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Rich presence: the menus, or the map, game type, server and player count while "
+                "you're in a game. Needs the Discord desktop client running on this machine."),
+    Option("discord.app_id", "Discord", "Discord application ID", "text", "1563045749846056970",
+           hook=True, advanced=True, requires=(("discord.presence", (True,)),),
+           help="The Discord application whose name and art the presence shows. Its art asset "
+                "should be named \"tribes2\"."),
     # Gamescope
     Option("video.gamescope", "Gamescope", "Run inside gamescope", "bool", False,
            env="T2LAUNCH_GAMESCOPE",

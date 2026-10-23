@@ -20,7 +20,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(sorted(c_keys), sorted(python_keys))
         # Defaults must agree too, so the hook behaves the same without a config.
         for key, default in re.findall(r'\{"([a-z_]+\.[a-z_]+)", "([^"]*)"', table):
-            self.assertEqual(default, "1" if t2options.BY_KEY[key].default else "0", key)
+            self.assertEqual(default, t2options._text(t2options.BY_KEY[key].default), key)
 
     def test_old_wonemu_flag_migrates_to_won_mode(self):
         self.assertEqual(t2options.migrate({"wonemu": True})["won.mode"], "local")
@@ -40,7 +40,7 @@ class OptionTests(unittest.TestCase):
         self.assertFalse(values["hook.tribesnext"])
         # Without the hook every hook-applied option is off; runtime options stay.
         values = t2options.effective({"won.mode": "local"}, {"launcher.load_hook": False})
-        self.assertFalse(any(values[o.key] for o in t2options.OPTIONS if o.hook))
+        self.assertFalse(any(values[o.key] for o in t2options.OPTIONS if o.hook and o.kind == "bool"))
         self.assertTrue(values["audio.openal_volume_fix"])
 
     def test_unmet_reports_each_requirement(self):

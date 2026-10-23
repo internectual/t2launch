@@ -9,6 +9,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <dlfcn.h>
@@ -51,6 +52,7 @@ static volatile int filter_max_bots_override_installed = 0;
 static volatile int net_options_override_installed = 0;
 static volatile int depot_downloads_installed = 0;
 static volatile int vsync_support_installed = 0;
+static volatile int discord_presence_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -95,6 +97,8 @@ static struct hook_option hook_options[] = {
     {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
     {"net.depot_downloads", "0", NULL, 0, "", 0},
     {"net.native_auth", "0", NULL, 0, "", 0},
+    {"discord.presence", "0", NULL, 0, "", 0},
+    {"discord.app_id", "1563045749846056970", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -479,6 +483,89 @@ static const char depot_downloads_script[] =
     "}\n"
     "};\n"
     "activatePackage(T2LaunchDepot);\n";
+
+/* ── Discord presence (discord.presence) ─────────────────────────────────
+ * The stock client keeps the server, map and game type it was told on
+ * joining in $clServerName, $clMissionName and $clMissionType. Every few
+ * seconds the hook asks t2launch_presence() for the state and passes each
+ * change as a line to $T2LAUNCH_DISCORD_HELPER, which talks to Discord. The
+ * helper exits when the game closes its end of the socket. */
+static const char discord_presence_script[] =
+    "function t2launch_presence() {\n"
+    " if (!isObject(ServerConnection)) {\n"
+    "  $clMissionName = \"\";\n"
+    "  return \"menu\";\n"
+    " }\n"
+    " if (isDemo()) return \"demo\";\n"
+    " if ($clMissionName $= \"\" || (isObject(LoadingGui) && LoadingGui.isAwake())) return \"joining\";\n"
+    " %players = 0;\n"
+    " if (isObject(PlayerListGroup)) %players = PlayerListGroup.getCount();\n"
+    " return \"game\\t\" @ $clServerName @ \"\\t\" @ $clMissionName @ \"\\t\" @ $clMissionType @ \"\\t\" @ %players;\n"
+    "}\n";
+
+static int discord_socket = -1;
+static pid_t discord_child = -1;
+static time_t discord_last_poll;
+static char discord_last_state[512];
+
+static int start_discord_presence(void) {
+    const char *helper = getenv("T2LAUNCH_DISCORD_HELPER");
+    const char *app_id = hook_option_str("discord.app_id");
+    if (discord_socket >= 0) return 1;
+    if (!helper || !helper[0] || access(helper, X_OK) != 0) {
+        fprintf(stderr, "[t2_hook] Discord presence: no helper (T2LAUNCH_DISCORD_HELPER)\n");
+        return 0;
+    }
+    if (!app_id || !app_id[0] || strspn(app_id, "0123456789") != strlen(app_id)) {
+        fprintf(stderr, "[t2_hook] Discord presence: the application ID must be a number\n");
+        return 0;
+    }
+    char **env = helper_environment();
+    int pair[2];
+    if (!env) return 0;
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0) { free(env); return 0; }
+    char pid_text[16];
+    snprintf(pid_text, sizeof(pid_text), "%d", (int)getpid());
+    char *args[] = {(char *)helper, "--app-id", (char *)app_id, "--pid", pid_text, NULL};
+    pid_t child = fork();
+    if (child == 0) {
+        dup2(pair[1], STDIN_FILENO);
+        execve(helper, args, env);
+        _exit(127);
+    }
+    free(env);
+    close(pair[1]);
+    if (child < 0) { close(pair[0]); return 0; }
+    discord_socket = pair[0];
+    discord_child = child;
+    discord_last_state[0] = 0;
+    fprintf(stderr, "[t2_hook] Started Discord presence for application %s\n", app_id);
+    return 1;
+}
+
+/* Send the state if it changed; a closed helper stops presence for the session. */
+static void send_discord_presence(const char *state) {
+    char line[sizeof(discord_last_state) + 1];
+    if (discord_socket < 0 || !state) return;
+    snprintf(line, sizeof(discord_last_state), "%s", state);
+    line[strcspn(line, "\r\n")] = 0;
+    if (strcmp(line, discord_last_state) == 0) return;
+    memcpy(discord_last_state, line, strlen(line) + 1);
+    size_t length = strlen(line);
+    line[length++] = '\n';
+    if (send(discord_socket, line, length, MSG_NOSIGNAL | MSG_DONTWAIT) != (ssize_t)length) {
+        fprintf(stderr, "[t2_hook] Discord presence helper stopped\n");
+        close(discord_socket);
+        discord_socket = -1;
+        waitpid(discord_child, NULL, WNOHANG);
+    }
+}
+
+static void poll_discord_presence(time_t now) {
+    if (discord_socket < 0 || now - discord_last_poll < 5) return;
+    discord_last_poll = now;
+    send_discord_presence(Con__evaluate("t2launch_presence();", 0, NULL, 0));
+}
 
 #define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
@@ -1860,6 +1947,11 @@ void SDL_GL_SwapBuffers(void) {
                 depot_downloads_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime TribesNext depot downloads\n");
             }
+            if (!discord_presence_installed && hook_option_bool("discord.presence")) {
+                discord_presence_installed = 1;
+                Con__evaluate(discord_presence_script, 0, "t2launch/discord.cs", 0);
+                start_discord_presence();
+            }
             if (!vsync_support_installed && hook_option_bool("video.vsync")) {
                 Con__evaluate("$SwapIntervalSupported = 1;"
                               " setVerticalSync(!$pref::Video::disableVerticalSync);", 0, NULL, 0);
@@ -1878,6 +1970,8 @@ void SDL_GL_SwapBuffers(void) {
             shell_audio_setup_done = 1;
         }
     }
+    if (shell_audio_setup_done && now != (time_t)-1)
+        poll_discord_presence(now);
 }
 
 /* Observe SDL 1.2 mode changes without replacing its return surface or flags. */

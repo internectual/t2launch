@@ -642,6 +642,17 @@ options bring the parts of it that fit the Linux client:
   protocol-52 game data would not parse in this client, so it keeps
   announcing 51. A stock server ignores the extra bits; one logged in to WON
   accepts the connection without checking a WON certificate.
+- **Discord presence** (`discord.presence`, off). Shows the menus, or the
+  map, game type, server and player count while you're in a game, in the
+  Discord desktop client on the same machine. The stock client keeps what the
+  server told it on joining in `$clServerName`, `$clMissionName` and
+  `$clMissionType`; every 5 seconds the hook asks a runtime
+  `t2launch_presence()` for the state and writes each change as a line to
+  `discord_presence.py`, which it starts beside the game. The helper sends it
+  over Discord's IPC socket (`$XDG_RUNTIME_DIR/discord-ipc-N`, including the
+  Flatpak, Snap and Vesktop locations), connects whenever Discord is running,
+  and exits when the game does. `discord.app_id` (advanced) picks the Discord
+  application; its art asset should be named `tribes2`.
 
 ## Development
 
@@ -665,6 +676,7 @@ t2launch/
 ├── community_store.py         # SQLite community store
 ├── tribesnext.py              # TribesNext certificate/challenge/account helpers
 ├── depot.py                   # TribesNext depot download for missing map files
+├── discord_presence.py        # Discord rich presence over the local IPC socket
 ├── t2options.py               # Profile option declarations
 ├── t2launch_app.py            # Desktop launcher
 ├── install.sh                 # Launcher installer and dependency check

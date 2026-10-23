@@ -424,6 +424,7 @@ launch_game() {
                "T2LAUNCH_GAME_DIR=$HOST_GAME_PATH"
                "T2LAUNCH_RSA_HELPER=$support_dir/rsa_helper"
                "T2LAUNCH_DEPOT_HELPER=$REPO_DIR/depot.py"
+               "T2LAUNCH_DISCORD_HELPER=$REPO_DIR/discord_presence.py"
                "T2_GAME_DIR=$HOST_GAME_PATH"
                "T2_LIBRARY_PATH=$compat_dir:$HOST_GAME_PATH"
                "T2_GAME_AUDIT=$support_dir/t2_realign.so"

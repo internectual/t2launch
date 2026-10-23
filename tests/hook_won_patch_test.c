@@ -34,7 +34,8 @@ int main(void) {
     /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
        account check and warning must run unmodified. */
     const char *scripts[] = {core_runtime_script, tribesnext_runtime_script,
-                             player_pane_button_click_override, depot_downloads_script};
+                             player_pane_button_click_override, depot_downloads_script,
+                             discord_presence_script};
     for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); ++i) {
         assert(strstr(scripts[i], "function checkNamesAndAliases") == NULL);
         assert(strstr(scripts[i], "function LaunchGui::onWake") == NULL);
@@ -447,6 +448,46 @@ int main(void) {
     }
     assert(strcmp(depot_status, "error not in the depot") == 0);
     unlink(fake_depot); rmdir(depot_dir);
+
+    /* Discord presence: the helper reads one line per state change on stdin,
+       runs without the game's loader settings, and sees EOF when the game
+       closes its end. */
+    char discord_dir[] = "/tmp/t2_hook_discord_XXXXXX";
+    assert(mkdtemp(discord_dir));
+    char fake_discord[96], discord_seen[96];
+    snprintf(fake_discord, sizeof(fake_discord), "%s/discord.py", discord_dir);
+    snprintf(discord_seen, sizeof(discord_seen), "%s/seen", discord_dir);
+    script = fopen(fake_discord, "w");
+    assert(script);
+    fprintf(script, "#!/bin/sh\necho \"$#|$1|$2|$3|$4|${LD_PRELOAD-unset}\" > '%s'\ncat >> '%s'\n",
+            discord_seen, discord_seen);
+    fclose(script);
+    assert(chmod(fake_discord, 0700) == 0);
+    unsetenv("T2LAUNCH_DISCORD_HELPER");
+    assert(!start_discord_presence());
+    setenv("T2LAUNCH_DISCORD_HELPER", fake_discord, 1);
+    setenv("LD_PRELOAD", "/nonexistent/t2_hook.so", 1);
+    assert(start_discord_presence());
+    unsetenv("LD_PRELOAD");
+    send_discord_presence("menu");
+    send_discord_presence("menu");  /* unchanged: not sent again */
+    send_discord_presence("game\tServer\tKatabatic\tCTF\t12\r\nextra");
+    send_discord_presence(NULL);
+    close(discord_socket);
+    discord_socket = -1;
+    assert(waitpid(discord_child, NULL, 0) == discord_child);
+    char discord_expected[256], discord_result[256] = "";
+    snprintf(discord_expected, sizeof(discord_expected),
+             "4|--app-id|1563045749846056970|--pid|%d|unset\nmenu\ngame\tServer\tKatabatic\tCTF\t12\n",
+             (int)getpid());
+    FILE *discord_file = fopen(discord_seen, "r");
+    assert(discord_file);
+    size_t discord_length = fread(discord_result, 1, sizeof(discord_result) - 1, discord_file);
+    discord_result[discord_length] = 0;
+    fclose(discord_file);
+    assert(strcmp(discord_result, discord_expected) == 0);
+    send_discord_presence("menu");  /* no helper: ignored */
+    unlink(fake_discord); unlink(discord_seen); rmdir(discord_dir);
 
     char path[64];
     setenv("T2LAUNCH_GAME_DIR", "/games/t2", 1);
