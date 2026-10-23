@@ -580,6 +580,13 @@ options bring the parts of it that fit the Linux client:
 - **Borderless window** (`video.borderless`, off). Windowed
   `SDL_SetVideoMode` calls get `SDL_NOFRAME`, and `SDL_VIDEO_CENTERED=1`
   places the window. Choose the desktop resolution for borderless fullscreen.
+- **Gamescope** (`video.gamescope`, off). `run-game` starts the game inside
+  gamescope with the chosen game and output sizes, scaler, filter (`fsr`,
+  `nis`, ...), fullscreen, and relative mouse mode. gamescope itself runs
+  without the game's `LD_*` settings, and `window_resize.sh` is skipped.
+  Rendering the game below the output size and upscaling it is the Linux
+  stand-in for the update's UI scaling; keep the game windowed at the game
+  size.
 
 ## Development
 

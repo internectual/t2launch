@@ -152,6 +152,19 @@ class OptionTests(unittest.TestCase):
         unhooked = t2options.hook_config({"won.mode": "off"}, {"launcher.load_hook": False})
         self.assertIn("runtime.monotonic_clock=0", unhooked)
 
+    def test_gamescope_options_need_gamescope(self):
+        profile = {"won.mode": "off", "video.gamescope": True, "video.gamescope_filter": "fsr"}
+        with mock.patch.object(t2options.shutil, "which", return_value=None):
+            with self.assertRaisesRegex(ValueError, "gamescope installed"):
+                t2options.validate(profile, HOOKED)
+        with mock.patch.object(t2options.shutil, "which", return_value="/usr/bin/gamescope"):
+            t2options.validate(profile, HOOKED)
+        env = t2options.launch_env(profile, HOOKED)
+        self.assertEqual((env["T2LAUNCH_GAMESCOPE"], env["T2LAUNCH_GAMESCOPE_FILTER"]), ("1", "fsr"))
+        off = t2options.launch_env({"won.mode": "off"}, HOOKED)
+        self.assertEqual(off["T2LAUNCH_GAMESCOPE"], "0")
+        self.assertNotIn("T2LAUNCH_GAMESCOPE_FILTER", off)
+
     def test_hook_config_file_is_private(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(t2options, "HOOK_CONFIG_DIR", Path(directory) / "hook"):

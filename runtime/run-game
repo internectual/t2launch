@@ -437,6 +437,15 @@ launch_game() {
             GAME_ENV+=("T2_STRACE_LOG=$TRACE_DIR/tribes2-connect.strace")
         fi
     fi
+    if [[ "${T2LAUNCH_GAMESCOPE:-0}" == "1" ]]; then
+        if ! command -v gamescope >/dev/null 2>&1; then
+            echo "ERROR: Run inside gamescope is on, but gamescope is not installed." >&2
+            exit 1
+        fi
+        # gamescope sizes and places the game's window itself.
+        GAME_ENV+=(USE_GAME_WINDOW_RESIZE=0)
+        echo "[t2launch] Running inside gamescope (filter=${T2LAUNCH_GAMESCOPE_FILTER:-linear})"
+    fi
     echo "[t2launch] Launching from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
     # LD_AUDIT and LD_PRELOAD are set only on the game itself, not the helpers.
     # shellcheck disable=SC2016 # The script is interpreted by the child bash.
@@ -452,8 +461,21 @@ launch_game() {
         else
             set -- "$GAME_BINARY" "$@"
         fi
-        exec env LD_LIBRARY_PATH="$T2_LIBRARY_PATH" LD_AUDIT="$T2_GAME_AUDIT" \
+        set -- env LD_LIBRARY_PATH="$T2_LIBRARY_PATH" LD_AUDIT="$T2_GAME_AUDIT" \
             LD_PRELOAD="$T2_GAME_PRELOAD" "$@"
+        # gamescope itself runs without the game'"'"'s 32-bit loader settings.
+        if [ "${T2LAUNCH_GAMESCOPE:-0}" = "1" ]; then
+            scope=(gamescope)
+            [ "${T2LAUNCH_GAMESCOPE_WIDTH:-0}" != "0" ] && scope+=(-w "$T2LAUNCH_GAMESCOPE_WIDTH")
+            [ "${T2LAUNCH_GAMESCOPE_HEIGHT:-0}" != "0" ] && scope+=(-h "$T2LAUNCH_GAMESCOPE_HEIGHT")
+            [ "${T2LAUNCH_GAMESCOPE_OUTPUT_WIDTH:-0}" != "0" ] && scope+=(-W "$T2LAUNCH_GAMESCOPE_OUTPUT_WIDTH")
+            [ "${T2LAUNCH_GAMESCOPE_OUTPUT_HEIGHT:-0}" != "0" ] && scope+=(-H "$T2LAUNCH_GAMESCOPE_OUTPUT_HEIGHT")
+            scope+=(-S "${T2LAUNCH_GAMESCOPE_SCALER:-auto}" -F "${T2LAUNCH_GAMESCOPE_FILTER:-linear}")
+            [ "${T2LAUNCH_GAMESCOPE_FULLSCREEN:-1}" = "1" ] && scope+=(-f)
+            [ "${T2LAUNCH_GAMESCOPE_GRAB_CURSOR:-1}" = "1" ] && scope+=(--force-grab-cursor)
+            set -- "${scope[@]}" -- "$@"
+        fi
+        exec "$@"
     ' _ "${GAME_ARGS[@]}"
 }
 launch_game

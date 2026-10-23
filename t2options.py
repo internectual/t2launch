@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -153,6 +154,36 @@ OPTIONS = (
            help="Raise the client's 32/s and 450-byte limits so QoL-patched TribesNext servers can "
                 "send more, and add a matching \"TribesNext QoL\" network preset. Stock servers "
                 "still send at their own limits."),
+    # Gamescope
+    Option("video.gamescope", "Gamescope", "Run inside gamescope", "bool", False,
+           env="T2LAUNCH_GAMESCOPE",
+           help="Run the game in a gamescope window: render at a lower game resolution and "
+                "upscale it (a larger HUD on high-DPI screens), with FSR or NIS filtering. "
+                "Keep the game windowed at the game size below; gamescope handles fullscreen."),
+    Option("video.gamescope_width", "Gamescope", "Game width (0 = gamescope default)", "int", 0,
+           minimum=0, maximum=16384, env="T2LAUNCH_GAMESCOPE_WIDTH",
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_height", "Gamescope", "Game height (0 = gamescope default)", "int", 0,
+           minimum=0, maximum=16384, env="T2LAUNCH_GAMESCOPE_HEIGHT",
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_output_width", "Gamescope", "Output width (0 = monitor)", "int", 0,
+           minimum=0, maximum=16384, env="T2LAUNCH_GAMESCOPE_OUTPUT_WIDTH", advanced=True,
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_output_height", "Gamescope", "Output height (0 = monitor)", "int", 0,
+           minimum=0, maximum=16384, env="T2LAUNCH_GAMESCOPE_OUTPUT_HEIGHT", advanced=True,
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_scaler", "Gamescope", "Scaling", "choice", "auto",
+           choices=("auto", "integer", "fit", "fill", "stretch"), env="T2LAUNCH_GAMESCOPE_SCALER",
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_filter", "Gamescope", "Upscale filter", "choice", "linear",
+           choices=("linear", "nearest", "fsr", "nis", "pixel"), env="T2LAUNCH_GAMESCOPE_FILTER",
+           requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_fullscreen", "Gamescope", "Gamescope fullscreen", "bool", True,
+           env="T2LAUNCH_GAMESCOPE_FULLSCREEN", requires=(("video.gamescope", (True,)),)),
+    Option("video.gamescope_grab_cursor", "Gamescope", "Relative mouse mode", "bool", True,
+           env="T2LAUNCH_GAMESCOPE_GRAB_CURSOR", advanced=True,
+           requires=(("video.gamescope", (True,)),),
+           help="Always use relative mouse motion; the game steers by warping the pointer."),
     # Audio
     Option("audio.openal_volume_fix", "Audio", "Volume slider fix", "bool", True,
            env="T2LAUNCH_OPENAL_VOLUME_FIX",
@@ -313,6 +344,8 @@ def validate(options, context=None):
         if key in BY_KEY:
             coerce(BY_KEY[key], value)
     values = effective(options, context)
+    if values["video.gamescope"] and not shutil.which("gamescope"):
+        raise ValueError("Run inside gamescope needs gamescope installed")
     if values["won.mode"] == "remote":
         if not values["won.endpoints"]:
             raise ValueError("Remote WON emulation needs the remote host:port to connect to")
