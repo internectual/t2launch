@@ -143,6 +143,10 @@ OPTIONS = (
            requires=(("launcher.load_hook", (True,)),),
            help="Apply the Video options gamma in a shader pass; the game's X11 gamma ramps do "
                 "nothing under Wayland and most compositors."),
+    Option("video.disable_locked_arrays", "Video", "Hide EXT_compiled_vertex_array", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="For drivers that tear or flicker once the game locks vertex arrays: hide the "
+                "extension so the game never uses it."),
     Option("video.software_gl", "Video", "Software OpenGL", "bool", False,
            env="T2LAUNCH_SOFTWARE_GL", help="Render with Mesa's software rasterizer."),
     Option("video.xrandr_modes", "Video", "Offer the display's real video modes", "bool", True,

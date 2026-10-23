@@ -594,6 +594,15 @@ options bring the parts of it that fit the Linux client:
   through a GLSL shader computing `pow(colour, 1/gamma)`, saving and
   restoring the GL state around the pass. Neutral is near the middle of the
   slider.
+- **Hide `EXT_compiled_vertex_array`** (`video.disable_locked_arrays`, off).
+  Some drivers (AMD's rewritten Windows OpenGL driver, per TribesNext forum
+  thread 4362) tear and flicker after the game first calls `glLockArraysEXT`,
+  and `$pref::OpenGL::disableEXTCompiledVertexArray` does not cover every
+  use. The game resolves GL through `SDL_GL_GetProcAddress`; with this option
+  the hook hands it a `glGetString` whose extension list omits the extension
+  and no `glLockArraysEXT`, so the console lists it under "Disabled
+  Extensions". Mesa's radeonsi is not known to be affected, so it is off by
+  default.
 - **Gamescope** (`video.gamescope`, off). `run-game` starts the game inside
   gamescope with the chosen game and output sizes, scaler, filter (`fsr`,
   `nis`, ...), fullscreen, and relative mouse mode. gamescope itself runs

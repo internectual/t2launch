@@ -90,6 +90,7 @@ static struct hook_option hook_options[] = {
     {"video.borderless", "0", NULL, 0, "", 0},
     {"video.vsync", "1", NULL, 0, "", 0},
     {"video.gamma", "1", NULL, 0, "", 0},
+    {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1332,6 +1333,71 @@ int SDL_SetGamma(float red, float green, float blue) {
         fprintf(stderr, "[t2_hook] Gamma %.3f\n", (double)red);
     gamma_requested = red;
     return 0;
+}
+
+/* ── Locked arrays (video.disable_locked_arrays) ─────────────────────────
+ * Some drivers (AMD's rewritten Windows OpenGL driver, per the TribesNext
+ * forum) tear and flicker once the game calls glLockArraysEXT, until the
+ * context is destroyed. $pref::OpenGL::disableEXTCompiledVertexArray does not
+ * cover every use, so hide the extension: the game resolves GL through
+ * SDL_GL_GetProcAddress, and gets a glGetString without it and no
+ * glLockArraysEXT. */
+#define GL_EXTENSIONS_ 0x1F03
+#define LOCKED_ARRAYS_EXTENSION "GL_EXT_compiled_vertex_array"
+
+/* Copy extensions into output without one space-separated token. */
+static void remove_extension(const char *extensions, const char *token, char *output, size_t size) {
+    size_t used = 0, token_length = strlen(token);
+    const char *cursor = extensions;
+    if (size) output[0] = 0;
+    while (*cursor) {
+        while (*cursor == ' ') cursor++;
+        const char *end = cursor;
+        while (*end && *end != ' ') end++;
+        size_t length = (size_t)(end - cursor);
+        if (length && !(length == token_length && strncmp(cursor, token, length) == 0) &&
+            used + length + 2 <= size) {
+            if (used) output[used++] = ' ';
+            memcpy(output + used, cursor, length);
+            used += length;
+            output[used] = 0;
+        }
+        cursor = end;
+    }
+}
+
+static const unsigned char *(*real_gl_get_string)(unsigned);
+
+static const unsigned char *filtered_gl_get_string(unsigned name) {
+    static const unsigned char *source;
+    static char *filtered;
+    const unsigned char *value = real_gl_get_string ? real_gl_get_string(name) : NULL;
+    if (name != GL_EXTENSIONS_ || !value) return value;
+    if (value != source) {
+        size_t size = strlen((const char *)value) + 1;
+        char *copy = malloc(size);
+        if (!copy) return value;
+        remove_extension((const char *)value, LOCKED_ARRAYS_EXTENSION, copy, size);
+        free(filtered);
+        filtered = copy;
+        source = value;
+        fprintf(stderr, "[t2_hook] Hid %s from the game\n", LOCKED_ARRAYS_EXTENSION);
+    }
+    return (const unsigned char *)filtered;
+}
+
+void *SDL_GL_GetProcAddress(const char *proc) {
+    static void *(*real_get_proc)(const char *);
+    if (!real_get_proc) real_get_proc = (void *(*)(const char *))dlsym(RTLD_NEXT, "SDL_GL_GetProcAddress");
+    if (!real_get_proc) return NULL;
+    void *address = real_get_proc(proc);
+    if (!proc || !hook_option_bool("video.disable_locked_arrays")) return address;
+    if (strcmp(proc, "glLockArraysEXT") == 0 || strcmp(proc, "glUnlockArraysEXT") == 0) return NULL;
+    if (strcmp(proc, "glGetString") == 0 && address) {
+        real_gl_get_string = (const unsigned char *(*)(unsigned))address;
+        return (void *)filtered_gl_get_string;
+    }
+    return address;
 }
 
 /* Frame cap (video.fps_limit): advance an absolute deadline by one period per

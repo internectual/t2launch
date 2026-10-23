@@ -175,6 +175,18 @@ int main(void) {
         assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
     }
 
+    /* Locked arrays: only the exact extension token is removed. */
+    {
+        char out[256];
+        remove_extension("GL_ARB_multitexture GL_EXT_compiled_vertex_array GL_EXT_compiled_vertex_array_x "
+                         "GL_EXT_texture_env_add", LOCKED_ARRAYS_EXTENSION, out, sizeof(out));
+        assert(strcmp(out, "GL_ARB_multitexture GL_EXT_compiled_vertex_array_x GL_EXT_texture_env_add") == 0);
+        remove_extension(LOCKED_ARRAYS_EXTENSION, LOCKED_ARRAYS_EXTENSION, out, sizeof(out));
+        assert(strcmp(out, "") == 0);
+        remove_extension("  GL_A  " LOCKED_ARRAYS_EXTENSION " GL_B ", LOCKED_ARRAYS_EXTENSION, out, sizeof(out));
+        assert(strcmp(out, "GL_A GL_B") == 0);
+    }
+
     /* Frame cap: steady frames sleep to the deadline; a late frame restarts it. */
     {
         struct timespec deadline = {0, 0}, now = {100, 0};
