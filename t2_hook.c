@@ -94,6 +94,7 @@ static struct hook_option hook_options[] = {
     {"video.gamma", "1", NULL, 0, "", 0},
     {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
     {"net.depot_downloads", "0", NULL, 0, "", 0},
+    {"net.native_auth", "0", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1003,6 +1004,235 @@ static int install_net_packet_limits(void) {
     if (!apply_code_patches("Network packet limit", patches, count)) return 0;
     fprintf(stderr, "[t2_hook] Network: client packet limits %d/s and %d bytes instead of 32/s and 450 "
             "(memory only)\n", NET_PACKET_RATE_LIMIT, NET_PACKET_SIZE_LIMIT);
+    return 1;
+}
+
+/* ── Native TribesNext handshake ──────────────────────────────────────────
+ * The TribesNext QoL update authenticates accounts in the connection
+ * handshake itself, which servers with $Host::RequireAuth insist on. Its
+ * challenge request replaces the WON certificate flag with a 0 and appends a
+ * native flag: 0x54, an 8-byte nonce, the server's IPv4 address as the
+ * client sees it, a 12-bit length, and the account blob from
+ * native_auth_blob(). The server answers in the WON flag's place of the
+ * challenge response with a flag, a 9-bit length and a challenge encrypted to
+ * the account key; the client decrypts it (raw RSA, as hook_tn_decrypt does),
+ * finds its nonce, keeps the 64 bytes from there and sends bytes 12-51 back
+ * in the connect request's flag slot. QoL servers read all of this at
+ * protocol 51 too, and their protocol-52 game data would not parse here, so
+ * the client keeps announcing 51. */
+#define NATIVE_AUTH_CHALLENGE_FLAG_CALL 0x08236844
+#define NATIVE_AUTH_REPLY_FLAG_READ     0x082376E2
+#define NATIVE_AUTH_REPLY_FLAG_STORE    0x08237713
+#define NATIVE_AUTH_CONNECT_FLAG_CALL   0x08237556
+#define NATIVE_AUTH_SERVER_ADDRESS      0x08689418  /* the pending connection's NetAddress */
+#define BITSTREAM_WRITE_FLAG            0x08102C04
+#define BITSTREAM_READ_INT              0x08102E60
+#define BITSTREAM_WRITE_INT             0x08102F1C
+#define NATIVE_AUTH_MARKER              0x54
+#define NATIVE_AUTH_SIGNATURE_BYTES     512
+#define NATIVE_AUTH_BLOB_MIN            0x218  /* the server's accepted blob lengths */
+#define NATIVE_AUTH_BLOB_MAX            0x400
+/* Both calls go to writeFlag at 0x08102C04. */
+static const unsigned char native_auth_challenge_call_original[] = {0xe8, 0xbb, 0xc3, 0xec, 0xff};
+static const unsigned char native_auth_connect_call_original[] = {0xe8, 0xa9, 0xb6, 0xec, 0xff};
+static const unsigned char native_auth_reply_read_original[] =
+    {0x8b, 0x77, 0x0c, 0x3b, 0x77, 0x18, 0x7e, 0x08, 0xc6, 0x47, 0x14, 0x01, 0xb0, 0x00};
+
+typedef char (*bitstream_write_flag_t)(void *stream, int flag);
+typedef int (*bitstream_read_int_t)(void *stream, int bits);
+typedef void (*bitstream_write_int_t)(void *stream, int value, int bits);
+static bitstream_write_flag_t bitstream_write_flag = (bitstream_write_flag_t)BITSTREAM_WRITE_FLAG;
+static bitstream_read_int_t bitstream_read_int = (bitstream_read_int_t)BITSTREAM_READ_INT;
+static bitstream_write_int_t bitstream_write_int = (bitstream_write_int_t)BITSTREAM_WRITE_INT;
+
+static struct {
+    int sent;       /* the last challenge request carried the native flag */
+    int verified;   /* its reply echoed our nonce; the connect request answers */
+    unsigned char nonce[8];
+    unsigned char block[64];
+} native_auth;
+
+static int run_rsa_helper(const char *base, const char *exp, const char *mod,
+                          char *result, size_t result_size);
+static int hex2nibble(char c);
+static void bytes_to_hex(const uint8_t *data, int len, char *out);
+
+/* Hex digits to big-endian bytes without leading zero bytes; -1 if invalid. */
+static int native_auth_hex_bytes(const char *hex, size_t hex_length, unsigned char *out, size_t cap) {
+    while (hex_length > 1 && hex[0] == '0') { hex++; hex_length--; }
+    if (!hex_length) return -1;
+    size_t count = (hex_length + 1) / 2;
+    if (count > cap) return -1;
+    memset(out, 0, count);
+    for (size_t i = 0; i < hex_length; i++) {
+        int nibble = hex2nibble(hex[i]);
+        if (nibble < 0) return -1;
+        size_t digit = hex_length - 1 - i;  /* from the least significant end */
+        out[count - 1 - digit / 2] |= (unsigned char)(digit % 2 ? nibble << 4 : nibble);
+    }
+    return (int)count;
+}
+
+/* The account blob of the QoL client's certificate helper:
+   "name\tguid\tlen(E)\tlen(N)+1\t", E, a zero byte and N (the zero ends the
+   server's tab tokenizer before N), then the 512-byte certificate signature. */
+static int native_auth_blob(const char *certificate, unsigned char *out, size_t cap) {
+    const char *fields[5];
+    size_t lengths[5];
+    const char *field = certificate;
+    for (int i = 0; i < 5; i++) {
+        const char *tab = strchr(field, '\t');
+        if ((i < 4) != (tab != NULL)) return -1;
+        fields[i] = field;
+        lengths[i] = tab ? (size_t)(tab - field) : strlen(field);
+        if (!lengths[i]) return -1;
+        field = tab ? tab + 1 : field;
+    }
+    char name[64], guid_text[16];
+    if (lengths[0] >= sizeof(name) || lengths[1] >= sizeof(guid_text)) return -1;
+    memcpy(name, fields[0], lengths[0]); name[lengths[0]] = 0;
+    memcpy(guid_text, fields[1], lengths[1]); guid_text[lengths[1]] = 0;
+    char *end;
+    long guid = strtol(guid_text, &end, 10);
+    if (*end || guid <= 0 || guid > 0x7fffffffL) return -1;
+    unsigned char exponent[512], modulus[512], signature[NATIVE_AUTH_SIGNATURE_BYTES];
+    int exponent_length = native_auth_hex_bytes(fields[2], lengths[2], exponent, sizeof(exponent));
+    int modulus_length = native_auth_hex_bytes(fields[3], lengths[3], modulus, sizeof(modulus));
+    int signature_length = native_auth_hex_bytes(fields[4], lengths[4], signature, sizeof(signature));
+    if (exponent_length <= 0 || modulus_length <= 0 || signature_length <= 0) return -1;
+    memmove(signature + sizeof(signature) - signature_length, signature, (size_t)signature_length);
+    memset(signature, 0, sizeof(signature) - signature_length);
+    int header = snprintf((char *)out, cap, "%s\t%ld\t%d\t%d\t", name, guid,
+                          exponent_length, modulus_length + 1);
+    if (header < 0) return -1;
+    size_t length = (size_t)header + exponent_length + 1 + modulus_length + sizeof(signature);
+    if (length > cap || length < NATIVE_AUTH_BLOB_MIN || length > NATIVE_AUTH_BLOB_MAX) return -1;
+    unsigned char *cursor = out + header;
+    memcpy(cursor, exponent, exponent_length); cursor += exponent_length;
+    *cursor++ = 0;
+    memcpy(cursor, modulus, modulus_length); cursor += modulus_length;
+    memcpy(cursor, signature, sizeof(signature));
+    return (int)length;
+}
+
+/* The QoL client's search: the first nonzero position holding the nonce with
+   64 bytes left, which it keeps. */
+static int native_auth_find_block(const unsigned char *plain, int length,
+                                  const unsigned char nonce[8], unsigned char block[64]) {
+    for (int i = 0; i < length; i++) {
+        if (plain[i] == 0) continue;
+        if (i + 64 > length) return 0;
+        if (memcmp(plain + i, nonce, 8) == 0) {
+            memcpy(block, plain + i, 64);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int native_auth_ready(void) {
+    return tribesnext_certificate[0] && tribesnext_private_exponent[0] && tribesnext_modulus[0];
+}
+
+/* Replaces the challenge request's writeFlag(WON certificate) call. */
+static char native_auth_challenge_flag(void *stream, int won_flag) {
+    unsigned char blob[NATIVE_AUTH_BLOB_MAX];
+    const unsigned char *address = (const unsigned char *)NATIVE_AUTH_SERVER_ADDRESS;
+    memset(&native_auth, 0, sizeof(native_auth));
+    int length = native_auth_ready() ? native_auth_blob(tribesnext_certificate, blob, sizeof(blob)) : -1;
+    FILE *random = length > 0 ? fopen("/dev/urandom", "rb") : NULL;
+    int have_nonce = random && fread(native_auth.nonce, 1, sizeof(native_auth.nonce), random) ==
+                     sizeof(native_auth.nonce);
+    if (random) fclose(random);
+    if (length <= 0 || !have_nonce || *(const int32_t *)address != 1 /* IP address */) {
+        fprintf(stderr, "[t2_hook] Native TribesNext challenge not sent: %s\n",
+                !native_auth_ready() ? "the account is not unlocked" :
+                length <= 0 ? "the certificate is not usable" : "no nonce or IP address");
+        return bitstream_write_flag(stream, won_flag & 0xff);
+    }
+    bitstream_write_flag(stream, 0);
+    bitstream_write_flag(stream, 1);
+    bitstream_write_int(stream, NATIVE_AUTH_MARKER, 8);
+    for (size_t i = 0; i < sizeof(native_auth.nonce); i++)
+        bitstream_write_int(stream, native_auth.nonce[i], 8);
+    for (int i = 4; i < 8; i++) bitstream_write_int(stream, address[i], 8);
+    bitstream_write_int(stream, length, 12);
+    for (int i = 0; i < length; i++) bitstream_write_int(stream, blob[i], 8);
+    native_auth.sent = 1;
+    fprintf(stderr, "[t2_hook] Native TribesNext challenge sent (%d-byte account blob)\n", length);
+    return 0;
+}
+
+/* Replaces the challenge response's inline readFlag; the stock code stores
+   and tests the result as the WON certificate flag. A native challenge is
+   answered here and reported as 0, so the stock accept path runs. */
+static int native_auth_reply_flag(void *stream) {
+    if (!bitstream_read_int(stream, 1)) return 0;
+    if (!native_auth.sent) return 1;
+    native_auth.sent = 0;
+    int length = bitstream_read_int(stream, 9) & 0x1ff;
+    unsigned char cipher[512], plain[512];
+    for (int i = 0; i < length; i++) cipher[i] = (unsigned char)bitstream_read_int(stream, 8);
+    int key_bytes = (int)(strlen(tribesnext_modulus) + 1) / 2;
+    char cipher_hex[1025], plain_hex[2048];
+    if (length < 64 || length > key_bytes || key_bytes > (int)sizeof(plain)) {
+        fprintf(stderr, "[t2_hook] Native TribesNext challenge refused: %d bytes\n", length);
+        return 0;
+    }
+    bytes_to_hex(cipher, length, cipher_hex);
+    if (!run_rsa_helper(cipher_hex, tribesnext_private_exponent, tribesnext_modulus,
+                        plain_hex, sizeof(plain_hex))) {
+        fprintf(stderr, "[t2_hook] Native TribesNext challenge: RSA operation failed\n");
+        return 0;
+    }
+    memset(plain, 0, sizeof(plain));
+    int plain_length = native_auth_hex_bytes(plain_hex, strlen(plain_hex), plain, sizeof(plain));
+    if (plain_length <= 0 || plain_length > key_bytes) return 0;
+    memmove(plain + key_bytes - plain_length, plain, (size_t)plain_length);
+    memset(plain, 0, (size_t)(key_bytes - plain_length));
+    native_auth.verified = native_auth_find_block(plain, key_bytes, native_auth.nonce, native_auth.block);
+    fprintf(stderr, "[t2_hook] Native TribesNext challenge %s\n",
+            native_auth.verified ? "answered" : "did not contain our nonce");
+    return 0;
+}
+
+/* Replaces the connect request's writeFlag(WON certificate) call. */
+static char native_auth_connect_flag(void *stream, int won_flag) {
+    if (!native_auth.verified) return bitstream_write_flag(stream, won_flag & 0xff);
+    bitstream_write_flag(stream, 1);
+    for (int i = 12; i < 52; i++) bitstream_write_int(stream, native_auth.block[i], 8);
+    memset(&native_auth, 0, sizeof(native_auth));
+    return 0;
+}
+
+static void native_auth_call(unsigned char call[5], uintptr_t site, const void *target) {
+    int32_t offset = (int32_t)((uintptr_t)target - (site + 5));
+    call[0] = 0xe8;
+    memcpy(call + 1, &offset, sizeof(offset));
+}
+
+static int install_native_auth(void) {
+    unsigned char challenge_call[5], connect_call[5], reply_read[14];
+    native_auth_call(challenge_call, NATIVE_AUTH_CHALLENGE_FLAG_CALL, (const void *)native_auth_challenge_flag);
+    native_auth_call(connect_call, NATIVE_AUTH_CONNECT_FLAG_CALL, (const void *)native_auth_connect_flag);
+    /* push %edi (the stream); call native_auth_reply_flag; add $4,%esp; jmp to the store */
+    reply_read[0] = 0x57;
+    native_auth_call(reply_read + 1, NATIVE_AUTH_REPLY_FLAG_READ + 1, (const void *)native_auth_reply_flag);
+    reply_read[6] = 0x83; reply_read[7] = 0xc4; reply_read[8] = 0x04;
+    reply_read[9] = 0xe9;
+    int32_t store = (int32_t)(NATIVE_AUTH_REPLY_FLAG_STORE - (NATIVE_AUTH_REPLY_FLAG_READ + 14));
+    memcpy(reply_read + 10, &store, sizeof(store));
+    const struct code_patch patches[] = {
+        {NATIVE_AUTH_CHALLENGE_FLAG_CALL, native_auth_challenge_call_original,
+         sizeof(native_auth_challenge_call_original), 0, challenge_call, sizeof(challenge_call)},
+        {NATIVE_AUTH_REPLY_FLAG_READ, native_auth_reply_read_original,
+         sizeof(native_auth_reply_read_original), 0, reply_read, sizeof(reply_read)},
+        {NATIVE_AUTH_CONNECT_FLAG_CALL, native_auth_connect_call_original,
+         sizeof(native_auth_connect_call_original), 0, connect_call, sizeof(connect_call)},
+    };
+    if (!apply_code_patches("Native TribesNext handshake", patches, sizeof(patches) / sizeof(patches[0])))
+        return 0;
+    fprintf(stderr, "[t2_hook] Native TribesNext handshake enabled at protocol 51 (memory only)\n");
     return 1;
 }
 
@@ -2441,6 +2671,8 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
+    if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))
+        install_native_auth();
     /* SDL reads this when it creates the window; a borderless window has no
        title bar to move it by. */
     if (hook_option_bool("video.borderless")) setenv("SDL_VIDEO_CENTERED", "1", 0);

@@ -626,6 +626,22 @@ options bring the parts of it that fit the Linux client:
   minute. Unknown files, failed downloads, and a file that is still missing
   after its download keep the stock DISCONNECTED box. Missing textures don't
   stop a map loading, so they aren't fetched.
+- **Native TribesNext authentication** (`net.native_auth`, off). QoL servers
+  can authenticate accounts in the connection handshake, and those with
+  `$Host::RequireAuth` reject clients that don't. Once the TribesNext account
+  is unlocked, the hook retargets the two `writeFlag` calls that send the WON
+  certificate flag (`0x08236844` in the challenge request, `0x08237556` in
+  the connect request) and replaces the inline flag read in the challenge
+  response (`0x082376E2`). The challenge request then carries the QoL
+  client's native flag: `0x54`, an 8-byte nonce, the server's IPv4 address,
+  and the account blob (name, GUID, the key's exponent and modulus as bytes,
+  and the 512-byte certificate signature). A QoL server answers with a
+  challenge encrypted to the account key; the hook decrypts it with
+  `rsa_helper`, finds the nonce, and sends 40 bytes of it back in the connect
+  request. QoL servers read all of this at protocol 51 as well, and their
+  protocol-52 game data would not parse in this client, so it keeps
+  announcing 51. A stock server ignores the extra bits; one logged in to WON
+  accepts the connection without checking a WON certificate.
 
 ## Development
 

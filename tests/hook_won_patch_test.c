@@ -4,6 +4,32 @@
 #include <assert.h>
 #include <sys/stat.h>
 
+/* A BitStream stand-in for the native handshake: bits in order, LSB first. */
+struct fake_stream { unsigned char bits[16384]; int length, position; };
+static char fake_write_flag(void *stream, int flag) {
+    struct fake_stream *fake = stream;
+    fake->bits[fake->length++] = (flag & 0xff) != 0;
+    return (flag & 0xff) != 0;
+}
+static void fake_write_int(void *stream, int value, int bits) {
+    struct fake_stream *fake = stream;
+    for (int i = 0; i < bits; i++) fake->bits[fake->length++] = (value >> i) & 1;
+}
+static int fake_read_int(void *stream, int bits) {
+    struct fake_stream *fake = stream;
+    int value = 0;
+    for (int i = 0; i < bits; i++)
+        if (fake->position < fake->length && fake->bits[fake->position++]) value |= 1 << i;
+    return value;
+}
+static int32_t call_target_offset(uintptr_t site) {
+    int32_t offset;
+    memcpy(&offset, (const void *)(site + 1), sizeof(offset));
+    return offset;
+}
+#define TEST_RSA_MODULUS "8302c77f71653bd46d53472094c45171bbb1b2dc8408bab25ea4b016be4da0869737ea99ca887a4869a09176c43e73eab974ccdbf9a25ab8ccbb86fa343720f600c6cd6be3a4599a2796868790a2051e15607d06b470ad281b57e66fde832e576a760fb757c8ea3f6c82ed0381caeddfcbb6a0e467fc253b1e86d3f50341ea95"
+#define TEST_RSA_PRIVATE "346782ffc6f54b21c55482d9d51b53c717e0adf1ce69e447590eacd5e5b8a69c3c7cc43d843697502a403a2f81b294c44a2eb857fd742449eb7e35fdae7c739506d703ccf3688366bd209480bc8e0a517d37ec89912132399cf3003298fef461bee2565b46084f4983a1f5accf6ead869d3d4c187b6ffa2f04c95250a26c130d"
+
 int main(void) {
     /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
        account check and warning must run unmodified. */
@@ -173,6 +199,151 @@ int main(void) {
         for (int i = 0; i < 2; i++) munmap((void *)pages[i], size);
         assert(strstr(net_options_override, "OP_PacketRateSlider.range = \"2 64\"") != NULL);
         assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
+    }
+
+    /* Native TribesNext handshake: blob layout, nonce search, the three
+       BitStream hooks against a real RSA round trip, and the code patches. */
+    {
+        unsigned char bytes[8];
+        assert(native_auth_hex_bytes("000a1b", 6, bytes, sizeof(bytes)) == 2 &&
+               bytes[0] == 0x0a && bytes[1] == 0x1b);
+        assert(native_auth_hex_bytes("5", 1, bytes, sizeof(bytes)) == 1 && bytes[0] == 5);
+        assert(native_auth_hex_bytes("00", 2, bytes, sizeof(bytes)) == 1 && bytes[0] == 0);
+        assert(native_auth_hex_bytes("xyz", 3, bytes, sizeof(bytes)) == -1);
+        assert(native_auth_hex_bytes("112233445566778899", 18, bytes, sizeof(bytes)) == -1);
+
+        static char certificate[2048], signature[1022];
+        memset(signature, '0', sizeof(signature) - 1);
+        signature[0] = '1';                    /* 1021 digits: 511 bytes, padded to 512 */
+        signature[sizeof(signature) - 1] = 0;
+        snprintf(certificate, sizeof(certificate), "Player\t0004321\t05\t%s\t%s", TEST_RSA_MODULUS, signature);
+        unsigned char blob[NATIVE_AUTH_BLOB_MAX];
+        int length = native_auth_blob(certificate, blob, sizeof(blob));
+        const char *header = "Player\t4321\t1\t129\t";
+        size_t header_length = strlen(header);
+        assert(length == (int)(header_length + 1 + 1 + 128 + 512));
+        assert(memcmp(blob, header, header_length) == 0);
+        assert(blob[header_length] == 5 && blob[header_length + 1] == 0);
+        assert(blob[header_length + 2] == 0x83 && blob[header_length + 129] == 0x95);
+        assert(blob[header_length + 130] == 0 && blob[header_length + 131] == 0x01);
+        assert(native_auth_blob("Player\t1\t05\tab", blob, sizeof(blob)) == -1);
+        snprintf(certificate, sizeof(certificate), "Player\tguid\t05\t%s\t%s", TEST_RSA_MODULUS, signature);
+        assert(native_auth_blob(certificate, blob, sizeof(blob)) == -1);
+        snprintf(certificate, sizeof(certificate), "Player\t0004321\t05\t%s\t%s", TEST_RSA_MODULUS, signature);
+
+        unsigned char plain[128] = {0}, nonce[8] = {1, 2, 3, 4, 5, 6, 7, 8}, block[64];
+        memcpy(plain + 20, nonce, 8);
+        plain[60] = 0xaa;
+        assert(native_auth_find_block(plain, 128, nonce, block) && block[40] == 0xaa);
+        memset(plain, 0, sizeof(plain));
+        memcpy(plain + 70, nonce, 8);
+        assert(!native_auth_find_block(plain, 128, nonce, block));
+
+        /* The pending connection's address (an IP NetAddress) and a real key. */
+        uintptr_t address_page = NATIVE_AUTH_SERVER_ADDRESS & ~((uintptr_t)size - 1);
+        assert(mmap((void *)address_page, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)address_page);
+        int32_t ip_type = 1;
+        memcpy((void *)NATIVE_AUTH_SERVER_ADDRESS, &ip_type, 4);
+        memcpy((void *)(NATIVE_AUTH_SERVER_ADDRESS + 4), "\x0a\x00\x00\x07", 4);
+        bitstream_write_flag = fake_write_flag;
+        bitstream_write_int = fake_write_int;
+        bitstream_read_int = fake_read_int;
+        static struct fake_stream stream;
+
+        /* Without unlocked credentials the stock WON flag goes through. */
+        tribesnext_certificate[0] = 0;
+        memset(&stream, 0, sizeof(stream));
+        assert(native_auth_challenge_flag(&stream, 0x7701) == 1 && stream.length == 1 && stream.bits[0]);
+
+        snprintf(tribesnext_certificate, sizeof(tribesnext_certificate), "%s", certificate);
+        snprintf(tribesnext_modulus, sizeof(tribesnext_modulus), "%s", TEST_RSA_MODULUS);
+        snprintf(tribesnext_private_exponent, sizeof(tribesnext_private_exponent), "%s", TEST_RSA_PRIVATE);
+        memset(&stream, 0, sizeof(stream));
+        assert(native_auth_challenge_flag(&stream, 1) == 0 && native_auth.sent);
+        assert(fake_read_int(&stream, 1) == 0 && fake_read_int(&stream, 1) == 1);
+        assert(fake_read_int(&stream, 8) == NATIVE_AUTH_MARKER);
+        for (int i = 0; i < 8; i++) assert(fake_read_int(&stream, 8) == native_auth.nonce[i]);
+        assert(fake_read_int(&stream, 8) == 10 && fake_read_int(&stream, 8) == 0 &&
+               fake_read_int(&stream, 8) == 0 && fake_read_int(&stream, 8) == 7);
+        assert(fake_read_int(&stream, 12) == length);
+        for (int i = 0; i < length; i++) assert(fake_read_int(&stream, 8) == blob[i]);
+        assert(stream.position == stream.length);
+
+        /* The server's challenge: the nonce and 56 more bytes, encrypted to the account key. */
+        char helper[4096];
+        snprintf(helper, sizeof(helper), "%s", getenv("T2LAUNCH_TEST_RSA_HELPER") ?
+                 getenv("T2LAUNCH_TEST_RSA_HELPER") : "games/tribes2/rsa_helper");
+        assert(access(helper, X_OK) == 0);
+        setenv("T2LAUNCH_RSA_HELPER", helper, 1);
+        memset(plain, 0, sizeof(plain));
+        plain[1] = 0x42;  /* nonzero bytes before the nonce are skipped */
+        memcpy(plain + 5, native_auth.nonce, 8);
+        for (int i = 13; i < 69; i++) plain[i] = (unsigned char)(i * 7);
+        char plain_hex[257], cipher_hex[2048];
+        bytes_to_hex(plain, sizeof(plain), plain_hex);
+        assert(run_rsa_helper(plain_hex, "5", TEST_RSA_MODULUS, cipher_hex, sizeof(cipher_hex)));
+        unsigned char cipher[128];
+        int cipher_length = native_auth_hex_bytes(cipher_hex, strlen(cipher_hex), cipher, sizeof(cipher));
+        assert(cipher_length >= 64 && cipher_length <= 128);
+        memset(&stream, 0, sizeof(stream));
+        fake_write_flag(&stream, 1);
+        fake_write_int(&stream, cipher_length, 9);
+        for (int i = 0; i < cipher_length; i++) fake_write_int(&stream, cipher[i], 8);
+        assert(native_auth_reply_flag(&stream) == 0 && native_auth.verified && !native_auth.sent);
+        assert(memcmp(native_auth.block, plain + 5, 64) == 0);
+
+        memset(&stream, 0, sizeof(stream));
+        assert(native_auth_connect_flag(&stream, 0) == 0);
+        assert(fake_read_int(&stream, 1) == 1);
+        for (int i = 12; i < 52; i++) assert(fake_read_int(&stream, 8) == plain[5 + i]);
+        assert(stream.position == stream.length && !native_auth.verified);
+        memset(&stream, 0, sizeof(stream));
+        assert(native_auth_connect_flag(&stream, 1) == 1 && stream.length == 1);
+
+        /* A stock server's WON flag reaches the stock code unchanged. */
+        memset(&stream, 0, sizeof(stream));
+        fake_write_flag(&stream, 1);
+        assert(native_auth_reply_flag(&stream) == 1);
+        memset(&stream, 0, sizeof(stream));
+        fake_write_flag(&stream, 0);
+        assert(native_auth_reply_flag(&stream) == 0);
+        munmap((void *)address_page, size);
+        tribesnext_certificate[0] = tribesnext_modulus[0] = tribesnext_private_exponent[0] = 0;
+
+        /* The patches: two calls retargeted and the inline flag read replaced. */
+        uintptr_t pages[2] = {0x08236000, 0x08237000};
+        for (int i = 0; i < 2; i++)
+            assert(mmap((void *)pages[i], size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)pages[i]);
+        memcpy((void *)NATIVE_AUTH_CHALLENGE_FLAG_CALL, native_auth_challenge_call_original, 5);
+        memcpy((void *)NATIVE_AUTH_CONNECT_FLAG_CALL, native_auth_connect_call_original, 5);
+        memcpy((void *)NATIVE_AUTH_REPLY_FLAG_READ, native_auth_reply_read_original,
+               sizeof(native_auth_reply_read_original));
+        ((unsigned char *)NATIVE_AUTH_REPLY_FLAG_READ)[13] = 0x01;
+        for (int i = 0; i < 2; i++) assert(mprotect((void *)pages[i], size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_native_auth());
+        assert(memcmp((void *)NATIVE_AUTH_CHALLENGE_FLAG_CALL, native_auth_challenge_call_original, 5) == 0);
+        assert(mprotect((void *)pages[1], size, PROT_READ | PROT_WRITE) == 0);
+        ((unsigned char *)NATIVE_AUTH_REPLY_FLAG_READ)[13] = 0x00;
+        assert(mprotect((void *)pages[1], size, PROT_READ | PROT_EXEC) == 0);
+        assert(NATIVE_AUTH_CHALLENGE_FLAG_CALL + 5 + call_target_offset(NATIVE_AUTH_CHALLENGE_FLAG_CALL) ==
+               BITSTREAM_WRITE_FLAG);
+        assert(NATIVE_AUTH_CONNECT_FLAG_CALL + 5 + call_target_offset(NATIVE_AUTH_CONNECT_FLAG_CALL) ==
+               BITSTREAM_WRITE_FLAG);
+        assert(install_native_auth());
+        assert(NATIVE_AUTH_CHALLENGE_FLAG_CALL + 5 + call_target_offset(NATIVE_AUTH_CHALLENGE_FLAG_CALL) ==
+               (uintptr_t)native_auth_challenge_flag);
+        assert(NATIVE_AUTH_CONNECT_FLAG_CALL + 5 + call_target_offset(NATIVE_AUTH_CONNECT_FLAG_CALL) ==
+               (uintptr_t)native_auth_connect_flag);
+        const unsigned char *reply = (const unsigned char *)NATIVE_AUTH_REPLY_FLAG_READ;
+        assert(reply[0] == 0x57 && reply[1] == 0xe8 && reply[6] == 0x83 && reply[7] == 0xc4 &&
+               reply[8] == 0x04 && reply[9] == 0xe9);
+        assert(NATIVE_AUTH_REPLY_FLAG_READ + 6 + call_target_offset(NATIVE_AUTH_REPLY_FLAG_READ + 1) ==
+               (uintptr_t)native_auth_reply_flag);
+        assert(NATIVE_AUTH_REPLY_FLAG_READ + 14 + call_target_offset(NATIVE_AUTH_REPLY_FLAG_READ + 9) ==
+               NATIVE_AUTH_REPLY_FLAG_STORE);
+        for (int i = 0; i < 2; i++) munmap((void *)pages[i], size);
     }
 
     /* Locked arrays: only the exact extension token is removed. */

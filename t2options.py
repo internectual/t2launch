@@ -172,6 +172,11 @@ OPTIONS = (
            help="When a server's map needs an interior, shape or terrain you don't have, fetch it "
                 "from depot.tribes2.net into ~/.loki/tribes2/base, check its MD5 and rejoin. "
                 "Missing textures don't stop a map loading and aren't fetched."),
+    Option("net.native_auth", "Network", "TribesNext native authentication", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)), ("hook.tribesnext", (True,))),
+           help="Prove your TribesNext account in the connection handshake, as the QoL client "
+                "does, so servers that require it ($Host::RequireAuth) let you in. Replaces the "
+                "WON certificate in the handshake; the game still connects at protocol 51."),
     # Gamescope
     Option("video.gamescope", "Gamescope", "Run inside gamescope", "bool", False,
            env="T2LAUNCH_GAMESCOPE",
