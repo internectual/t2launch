@@ -423,6 +423,7 @@ launch_game() {
     GAME_ENV+=(__GL_ExtensionStringVersion=17700
                "T2LAUNCH_GAME_DIR=$HOST_GAME_PATH"
                "T2LAUNCH_RSA_HELPER=$support_dir/rsa_helper"
+               "T2LAUNCH_DEPOT_HELPER=$REPO_DIR/depot.py"
                "T2_GAME_DIR=$HOST_GAME_PATH"
                "T2_LIBRARY_PATH=$compat_dir:$HOST_GAME_PATH"
                "T2_GAME_AUDIT=$support_dir/t2_realign.so"

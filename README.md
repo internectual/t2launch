@@ -610,6 +610,22 @@ options bring the parts of it that fit the Linux client:
   Rendering the game below the output size and upscaling it is the Linux
   stand-in for the update's UI scaling; keep the game windowed at the game
   size.
+- **Missing map files** (`net.depot_downloads`, off). When a server's map
+  uses an interior, shape, or terrain the client lacks, the game disconnects
+  with "Unable to load interior: X", "Unable to load shape: X", or "You are
+  missing a file needed to play this mission: X". With this option the hook
+  wraps the stock `onConnectionToServerLost` in a package: `depot.py` looks
+  the file up in the TribesNext depot index
+  (`https://www.tribesnext.com/files/depot.txt`, cached for a day), downloads
+  it from `depot.tribes2.net`, checks its size and MD5, and saves it under
+  `~/.loki/tribes2/base/interiors`, `shapes`, or `terrains` with the name the
+  game asked for. The game then rescans with `setModPaths(getModPaths())`
+  and rejoins, once per missing file and up to 32 files per server. A server
+  that answers the rejoin with "Server is cycling missions" (a map change,
+  or an empty server reloading its map) is retried every 5 seconds for a
+  minute. Unknown files, failed downloads, and a file that is still missing
+  after its download keep the stock DISCONNECTED box. Missing textures don't
+  stop a map loading, so they aren't fetched.
 
 ## Development
 
@@ -632,6 +648,7 @@ t2launch/
 ├── woncrypto.py               # WON wire-format crypto
 ├── community_store.py         # SQLite community store
 ├── tribesnext.py              # TribesNext certificate/challenge/account helpers
+├── depot.py                   # TribesNext depot download for missing map files
 ├── t2options.py               # Profile option declarations
 ├── t2launch_app.py            # Desktop launcher
 ├── install.sh                 # Launcher installer and dependency check

@@ -166,6 +166,12 @@ OPTIONS = (
            help="Raise the client's 32/s and 450-byte limits so QoL-patched TribesNext servers can "
                 "send more, and add a matching \"TribesNext QoL\" network preset. Stock servers "
                 "still send at their own limits."),
+    Option("net.depot_downloads", "Network", "Download missing map files from the TribesNext depot",
+           "bool", False, hook=True,
+           requires=(("launcher.load_hook", (True,)), ("hook.console_commands", (True,))),
+           help="When a server's map needs an interior, shape or terrain you don't have, fetch it "
+                "from depot.tribes2.net into ~/.loki/tribes2/base, check its MD5 and rejoin. "
+                "Missing textures don't stop a map loading and aren't fetched."),
     # Gamescope
     Option("video.gamescope", "Gamescope", "Run inside gamescope", "bool", False,
            env="T2LAUNCH_GAMESCOPE",

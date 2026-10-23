@@ -8,7 +8,7 @@ int main(void) {
     /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
        account check and warning must run unmodified. */
     const char *scripts[] = {core_runtime_script, tribesnext_runtime_script,
-                             player_pane_button_click_override};
+                             player_pane_button_click_override, depot_downloads_script};
     for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); ++i) {
         assert(strstr(scripts[i], "function checkNamesAndAliases") == NULL);
         assert(strstr(scripts[i], "function LaunchGui::onWake") == NULL);
@@ -237,6 +237,45 @@ int main(void) {
     }
     assert(strcmp(result, "1|https://www.tribesnext.com/?a=1&b=$HOME|unset") == 0);
     unlink(opened); unlink(fake_open); rmdir(bin_dir);
+
+    /* Depot downloads: the helper gets the file name after "--", runs without
+       the game's loader settings, and its one output line is the status. */
+    assert(strcmp(hook_depot_status_cb(NULL, 1, NULL), "error no download is running") == 0);
+    char depot_dir[] = "/tmp/t2_hook_depot_XXXXXX";
+    assert(mkdtemp(depot_dir));
+    char fake_depot[96];
+    snprintf(fake_depot, sizeof(fake_depot), "%s/depot.py", depot_dir);
+    script = fopen(fake_depot, "w");
+    assert(script);
+    fprintf(script, "#!/bin/sh\n[ \"$#|$1|$3|${LD_PRELOAD-unset}\" = \"4|--dest|--|unset\" ] || exit 2\n"
+                    "[ \"$4\" = 'missing map.ter' ] || { echo \"error not in the depot\"; exit 1; }\n"
+                    "echo \"ok $2/terrains/$4\"\n");
+    fclose(script);
+    assert(chmod(fake_depot, 0700) == 0);
+    const char *depot_args[] = {"hook_depot_fetch", "missing map.ter"};
+    unsetenv("T2LAUNCH_DEPOT_HELPER");
+    assert(strcmp(hook_depot_fetch_cb(NULL, 2, depot_args), "0") == 0);
+    setenv("T2LAUNCH_DEPOT_HELPER", fake_depot, 1);
+    setenv("HOME", "/home/player", 1);
+    setenv("LD_PRELOAD", "/nonexistent/t2_hook.so", 1);
+    assert(strcmp(hook_depot_fetch_cb(NULL, 2, depot_args), "1") == 0);
+    assert(strcmp(hook_depot_fetch_cb(NULL, 2, depot_args), "0") == 0);  /* one at a time */
+    unsetenv("LD_PRELOAD");
+    const char *depot_status = "running";
+    for (int tries = 0; tries < 250 && strcmp(depot_status, "running") == 0; tries++) {
+        usleep(20000);
+        depot_status = hook_depot_status_cb(NULL, 1, NULL);
+    }
+    assert(strcmp(depot_status, "ok /home/player/.loki/tribes2/base/terrains/missing map.ter") == 0);
+    depot_args[1] = "other.dif";
+    assert(strcmp(hook_depot_fetch_cb(NULL, 2, depot_args), "1") == 0);
+    depot_status = "running";
+    for (int tries = 0; tries < 250 && strcmp(depot_status, "running") == 0; tries++) {
+        usleep(20000);
+        depot_status = hook_depot_status_cb(NULL, 1, NULL);
+    }
+    assert(strcmp(depot_status, "error not in the depot") == 0);
+    unlink(fake_depot); rmdir(depot_dir);
 
     char path[64];
     setenv("T2LAUNCH_GAME_DIR", "/games/t2", 1);

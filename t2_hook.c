@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -48,6 +49,7 @@ static volatile int shell_audio_setup_done = 0;
 static volatile int player_pane_override_installed = 0;
 static volatile int filter_max_bots_override_installed = 0;
 static volatile int net_options_override_installed = 0;
+static volatile int depot_downloads_installed = 0;
 static volatile int vsync_support_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
@@ -91,6 +93,7 @@ static struct hook_option hook_options[] = {
     {"video.vsync", "1", NULL, 0, "", 0},
     {"video.gamma", "1", NULL, 0, "", 0},
     {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
+    {"net.depot_downloads", "0", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -226,18 +229,26 @@ static const char *web_link_url(const char *command) {
     return url;
 }
 
-static int open_web_link(const char *url) {
-    /* xdg-open and the browser are 64-bit; leave the game's loader settings behind. */
+/* The environment without the game's loader settings, for 64-bit helpers.
+   The caller frees the array, not its strings. */
+static char **helper_environment(void) {
     size_t count = 0;
     while (environ[count]) count++;
     char **env = malloc((count + 1) * sizeof(*env));
-    if (!env) return -1;
+    if (!env) return NULL;
     size_t kept = 0;
     for (size_t i = 0; i < count; i++)
         if (strncmp(environ[i], "LD_PRELOAD=", 11) != 0 && strncmp(environ[i], "LD_AUDIT=", 9) != 0 &&
             strncmp(environ[i], "LD_LIBRARY_PATH=", 16) != 0)
             env[kept++] = environ[i];
     env[kept] = NULL;
+    return env;
+}
+
+static int open_web_link(const char *url) {
+    /* xdg-open and the browser are 64-bit; leave the game's loader settings behind. */
+    char **env = helper_environment();
+    if (!env) return -1;
     char *argv[] = {"xdg-open", (char *)url, NULL};
     pid_t child = fork();
     if (child == 0) {
@@ -389,6 +400,84 @@ static const char net_options_override[] =
     "if (isObject(OP_NetworkPresetsMenu) && OP_NetworkPresetsMenu.size())\n"
     " OP_NetworkPresetsMenu.add(\"TribesNext QoL\", $NetworkPresetCount);\n"
     "$NetworkPresetCount++;\n";
+
+/* The stock client disconnects when a mission needs an interior, shape or
+   terrain it doesn't have. Fetch that file from the TribesNext depot with
+   hook_depot_fetch(), rescan the mod paths so the game sees it, and rejoin;
+   repeat for each further missing file. Anything else, a file already tried
+   on this server, or a failed download keeps the stock DISCONNECTED box. */
+static const char depot_downloads_script[] =
+    "function t2launch_depotFile(%msg) {\n"
+    " for (%i = 0; %i < 3; %i++) {\n"
+    "  %prefix = getField(\"Unable to load interior: \\tUnable to load shape: \\t"
+    "You are missing a file needed to play this mission: \", %i);\n"
+    "  %at = strstr(%msg, %prefix);\n"
+    "  if (%at >= 0) {\n"
+    "   %file = trim(getSubStr(%msg, %at + strlen(%prefix), 1000));\n"
+    "   if (getSubStr(%file, strlen(%file) - 1, 1) $= \".\") %file = getSubStr(%file, 0, strlen(%file) - 1);\n"
+    "   return %file;\n"
+    "  }\n"
+    " }\n"
+    " return \"\";\n"
+    "}\n"
+    "function t2launch_depotPoll() {\n"
+    " %status = hook_depot_status();\n"
+    " if (%status $= \"running\") { schedule(250, 0, \"t2launch_depotPoll\"); return; }\n"
+    " CloseMessagePopup();\n"
+    " %detail = getSubStr(%status, strlen(getWord(%status, 0)) + 1, 1000);\n"
+    " if (getWord(%status, 0) $= \"ok\") {\n"
+    "  echo(\"TribesNext depot: saved \" @ %detail);\n"
+    "  setModPaths(getModPaths());\n"
+    "  $T2Launch::DepotRetries = 12;\n"
+    "  JoinGame($T2Launch::DepotAddress);\n"
+    "  return;\n"
+    " }\n"
+    " MessageBoxOK(\"DISCONNECTED\", $T2Launch::DepotMessage NL \"\" NL \"The TribesNext depot download failed: \" @ %detail);\n"
+    "}\n"
+    /* The server may be changing maps when the rejoin arrives; it refuses
+       connections until the new map is loaded, so try again for a minute. */
+    "function t2launch_depotRetry(%msg) {\n"
+    " if ($T2Launch::DepotRetries <= 0 || strstr(%msg, \"cycling missions\") < 0) return 0;\n"
+    " $T2Launch::DepotRetries--;\n"
+    " echo(\"TribesNext depot: \" @ %msg @ \" Retrying in 5 seconds.\");\n"
+    " CloseMessagePopup();\n"
+    " DisconnectedCleanup();\n"
+    " MessagePopup(\"REJOINING\", \"The server is changing maps. Rejoining in a moment...\");\n"
+    " schedule(5000, 0, \"JoinGame\", $T2Launch::DepotAddress);\n"
+    " return 1;\n"
+    "}\n"
+    "package T2LaunchDepot {\n"
+    "function onChallengeRequestRejected(%msg) {\n"
+    " if (!t2launch_depotRetry(%msg)) Parent::onChallengeRequestRejected(%msg);\n"
+    "}\n"
+    "function onConnectRequestRejected(%msg) {\n"
+    " if (!t2launch_depotRetry(%msg)) Parent::onConnectRequestRejected(%msg);\n"
+    "}\n"
+    "function JoinGame(%address) {\n"
+    " if (%address !$= $T2Launch::DepotAddress) {\n"
+    "  $T2Launch::DepotAddress = %address; $T2Launch::DepotTried = \"\"; $T2Launch::DepotCount = 0;\n"
+    "  $T2Launch::DepotRetries = 0;\n"
+    " }\n"
+    " Parent::JoinGame(%address);\n"
+    "}\n"
+    "function onConnectionToServerLost(%msg) {\n"
+    " %file = t2launch_depotFile(%msg);\n"
+    " if ($T2Launch::DepotAddress $= \"\") $T2Launch::DepotAddress = $JoinGameAddress;\n"
+    " if (%file $= \"\" || $T2Launch::DepotAddress $= \"\" || $T2Launch::DepotCount >= 32 ||\n"
+    "     strstr(\"\\t\" @ $T2Launch::DepotTried @ \"\\t\", \"\\t\" @ %file @ \"\\t\") >= 0 ||\n"
+    "     hook_depot_fetch(%file) !$= \"1\") {\n"
+    "  Parent::onConnectionToServerLost(%msg);\n"
+    "  return;\n"
+    " }\n"
+    " $T2Launch::DepotTried = $T2Launch::DepotTried @ \"\\t\" @ %file;\n"
+    " $T2Launch::DepotCount++;\n"
+    " $T2Launch::DepotMessage = %msg;\n"
+    " DisconnectedCleanup();\n"
+    " MessagePopup(\"DOWNLOADING\", \"Fetching \" @ %file @ \" from the TribesNext depot...\");\n"
+    " schedule(250, 0, \"t2launch_depotPoll\");\n"
+    "}\n"
+    "};\n"
+    "activatePackage(T2LaunchDepot);\n";
 
 #define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
@@ -1535,6 +1624,12 @@ void SDL_GL_SwapBuffers(void) {
                 net_options_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime network options ranges 64/s and 1000 bytes\n");
             }
+            if (!depot_downloads_installed && hook_option_bool("net.depot_downloads") &&
+                hook_option_bool("hook.console_commands")) {
+                Con__evaluate(depot_downloads_script, 0, "t2launch/depot.cs", 0);
+                depot_downloads_installed = 1;
+                fprintf(stderr, "[t2_hook] Installed runtime TribesNext depot downloads\n");
+            }
             if (!vsync_support_installed && hook_option_bool("video.vsync")) {
                 Con__evaluate("$SwapIntervalSupported = 1;"
                               " setVerticalSync(!$pref::Video::disableVerticalSync);", 0, NULL, 0);
@@ -2156,6 +2251,75 @@ static const char *set_vertical_sync_cb(void *obj, S32 argc, const char **argv) 
     return done ? "1" : "0";
 }
 
+/* One depot helper at a time; its single output line becomes the status. */
+static pid_t depot_child = -1;
+static int depot_output = -1;
+static char depot_result[512];
+static size_t depot_result_length;
+
+static const char *hook_depot_fetch_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc;
+    const char *helper = getenv("T2LAUNCH_DEPOT_HELPER");
+    const char *home = getenv("HOME");
+    char destination[4096];
+    if (depot_child > 0 || !helper || !helper[0] || access(helper, X_OK) != 0 ||
+        !home || !home[0] || !argv[1][0])
+        return "0";
+    snprintf(destination, sizeof(destination), "%s/.loki/tribes2/base", home);
+    char **env = helper_environment();
+    int output[2];
+    if (!env) return "0";
+    if (pipe(output) != 0) { free(env); return "0"; }
+    char *args[] = {(char *)helper, "--dest", destination, "--", (char *)argv[1], NULL};
+    pid_t child = fork();
+    if (child == 0) {
+        dup2(output[1], STDOUT_FILENO);
+        close(output[0]); close(output[1]);
+        execve(helper, args, env);
+        _exit(127);
+    }
+    free(env);
+    close(output[1]);
+    if (child < 0) { close(output[0]); return "0"; }
+    fcntl(output[0], F_SETFL, fcntl(output[0], F_GETFL) | O_NONBLOCK);
+    depot_child = child;
+    depot_output = output[0];
+    depot_result_length = 0;
+    depot_result[0] = 0;
+    fprintf(stderr, "[t2_hook] Fetching %s from the TribesNext depot\n", argv[1]);
+    return "1";
+}
+
+static void read_depot_output(void) {
+    while (depot_result_length < sizeof(depot_result) - 1) {
+        ssize_t count = read(depot_output, depot_result + depot_result_length,
+                             sizeof(depot_result) - 1 - depot_result_length);
+        if (count <= 0) break;
+        depot_result_length += (size_t)count;
+    }
+    depot_result[depot_result_length] = 0;
+}
+
+static const char *hook_depot_status_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (depot_child <= 0) return "error no download is running";
+    read_depot_output();
+    int status = 0;
+    pid_t done = waitpid(depot_child, &status, WNOHANG);
+    if (done == 0) return "running";
+    read_depot_output();
+    close(depot_output);
+    depot_output = -1;
+    depot_child = -1;
+    depot_result[strcspn(depot_result, "\r\n")] = 0;
+    int ok = done > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+             strncmp(depot_result, "ok ", 3) == 0;
+    if (!ok && strncmp(depot_result, "error ", 6) != 0)
+        snprintf(depot_result, sizeof(depot_result), "error the depot helper failed");
+    fprintf(stderr, "[t2_hook] TribesNext depot: %s\n", depot_result);
+    return depot_result;
+}
+
 static int register_hook_commands(void) {
     if (registered) return 1;
     uint32_t console_ptr = *(volatile uint32_t *)CONSOLE_GLOBAL;
@@ -2199,6 +2363,12 @@ static int register_hook_commands(void) {
         "hook_tn_ip_trace <ip> <hex> - safe challenge address diagnostics", 3, 3);
     Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
         "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
+    if (hook_option_bool("net.depot_downloads")) {
+        Con__addMethodS(NULL, "hook_depot_fetch", hook_depot_fetch_cb,
+            "hook_depot_fetch <file> - fetch a missing map file from the TribesNext depot", 2, 2);
+        Con__addMethodS(NULL, "hook_depot_status", hook_depot_status_cb,
+            "hook_depot_status - running, ok <path> or error <reason>", 1, 1);
+    }
     registered = 1;
     fprintf(stderr, "[t2_hook] Registered 15 commands on the game thread (table_size=%d)\n", table_size);
     return 1;
