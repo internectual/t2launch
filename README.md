@@ -512,6 +512,47 @@ need handling on current 32-bit libraries:
 `MESA_EXTENSION_MAX_YEAR=2000` and `__GL_ExtensionStringVersion=17700` keep the
 GL extension string short enough for the client's fixed buffer.
 
+### Game clock
+
+The Linux client's `Platform::getRealMilliseconds` (`0x081CFA44`) divides
+`rdtsc` ticks by a rate it measures against `gettimeofday` for 100 ms at
+startup, the same timestamp-counter clock behind the Windows multi-core
+speed-up reports. CPUs that report `constant_tsc` and `nonstop_tsc`, with the
+kernel's clocksource set to `tsc`, keep the counter in step across cores. Older
+multi-core CPUs, some virtual machines, and hosts whose kernel marks the TSC
+unstable do not. With the **Game clock from the system monotonic clock** hook
+option (`runtime.monotonic_clock`, on by default) the hook checks the
+function's prologue and replaces it in memory with a jump to a
+`CLOCK_MONOTONIC` clock before the game starts. The log names the kernel
+clocksource. No CPU affinity is needed.
+
+### Other reported Tribes 2 issues
+
+- **Network rates.** The engine limits packet rate to 32 per second each way
+  and packet size to 450 bytes. The stock defaults are the 56K preset
+  (16/20/240); the stock Options → Network **T1/LAN** preset already sets the
+  maximum (32/32/450). Servers set the same `$pref::Net::` values in their
+  ServerPrefs. No hook change is needed.
+- **Crash dialogs and server restarts.** On Linux a crash does not wait on a
+  dialog: Loki's signal handler prints `BUG! (Segmentation Fault)  Going down
+  hard...` and exits. `$pref::Engine::ExitOnException` and
+  `purgeNativeTextures()` do not exist in the Linux binaries. The stock scripts
+  already call `purgeResources()` on each mission load. Dedicated servers run
+  `tribes2d`, which the hook does not load into; the stock
+  `tribes2d-restart.sh` restarts it after a crash.
+- **Servers with many bots.** `queryMasterServer()` given only a port (the
+  browser's "All servers") defaults the maximum bot count to 16
+  (`0x082E6B23`), and the client drops servers reporting more;
+  `ChooseFilterDlg.cs` also clamps a filter's Max Bots to 16. With **List
+  servers with more than 16 bots** (`browser.many_bots`, on by default) the
+  hook raises the default to 255 in memory and redefines
+  `FilterEditDlg::setMaxBots` at runtime to allow 0-255. Counts are compared
+  unsigned, so values above 127 are handled as written. A server reporting
+  200 players, 255 maximum, and 150 bots lists and opens its info dialog
+  without the crash reported for the Windows client. A player list longer
+  than one 1500-byte reply (200 rows, 4803 bytes declared, 1446 sent) shows
+  the 62 complete rows that arrived.
+
 ## Development
 
 ### Repository layout

@@ -81,6 +81,60 @@ int main(void) {
     assert(readable_range((uintptr_t)a, 15, &protection));
     assert(protection == PROT_READ);
     munmap(mapping, size);
+    /* The game clock jumps to the CLOCK_MONOTONIC replacement only over the
+       expected getRealMilliseconds prologue, and restores the protection. */
+    page = REAL_MILLISECONDS_ADDRESS & ~((uintptr_t)size - 1);
+    mapping = mmap((void *)page, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    assert(mapping == (void *)page);
+    unsigned char *timer = (unsigned char *)REAL_MILLISECONDS_ADDRESS;
+    memcpy(timer, real_milliseconds_original, sizeof(real_milliseconds_original));
+    timer[7] = 0x10;
+    assert(mprotect(mapping, size, PROT_READ | PROT_EXEC) == 0);
+    assert(!install_monotonic_clock());
+    assert(timer[0] == 0x0f);
+    assert(mprotect(mapping, size, PROT_READ | PROT_WRITE) == 0);
+    timer[7] = 0x14;
+    assert(mprotect(mapping, size, PROT_READ | PROT_EXEC) == 0);
+    assert(install_monotonic_clock());
+    int32_t offset;
+    memcpy(&offset, timer + 1, sizeof(offset));
+    assert(timer[0] == 0xe9);
+    assert(REAL_MILLISECONDS_ADDRESS + 5 + (uintptr_t)offset == (uintptr_t)monotonic_real_milliseconds);
+    assert(memcmp(timer + 5, real_milliseconds_original + 5, 3) == 0);
+    assert(readable_range(REAL_MILLISECONDS_ADDRESS, 5, &protection));
+    assert(protection == (PROT_READ | PROT_EXEC));
+    uint32_t (*patched_clock)(void) = (uint32_t (*)(void))REAL_MILLISECONDS_ADDRESS;
+    uint32_t before = patched_clock();
+    struct timespec pause = {0, 20 * 1000000};
+    nanosleep(&pause, NULL);
+    uint32_t after = patched_clock();
+    assert(after >= before + 19 && after < before + 1000);
+    munmap(mapping, size);
+
+    /* The browser's default bot limit changes only over the expected code. */
+    page = BROWSER_BOT_LIMIT_ADDRESS & ~((uintptr_t)size - 1);
+    mapping = mmap((void *)page, size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    assert(mapping == (void *)page);
+    unsigned char *bot_limit = (unsigned char *)BROWSER_BOT_LIMIT_ADDRESS;
+    memcpy(bot_limit, browser_bot_limit_original, sizeof(browser_bot_limit_original));
+    bot_limit[9] = 0x07;
+    assert(mprotect(mapping, size, PROT_READ | PROT_EXEC) == 0);
+    assert(!install_browser_bot_limit());
+    assert(bot_limit[1] == 0x10);
+    assert(mprotect(mapping, size, PROT_READ | PROT_WRITE) == 0);
+    bot_limit[9] = 0x06;
+    assert(mprotect(mapping, size, PROT_READ | PROT_EXEC) == 0);
+    assert(install_browser_bot_limit());
+    assert(bot_limit[0] == 0xb8 && bot_limit[1] == 0xff);
+    assert(memcmp(bot_limit + 2, browser_bot_limit_original + 2, sizeof(browser_bot_limit_original) - 2) == 0);
+    assert(readable_range(BROWSER_BOT_LIMIT_ADDRESS, 2, &protection));
+    assert(protection == (PROT_READ | PROT_EXEC));
+    munmap(mapping, size);
+    assert(strstr(filter_max_bots_override, "function FilterEditDlg::setMaxBots(%this)") != NULL);
+    assert(strstr(filter_max_bots_override, "> 255") != NULL);
+
     char path[64];
     setenv("T2LAUNCH_GAME_DIR", "/games/t2", 1);
     assert(strcmp(game_path(path, sizeof(path), "base/public.store"),
@@ -103,6 +157,6 @@ int main(void) {
     assert(!parse_won_endpoints("a:1,,b:2", NULL, slots));
     assert(!parse_won_endpoints("", "70000", slots));
 
-    puts("Hook mode enumeration and WON patch: host modes preserved, replacement and permissions passed");
+    puts("Hook mode enumeration, WON patch, game clock, and browser bot limit: host modes preserved, replacement and permissions passed");
     return 0;
 }

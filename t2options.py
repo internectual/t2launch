@@ -132,6 +132,11 @@ OPTIONS = (
     Option("video.xrandr_modes", "Video", "Offer the display's real video modes", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Replace Tribes 2's short built-in windowed mode list with the host's modes."),
+    # Server browser
+    Option("browser.many_bots", "Server browser", "List servers with more than 16 bots", "bool", True,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="The browser hides servers with more than 16 bots unless a filter allows more, "
+                "and the filter editor stops at 16. Raise both limits to 255."),
     # Audio
     Option("audio.openal_volume_fix", "Audio", "Volume slider fix", "bool", True,
            env="T2LAUNCH_OPENAL_VOLUME_FIX",
@@ -144,6 +149,10 @@ OPTIONS = (
     Option("runtime.thread_join_guard", "Runtime", "Guard detached-thread joins", "bool", True,
            hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
            help="Refuse the client's joins on detached threads, which crash modern glibc."),
+    Option("runtime.monotonic_clock", "Runtime", "Game clock from the system monotonic clock", "bool",
+           True, hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Time the game with CLOCK_MONOTONIC instead of the CPU's timestamp counter, which "
+                "can run fast or jump between cores on some CPUs and virtual machines."),
     # Debugging
     Option("debug.trace_connects", "Debugging", "Trace resolver and connect() calls", "bool",
            False, env="T2LAUNCH_TRACE_CONNECTS", advanced=True,

@@ -42,6 +42,7 @@ static volatile int core_runtime_installed = 0;
 static volatile int tribesnext_runtime_installed = 0;
 static volatile int shell_audio_setup_done = 0;
 static volatile int player_pane_override_installed = 0;
+static volatile int filter_max_bots_override_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -75,6 +76,8 @@ static struct hook_option hook_options[] = {
     {"video.xrandr_modes", "1", NULL, 0, "", 0},
     {"audio.launch_reset", "1", NULL, 0, "", 0},
     {"runtime.thread_join_guard", "1", NULL, 0, "", 0},
+    {"runtime.monotonic_clock", "1", NULL, 0, "", 0},
+    {"browser.many_bots", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -292,6 +295,15 @@ static const char tribesnext_runtime_script[] =
     " hook_tn_trace(\"response_sent\");\n"
     "}\n"
       "t2launch_tnUnlockPoll();\n";
+
+/* ChooseFilterDlg.cs clamps a filter's Max Bots field to 16; allow the full
+   0-255 a server can report, matching install_browser_bot_limit(). */
+static const char filter_max_bots_override[] =
+    "function FilterEditDlg::setMaxBots(%this) {\n"
+    " %newMax = FilterEditMaxBots.getValue();\n"
+    " if (%newMax < 0) FilterEditMaxBots.setValue(0);\n"
+    " else if (%newMax > 255) FilterEditMaxBots.setValue(255);\n"
+    "}\n";
 
 #define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
@@ -656,6 +668,95 @@ static int redirect_won_bootstrap(void) {
     return 1;
 }
 
+/* Platform::getRealMilliseconds divides rdtsc ticks by a rate it measures for
+   100 ms at startup. On CPUs and VMs whose timestamp counters are not
+   synchronized or constant across cores, game time runs fast or jumps as the
+   thread migrates. Jump to a CLOCK_MONOTONIC replacement instead. */
+#define REAL_MILLISECONDS_ADDRESS 0x081CFA44
+static const unsigned char real_milliseconds_original[] = {0x0f, 0x31, 0x55, 0x89, 0xe5, 0x83, 0xec, 0x14};
+static struct timespec monotonic_clock_base;
+
+static uint32_t monotonic_real_milliseconds(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int64_t elapsed = (int64_t)(now.tv_sec - monotonic_clock_base.tv_sec) * 1000 +
+        (now.tv_nsec - monotonic_clock_base.tv_nsec) / 1000000;
+    return (uint32_t)elapsed;
+}
+
+static int install_monotonic_clock(void) {
+    uintptr_t address = REAL_MILLISECONDS_ADDRESS;
+    int protection;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+    uintptr_t page = address & ~((uintptr_t)page_size - 1);
+    if (!readable_range(address, sizeof(real_milliseconds_original), &protection) ||
+        !(protection & PROT_EXEC) || address + 5 > page + (uintptr_t)page_size ||
+        memcmp((void *)address, real_milliseconds_original, sizeof(real_milliseconds_original)) != 0) {
+        fprintf(stderr, "[t2_hook] Game clock patch refused: unexpected code at 0x%08lx\n",
+                (unsigned long)address);
+        return 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &monotonic_clock_base);
+    unsigned char jump[5] = {0xe9};
+    int32_t offset = (int32_t)((uintptr_t)monotonic_real_milliseconds - (address + sizeof(jump)));
+    memcpy(jump + 1, &offset, sizeof(offset));
+    if (mprotect((void *)page, (size_t)page_size, protection | PROT_WRITE) != 0) {
+        fprintf(stderr, "[t2_hook] Game clock patch: mprotect failed: %s\n", strerror(errno));
+        return 0;
+    }
+    memcpy((void *)address, jump, sizeof(jump));
+    if (mprotect((void *)page, (size_t)page_size, protection) != 0) {
+        fprintf(stderr, "[t2_hook] Game clock patch: restoring page permissions failed: %s\n", strerror(errno));
+        return 0;
+    }
+    char clocksource[64] = "unknown";
+    FILE *source = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "r");
+    if (source) {
+        if (fgets(clocksource, sizeof(clocksource), source)) trim_space(clocksource);
+        fclose(source);
+    }
+    fprintf(stderr, "[t2_hook] Game clock: CLOCK_MONOTONIC instead of rdtsc (kernel clocksource %s, memory only)\n",
+            clocksource);
+    return 1;
+}
+
+/* queryMasterServer() given only a port (the browser's "All servers")
+   defaults its maximum bot count to 16 with `mov $0x10,%eax`, and the client
+   drops any server reporting more. Raise the default to 255, the largest
+   count a server can report. The context bytes (push %eax; cmpl $6,argc)
+   pin the instruction inside the console wrapper. */
+#define BROWSER_BOT_LIMIT_ADDRESS 0x082E6B23
+static const unsigned char browser_bot_limit_original[] =
+    {0xb8, 0x10, 0x00, 0x00, 0x00, 0x50, 0x83, 0x7d, 0x0c, 0x06};
+
+static int install_browser_bot_limit(void) {
+    uintptr_t address = BROWSER_BOT_LIMIT_ADDRESS;
+    int protection;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+    uintptr_t page = address & ~((uintptr_t)page_size - 1);
+    if (!readable_range(address, sizeof(browser_bot_limit_original), &protection) ||
+        !(protection & PROT_EXEC) || address + 2 > page + (uintptr_t)page_size ||
+        memcmp((void *)address, browser_bot_limit_original, sizeof(browser_bot_limit_original)) != 0) {
+        fprintf(stderr, "[t2_hook] Browser bot limit patch refused: unexpected code at 0x%08lx\n",
+                (unsigned long)address);
+        return 0;
+    }
+    if (mprotect((void *)page, (size_t)page_size, protection | PROT_WRITE) != 0) {
+        fprintf(stderr, "[t2_hook] Browser bot limit patch: mprotect failed: %s\n", strerror(errno));
+        return 0;
+    }
+    *(volatile unsigned char *)(address + 1) = 0xff;
+    if (mprotect((void *)page, (size_t)page_size, protection) != 0) {
+        fprintf(stderr, "[t2_hook] Browser bot limit patch: restoring page permissions failed: %s\n",
+                strerror(errno));
+        return 0;
+    }
+    fprintf(stderr, "[t2_hook] Server browser: default maximum bot count 255 instead of 16 (memory only)\n");
+    return 1;
+}
+
 static int install_won_verifier(void) {
     const char *path = getenv("T2LAUNCH_WON_VERIFIER");
     if (!path || !*path) {
@@ -938,6 +1039,11 @@ void SDL_GL_SwapBuffers(void) {
                 Con__evaluate(player_pane_button_click_override, 0, "t2launch/browser.cs", 0);
                 player_pane_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
+            }
+            if (!filter_max_bots_override_installed && hook_option_bool("browser.many_bots")) {
+                Con__evaluate(filter_max_bots_override, 0, "t2launch/filters.cs", 0);
+                filter_max_bots_override_installed = 1;
+                fprintf(stderr, "[t2_hook] Installed runtime filter Max Bots range 0-255\n");
             }
             /* A bare expression is not a TorqueScript statement; call a
                function so the evaluation returns the value. */
@@ -1602,6 +1708,9 @@ static void __attribute__((constructor)) init(void) {
         if (!install_won_verifier() || !redirect_won_bootstrap()) _exit(1);
     }
     pthread_once(&hook_options_once, load_hook_options);
+    /* Before main() calibrates or reads the timer, so game time never jumps. */
+    if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
+    if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     fprintf(stderr, "[t2_hook] Console command registration deferred to the game thread\n");
 }
 #endif

@@ -147,7 +147,10 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(lines["hook.tribesnext"], "0")
         self.assertEqual(lines["audio.launch_reset"], "0")
         self.assertEqual(lines["video.full_redraw"], "1")
+        self.assertEqual(lines["runtime.monotonic_clock"], "1")
         self.assertNotIn("video.software_gl", lines)
+        unhooked = t2options.hook_config({"won.mode": "off"}, {"launcher.load_hook": False})
+        self.assertIn("runtime.monotonic_clock=0", unhooked)
 
     def test_hook_config_file_is_private(self):
         with tempfile.TemporaryDirectory() as directory, \
