@@ -78,6 +78,7 @@ static struct hook_option hook_options[] = {
     {"runtime.thread_join_guard", "1", NULL, 0, "", 0},
     {"runtime.monotonic_clock", "1", NULL, 0, "", 0},
     {"browser.many_bots", "1", NULL, 0, "", 0},
+    {"browser.web_links", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -190,6 +191,68 @@ char *strcpy(char *destination, const char *source)
     for (size_t i = 0; i < length; ++i)
         output[i] = (unsigned char)source[i];
     return result;
+}
+
+/* Loki's gotoWebPage() formats $LOKI_BROWSER with the URL and passes it to
+ * system(), or looks for netscape/mozilla and gives up when neither exists.
+ * The hook points LOKI_BROWSER at a marker that system() below turns into
+ * xdg-open with the URL as one argument, so no shell ever parses the URL. */
+#define WEB_LINK_MARKER "T2LAUNCH_OPEN_URL "
+extern char **environ;
+
+/* The URL from a marker command, or NULL when it is not one we open. */
+static const char *web_link_url(const char *command) {
+    size_t marker = strlen(WEB_LINK_MARKER);
+    if (!command || strncmp(command, WEB_LINK_MARKER, marker) != 0) return NULL;
+    const char *url = command + marker;
+    if (strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0 &&
+        strncmp(url, "ftp://", 6) != 0)
+        return NULL;
+    for (const unsigned char *c = (const unsigned char *)url; *c; c++)
+        if (*c <= ' ' || *c == 0x7f || *c == '\'' || *c == '"' || *c == '\\' || *c == '`')
+            return NULL;
+    return url;
+}
+
+static int open_web_link(const char *url) {
+    /* xdg-open and the browser are 64-bit; leave the game's loader settings behind. */
+    size_t count = 0;
+    while (environ[count]) count++;
+    char **env = malloc((count + 1) * sizeof(*env));
+    if (!env) return -1;
+    size_t kept = 0;
+    for (size_t i = 0; i < count; i++)
+        if (strncmp(environ[i], "LD_PRELOAD=", 11) != 0 && strncmp(environ[i], "LD_AUDIT=", 9) != 0 &&
+            strncmp(environ[i], "LD_LIBRARY_PATH=", 16) != 0)
+            env[kept++] = environ[i];
+    env[kept] = NULL;
+    char *argv[] = {"xdg-open", (char *)url, NULL};
+    pid_t child = fork();
+    if (child == 0) {
+        setsid();
+        if (fork() == 0) {
+            execvpe("xdg-open", argv, env);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    free(env);
+    if (child < 0) return -1;
+    waitpid(child, NULL, 0);
+    fprintf(stderr, "[t2_hook] Opened web link with xdg-open: %s\n", url);
+    return 0;
+}
+
+int system(const char *command) {
+    static int (*real_system)(const char *);
+    const char *url = web_link_url(command);
+    if (url) return open_web_link(url);
+    if (command && strncmp(command, WEB_LINK_MARKER, strlen(WEB_LINK_MARKER)) == 0) {
+        fprintf(stderr, "[t2_hook] Refused web link with an unsupported or unsafe URL\n");
+        return -1;
+    }
+    if (!real_system) real_system = (int (*)(const char *))dlsym(RTLD_NEXT, "system");
+    return real_system ? real_system(command) : -1;
 }
 
 /* Installed whenever the hook runs: helpers the hook itself evaluates, the
@@ -1711,6 +1774,10 @@ static void __attribute__((constructor)) init(void) {
     /* Before main() calibrates or reads the timer, so game time never jumps. */
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
+    if (hook_option_bool("browser.web_links")) {
+        const char *browser = getenv("LOKI_BROWSER");
+        if (!browser || !browser[0]) setenv("LOKI_BROWSER", WEB_LINK_MARKER "%s", 1);
+    }
     fprintf(stderr, "[t2_hook] Console command registration deferred to the game thread\n");
 }
 #endif

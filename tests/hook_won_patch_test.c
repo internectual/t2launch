@@ -2,6 +2,7 @@
 #define T2_HOOK_TEST
 #include "../t2_hook.c"
 #include <assert.h>
+#include <sys/stat.h>
 
 int main(void) {
     /* AuthInfo comes from the emulator's Auth2 certificate; the game's own
@@ -134,6 +135,43 @@ int main(void) {
     munmap(mapping, size);
     assert(strstr(filter_max_bots_override, "function FilterEditDlg::setMaxBots(%this)") != NULL);
     assert(strstr(filter_max_bots_override, "> 255") != NULL);
+
+    /* Web links: only the marker with a plain http(s)/ftp URL is opened. */
+    assert(strcmp(web_link_url(WEB_LINK_MARKER "https://www.tribesnext.com/forum"),
+                  "https://www.tribesnext.com/forum") == 0);
+    assert(web_link_url(WEB_LINK_MARKER "ftp://example.net/map.vl2") != NULL);
+    assert(web_link_url("netscape https://www.tribesnext.com") == NULL);
+    assert(web_link_url(WEB_LINK_MARKER "file:///etc/passwd") == NULL);
+    assert(web_link_url(WEB_LINK_MARKER "https://x.net/';touch /tmp/pwned;'") == NULL);
+    assert(web_link_url(WEB_LINK_MARKER "https://x.net/a b") == NULL);
+    assert(web_link_url(WEB_LINK_MARKER "https://x.net/$(id)`id`") == NULL);
+    assert(system(WEB_LINK_MARKER "javascript:alert(1)") == -1);
+    assert(system("exit 3") != -1);
+    /* The URL reaches xdg-open as one argument, without the game's loader settings. */
+    char bin_dir[] = "/tmp/t2_hook_xdg_XXXXXX";
+    assert(mkdtemp(bin_dir));
+    char fake_open[96], opened[96], saved_path[4096];
+    snprintf(fake_open, sizeof(fake_open), "%s/xdg-open", bin_dir);
+    snprintf(opened, sizeof(opened), "%s/opened", bin_dir);
+    FILE *script = fopen(fake_open, "w");
+    assert(script);
+    fprintf(script, "#!/bin/sh\nprintf '%%s|%%s|%%s' \"$#\" \"$1\" \"${LD_PRELOAD-unset}\" > '%s'\n", opened);
+    fclose(script);
+    assert(chmod(fake_open, 0700) == 0);
+    snprintf(saved_path, sizeof(saved_path), "%s", getenv("PATH"));
+    setenv("PATH", bin_dir, 1);
+    setenv("LD_PRELOAD", "/nonexistent/t2_hook.so", 1);
+    assert(system(WEB_LINK_MARKER "https://www.tribesnext.com/?a=1&b=$HOME") == 0);
+    setenv("PATH", saved_path, 1);
+    unsetenv("LD_PRELOAD");
+    char result[256] = "";
+    for (int tries = 0; tries < 100 && !result[0]; tries++) {
+        FILE *seen = fopen(opened, "r");
+        if (seen) { if (!fgets(result, sizeof(result), seen)) result[0] = 0; fclose(seen); }
+        if (!result[0]) usleep(20000);
+    }
+    assert(strcmp(result, "1|https://www.tribesnext.com/?a=1&b=$HOME|unset") == 0);
+    unlink(opened); unlink(fake_open); rmdir(bin_dir);
 
     char path[64];
     setenv("T2LAUNCH_GAME_DIR", "/games/t2", 1);

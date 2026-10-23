@@ -137,6 +137,9 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="The browser hides servers with more than 16 bots unless a filter allows more, "
                 "and the filter editor stops at 16. Raise both limits to 255."),
+    Option("browser.web_links", "Server browser", "Open web links in the default browser", "bool", True,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="The game only knows netscape and mozilla; open links from the game with xdg-open."),
     # Audio
     Option("audio.openal_volume_fix", "Audio", "Volume slider fix", "bool", True,
            env="T2LAUNCH_OPENAL_VOLUME_FIX",

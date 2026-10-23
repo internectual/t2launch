@@ -553,6 +553,18 @@ clocksource. No CPU affinity is needed.
   than one 1500-byte reply (200 rows, 4803 bytes declared, 1446 sent) shows
   the 62 complete rows that arrived.
 
+### Quality-of-life options
+
+The TribesNext "QoL fixes" update is Windows only. These hook and launcher
+options bring the parts of it that fit the Linux client:
+
+- **Web links** (`browser.web_links`, on). Loki's `gotoWebPage()` formats
+  `$LOKI_BROWSER` with the URL and runs it with `system()`, or searches for
+  netscape and mozilla. Unless `LOKI_BROWSER` is already set, the hook sets it
+  to a marker that its `system()` turns into `xdg-open <url>`: one argument,
+  no shell, only `http`, `https`, and `ftp` URLs without quotes, spaces, or
+  backslashes, and without the game's `LD_*` loader settings.
+
 ## Development
 
 ### Repository layout
