@@ -564,6 +564,15 @@ options bring the parts of it that fit the Linux client:
   to a marker that its `system()` turns into `xdg-open <url>`: one argument,
   no shell, only `http`, `https`, and `ftp` URLs without quotes, spaces, or
   backslashes, and without the game's `LD_*` loader settings.
+- **Packet rate and size** (`net.packet_limits`, on). The client clamps
+  `$pref::Net::PacketRateToClient` to 32 and `$pref::Net::PacketSize` to 450
+  at three sites (`0x081F8EAE`, `0x081FB382`, `0x081FB683` and the size
+  checks after them) before asking the server for that rate. The hook raises
+  the limits to 64 and 1000, widens the Network options sliders to match, and
+  adds a "TribesNext QoL" preset (64/32/1000). A connection takes the larger
+  update delay and the smaller packet size of the two sides' requests
+  (`0x081F96A4`), so a stock server keeps sending at its own 32/450; QoL
+  servers accept the higher request.
 
 ## Development
 

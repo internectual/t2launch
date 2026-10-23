@@ -140,6 +140,12 @@ OPTIONS = (
     Option("browser.web_links", "Server browser", "Open web links in the default browser", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="The game only knows netscape and mozilla; open links from the game with xdg-open."),
+    # Network
+    Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Raise the client's 32/s and 450-byte limits so QoL-patched TribesNext servers can "
+                "send more, and add a matching \"TribesNext QoL\" network preset. Stock servers "
+                "still send at their own limits."),
     # Audio
     Option("audio.openal_volume_fix", "Audio", "Volume slider fix", "bool", True,
            env="T2LAUNCH_OPENAL_VOLUME_FIX",

@@ -43,6 +43,7 @@ static volatile int tribesnext_runtime_installed = 0;
 static volatile int shell_audio_setup_done = 0;
 static volatile int player_pane_override_installed = 0;
 static volatile int filter_max_bots_override_installed = 0;
+static volatile int net_options_override_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -79,6 +80,7 @@ static struct hook_option hook_options[] = {
     {"runtime.monotonic_clock", "1", NULL, 0, "", 0},
     {"browser.many_bots", "1", NULL, 0, "", 0},
     {"browser.web_links", "1", NULL, 0, "", 0},
+    {"net.packet_limits", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -367,6 +369,16 @@ static const char filter_max_bots_override[] =
     " if (%newMax < 0) FilterEditMaxBots.setValue(0);\n"
     " else if (%newMax > 255) FilterEditMaxBots.setValue(255);\n"
     "}\n";
+
+/* The Network options sliders stop at 32 packets/s and 450 bytes; match
+   install_net_packet_limits() and offer the rates QoL servers recommend. */
+static const char net_options_override[] =
+    "if (isObject(OP_PacketRateSlider)) OP_PacketRateSlider.range = \"2 64\";\n"
+    "if (isObject(OP_PacketSizeSlider)) OP_PacketSizeSlider.range = \"100 1000\";\n"
+    "$NetworkPreset[$NetworkPresetCount] = \"TribesNext QoL\\t64\\t32\\t1000\";\n"
+    "if (isObject(OP_NetworkPresetsMenu) && OP_NetworkPresetsMenu.size())\n"
+    " OP_NetworkPresetsMenu.add(\"TribesNext QoL\", $NetworkPresetCount);\n"
+    "$NetworkPresetCount++;\n";
 
 #define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
@@ -793,30 +805,105 @@ static int install_monotonic_clock(void) {
 static const unsigned char browser_bot_limit_original[] =
     {0xb8, 0x10, 0x00, 0x00, 0x00, 0x50, 0x83, 0x7d, 0x0c, 0x06};
 
-static int install_browser_bot_limit(void) {
-    uintptr_t address = BROWSER_BOT_LIMIT_ADDRESS;
-    int protection;
+/* One in-memory code change: the bytes expected at address, and the bytes
+   written at address + offset once every site in the set has matched. */
+struct code_patch {
+    uintptr_t address;
+    const unsigned char *expected;
+    size_t expected_length;
+    size_t offset;
+    const unsigned char *replacement;
+    size_t replacement_length;
+};
+
+/* Apply all patches or none: refuse unless every site holds its expected
+   executable bytes, then write each page and restore its protection. */
+static int apply_code_patches(const char *name, const struct code_patch *patches, size_t count) {
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return 0;
-    uintptr_t page = address & ~((uintptr_t)page_size - 1);
-    if (!readable_range(address, sizeof(browser_bot_limit_original), &protection) ||
-        !(protection & PROT_EXEC) || address + 2 > page + (uintptr_t)page_size ||
-        memcmp((void *)address, browser_bot_limit_original, sizeof(browser_bot_limit_original)) != 0) {
-        fprintf(stderr, "[t2_hook] Browser bot limit patch refused: unexpected code at 0x%08lx\n",
-                (unsigned long)address);
-        return 0;
+    for (size_t i = 0; i < count; i++) {
+        const struct code_patch *patch = &patches[i];
+        uintptr_t page = patch->address & ~((uintptr_t)page_size - 1);
+        int protection;
+        if (patch->offset + patch->replacement_length > patch->expected_length ||
+            !readable_range(patch->address, patch->expected_length, &protection) ||
+            !(protection & PROT_EXEC) ||
+            patch->address + patch->offset + patch->replacement_length > page + (uintptr_t)page_size ||
+            memcmp((void *)patch->address, patch->expected, patch->expected_length) != 0) {
+            fprintf(stderr, "[t2_hook] %s patch refused: unexpected code at 0x%08lx\n", name,
+                    (unsigned long)patch->address);
+            return 0;
+        }
     }
-    if (mprotect((void *)page, (size_t)page_size, protection | PROT_WRITE) != 0) {
-        fprintf(stderr, "[t2_hook] Browser bot limit patch: mprotect failed: %s\n", strerror(errno));
-        return 0;
+    for (size_t i = 0; i < count; i++) {
+        const struct code_patch *patch = &patches[i];
+        uintptr_t page = patch->address & ~((uintptr_t)page_size - 1);
+        int protection;
+        if (!readable_range(patch->address, patch->expected_length, &protection) ||
+            mprotect((void *)page, (size_t)page_size, protection | PROT_WRITE) != 0) {
+            fprintf(stderr, "[t2_hook] %s patch: mprotect failed: %s\n", name, strerror(errno));
+            return 0;
+        }
+        volatile unsigned char *target = (volatile unsigned char *)(patch->address + patch->offset);
+        for (size_t b = 0; b < patch->replacement_length; b++) target[b] = patch->replacement[b];
+        if (mprotect((void *)page, (size_t)page_size, protection) != 0) {
+            fprintf(stderr, "[t2_hook] %s patch: restoring page permissions failed: %s\n", name,
+                    strerror(errno));
+            return 0;
+        }
     }
-    *(volatile unsigned char *)(address + 1) = 0xff;
-    if (mprotect((void *)page, (size_t)page_size, protection) != 0) {
-        fprintf(stderr, "[t2_hook] Browser bot limit patch: restoring page permissions failed: %s\n",
-                strerror(errno));
-        return 0;
-    }
+    return 1;
+}
+
+static int install_browser_bot_limit(void) {
+    static const unsigned char limit[] = {0xff};
+    const struct code_patch patch = {BROWSER_BOT_LIMIT_ADDRESS, browser_bot_limit_original,
+                                     sizeof(browser_bot_limit_original), 1, limit, sizeof(limit)};
+    if (!apply_code_patches("Browser bot limit", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] Server browser: default maximum bot count 255 instead of 16 (memory only)\n");
+    return 1;
+}
+
+/* The client clamps $pref::Net::PacketRateToClient (0x08495CEC) to 32 and
+   $pref::Net::PacketSize (0x08495CF0) to 450 in three places: the
+   NetConnection constructor and two rate setters. The clamped values become
+   the rate and size the client asks the server for; a stock server still
+   sends at most its own rate and size, while QoL-patched TribesNext servers
+   accept more. The rate compare takes a sign-extended imm8, so 127 is the
+   largest possible limit. */
+#define NET_PACKET_RATE_LIMIT 64
+#define NET_PACKET_SIZE_LIMIT 1000
+static const uintptr_t net_rate_compare_sites[] = {0x081F8EAE, 0x081FB382, 0x081FB683};
+static const uintptr_t net_rate_store_sites[] = {0x081F8EB7, 0x081FB38B, 0x081FB68C};
+static const uintptr_t net_size_compare_sites[] = {0x081F8ED4, 0x081FB3A8, 0x081FB6A9};
+static const uintptr_t net_size_store_sites[] = {0x081F8EE0, 0x081FB3B4, 0x081FB6B5};
+static const unsigned char net_rate_compare_original[] = {0x83, 0x3d, 0xec, 0x5c, 0x49, 0x08, 0x20};
+static const unsigned char net_rate_store_original[] =
+    {0xc7, 0x05, 0xec, 0x5c, 0x49, 0x08, 0x20, 0x00, 0x00, 0x00};
+static const unsigned char net_size_compare_original[] =
+    {0x81, 0x3d, 0xf0, 0x5c, 0x49, 0x08, 0xc2, 0x01, 0x00, 0x00};
+static const unsigned char net_size_store_original[] =
+    {0xc7, 0x05, 0xf0, 0x5c, 0x49, 0x08, 0xc2, 0x01, 0x00, 0x00};
+
+static int install_net_packet_limits(void) {
+    static const unsigned char rate8[] = {NET_PACKET_RATE_LIMIT};
+    static const unsigned char rate32[] = {NET_PACKET_RATE_LIMIT, 0, 0, 0};
+    static const unsigned char size32[] = {NET_PACKET_SIZE_LIMIT & 0xff, NET_PACKET_SIZE_LIMIT >> 8, 0, 0};
+    struct code_patch patches[12];
+    size_t count = 0;
+    for (size_t i = 0; i < 3; i++) {
+        patches[count++] = (struct code_patch){net_rate_compare_sites[i], net_rate_compare_original,
+            sizeof(net_rate_compare_original), 6, rate8, sizeof(rate8)};
+        patches[count++] = (struct code_patch){net_rate_store_sites[i], net_rate_store_original,
+            sizeof(net_rate_store_original), 6, rate32, sizeof(rate32)};
+        patches[count++] = (struct code_patch){net_size_compare_sites[i], net_size_compare_original,
+            sizeof(net_size_compare_original), 6, size32, sizeof(size32)};
+        patches[count++] = (struct code_patch){net_size_store_sites[i], net_size_store_original,
+            sizeof(net_size_store_original), 6, size32, sizeof(size32)};
+    }
+    if (!apply_code_patches("Network packet limit", patches, count)) return 0;
+    fprintf(stderr, "[t2_hook] Network: client packet limits %d/s and %d bytes instead of 32/s and 450 "
+            "(memory only)\n", NET_PACKET_RATE_LIMIT, NET_PACKET_SIZE_LIMIT);
     return 1;
 }
 
@@ -1102,6 +1189,11 @@ void SDL_GL_SwapBuffers(void) {
                 Con__evaluate(player_pane_button_click_override, 0, "t2launch/browser.cs", 0);
                 player_pane_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime PlayerPane TRIBES handler\n");
+            }
+            if (!net_options_override_installed && hook_option_bool("net.packet_limits")) {
+                Con__evaluate(net_options_override, 0, "t2launch/network.cs", 0);
+                net_options_override_installed = 1;
+                fprintf(stderr, "[t2_hook] Installed runtime network options ranges 64/s and 1000 bytes\n");
             }
             if (!filter_max_bots_override_installed && hook_option_bool("browser.many_bots")) {
                 Con__evaluate(filter_max_bots_override, 0, "t2launch/filters.cs", 0);
@@ -1774,6 +1866,7 @@ static void __attribute__((constructor)) init(void) {
     /* Before main() calibrates or reads the timer, so game time never jumps. */
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
+    if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
     if (hook_option_bool("browser.web_links")) {
         const char *browser = getenv("LOKI_BROWSER");
         if (!browser || !browser[0]) setenv("LOKI_BROWSER", WEB_LINK_MARKER "%s", 1);

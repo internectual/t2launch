@@ -136,6 +136,45 @@ int main(void) {
     assert(strstr(filter_max_bots_override, "function FilterEditDlg::setMaxBots(%this)") != NULL);
     assert(strstr(filter_max_bots_override, "> 255") != NULL);
 
+    /* Network packet limits: twelve sites over two pages, all or nothing. */
+    {
+        uintptr_t pages[2] = {0x081F8000, 0x081FB000};
+        for (int i = 0; i < 2; i++)
+            assert(mmap((void *)pages[i], size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)pages[i]);
+        for (int i = 0; i < 3; i++) {
+            memcpy((void *)net_rate_compare_sites[i], net_rate_compare_original, sizeof(net_rate_compare_original));
+            memcpy((void *)net_rate_store_sites[i], net_rate_store_original, sizeof(net_rate_store_original));
+            memcpy((void *)net_size_compare_sites[i], net_size_compare_original, sizeof(net_size_compare_original));
+            memcpy((void *)net_size_store_sites[i], net_size_store_original, sizeof(net_size_store_original));
+        }
+        unsigned char *last = (unsigned char *)net_size_store_sites[2];
+        last[6] = 0xc3;
+        for (int i = 0; i < 2; i++) assert(mprotect((void *)pages[i], size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_net_packet_limits());
+        assert(((unsigned char *)net_rate_compare_sites[0])[6] == 0x20);
+        assert(mprotect((void *)pages[1], size, PROT_READ | PROT_WRITE) == 0);
+        last[6] = 0xc2;
+        assert(mprotect((void *)pages[1], size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_net_packet_limits());
+        for (int i = 0; i < 3; i++) {
+            uint32_t value;
+            assert(((unsigned char *)net_rate_compare_sites[i])[6] == 64);
+            memcpy(&value, (unsigned char *)net_rate_store_sites[i] + 6, 4);
+            assert(value == 64);
+            memcpy(&value, (unsigned char *)net_size_compare_sites[i] + 6, 4);
+            assert(value == 1000);
+            memcpy(&value, (unsigned char *)net_size_store_sites[i] + 6, 4);
+            assert(value == 1000);
+            assert(memcmp((void *)net_size_store_sites[i], net_size_store_original, 6) == 0);
+        }
+        assert(readable_range(net_rate_compare_sites[0], 7, &protection) &&
+               protection == (PROT_READ | PROT_EXEC));
+        for (int i = 0; i < 2; i++) munmap((void *)pages[i], size);
+        assert(strstr(net_options_override, "OP_PacketRateSlider.range = \"2 64\"") != NULL);
+        assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
+    }
+
     /* Web links: only the marker with a plain http(s)/ftp URL is opened. */
     assert(strcmp(web_link_url(WEB_LINK_MARKER "https://www.tribesnext.com/forum"),
                   "https://www.tribesnext.com/forum") == 0);
