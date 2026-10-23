@@ -27,6 +27,7 @@ typedef struct { int16_t x, y; uint16_t w, h; } sdl_rect_t;
 typedef sdl_rect_t **(*sdl_list_modes_t)(void *format, uint32_t flags);
 
 #define SDL_FULLSCREEN_FLAG 0x80000000u
+#define SDL_NOFRAME_FLAG 0x00000020u
 
 static con_addMethodS_t Con__addMethodS = NULL;
 static con_evaluate_t Con__evaluate = (con_evaluate_t)0x080E88F4;
@@ -81,6 +82,8 @@ static struct hook_option hook_options[] = {
     {"browser.many_bots", "1", NULL, 0, "", 0},
     {"browser.web_links", "1", NULL, 0, "", 0},
     {"net.packet_limits", "1", NULL, 0, "", 0},
+    {"video.fps_limit", "0", NULL, 0, "", 0},
+    {"video.borderless", "0", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1102,6 +1105,40 @@ int pthread_detach(pthread_t thread) {
     return real_detach(thread);
 }
 
+/* Frame cap (video.fps_limit): advance an absolute deadline by one period per
+   frame and report how long to sleep. A frame that ends more than a period
+   late restarts the schedule instead of rushing to catch up. */
+static long frame_cap_delay_ns(struct timespec *deadline, const struct timespec *now, long period_ns) {
+    int64_t now_ns = (int64_t)now->tv_sec * 1000000000 + now->tv_nsec;
+    int64_t due_ns = (int64_t)deadline->tv_sec * 1000000000 + deadline->tv_nsec;
+    long delay = 0;
+    if (due_ns == 0 || now_ns - due_ns > period_ns) due_ns = now_ns;
+    else if (due_ns > now_ns) delay = (long)(due_ns - now_ns);
+    due_ns += period_ns;
+    deadline->tv_sec = (time_t)(due_ns / 1000000000);
+    deadline->tv_nsec = (long)(due_ns % 1000000000);
+    return delay;
+}
+
+static void cap_frame_rate(void) {
+    static int limit = -1;
+    static struct timespec deadline;
+    if (limit < 0) {
+        const char *value = hook_option_str("video.fps_limit");
+        limit = value ? atoi(value) : 0;
+        if (limit < 0) limit = 0;
+        if (limit) fprintf(stderr, "[t2_hook] Frame rate capped at %d fps\n", limit);
+    }
+    if (!limit) return;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long delay = frame_cap_delay_ns(&deadline, &now, 1000000000L / limit);
+    if (delay > 0) {
+        struct timespec pause = {delay / 1000000000, delay % 1000000000};
+        nanosleep(&pause, NULL);
+    }
+}
+
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
@@ -1110,6 +1147,7 @@ void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers) return;
 
     real_sdl_gl_swap_buffers();
+    cap_frame_rate();
     if (!sdl_gl_swap_hook_reported) {
         sdl_gl_swap_hook_reported = 1;
         game_main_thread = pthread_self();
@@ -1216,6 +1254,8 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         real_sdl_set_video_mode = (sdl_set_video_mode_t)dlsym(
             RTLD_NEXT, "SDL_SetVideoMode");
     if (!real_sdl_set_video_mode) return NULL;
+    if (!(flags & SDL_FULLSCREEN_FLAG) && hook_option_bool("video.borderless"))
+        flags |= SDL_NOFRAME_FLAG;
     void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
     if (surface && width > 0 && height > 0) {
         __sync_lock_test_and_set(&video_mode_repaint_frames, 120);
@@ -1867,6 +1907,9 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
+    /* SDL reads this when it creates the window; a borderless window has no
+       title bar to move it by. */
+    if (hook_option_bool("video.borderless")) setenv("SDL_VIDEO_CENTERED", "1", 0);
     if (hook_option_bool("browser.web_links")) {
         const char *browser = getenv("LOKI_BROWSER");
         if (!browser || !browser[0]) setenv("LOKI_BROWSER", WEB_LINK_MARKER "%s", 1);

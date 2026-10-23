@@ -127,6 +127,13 @@ OPTIONS = (
     Option("video.full_redraw", "Video", "Redraw the whole GUI every frame", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Avoids flicker and ghost cursors on drivers that do not preserve the back buffer."),
+    Option("video.fps_limit", "Video", "Frame rate limit (0 = off)", "int", 0, hook=True,
+           minimum=0, maximum=1000, requires=(("launcher.load_hook", (True,)),),
+           help="Cap frames per second to save CPU, GPU, and power; 0 leaves the game uncapped."),
+    Option("video.borderless", "Video", "Borderless window", "bool", False, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Draw windowed modes without a title bar or frame; pick the desktop resolution "
+                "for borderless fullscreen."),
     Option("video.software_gl", "Video", "Software OpenGL", "bool", False,
            env="T2LAUNCH_SOFTWARE_GL", help="Render with Mesa's software rasterizer."),
     Option("video.xrandr_modes", "Video", "Offer the display's real video modes", "bool", True,

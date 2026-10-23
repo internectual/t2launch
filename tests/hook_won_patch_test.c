@@ -175,6 +175,20 @@ int main(void) {
         assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
     }
 
+    /* Frame cap: steady frames sleep to the deadline; a late frame restarts it. */
+    {
+        struct timespec deadline = {0, 0}, now = {100, 0};
+        const long period = 1000000000L / 100;
+        assert(frame_cap_delay_ns(&deadline, &now, period) == 0);
+        assert(deadline.tv_sec == 100 && deadline.tv_nsec == period);
+        now.tv_nsec = 4000000;
+        assert(frame_cap_delay_ns(&deadline, &now, period) == period - 4000000);
+        assert(deadline.tv_nsec == 2 * period);
+        now.tv_sec = 101;
+        assert(frame_cap_delay_ns(&deadline, &now, period) == 0);
+        assert(deadline.tv_sec == 101 && deadline.tv_nsec == 4000000 + period);
+    }
+
     /* Web links: only the marker with a plain http(s)/ftp URL is opened. */
     assert(strcmp(web_link_url(WEB_LINK_MARKER "https://www.tribesnext.com/forum"),
                   "https://www.tribesnext.com/forum") == 0);

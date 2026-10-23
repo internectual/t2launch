@@ -573,6 +573,13 @@ options bring the parts of it that fit the Linux client:
   update delay and the smaller packet size of the two sides' requests
   (`0x081F96A4`), so a stock server keeps sending at its own 32/450; QoL
   servers accept the higher request.
+- **Frame rate limit** (`video.fps_limit`, 0 = off). After each
+  `SDL_GL_SwapBuffers` the hook sleeps to an absolute `CLOCK_MONOTONIC`
+  deadline; a frame that runs more than one period late restarts the
+  schedule rather than rushing to catch up.
+- **Borderless window** (`video.borderless`, off). Windowed
+  `SDL_SetVideoMode` calls get `SDL_NOFRAME`, and `SDL_VIDEO_CENTERED=1`
+  places the window. Choose the desktop resolution for borderless fullscreen.
 
 ## Development
 
