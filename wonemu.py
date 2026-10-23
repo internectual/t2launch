@@ -3282,11 +3282,18 @@ class Emulator:
             return response.read(1_000_000).decode("utf-8", errors="replace")
 
     def tribesnext_servers(self, query, base_url=None):
+        # The client's own default is lowercase "any"; TribesNext's filtered
+        # list only matches "Any".
         game_type = query["game_type"] or "Any"
         mission_type = query["mission_type"] or "Any"
-        unfiltered = (game_type.casefold() == "any" and mission_type.casefold() == "any" and
+        if game_type.casefold() == "any":
+            game_type = "Any"
+        if mission_type.casefold() == "any":
+            mission_type = "Any"
+        # 255 bots is the default once the hook lifts the client's 16-bot limit.
+        unfiltered = (game_type == "Any" and mission_type == "Any" and
                       query["min_players"] == 0 and query["max_players"] in (0, 100, 255) and
-                      query["max_bots"] in (0, 16) and query["regions"] in (0, 0xffffffff) and
+                      query["max_bots"] in (0, 16, 255) and query["regions"] in (0, 0xffffffff) and
                       query["version"] == 0 and query["min_cpu"] == 0 and
                       query["info_flags"] == 0 and not query["buddies"])
         if unfiltered:

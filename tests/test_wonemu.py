@@ -2456,6 +2456,17 @@ class NetworkTests(unittest.TestCase):
                 emulator.tribesnext_servers(default_query)
             fetch.assert_called_once_with("/list", None)
 
+            # "All servers" with the hook's 255-bot default, in the client's
+            # lowercase spelling, is still the unfiltered list.
+            all_servers = dict(default_query, game_type="any", mission_type="any", max_bots=255)
+            with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
+                emulator.tribesnext_servers(all_servers)
+            fetch.assert_called_once_with("/list", None)
+            # A filtered query sends TribesNext's capitalized "Any".
+            with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
+                emulator.tribesnext_servers(dict(all_servers, min_players=2))
+            fetch.assert_called_once_with("/list/Any/Any/2/255/255/0", None)
+
             with patch.object(emulator, "fetch_tribesnext",
                               return_value="66.42.121.64:28001\n"):
                 fission = emulator.tribesnext_servers(default_query)
