@@ -89,6 +89,7 @@ static struct hook_option hook_options[] = {
     {"video.fps_limit", "0", NULL, 0, "", 0},
     {"video.borderless", "0", NULL, 0, "", 0},
     {"video.vsync", "1", NULL, 0, "", 0},
+    {"video.gamma", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1110,6 +1111,229 @@ int pthread_detach(pthread_t thread) {
     return real_detach(thread);
 }
 
+/* ── Gamma (video.gamma) ─────────────────────────────────────────────────
+ * The Video options gamma slider (0 to 1) reaches SDL_SetGamma as gamma 0.48
+ * to 1.48 (0x081D5F98), which sets X11 gamma ramps; XWayland and most
+ * compositors ignore them. The
+ * hook records the value instead and, before each swap, copies the back
+ * buffer into a texture and draws it back through a shader computing
+ * pow(colour, 1/gamma), the curve SDL's ramps used. */
+#define GL_TEXTURE_2D_ 0x0DE1
+#define GL_RGB_ 0x1907
+#define GL_UNSIGNED_BYTE_ 0x1401
+#define GL_TEXTURE_MIN_FILTER_ 0x2801
+#define GL_TEXTURE_MAG_FILTER_ 0x2800
+#define GL_NEAREST_ 0x2600
+#define GL_ALL_ATTRIB_BITS_ 0x000FFFFF
+#define GL_CLIENT_ALL_ATTRIB_BITS_ 0xFFFFFFFF
+#define GL_PROJECTION_ 0x1701
+#define GL_MODELVIEW_ 0x1700
+#define GL_TEXTURE_ 0x1702
+#define GL_QUADS_ 0x0007
+#define GL_BACK_ 0x0405
+#define GL_TEXTURE0_ 0x84C0
+#define GL_ACTIVE_TEXTURE_ 0x84E0
+#define GL_CURRENT_PROGRAM_ 0x8B8D
+#define GL_FRAGMENT_SHADER_ 0x8B30
+#define GL_VERTEX_SHADER_ 0x8B31
+#define GL_COMPILE_STATUS_ 0x8B81
+#define GL_LINK_STATUS_ 0x8B82
+#define GL_DEPTH_TEST_ 0x0B71
+#define GL_BLEND_ 0x0BE2
+#define GL_ALPHA_TEST_ 0x0BC0
+#define GL_CULL_FACE_ 0x0B44
+#define GL_SCISSOR_TEST_ 0x0C11
+#define GL_STENCIL_TEST_ 0x0B90
+#define GL_FOG_ 0x0B60
+#define GL_LIGHTING_ 0x0B50
+
+static volatile float gamma_requested = 1.0f;
+static int gamma_width, gamma_height;
+
+static struct {
+    int state;  /* 0 unresolved, 1 ready, -1 unavailable */
+    void (*GetIntegerv)(unsigned, int *);
+    void (*GenTextures)(int, unsigned *);
+    void (*DeleteTextures)(int, const unsigned *);
+    void (*BindTexture)(unsigned, unsigned);
+    void (*TexParameteri)(unsigned, unsigned, int);
+    void (*TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+    void (*CopyTexSubImage2D)(unsigned, int, int, int, int, int, int, int);
+    void (*ReadBuffer)(unsigned);
+    void (*PushAttrib)(unsigned);
+    void (*PopAttrib)(void);
+    void (*PushClientAttrib)(unsigned);
+    void (*PopClientAttrib)(void);
+    void (*MatrixMode)(unsigned);
+    void (*PushMatrix)(void);
+    void (*PopMatrix)(void);
+    void (*LoadIdentity)(void);
+    void (*Disable)(unsigned);
+    void (*Enable)(unsigned);
+    void (*Viewport)(int, int, int, int);
+    void (*ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
+    void (*Begin)(unsigned);
+    void (*End)(void);
+    void (*TexCoord2f)(float, float);
+    void (*Vertex2f)(float, float);
+    void (*ActiveTexture)(unsigned);
+    unsigned (*CreateShader)(unsigned);
+    void (*ShaderSource)(unsigned, int, const char *const *, const int *);
+    void (*CompileShader)(unsigned);
+    void (*GetShaderiv)(unsigned, unsigned, int *);
+    unsigned (*CreateProgram)(void);
+    void (*AttachShader)(unsigned, unsigned);
+    void (*LinkProgram)(unsigned);
+    void (*GetProgramiv)(unsigned, unsigned, int *);
+    void (*UseProgram)(unsigned);
+    int (*GetUniformLocation)(unsigned, const char *);
+    void (*Uniform1i)(int, int);
+    void (*Uniform1f)(int, float);
+    unsigned program, texture;
+    int texture_width, texture_height, exponent_location;
+} gl_gamma;
+
+static const char gamma_vertex_shader[] =
+    "void main() { gl_TexCoord[0] = gl_MultiTexCoord0; gl_Position = gl_Vertex; }\n";
+static const char gamma_fragment_shader[] =
+    "uniform sampler2D frame; uniform float exponent;\n"
+    "void main() {\n"
+    " vec3 colour = texture2D(frame, gl_TexCoord[0].xy).rgb;\n"
+    " gl_FragColor = vec4(pow(colour, vec3(exponent)), 1.0);\n"
+    "}\n";
+
+static int resolve_gl_gamma(void) {
+    if (gl_gamma.state) return gl_gamma.state > 0;
+    gl_gamma.state = -1;
+    void *gl = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    void *scope = gl ? gl : RTLD_DEFAULT;
+    void *(*get_proc)(const unsigned char *) =
+        (void *(*)(const unsigned char *))dlsym(scope, "glXGetProcAddressARB");
+#define GL_FN(field, name) \
+    do { \
+        *(void **)&gl_gamma.field = get_proc ? get_proc((const unsigned char *)name) : NULL; \
+        if (!gl_gamma.field) *(void **)&gl_gamma.field = dlsym(scope, name); \
+        if (!gl_gamma.field) { \
+            fprintf(stderr, "[t2_hook] Gamma unavailable: no %s\n", name); \
+            return 0; \
+        } \
+    } while (0)
+    GL_FN(GetIntegerv, "glGetIntegerv"); GL_FN(GenTextures, "glGenTextures");
+    GL_FN(DeleteTextures, "glDeleteTextures"); GL_FN(BindTexture, "glBindTexture");
+    GL_FN(TexParameteri, "glTexParameteri"); GL_FN(TexImage2D, "glTexImage2D");
+    GL_FN(CopyTexSubImage2D, "glCopyTexSubImage2D"); GL_FN(ReadBuffer, "glReadBuffer");
+    GL_FN(PushAttrib, "glPushAttrib"); GL_FN(PopAttrib, "glPopAttrib");
+    GL_FN(PushClientAttrib, "glPushClientAttrib"); GL_FN(PopClientAttrib, "glPopClientAttrib");
+    GL_FN(MatrixMode, "glMatrixMode"); GL_FN(PushMatrix, "glPushMatrix");
+    GL_FN(PopMatrix, "glPopMatrix"); GL_FN(LoadIdentity, "glLoadIdentity");
+    GL_FN(Disable, "glDisable"); GL_FN(Enable, "glEnable"); GL_FN(Viewport, "glViewport");
+    GL_FN(ColorMask, "glColorMask"); GL_FN(Begin, "glBegin"); GL_FN(End, "glEnd");
+    GL_FN(TexCoord2f, "glTexCoord2f"); GL_FN(Vertex2f, "glVertex2f");
+    GL_FN(ActiveTexture, "glActiveTexture"); GL_FN(CreateShader, "glCreateShader");
+    GL_FN(ShaderSource, "glShaderSource"); GL_FN(CompileShader, "glCompileShader");
+    GL_FN(GetShaderiv, "glGetShaderiv"); GL_FN(CreateProgram, "glCreateProgram");
+    GL_FN(AttachShader, "glAttachShader"); GL_FN(LinkProgram, "glLinkProgram");
+    GL_FN(GetProgramiv, "glGetProgramiv"); GL_FN(UseProgram, "glUseProgram");
+    GL_FN(GetUniformLocation, "glGetUniformLocation"); GL_FN(Uniform1i, "glUniform1i");
+    GL_FN(Uniform1f, "glUniform1f");
+#undef GL_FN
+    const char *sources[2] = {gamma_vertex_shader, gamma_fragment_shader};
+    unsigned types[2] = {GL_VERTEX_SHADER_, GL_FRAGMENT_SHADER_};
+    unsigned program = gl_gamma.CreateProgram();
+    for (int i = 0; i < 2; i++) {
+        unsigned shader = gl_gamma.CreateShader(types[i]);
+        int ok = 0;
+        gl_gamma.ShaderSource(shader, 1, &sources[i], NULL);
+        gl_gamma.CompileShader(shader);
+        gl_gamma.GetShaderiv(shader, GL_COMPILE_STATUS_, &ok);
+        if (!ok) {
+            fprintf(stderr, "[t2_hook] Gamma unavailable: shader did not compile\n");
+            return 0;
+        }
+        gl_gamma.AttachShader(program, shader);
+    }
+    int linked = 0;
+    gl_gamma.LinkProgram(program);
+    gl_gamma.GetProgramiv(program, GL_LINK_STATUS_, &linked);
+    if (!linked) {
+        fprintf(stderr, "[t2_hook] Gamma unavailable: shader did not link\n");
+        return 0;
+    }
+    gl_gamma.program = program;
+    gl_gamma.exponent_location = gl_gamma.GetUniformLocation(program, "exponent");
+    int previous = 0;
+    gl_gamma.GetIntegerv(GL_CURRENT_PROGRAM_, &previous);
+    gl_gamma.UseProgram(program);
+    gl_gamma.Uniform1i(gl_gamma.GetUniformLocation(program, "frame"), 0);
+    gl_gamma.UseProgram((unsigned)previous);
+    gl_gamma.state = 1;
+    fprintf(stderr, "[t2_hook] Gamma correction drawn by a shader pass\n");
+    return 1;
+}
+
+/* Called before each swap on the game thread with the game's context current. */
+static void apply_gamma_pass(void) {
+    float gamma = gamma_requested;
+    if (gamma > 0.999f && gamma < 1.001f) return;
+    if (gamma_width <= 0 || gamma_height <= 0 || !resolve_gl_gamma()) return;
+    int previous_program = 0, previous_unit = 0;
+    gl_gamma.GetIntegerv(GL_CURRENT_PROGRAM_, &previous_program);
+    gl_gamma.GetIntegerv(GL_ACTIVE_TEXTURE_, &previous_unit);
+    gl_gamma.PushAttrib(GL_ALL_ATTRIB_BITS_);
+    gl_gamma.PushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS_);
+    gl_gamma.ActiveTexture(GL_TEXTURE0_);
+    gl_gamma.MatrixMode(GL_TEXTURE_); gl_gamma.PushMatrix(); gl_gamma.LoadIdentity();
+    gl_gamma.MatrixMode(GL_PROJECTION_); gl_gamma.PushMatrix(); gl_gamma.LoadIdentity();
+    gl_gamma.MatrixMode(GL_MODELVIEW_); gl_gamma.PushMatrix(); gl_gamma.LoadIdentity();
+    unsigned disabled[] = {GL_DEPTH_TEST_, GL_BLEND_, GL_ALPHA_TEST_, GL_CULL_FACE_, GL_SCISSOR_TEST_,
+                           GL_STENCIL_TEST_, GL_FOG_, GL_LIGHTING_};
+    for (size_t i = 0; i < sizeof(disabled) / sizeof(disabled[0]); i++) gl_gamma.Disable(disabled[i]);
+    gl_gamma.ColorMask(1, 1, 1, 1);
+    gl_gamma.Viewport(0, 0, gamma_width, gamma_height);
+    if (!gl_gamma.texture) gl_gamma.GenTextures(1, &gl_gamma.texture);
+    gl_gamma.Enable(GL_TEXTURE_2D_);
+    gl_gamma.BindTexture(GL_TEXTURE_2D_, gl_gamma.texture);
+    if (gl_gamma.texture_width != gamma_width || gl_gamma.texture_height != gamma_height) {
+        gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
+        gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_NEAREST_);
+        gl_gamma.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGB_, gamma_width, gamma_height, 0, GL_RGB_,
+                            GL_UNSIGNED_BYTE_, NULL);
+        gl_gamma.texture_width = gamma_width;
+        gl_gamma.texture_height = gamma_height;
+    }
+    gl_gamma.ReadBuffer(GL_BACK_);
+    gl_gamma.CopyTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, 0, 0, gamma_width, gamma_height);
+    gl_gamma.UseProgram(gl_gamma.program);
+    gl_gamma.Uniform1f(gl_gamma.exponent_location, 1.0f / gamma);
+    gl_gamma.Begin(GL_QUADS_);
+    gl_gamma.TexCoord2f(0, 0); gl_gamma.Vertex2f(-1, -1);
+    gl_gamma.TexCoord2f(1, 0); gl_gamma.Vertex2f(1, -1);
+    gl_gamma.TexCoord2f(1, 1); gl_gamma.Vertex2f(1, 1);
+    gl_gamma.TexCoord2f(0, 1); gl_gamma.Vertex2f(-1, 1);
+    gl_gamma.End();
+    gl_gamma.UseProgram((unsigned)previous_program);
+    gl_gamma.MatrixMode(GL_TEXTURE_); gl_gamma.PopMatrix();
+    gl_gamma.MatrixMode(GL_PROJECTION_); gl_gamma.PopMatrix();
+    gl_gamma.MatrixMode(GL_MODELVIEW_); gl_gamma.PopMatrix();
+    gl_gamma.PopClientAttrib();
+    gl_gamma.PopAttrib();
+    gl_gamma.ActiveTexture((unsigned)previous_unit);
+}
+
+int SDL_SetGamma(float red, float green, float blue) {
+    static int (*real_set_gamma)(float, float, float);
+    if (!hook_option_bool("video.gamma")) {
+        if (!real_set_gamma) real_set_gamma = (int (*)(float, float, float))dlsym(RTLD_NEXT, "SDL_SetGamma");
+        return real_set_gamma ? real_set_gamma(red, green, blue) : -1;
+    }
+    (void)green; (void)blue;  /* the game passes one value for all three */
+    if (red <= 0.0f) return -1;
+    if (red != gamma_requested)
+        fprintf(stderr, "[t2_hook] Gamma %.3f\n", (double)red);
+    gamma_requested = red;
+    return 0;
+}
+
 /* Frame cap (video.fps_limit): advance an absolute deadline by one period per
    frame and report how long to sleep. A frame that ends more than a period
    late restarts the schedule instead of rushing to catch up. */
@@ -1151,6 +1375,8 @@ void SDL_GL_SwapBuffers(void) {
             RTLD_NEXT, "SDL_GL_SwapBuffers");
     if (!real_sdl_gl_swap_buffers) return;
 
+    if (game_main_thread_known && pthread_equal(pthread_self(), game_main_thread))
+        apply_gamma_pass();
     real_sdl_gl_swap_buffers();
     cap_frame_rate();
     if (!sdl_gl_swap_hook_reported) {
@@ -1273,6 +1499,14 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         flags |= SDL_NOFRAME_FLAG;
     void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
     if (surface && vsync_requested >= 0) vsync_reapply = 1;
+    if (surface) {
+        /* A new context needs a new texture; the old one went with its context. */
+        gamma_width = width;
+        gamma_height = height;
+        gl_gamma.texture = 0;
+        gl_gamma.texture_width = gl_gamma.texture_height = 0;
+        if (gl_gamma.state > 0) gl_gamma.state = 0;
+    }
     if (surface && width > 0 && height > 0) {
         __sync_lock_test_and_set(&video_mode_repaint_frames, 120);
         fprintf(stderr, "[t2_hook] Queued full-canvas refresh after video mode %dx%d\n",

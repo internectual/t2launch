@@ -139,6 +139,10 @@ OPTIONS = (
            requires=(("launcher.load_hook", (True,)),),
            help="Enable the Video options VSync checkbox and set the GLX swap interval when it "
                 "changes; the Linux client never detects swap control on its own."),
+    Option("video.gamma", "Video", "Make the gamma slider work", "bool", True, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Apply the Video options gamma in a shader pass; the game's X11 gamma ramps do "
+                "nothing under Wayland and most compositors."),
     Option("video.software_gl", "Video", "Software OpenGL", "bool", False,
            env="T2LAUNCH_SOFTWARE_GL", help="Render with Mesa's software rasterizer."),
     Option("video.xrandr_modes", "Video", "Offer the display's real video modes", "bool", True,

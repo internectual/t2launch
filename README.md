@@ -587,6 +587,13 @@ options bring the parts of it that fit the Linux client:
   calls `glXSwapIntervalEXT` (or the MESA or SGI variant), applies
   `$pref::Video::disableVerticalSync` at startup, and reapplies the setting
   after a video mode change.
+- **Gamma** (`video.gamma`, on). The Video options gamma slider (0 to 1)
+  reaches `SDL_SetGamma` as gamma 0.48 to 1.48, which sets X11 gamma ramps;
+  XWayland and most compositors ignore them. The hook records the value and,
+  before each swap, copies the back buffer into a texture and draws it back
+  through a GLSL shader computing `pow(colour, 1/gamma)`, saving and
+  restoring the GL state around the pass. Neutral is near the middle of the
+  slider.
 - **Gamescope** (`video.gamescope`, off). `run-game` starts the game inside
   gamescope with the chosen game and output sizes, scaler, filter (`fsr`,
   `nis`, ...), fullscreen, and relative mouse mode. gamescope itself runs
