@@ -38,6 +38,9 @@ static pthread_t game_main_thread;
 static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
 static int register_hook_commands(void);
+static int set_swap_interval(int interval);
+static volatile int vsync_requested = -1;   /* -1: never set by the game */
+static volatile int vsync_reapply = 0;
 static volatile int profile_browser_wake_seen = 0;
 static volatile int core_runtime_installed = 0;
 static volatile int tribesnext_runtime_installed = 0;
@@ -45,6 +48,7 @@ static volatile int shell_audio_setup_done = 0;
 static volatile int player_pane_override_installed = 0;
 static volatile int filter_max_bots_override_installed = 0;
 static volatile int net_options_override_installed = 0;
+static volatile int vsync_support_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -84,6 +88,7 @@ static struct hook_option hook_options[] = {
     {"net.packet_limits", "1", NULL, 0, "", 0},
     {"video.fps_limit", "0", NULL, 0, "", 0},
     {"video.borderless", "0", NULL, 0, "", 0},
+    {"video.vsync", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1161,6 +1166,11 @@ void SDL_GL_SwapBuffers(void) {
         !pthread_equal(pthread_self(), game_main_thread))
         return;
 
+    if (vsync_reapply) {
+        vsync_reapply = 0;
+        set_swap_interval(vsync_requested ? 1 : 0);
+    }
+
     /* SDL 1.2 mode changes can leave stale damage on accelerated XWayland
        surfaces. A full Canvas repaint clears the same stale regions that a
        pointer-expose event otherwise repairs. Limit the extra work to the
@@ -1233,6 +1243,11 @@ void SDL_GL_SwapBuffers(void) {
                 net_options_override_installed = 1;
                 fprintf(stderr, "[t2_hook] Installed runtime network options ranges 64/s and 1000 bytes\n");
             }
+            if (!vsync_support_installed && hook_option_bool("video.vsync")) {
+                Con__evaluate("$SwapIntervalSupported = 1;"
+                              " setVerticalSync(!$pref::Video::disableVerticalSync);", 0, NULL, 0);
+                vsync_support_installed = 1;
+            }
             if (!filter_max_bots_override_installed && hook_option_bool("browser.many_bots")) {
                 Con__evaluate(filter_max_bots_override, 0, "t2launch/filters.cs", 0);
                 filter_max_bots_override_installed = 1;
@@ -1257,6 +1272,7 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
     if (!(flags & SDL_FULLSCREEN_FLAG) && hook_option_bool("video.borderless"))
         flags |= SDL_NOFRAME_FLAG;
     void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
+    if (surface && vsync_requested >= 0) vsync_reapply = 1;
     if (surface && width > 0 && height > 0) {
         __sync_lock_test_and_set(&video_mode_repaint_frames, 120);
         fprintf(stderr, "[t2_hook] Queued full-canvas refresh after video mode %dx%d\n",
@@ -1796,6 +1812,50 @@ static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
 
 /* ── Registration thread ─────────────────────────────────────────────── */
 
+/* ── VSync (video.vsync) ─────────────────────────────────────────────────
+ * The Loki client never probes for a swap-control extension, so
+ * $SwapIntervalSupported stays unset, the Options checkbox is disabled, and
+ * setVerticalSync() does nothing. The hook replaces setVerticalSync() with
+ * one that sets the GLX swap interval, and reapplies it after a video mode
+ * change creates a new context. */
+static int set_swap_interval(int interval) {
+    typedef void *(*get_proc_t)(const unsigned char *);
+    typedef void (*swap_ext_t)(void *, unsigned long, int);
+    typedef int (*swap_int_t)(int);
+    typedef void *(*current_display_t)(void);
+    typedef unsigned long (*current_drawable_t)(void);
+    void *gl = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    void *scope = gl ? gl : RTLD_DEFAULT;
+    get_proc_t get_proc = (get_proc_t)dlsym(scope, "glXGetProcAddressARB");
+    if (!get_proc) get_proc = (get_proc_t)dlsym(scope, "glXGetProcAddress");
+    int done = 0;
+    if (get_proc) {
+        swap_ext_t swap_ext = (swap_ext_t)get_proc((const unsigned char *)"glXSwapIntervalEXT");
+        current_display_t display = (current_display_t)dlsym(scope, "glXGetCurrentDisplay");
+        current_drawable_t drawable = (current_drawable_t)dlsym(scope, "glXGetCurrentDrawable");
+        if (swap_ext && display && drawable && display() && drawable()) {
+            swap_ext(display(), drawable(), interval);
+            done = 1;
+        }
+        swap_int_t swap_mesa = done ? NULL : (swap_int_t)get_proc((const unsigned char *)"glXSwapIntervalMESA");
+        if (swap_mesa && swap_mesa(interval) == 0) done = 1;
+        swap_int_t swap_sgi = done ? NULL : (swap_int_t)get_proc((const unsigned char *)"glXSwapIntervalSGI");
+        if (swap_sgi && interval > 0 && swap_sgi(interval) == 0) done = 1;
+    }
+    if (gl) dlclose(gl);
+    return done;
+}
+
+static const char *set_vertical_sync_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    int enable = argc > 1 && (strcmp(argv[1], "1") == 0 || strcasecmp(argv[1], "true") == 0);
+    vsync_requested = enable;
+    int done = set_swap_interval(enable ? 1 : 0);
+    fprintf(stderr, "[t2_hook] VSync %s%s\n", enable ? "on" : "off",
+            done ? "" : " (no GLX swap-control extension)");
+    return done ? "1" : "0";
+}
+
 static int register_hook_commands(void) {
     if (registered) return 1;
     uint32_t console_ptr = *(volatile uint32_t *)CONSOLE_GLOBAL;
@@ -1803,12 +1863,16 @@ static int register_hook_commands(void) {
     uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
     if (table_size == 0) return 0;
 
+    Con__addMethodS = (con_addMethodS_t)0x80E85C0;
+    /* Replaces the stock no-op; not one of the optional hook_* commands. */
+    if (hook_option_bool("video.vsync"))
+        Con__addMethodS(NULL, "setVerticalSync", set_vertical_sync_cb,
+            "setVerticalSync( <bool> )", 2, 2);
     if (!hook_option_bool("hook.console_commands")) {
         registered = 1;  /* the console is ready; only the commands are skipped */
         fprintf(stderr, "[t2_hook] Console commands disabled by hook.console_commands\n");
         return 1;
     }
-    Con__addMethodS = (con_addMethodS_t)0x80E85C0;
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);

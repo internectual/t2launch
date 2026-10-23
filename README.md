@@ -580,6 +580,13 @@ options bring the parts of it that fit the Linux client:
 - **Borderless window** (`video.borderless`, off). Windowed
   `SDL_SetVideoMode` calls get `SDL_NOFRAME`, and `SDL_VIDEO_CENTERED=1`
   places the window. Choose the desktop resolution for borderless fullscreen.
+- **VSync** (`video.vsync`, on). The Linux client never probes for a
+  swap-control extension, so `$SwapIntervalSupported` stays unset, the Video
+  options checkbox is disabled, and `setVerticalSync()` does nothing. The hook
+  sets `$SwapIntervalSupported`, replaces `setVerticalSync()` with one that
+  calls `glXSwapIntervalEXT` (or the MESA or SGI variant), applies
+  `$pref::Video::disableVerticalSync` at startup, and reapplies the setting
+  after a video mode change.
 - **Gamescope** (`video.gamescope`, off). `run-game` starts the game inside
   gamescope with the chosen game and output sizes, scaler, filter (`fsr`,
   `nis`, ...), fullscreen, and relative mouse mode. gamescope itself runs

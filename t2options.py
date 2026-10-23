@@ -135,6 +135,10 @@ OPTIONS = (
            requires=(("launcher.load_hook", (True,)),),
            help="Draw windowed modes without a title bar or frame; pick the desktop resolution "
                 "for borderless fullscreen."),
+    Option("video.vsync", "Video", "Make the VSync option work", "bool", True, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Enable the Video options VSync checkbox and set the GLX swap interval when it "
+                "changes; the Linux client never detects swap control on its own."),
     Option("video.software_gl", "Video", "Software OpenGL", "bool", False,
            env="T2LAUNCH_SOFTWARE_GL", help="Render with Mesa's software rasterizer."),
     Option("video.xrandr_modes", "Video", "Offer the display's real video modes", "bool", True,
