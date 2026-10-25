@@ -42,6 +42,9 @@ AUTH_STAGE = "directory + local-account Auth1 + IRC auth + SQLite community DB +
 LOG_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "t2launch/wonemu"
 PORTS = {"directory": 15104, "auth": 15105, "dbproxy": 15106, "irc": 15107, "master": 15108}
 TRIBESNEXT_MASTER_URL = "http://master.tribesnext.com"
+# The membership the stock client checks for its MOTD and news edit controls.
+DEFAULT_MOTD = "Welcome to the local Tribes 2 community server."
+MOTD_EDITORS_TRIBE = {"id": 1402, "name": "T2Launch Editors", "tag": "", "append": 0, "rank": 0}
 # Each new message costs one robot read, so a mailbox poll fetches at most this
 # many (the TribesNext client's own chunk size).
 TRIBESNEXT_MAIL_PAGE = 25
@@ -344,6 +347,19 @@ def backends_from_master_sources(sources, tribesnext_url=TRIBESNEXT_MASTER_URL):
     backends[1]["master"] = ("lan", "") in sources
     backends += [{"kind": "torque", "master": address} for kind, address in sources if kind == "torque"]
     return backends
+
+
+def parse_motd_editors(text):
+    """Native account names, comma-separated, allowed to edit the MOTD and any news article."""
+    if isinstance(text, (frozenset, set, list, tuple)):
+        names = text
+    else:
+        names = str(text or "").split(",")
+    return frozenset(name.strip().casefold() for name in names if name.strip())
+
+
+def format_motd_editors(editors):
+    return ",".join(sorted(editors))
 
 
 def session_community(session):
@@ -1835,8 +1851,24 @@ class DBProxyQuery:
         return status, result, status_code
 
     def welcome(self):
-        status, result, status_code = "0\t", "Welcome to the local Tribes 2 community server.", 0
+        motd = self.emulator.community.get_motd()
+        status, result, status_code = "0\t", motd if motd is not None else DEFAULT_MOTD, 0
         return status, result, status_code
+
+    def is_motd_editor(self):
+        return (session_community(self.session) == "native" and
+                self.emulator.is_motd_editor(self.session["username"],
+                                             self.session.get("auth_provider")))
+
+    def update_motd(self):
+        if not self.is_motd_editor():
+            self.emulator.log.event("motd_rejected", connection=self.connection,
+                                    username=self.session["username"])
+            return "1\tOnly T2Launch MOTD editors can change the message of the day", "", 1
+        motd = self.emulator.community.set_motd(self.arguments)
+        self.emulator.log.event("motd_updated", connection=self.connection,
+                                username=self.session["username"], characters=len(motd))
+        return "0\tMessage of the day updated", "", 0
 
     def news(self):
         query_fields = self.arguments.split("\t")
@@ -1882,7 +1914,8 @@ class DBProxyQuery:
         try:
             if len(query_fields) < 6 or not self.emulator.community.edit_news(
                     int(query_fields[1]), self.session["username"], int(query_fields[4]),
-                    query_fields[5], "\t".join(query_fields[6:])):
+                    query_fields[5], "\t".join(query_fields[6:]),
+                    any_author=self.is_motd_editor()):
                 raise ValueError("Article not found or not owned by this account")
             status, result, status_code = "0\tArticle updated", "", 0
         except ValueError as exc:
@@ -1984,7 +2017,8 @@ class DBProxyQuery:
         query_fields = self.arguments.split("\t")
         try:
             if not query_fields or not self.emulator.community.delete_news(
-                    int(query_fields[0]), self.session["username"]):
+                    int(query_fields[0]), self.session["username"],
+                    any_author=self.is_motd_editor()):
                 raise ValueError("Article not found or not owned by this account")
             status, result, status_code = "0\tArticle deleted", "", 0
         except ValueError as exc:
@@ -2653,7 +2687,7 @@ class DBProxyQuery:
         (2, True): block_list,
         (3, False): delete_news,
         (3, True): player_search,
-        (4, False): tribe_search,
+        (4, False): update_motd,
         (4, True): tribe_search,
         (5, False): send_mail,
         (5, True): buddy_list,
@@ -2727,7 +2761,7 @@ class DBProxyQuery:
 TRIBESNEXT_ROBOT_QUERIES = frozenset(DBProxyQuery.ROBOT_HANDLERS)
 # Everything a TribesNext session may query; the rest is refused as unavailable.
 TRIBESNEXT_ALLOWED_QUERIES = TRIBESNEXT_ROBOT_QUERIES | frozenset({
-    (3, True), (4, True), (4, False), (6, True), (13, True),
+    (3, True), (4, True), (6, True), (13, True),
     (22, False), (23, False), (69, False),
 })
 
@@ -2938,7 +2972,8 @@ class Emulator:
     def __init__(self, ports=None, log_dir=LOG_DIR, empty=False, keys=None, private_store=None,
                  master_backend="local", tribesnext_master_url=TRIBESNEXT_MASTER_URL,
                  community_db=None, refresh_tribesnext=False, master_sources=None,
-                 bind_address=HOST, advertise_address="", backends=None, account_creation=True):
+                 bind_address=HOST, advertise_address="", backends=None, account_creation=True,
+                 motd_editors=()):
         self.ports = dict(ports or PORTS)
         self.bind_address = bind_address or "0.0.0.0"
         self.advertise_address = advertised_address(self.bind_address, advertise_address)
@@ -2950,6 +2985,7 @@ class Emulator:
         self.dbproxy_key = woncrypto.make_key(keys["auth"]) if keys else None
         self.peer_sessions = {}
         self.account_creation = bool(account_creation)
+        self.motd_editors = parse_motd_editors(motd_editors)
         self.private_store = Path(private_store) if private_store is not None else None
         self.public_store = self.private_store.with_name("public.store") if self.private_store else None
         self.tribesnext_robot = tribesnext.RobotClient()
@@ -3036,6 +3072,10 @@ class Emulator:
         return (session_community(session) == "tribesnext" and
                 any(kind == "native" for kind, _address in self.irc_backends))
 
+    def is_motd_editor(self, username, auth_provider=None):
+        """Native logins named in --motd-editors may edit the MOTD and any news article."""
+        return (auth_provider or "local") != "tribesnext" and str(username).casefold() in self.motd_editors
+
     def auth_info_tribes(self, username, auth_provider=None, tribesnext_credentials=None):
         """Return the memberships to embed in the Auth2 AuthInfo, best effort.
 
@@ -3056,6 +3096,10 @@ class Emulator:
             self.log.event("auth_info_tribes_unavailable", provider=provider,
                            error=type(exc).__name__)
             return []
+        if self.is_motd_editor(username, provider):
+            # The stock client shows its MOTD and news edit controls to members
+            # of tribe 1402; the store never gives a real tribe that id.
+            memberships = [*memberships, MOTD_EDITORS_TRIBE]
         tribes = []
         for tribe in memberships:
             if len(tribes) == woncrypto.T2_AUTH_INFO_MAX_TRIBES:
@@ -3268,6 +3312,7 @@ class Emulator:
                 "advertise_address": self.advertise_address,
                 "refresh_tribesnext": self.refresh_tribesnext,
                 "account_creation": self.account_creation,
+                "motd_editors": format_motd_editors(self.motd_editors),
                 "verifier_sha256": hashlib.sha256(woncrypto.public_key(self.keys["root"])).hexdigest() if self.keys else None,
                 "auth_key_sha256": hashlib.sha256(woncrypto.public_key(self.keys["auth"])).hexdigest() if self.keys else None,
                 "private_store_path_sha256": hashlib.sha256(str(self.private_store.resolve()).encode()).hexdigest()
@@ -3662,6 +3707,7 @@ def ensure(args):
         "implementation_sha256": IMPLEMENTATION_SHA256,
         "refresh_tribesnext": args.refresh_tribesnext,
         "account_creation": args.account_creation,
+        "motd_editors": format_motd_editors(parse_motd_editors(args.motd_editors)),
         "private_store_path_sha256": hashlib.sha256(str(private_store.resolve()).encode()).hexdigest(),
         "community_db_path_sha256": hashlib.sha256(
             str(community_db.expanduser().resolve()).encode()).hexdigest(),
@@ -3710,6 +3756,8 @@ def ensure(args):
             child_args.append("--refresh-tribesnext")
         if not args.account_creation:
             child_args.append("--no-account-creation")
+        if args.motd_editors:
+            child_args += ["--motd-editors", args.motd_editors]
         process = subprocess.Popen(child_args,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     for _ in range(50):
@@ -3773,6 +3821,8 @@ def main():
     parser.add_argument("--no-account-creation", dest="account_creation", action="store_false",
                         default=os.environ.get("T2LAUNCH_WON_ACCOUNT_CREATION", "1") != "0",
                         help="refuse the game's Create Account dialog")
+    parser.add_argument("--motd-editors", default=os.environ.get("T2LAUNCH_WON_MOTD_EDITORS", ""),
+                        help="comma-separated native accounts that may edit the MOTD and any news article")
     parser.add_argument("--empty-directory", action="store_true", help="serve successful queries with no entities")
     for service, port in PORTS.items():
         parser.add_argument(f"--{service}-port", type=int, default=port)
@@ -3828,7 +3878,7 @@ def main():
                             args.master_backend, args.tribesnext_master_url, args.community_db,
                             args.refresh_tribesnext, backends=args.backends,
                             bind_address=args.bind_address, advertise_address=args.advertise_address,
-                            account_creation=args.account_creation)
+                            account_creation=args.account_creation, motd_editors=args.motd_editors)
         def stop(_signum, _frame):
             emulator.stopped.set()
         signal.signal(signal.SIGTERM, stop)

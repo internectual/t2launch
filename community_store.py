@@ -11,6 +11,9 @@ from pathlib import Path
 
 LOCAL_PASSWORD_ITERATIONS = 310_000
 DEFAULT_PROFILE_GRAPHIC = "texticons/twb/twb_Laserrifle.jpg"
+# Tribe ids the stock client treats as Dynamix staff (1401) and news editors (1402).
+RESERVED_TRIBE_IDS = (1401, 1402)
+MOTD_MAX_CHARACTERS = 1024
 
 
 class CommunityStore:
@@ -234,6 +237,13 @@ class CommunityStore:
                                    (update_id, post["post_id"]))
                 connection.execute("UPDATE forum_topics SET update_id = MAX(update_id, ?) "
                                    "WHERE topic_id = ?", (update_id, post["topic_id"]))
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+            """)
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS news_articles (
                     article_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -490,6 +500,14 @@ class CommunityStore:
         self.ensure_profile(founder_username, founder_user_id)
         try:
             with self.lock, self._connection() as connection:
+                # The stock client gives members of tribes 1401 and 1402 Dynamix
+                # staff powers, so a local tribe never takes either id.
+                next_id = connection.execute(
+                    "SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'tribes'), 0), "
+                    "COALESCE((SELECT MAX(tribe_id) FROM tribes), 0)) + 1").fetchone()[0]
+                if next_id in RESERVED_TRIBE_IDS:
+                    connection.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = 'tribes'",
+                                       (max(RESERVED_TRIBE_IDS),))
                 cursor = connection.execute("""
                     INSERT INTO tribes (name, tag, appending, recruiting, description, created_at)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -1150,25 +1168,41 @@ class CommunityStore:
                 (category_id,)).fetchone()[0]
         return [dict(row) for row in rows], int(count)
 
-    def edit_news(self, article_id, author_username, category_id, title, body):
+    def edit_news(self, article_id, author_username, category_id, title, body, any_author=False):
+        """Edit an article by its author, or by anyone when any_author (an editor)."""
         if int(category_id) not in {105, 35500, 35501, 35503, 35504}:
             raise ValueError("Unknown news category")
         with self.lock, self._connection() as connection:
             cursor = connection.execute("""
                 UPDATE news_articles SET category_id = ?, title = ?, body = ?, updated_at = ?
-                WHERE article_id = ? AND author_id = (
-                    SELECT user_id FROM profiles WHERE username = ? COLLATE NOCASE)
+                WHERE article_id = ? AND (? OR author_id = (
+                    SELECT user_id FROM profiles WHERE username = ? COLLATE NOCASE))
                       AND is_deleted = 0
             """, (int(category_id), str(title), str(body), int(time.time()),
-                  int(article_id), str(author_username)))
+                  int(article_id), int(bool(any_author)), str(author_username)))
         return cursor.rowcount > 0
 
-    def delete_news(self, article_id, author_username):
+    def delete_news(self, article_id, author_username, any_author=False):
         with self.lock, self._connection() as connection:
             cursor = connection.execute("""
                 UPDATE news_articles SET is_deleted = 1, updated_at = ?
-                WHERE article_id = ? AND author_id = (
-                    SELECT user_id FROM profiles WHERE username = ? COLLATE NOCASE)
+                WHERE article_id = ? AND (? OR author_id = (
+                    SELECT user_id FROM profiles WHERE username = ? COLLATE NOCASE))
                       AND is_deleted = 0
-            """, (int(time.time()), int(article_id), str(author_username)))
+            """, (int(time.time()), int(article_id), int(bool(any_author)), str(author_username)))
         return cursor.rowcount > 0
+
+    def get_motd(self):
+        """The stored message of the day, or None."""
+        with self.lock, self._connection() as connection:
+            row = connection.execute("SELECT value FROM settings WHERE key = 'motd'").fetchone()
+        return row["value"] if row is not None else None
+
+    def set_motd(self, text):
+        text = str(text).replace("\r", "").replace("\0", "")[:MOTD_MAX_CHARACTERS]
+        with self.lock, self._connection() as connection:
+            connection.execute("""
+                INSERT INTO settings (key, value, updated_at) VALUES ('motd', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """, (text, int(time.time())))
+        return text

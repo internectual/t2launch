@@ -409,8 +409,16 @@ emulator's SQLite community store provides:
   and topics manageable by tribe moderators. The stock #25034 shell has no
   Forums tab, so these are reached only through existing forum links.
 
-MOTD administration and other DBProxy query families are not supported;
-unsupported requests are recorded by operation and payload hash.
+The MOTD on the News tab can be edited by the native accounts listed in the
+WON tab's **MOTD editors** option (advanced). Those logins carry the stock
+client's news-editor membership (tribe id 1402), so the stock Edit button
+appears; editors can also edit or delete any news article. Local tribes never
+get ids 1401 or 1402, which the stock client treats as staff.
+
+The stock client sends no other DBProxy queries. A community query wonemu
+doesn't know gets an "Unsupported DBProxy query N" reply, logged as
+`irc_dbproxy_query` with its number and argument length; an unknown message
+on the account service is logged as `unhandled` with its type and SHA-256.
 
 ### Running it by hand
 

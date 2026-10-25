@@ -107,6 +107,10 @@ OPTIONS = (
            requires=(("won.mode", ("local",)),),
            help="Let the game's Create Account dialog register accounts with the first "
                 "checked Auth backend: TribesNext (this machine only) or Native."),
+    Option("won.motd_editors", "Local service", "MOTD editors", "text", "", tab="won",
+           env="T2LAUNCH_WON_MOTD_EDITORS", advanced=True, requires=(("won.mode", ("local",)),),
+           help="Comma-separated native (T2Launch) accounts that may edit the News tab's message "
+                "of the day and any news article. TribesNext logins can't be editors."),
     Option("won.auth_key_profile", "Local service", "Auth key profile", "choice", "compat",
            tab="won", choices=("compat", "native"), env="T2LAUNCH_AUTH_KEY_PROFILE", advanced=True,
            requires=(("won.mode", ("local",)),),

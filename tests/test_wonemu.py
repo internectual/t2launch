@@ -538,7 +538,7 @@ class ProtocolTests(unittest.TestCase):
             self.assertIn("123456", player_search)
 
             handler.request.sent.clear()
-            handler._handle_dbqax("13 4 10 :Live", session, 1)
+            handler._handle_dbqax("13 C4 10 :Live", session, 1)
             clan_search = "".join(handler.request.sent)
             self.assertIn("Live Clan", clan_search)
 
@@ -549,7 +549,7 @@ class ProtocolTests(unittest.TestCase):
             emulator.tribesnext_robot.clan_search = unavailable_clan_search
             emulator.community.search_tribes = lambda *args, **kwargs: self.fail(
                 "TribesNext clan search must not fall back to local records")
-            handler._handle_dbqax("13 4 10 :Live", session, 1)
+            handler._handle_dbqax("13 C4 10 :Live", session, 1)
             unavailable_clan_search_reply = "".join(handler.request.sent)
             self.assertIn("TribesNext search unavailable", unavailable_clan_search_reply)
             self.assertNotIn("Live Clan", unavailable_clan_search_reply)
@@ -1265,6 +1265,67 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(store.list_news(35500)[0][0]["title"], "Updated headline")
             self.assertTrue(store.delete_news(article_id, "author"))
             self.assertEqual(store.list_news(35500), ([], 0))
+
+    def test_community_store_motd_and_reserved_tribe_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = community_store.CommunityStore(Path(directory) / "community.sqlite3")
+            self.assertIsNone(store.get_motd())
+            self.assertEqual(store.set_motd("Line one\r\nLine two\0"), "Line one\nLine two")
+            self.assertEqual(store.get_motd(), "Line one\nLine two")
+            self.assertEqual(len(store.set_motd("x" * 5000)), community_store.MOTD_MAX_CHARACTERS)
+            store.ensure_profile("founder", 101)
+            store.create_tribe("First", "F", 0, 0, "", "founder", 101)
+            with store._connection() as connection:
+                connection.execute("UPDATE sqlite_sequence SET seq = 1400 WHERE name = 'tribes'")
+            # 1401 and 1402 are the stock client's staff and news-editor tribes.
+            self.assertEqual(store.create_tribe("Second", "S", 0, 0, "", "founder", 101)["tribe_id"],
+                             1403)
+
+    def test_motd_editors_change_the_motd_and_any_news(self):
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory),
+                                       motd_editors=" Editor , other ")
+            self.assertEqual(emulator.identity()["motd_editors"], "editor,other")
+
+            class Request:
+                def __init__(self):
+                    self.sent = []
+
+                def sendall(self, payload):
+                    self.sent.append(payload.decode("utf-8"))
+
+            handler = wonemu.IRCHandler.__new__(wonemu.IRCHandler)
+            handler.server = SimpleNamespace(emulator=emulator)
+
+            def query(session, line):
+                handler.request = Request()
+                handler._handle_dbqax(line, session, 1)
+                return "".join(handler.request.sent)
+
+            editor = {"username": "EDITOR", "irc_authenticated": True, "auth_provider": "local"}
+            player = {"username": "player", "irc_authenticated": True, "auth_provider": "local"}
+            impostor = {"username": "editor", "irc_authenticated": True,
+                        "auth_provider": "tribesnext", "tribesnext_credentials": object()}
+            self.assertIn(wonemu.DEFAULT_MOTD, query(player, "1 0 0 :"))
+            self.assertIn("Only T2Launch MOTD editors", query(player, "2 4 0 :Hijacked"))
+            self.assertIn("community operation unavailable", query(impostor, "3 4 0 :Hijacked"))
+            self.assertIn("Message of the day updated", query(editor, "4 4 0 :Server rules\\nBe nice"))
+            self.assertIn("Server rules\\nBe nice", query(player, "5 0 0 :"))
+
+            emulator.community.ensure_profile("player", 101)
+            article = emulator.community.post_news(105, "player", 101, "Headline", "Body")
+            stranger = {"username": "stranger", "irc_authenticated": True, "auth_provider": "local"}
+            self.assertIn("not owned", query(stranger, f"6 3 0 :{article}"))
+            self.assertIn("Article updated",
+                          query(editor, f"7 2 0 :0\t{article}\t0\t0\t105\tFixed\tBody"))
+            self.assertIn("Article deleted", query(editor, f"8 3 0 :{article}"))
+
+            self.assertTrue(emulator.is_motd_editor("Editor"))
+            self.assertFalse(emulator.is_motd_editor("Editor", "tribesnext"))
+            tribes = emulator.auth_info_tribes("editor")
+            self.assertIn(wonemu.MOTD_EDITORS_TRIBE["id"], [int(tribe["id"]) for tribe in tribes])
+            self.assertNotIn(wonemu.MOTD_EDITORS_TRIBE["id"],
+                             [int(tribe["id"]) for tribe in emulator.auth_info_tribes("player")])
 
     def test_community_store_buddy_list_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
