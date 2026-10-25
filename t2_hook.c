@@ -2483,13 +2483,20 @@ static const char* hook_tn_verify_cert_cb(void *obj, S32 argc, const char **argv
    +0x2154), so wonemu players still authenticate both ways while
    TribesNext players connect and use T2CSRI. A server without a WON
    certificate also turns away every client off its own Class B network;
-   skip that LAN-only check, as TribesNext servers do. */
+   skip that LAN-only check, as TribesNext servers do. A server with one
+   ignores server-browser pings and info queries flagged as coming from a
+   client without one (flag bit 0), so TribesNext players' browsers time it
+   out; answer those as well. */
 #define SERVER_REPLY_CERT_FLAG 0x0822B604
 #define SERVER_LAN_CHECK       0x0822BC85
+#define SERVER_PING_QUERY_SKIP 0x08235323  /* jne past the ping reply */
+#define SERVER_INFO_QUERY_SKIP 0x0823601E  /* jne past the info reply */
 static const unsigned char server_reply_cert_flag_original[] =
     {0x83, 0x3d, 0x34, 0x60, 0x6b, 0x08, 0x00, 0x0f, 0x95, 0xc0};
 static const unsigned char server_lan_check_original[] =
     {0x83, 0x3d, 0x34, 0x60, 0x6b, 0x08, 0x00, 0x0f, 0x85, 0x42, 0x03, 0x00, 0x00};
+static const unsigned char server_ping_query_skip_original[] = {0x0f, 0x85, 0x30, 0x02, 0x00, 0x00};
+static const unsigned char server_info_query_skip_original[] = {0x0f, 0x85, 0xfb, 0x05, 0x00, 0x00};
 
 static int install_server_tribesnext_auth(void) {
     /* cmpl $0,0x2154(%esi), keeping the setne that follows */
@@ -2497,14 +2504,20 @@ static int install_server_tribesnext_auth(void) {
     /* jmp to the accept path (0x0822BFD4), then nops */
     static const unsigned char accept_any[] =
         {0xe9, 0x4a, 0x03, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    static const unsigned char answer_query[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
     const struct code_patch patches[] = {
         {SERVER_REPLY_CERT_FLAG, server_reply_cert_flag_original, sizeof(server_reply_cert_flag_original),
          0, client_cert_flag, sizeof(client_cert_flag)},
         {SERVER_LAN_CHECK, server_lan_check_original, sizeof(server_lan_check_original),
          0, accept_any, sizeof(accept_any)},
+        {SERVER_PING_QUERY_SKIP, server_ping_query_skip_original, sizeof(server_ping_query_skip_original),
+         0, answer_query, sizeof(answer_query)},
+        {SERVER_INFO_QUERY_SKIP, server_info_query_skip_original, sizeof(server_info_query_skip_original),
+         0, answer_query, sizeof(answer_query)},
     };
     if (!apply_code_patches("TribesNext server", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
-    fprintf(stderr, "[t2_hook] Server: clients without a WON certificate may connect (memory only)\n");
+    fprintf(stderr, "[t2_hook] Server: clients without a WON certificate may connect and query it "
+            "(memory only)\n");
     return 1;
 }
 

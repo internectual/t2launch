@@ -252,6 +252,14 @@ int main(void) {
                sizeof(server_reply_cert_flag_original));
         memcpy((void *)SERVER_LAN_CHECK, server_lan_check_original, sizeof(server_lan_check_original));
         ((unsigned char *)SERVER_LAN_CHECK)[9] = 0x43;
+        /* The ping and info skips are on two adjacent pages. */
+        uintptr_t query_page = SERVER_PING_QUERY_SKIP & ~((uintptr_t)size - 1);
+        assert((SERVER_INFO_QUERY_SKIP & ~((uintptr_t)size - 1)) == query_page + (uintptr_t)size);
+        assert(mmap((void *)query_page, 2 * size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)query_page);
+        memcpy((void *)SERVER_PING_QUERY_SKIP, server_ping_query_skip_original, 6);
+        memcpy((void *)SERVER_INFO_QUERY_SKIP, server_info_query_skip_original, 6);
+        assert(mprotect((void *)query_page, 2 * size, PROT_READ | PROT_EXEC) == 0);
         assert(mprotect(auth, size, PROT_READ | PROT_EXEC) == 0);
         assert(!install_server_tribesnext_auth());
         assert(memcmp((void *)SERVER_REPLY_CERT_FLAG, server_reply_cert_flag_original, 10) == 0);
@@ -265,6 +273,10 @@ int main(void) {
         assert(lan[0] == 0xe9 && SERVER_LAN_CHECK + 5 + (uintptr_t)call_target_offset(SERVER_LAN_CHECK) ==
                0x0822BFD4);
         munmap(auth, size);
+        /* Browser queries from clients without a certificate: both skips became nops. */
+        assert(memcmp((void *)SERVER_PING_QUERY_SKIP, "\x90\x90\x90\x90\x90\x90", 6) == 0);
+        assert(memcmp((void *)SERVER_INFO_QUERY_SKIP, "\x90\x90\x90\x90\x90\x90", 6) == 0);
+        munmap((void *)query_page, 2 * size);
         target = &game_targets[0];
     }
 

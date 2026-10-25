@@ -66,6 +66,9 @@ class GameBinaryTests(unittest.TestCase):
         # The flag replacement reads the pending connection's certificate, which
         # the challenge reply loads from the same field.
         self.assertEqual(read(0x0822B625, 6), bytes.fromhex("8b 86 54 21 00 00"))
+        # Ping and info replies skipped for clients without a WON certificate.
+        self.assertEqual(read(0x0823531E, 11), bytes.fromhex("8a 45 c4 a8 01 0f 85 30 02 00 00"))
+        self.assertEqual(read(0x0823601B, 9), bytes.fromhex("f6 c3 01 0f 85 fb 05 00 00"))
         # usleep(1000) ends Platform::process in the server's main loop.
         self.assertEqual(read(0x081CF44C, 5), bytes.fromhex("68 e8 03 00 00"))
 
