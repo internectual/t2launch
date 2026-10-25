@@ -31,6 +31,38 @@ typedef sdl_rect_t **(*sdl_list_modes_t)(void *format, uint32_t flags);
 #define SDL_FULLSCREEN_FLAG 0x80000000u
 #define SDL_NOFRAME_FLAG 0x00000020u
 
+/* ── Executables ─────────────────────────────────────────────────────────
+ * The hook runs in the Loki #25034 client (tribes2.dynamic) and in its
+ * separate dedicated-server build (tribes2d.dynamic), which places the same
+ * engine code at other addresses. The server has no SDL, GL, browser or
+ * account login, so the client-only patches below keep their client
+ * addresses and run only in the client. */
+struct game_target {
+    const char *executable;
+    const char *description;
+    int dedicated;
+    uintptr_t con_add_method;
+    uintptr_t con_evaluate;
+    uintptr_t string_table;          /* StringTable global; set once the console exists */
+    uintptr_t real_milliseconds;     /* Platform::getRealMilliseconds */
+    uintptr_t won_bootstrap[3];      /* "tribes2.mN.sierra.com:15104" */
+    uintptr_t won_verifier;          /* 817-byte DER slot read by the WON global constructor */
+    uintptr_t net_rate_variable;     /* $pref::Net::PacketRateToClient */
+    uintptr_t net_size_variable;     /* $pref::Net::PacketSize */
+    uintptr_t net_rate_compare[3];   /* see install_net_packet_limits() */
+};
+
+static const struct game_target game_targets[] = {
+    {"tribes2.dynamic", "client", 0, 0x080E85C0, 0x080E88F4, 0x08493DEC, 0x081CFA44,
+     {0x084846B1, 0x084846CD, 0x084846E9}, 0x0849A860, 0x08495CEC, 0x08495CF0,
+     {0x081F8EAE, 0x081FB382, 0x081FB683}},
+    {"tribes2d.dynamic", "dedicated server", 1, 0x080E74B0, 0x080E77E4, 0x0848902C, 0x081CD014,
+     {0x08479751, 0x0847976D, 0x08479789}, 0x0848F520, 0x0848ADCC, 0x0848ADD0,
+     {0x081EDB4E, 0x081F0022, 0x081F0323}},
+};
+#define GAME_TARGET_COUNT (sizeof(game_targets) / sizeof(game_targets[0]))
+static const struct game_target *target = &game_targets[0];
+
 static con_addMethodS_t Con__addMethodS = NULL;
 static con_evaluate_t Con__evaluate = (con_evaluate_t)0x080E88F4;
 static sdl_gl_swap_buffers_t real_sdl_gl_swap_buffers = NULL;
@@ -99,6 +131,8 @@ static struct hook_option hook_options[] = {
     {"net.native_auth", "0", NULL, 0, "", 0},
     {"discord.presence", "0", NULL, 0, "", 0},
     {"discord.app_id", "1563045749846056970", NULL, 0, "", 0},
+    {"server.tribesnext_auth", "1", NULL, 0, "", 0},
+    {"server.public_address", "", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -387,6 +421,126 @@ static const char tribesnext_runtime_script[] =
     "}\n"
       "t2launch_tnUnlockPoll();\n";
 
+/* Dedicated server: the helper the hook polls until the server scripts have
+   loaded, then the server half of T2CSRI (server.tribesnext_auth). */
+static const char server_core_script[] =
+    "function t2launch_serverReady() {\n"
+    " if (isObject(ServerGroup)) return \"1\";\n"
+    " return \"0\";\n"
+    "}\n";
+
+/* TribesNext players carry no WON certificate. This is TribesNext's own
+ * server protocol (serverSide.cs, T2CSRI 1.1), with the hook verifying the
+ * account certificate against the TribesNext root key and doing the RSA in
+ * native code: the server pokes the client, receives its certificate in
+ * chunks and a client challenge, encrypts the client challenge and its own
+ * to the account key, and admits the player once the client returns the
+ * server half. Players with a WON certificate (wonemu accounts) skip it. */
+static const char server_tribesnext_script[] =
+    "function t2launch_tnClientIP(%client) {\n"
+    " %ip = %client.getAddress();\n"
+    " %ip = getSubStr(%ip, strstr(%ip, \":\") + 1, strlen(%ip));\n"
+    " return getSubStr(%ip, 0, strstr(%ip, \":\"));\n"
+    "}\n"
+    "function t2launch_tnIsHex(%text) {\n"
+    " %text = strlwr(%text);\n"
+    " if (strlen(%text) == 0) return 0;\n"
+    " for (%i = 0; %i < strlen(%text); %i++)\n"
+    "  if (strstr(\"0123456789abcdef\", getSubStr(%text, %i, 1)) < 0) return 0;\n"
+    " return 1;\n"
+    "}\n"
+    "function t2launch_tnSameLan(%source, %destination) {\n"
+    " if (getSubStr(%destination, 0, 3) $= \"10.\") return getSubStr(%source, 0, 3) $= \"10.\";\n"
+    " if (getSubStr(%destination, 0, 4) $= \"172.\" && getSubStr(%destination, 4, 2) > 15 && getSubStr(%destination, 4, 2) < 32)\n"
+    "  return getSubStr(%source, 0, 4) $= \"172.\" && getSubStr(%source, 4, 2) > 15 && getSubStr(%source, 4, 2) < 32;\n"
+    " if (getSubStr(%destination, 0, 8) $= \"192.168.\") return getSubStr(%source, 0, 8) $= \"192.168.\";\n"
+    " if (getSubStr(%destination, 0, 8) $= \"169.254.\") return getSubStr(%source, 0, 8) $= \"169.254.\";\n"
+    " if (getSubStr(%destination, 0, 4) $= \"127.\") return getSubStr(%source, 0, 4) $= \"127.\";\n"
+    " return 0;\n"
+    "}\n"
+    /* The client names the address it connected to, so a proof it gives one
+       server is no good on another. Without a configured public address the
+       hook cannot tell which Internet address is ours, and accepts any. */
+    "function t2launch_tnReasonable(%source, %destination) {\n"
+    " %public = hook_option(\"server.public_address\");\n"
+    " if (%destination $= %public || (%destination $= $Host::BindAddress && $Host::BindAddress !$= \"\")) return 1;\n"
+    " if (t2launch_tnSameLan(%source, %destination)) return 1;\n"
+    " return %public $= \"\";\n"
+    "}\n"
+    "function t2launch_tnReject(%client, %reason) {\n"
+    " echo(\"T2CSRI: refused \" @ %client.getAddress() @ \": \" @ %reason);\n"
+    " %client.setDisconnectReason(%reason);\n"
+    " %client.delete();\n"
+    "}\n"
+    "function t2launch_tnExpire(%client) {\n"
+    " if (isObject(%client) && !%client.doneAuthenticating)\n"
+    "  t2launch_tnReject(%client, \"This is a TribesNext server. You must install the TribesNext client to play. See www.tribesnext.com for info.\");\n"
+    "}\n"
+    "function serverCmdt2csri_sendCertChunk(%client, %chunk) {\n"
+    " if (%client.doneAuthenticating || !%client.t2launchTNPending) return;\n"
+    " %client.t2csri_cert = %client.t2csri_cert @ %chunk;\n"
+    " if (strlen(%client.t2csri_cert) > 20000)\n"
+    "  t2launch_tnReject(%client, \"Account certificate too long. Check your account key for corruption.\");\n"
+    "}\n"
+    "function serverCmdt2csri_sendChallenge(%client, %clientChallenge) {\n"
+    " if (%client.doneAuthenticating || !%client.t2launchTNPending || %client.t2csri_serverChallenge !$= \"\") return;\n"
+    " %cert = %client.t2csri_cert;\n"
+    " if (hook_tn_verify_cert(%cert) !$= \"1\") { t2launch_tnReject(%client, \"Invalid account certificate.\"); return; }\n"
+    " if (!t2launch_tnIsHex(%clientChallenge) || strlen(%clientChallenge) < 9 || strlen(%clientChallenge) > 64) {\n"
+    "  t2launch_tnReject(%client, \"Invalid characters in client challenge.\"); return;\n"
+    " }\n"
+    " %claimed = hook_tn_hex_ipv4(getSubStr(%clientChallenge, strlen(%clientChallenge) - 8, 8));\n"
+    " %source = t2launch_tnClientIP(%client);\n"
+    " if (!t2launch_tnReasonable(%source, %claimed)) {\n"
+    "  t2launch_tnReject(%client, \"Potential man in the middle attack detected. Your client claims it connected to: \" @ %claimed @ \", but the server does not consider this reasonable.\");\n"
+    "  return;\n"
+    " }\n"
+    " %client.t2csri_clientChallenge = %clientChallenge;\n"
+    " %client.t2csri_serverChallenge = hook_rand64() @ hook_tn_ipv4_hex(%source);\n"
+    " %encrypted = hook_rsa_mod_exp(%clientChallenge @ %client.t2csri_serverChallenge, getField(%cert, 2), getField(%cert, 3));\n"
+    " if (!t2launch_tnIsHex(%encrypted)) { t2launch_tnReject(%client, \"The server could not encrypt your challenge.\"); return; }\n"
+    " for (%i = 0; %i < strlen(%encrypted); %i += 200)\n"
+    "  commandToClient(%client, 't2csri_getChallengeChunk', getSubStr(%encrypted, %i, 200));\n"
+    " commandToClient(%client, 't2csri_decryptChallenge');\n"
+    " %client.t2launchTNAuthInfo = getField(%cert, 0) @ \"\\t\\t0\\t\" @ getField(%cert, 1) @ \"\\n0\\n\";\n"
+    "}\n"
+    "function serverCmdt2csri_challengeResponse(%client, %serverChallenge) {\n"
+    " if (%client.doneAuthenticating || !%client.t2launchTNPending) return;\n"
+    " if (%client.t2csri_serverChallenge $= \"\" || %client.t2csri_serverChallenge !$= %serverChallenge) {\n"
+    "  t2launch_tnReject(%client, \"Invalid server challenge. Check your account key for corruption.\"); return;\n"
+    " }\n"
+    " %client.t2launchTNVerified = 1;\n"
+    " echo(\"T2CSRI: \" @ getField(%client.t2launchTNAuthInfo, 0) @ \" (\" @ getField(%client.t2launchTNAuthInfo, 3) @ \") authenticated\");\n"
+    " %client.onConnect(%client.tname, %client.trgen, %client.tskin, %client.tvoic, %client.tvopi);\n"
+    "}\n"
+    "package T2LaunchTribesNextServer {\n"
+    " function GameConnection::onConnect(%client, %name, %raceGender, %skin, %voice, %voicePitch) {\n"
+    "  if (!%client.t2launchTNVerified && !%client.isAIControlled() && getField(%client.getAuthInfo(), 3) <= 0) {\n"
+    "   if (%client.t2launchTNPending) return;\n"
+    "   %client.t2launchTNPending = 1;\n"
+    "   %client.tname = %name; %client.trgen = %raceGender; %client.tskin = %skin;\n"
+    "   %client.tvoic = %voice; %client.tvopi = %voicePitch;\n"
+    "   %client.tterm = schedule(15000, 0, t2launch_tnExpire, %client);\n"
+    "   commandToClient(%client, 't2csri_pokeClient', \"T2CSRI 1.1 - 03/18/2009\");\n"
+    "   return;\n"
+    "  }\n"
+    "  if (isEventPending(%client.tterm)) cancel(%client.tterm);\n"
+    "  Parent::onConnect(%client, %name, %raceGender, %skin, %voice, %voicePitch);\n"
+    "  %client.doneAuthenticating = 1;\n"
+    " }\n"
+    /* A player dropped while authenticating never joined, so there is no
+       leaving message or score to clean up. */
+    " function GameConnection::onDrop(%client, %reason) {\n"
+    "  if (!isObject(%client) || (%client.t2launchTNPending && !%client.doneAuthenticating)) return;\n"
+    "  Parent::onDrop(%client, %reason);\n"
+    " }\n"
+    " function GameConnection::getAuthInfo(%client) {\n"
+    "  if (%client.t2launchTNVerified) return %client.t2launchTNAuthInfo;\n"
+    "  return Parent::getAuthInfo(%client);\n"
+    " }\n"
+    "};\n"
+    "activatePackage(T2LaunchTribesNextServer);\n";
+
 /* ChooseFilterDlg.cs clamps a filter's Max Bots field to 16; allow the full
    0-255 a server can report, matching install_browser_bot_limit(). */
 static const char filter_max_bots_override[] =
@@ -567,7 +721,6 @@ static void poll_discord_presence(time_t now) {
     send_discord_presence(Con__evaluate("t2launch_presence();", 0, NULL, 0));
 }
 
-#define CONSOLE_GLOBAL 0x8493dec
 #define CONSOLE_TABLE_SIZE_OFFS 4
 
 /* PlayerPane::ButtonClick(2) trusts memberships embedded in AuthInfo, so the
@@ -884,7 +1037,7 @@ static int parse_won_endpoints(const char *list, const char *port_text,
 }
 
 static int redirect_won_bootstrap(void) {
-    static const uintptr_t addresses[] = {0x084846B1, 0x084846CD, 0x084846E9};
+    const uintptr_t *addresses = target->won_bootstrap;
     static const char *original[] = {
         "tribes2.m1.sierra.com:15104", "tribes2.m2.sierra.com:15104",
         "tribes2.m3.sierra.com:15104"
@@ -934,7 +1087,7 @@ static int redirect_won_bootstrap(void) {
    100 ms at startup. On CPUs and VMs whose timestamp counters are not
    synchronized or constant across cores, game time runs fast or jumps as the
    thread migrates. Jump to a CLOCK_MONOTONIC replacement instead. */
-#define REAL_MILLISECONDS_ADDRESS 0x081CFA44
+#define REAL_MILLISECONDS_ADDRESS 0x081CFA44  /* the client's; see game_targets */
 static const unsigned char real_milliseconds_original[] = {0x0f, 0x31, 0x55, 0x89, 0xe5, 0x83, 0xec, 0x14};
 static struct timespec monotonic_clock_base;
 
@@ -947,7 +1100,7 @@ static uint32_t monotonic_real_milliseconds(void) {
 }
 
 static int install_monotonic_clock(void) {
-    uintptr_t address = REAL_MILLISECONDS_ADDRESS;
+    uintptr_t address = target->real_milliseconds;
     int protection;
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return 0;
@@ -1051,46 +1204,59 @@ static int install_browser_bot_limit(void) {
     return 1;
 }
 
-/* The client clamps $pref::Net::PacketRateToClient (0x08495CEC) to 32 and
-   $pref::Net::PacketSize (0x08495CF0) to 450 in three places: the
-   NetConnection constructor and two rate setters. The clamped values become
-   the rate and size the client asks the server for; a stock server still
-   sends at most its own rate and size, while QoL-patched TribesNext servers
-   accept more. The rate compare takes a sign-extended imm8, so 127 is the
-   largest possible limit. */
+/* Both executables clamp $pref::Net::PacketRateToClient to 32 and
+   $pref::Net::PacketSize to 450 in three places: the NetConnection
+   constructor and two rate setters. In the client the clamped values become
+   the rate and size it asks the server for; in the server they cap what it
+   sends each client. A stock peer still holds the other end to 32 and 450,
+   while QoL-patched TribesNext peers accept more. At each site the rate
+   compare is followed by its store at +9, the size compare at +0x26 and its
+   store at +0x32; each instruction names its variable's address. The rate
+   compare takes a sign-extended imm8, so 127 is the largest possible limit. */
 #define NET_PACKET_RATE_LIMIT 64
 #define NET_PACKET_SIZE_LIMIT 1000
-static const uintptr_t net_rate_compare_sites[] = {0x081F8EAE, 0x081FB382, 0x081FB683};
-static const uintptr_t net_rate_store_sites[] = {0x081F8EB7, 0x081FB38B, 0x081FB68C};
-static const uintptr_t net_size_compare_sites[] = {0x081F8ED4, 0x081FB3A8, 0x081FB6A9};
-static const uintptr_t net_size_store_sites[] = {0x081F8EE0, 0x081FB3B4, 0x081FB6B5};
-static const unsigned char net_rate_compare_original[] = {0x83, 0x3d, 0xec, 0x5c, 0x49, 0x08, 0x20};
-static const unsigned char net_rate_store_original[] =
-    {0xc7, 0x05, 0xec, 0x5c, 0x49, 0x08, 0x20, 0x00, 0x00, 0x00};
-static const unsigned char net_size_compare_original[] =
-    {0x81, 0x3d, 0xf0, 0x5c, 0x49, 0x08, 0xc2, 0x01, 0x00, 0x00};
-static const unsigned char net_size_store_original[] =
-    {0xc7, 0x05, 0xf0, 0x5c, 0x49, 0x08, 0xc2, 0x01, 0x00, 0x00};
+#define NET_RATE_STORE_OFFSET 0x09
+#define NET_SIZE_COMPARE_OFFSET 0x26
+#define NET_SIZE_STORE_OFFSET 0x32
+
+/* An instruction's opcode bytes, its variable's address, then its operand. */
+static void net_instruction(unsigned char *out, unsigned char op1, unsigned char op2, uintptr_t variable,
+                            const unsigned char *operand, size_t operand_length) {
+    uint32_t address = (uint32_t)variable;
+    out[0] = op1;
+    out[1] = op2;
+    memcpy(out + 2, &address, sizeof(address));
+    memcpy(out + 6, operand, operand_length);
+}
 
 static int install_net_packet_limits(void) {
     static const unsigned char rate8[] = {NET_PACKET_RATE_LIMIT};
     static const unsigned char rate32[] = {NET_PACKET_RATE_LIMIT, 0, 0, 0};
     static const unsigned char size32[] = {NET_PACKET_SIZE_LIMIT & 0xff, NET_PACKET_SIZE_LIMIT >> 8, 0, 0};
+    static const unsigned char stock_rate8[] = {0x20}, stock_rate32[] = {0x20, 0, 0, 0};
+    static const unsigned char stock_size32[] = {0xc2, 0x01, 0, 0};
+    /* cmpl $32,rate; movl $32,rate; cmpl $450,size; movl $450,size */
+    unsigned char rate_compare[7], rate_store[10], size_compare[10], size_store[10];
+    net_instruction(rate_compare, 0x83, 0x3d, target->net_rate_variable, stock_rate8, 1);
+    net_instruction(rate_store, 0xc7, 0x05, target->net_rate_variable, stock_rate32, 4);
+    net_instruction(size_compare, 0x81, 0x3d, target->net_size_variable, stock_size32, 4);
+    net_instruction(size_store, 0xc7, 0x05, target->net_size_variable, stock_size32, 4);
     struct code_patch patches[12];
     size_t count = 0;
     for (size_t i = 0; i < 3; i++) {
-        patches[count++] = (struct code_patch){net_rate_compare_sites[i], net_rate_compare_original,
-            sizeof(net_rate_compare_original), 6, rate8, sizeof(rate8)};
-        patches[count++] = (struct code_patch){net_rate_store_sites[i], net_rate_store_original,
-            sizeof(net_rate_store_original), 6, rate32, sizeof(rate32)};
-        patches[count++] = (struct code_patch){net_size_compare_sites[i], net_size_compare_original,
-            sizeof(net_size_compare_original), 6, size32, sizeof(size32)};
-        patches[count++] = (struct code_patch){net_size_store_sites[i], net_size_store_original,
-            sizeof(net_size_store_original), 6, size32, sizeof(size32)};
+        uintptr_t site = target->net_rate_compare[i];
+        patches[count++] = (struct code_patch){site, rate_compare, sizeof(rate_compare), 6,
+            rate8, sizeof(rate8)};
+        patches[count++] = (struct code_patch){site + NET_RATE_STORE_OFFSET, rate_store,
+            sizeof(rate_store), 6, rate32, sizeof(rate32)};
+        patches[count++] = (struct code_patch){site + NET_SIZE_COMPARE_OFFSET, size_compare,
+            sizeof(size_compare), 6, size32, sizeof(size32)};
+        patches[count++] = (struct code_patch){site + NET_SIZE_STORE_OFFSET, size_store,
+            sizeof(size_store), 6, size32, sizeof(size32)};
     }
     if (!apply_code_patches("Network packet limit", patches, count)) return 0;
-    fprintf(stderr, "[t2_hook] Network: client packet limits %d/s and %d bytes instead of 32/s and 450 "
-            "(memory only)\n", NET_PACKET_RATE_LIMIT, NET_PACKET_SIZE_LIMIT);
+    fprintf(stderr, "[t2_hook] Network: %s packet limits %d/s and %d bytes instead of 32/s and 450 "
+            "(memory only)\n", target->description, NET_PACKET_RATE_LIMIT, NET_PACKET_SIZE_LIMIT);
     return 1;
 }
 
@@ -1339,42 +1505,52 @@ static int install_won_verifier(void) {
     int extra = fgetc(file);
     fclose(file);
     int protection;
-    /* Key slot consumed by the WON global constructor at 0x08374BED. */
+    /* Key slot consumed by the WON global constructor (client 0x08374BE3,
+       server 0x08368B43). */
+    uintptr_t slot = target->won_verifier;
     if (count != sizeof(encoded) || extra != EOF || encoded[0] != 0x30 ||
-        encoded[1] != 0x82 || !readable_range(0x0849A860, sizeof(encoded), &protection) ||
-        memcmp((void *)0x0849A860, "\x30\x82\x03\x2c", 4) != 0) {
+        encoded[1] != 0x82 || !readable_range(slot, sizeof(encoded), &protection) ||
+        memcmp((void *)slot, "\x30\x82\x03\x2c", 4) != 0) {
         fprintf(stderr, "[t2_hook] WON verifier refused: key/slot format mismatch\n");
         return 0;
     }
     long size = sysconf(_SC_PAGESIZE);
     if (size <= 0) return 0;
-    uintptr_t page = 0x0849A860 & ~((uintptr_t)size - 1);
-    if (0x0849A860 + sizeof(encoded) > page + (uintptr_t)size ||
+    uintptr_t page = slot & ~((uintptr_t)size - 1);
+    if (slot + sizeof(encoded) > page + (uintptr_t)size ||
         mprotect((void *)page, (size_t)size, protection | PROT_WRITE) != 0)
         return 0;
-    memcpy((void *)0x0849A860, encoded, sizeof(encoded));
+    memcpy((void *)slot, encoded, sizeof(encoded));
     if (mprotect((void *)page, (size_t)size, protection) != 0) return 0;
     fprintf(stderr, "[t2_hook] WON: installed local verifier key (signature checks remain active)\n");
     return 1;
 }
 
+/* Pick the target from the executable's basename; 0 for any other process. */
 static int is_game_process(void) {
     char executable[4096];
     ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
     if (length <= 0) return 0;
     executable[length] = 0;
     const char *name = strrchr(executable, '/');
-    return name && strcmp(name + 1, "tribes2.dynamic") == 0;
+    if (!name) return 0;
+    for (size_t i = 0; i < GAME_TARGET_COUNT; i++) {
+        if (strcmp(name + 1, game_targets[i].executable) == 0) {
+            target = &game_targets[i];
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int is_supported_game(void) {
     int protection;
     /* Guard the console addresses as well as the executable basename. */
-    return readable_range(0x080E85C0, 3, &protection) &&
-        (protection & PROT_EXEC) && memcmp((void *)0x080E85C0, "\x55\x89\xe5", 3) == 0 &&
-        readable_range(0x080E88F4, 3, &protection) &&
-        (protection & PROT_EXEC) && memcmp((void *)0x080E88F4, "\x55\x89\xe5", 3) == 0 &&
-        readable_range(CONSOLE_GLOBAL, sizeof(uint32_t), &protection);
+    return readable_range(target->con_add_method, 3, &protection) &&
+        (protection & PROT_EXEC) && memcmp((void *)target->con_add_method, "\x55\x89\xe5", 3) == 0 &&
+        readable_range(target->con_evaluate, 3, &protection) &&
+        (protection & PROT_EXEC) && memcmp((void *)target->con_evaluate, "\x55\x89\xe5", 3) == 0 &&
+        readable_range(target->string_table, sizeof(uint32_t), &protection);
 }
 
 /* Files the hook reads live beside the game. The launcher sets
@@ -1974,6 +2150,40 @@ void SDL_GL_SwapBuffers(void) {
         poll_discord_presence(now);
 }
 
+/* The dedicated server never swaps buffers. Platform::process (0x081CF400)
+   ends each main-loop pass with usleep(1000), so the hook's main-thread work
+   runs there instead. */
+static void server_tick(void) {
+    static int core_installed, tribesnext_installed;
+    static time_t last_ready_check;
+    if (!registered)
+        register_hook_commands();
+    if (!registered || !hook_option_bool("hook.console_commands")) return;
+    if (!core_installed) {
+        Con__evaluate(server_core_script, 0, "t2launch/server.cs", 0);
+        core_installed = 1;
+    }
+    time_t now = time(NULL);
+    if (tribesnext_installed || now == last_ready_check) return;
+    last_ready_check = now;
+    /* The package wraps GameConnection methods from the stock server scripts,
+       so wait for them; ServerGroup exists once the server has started. */
+    const char *ready = Con__evaluate("t2launch_serverReady();", 0, NULL, 0);
+    if (!ready || strcmp(ready, "1") != 0) return;
+    tribesnext_installed = 1;
+    if (!hook_option_bool("server.tribesnext_auth")) return;
+    Con__evaluate(server_tribesnext_script, 0, "t2launch/tribesnext_server.cs", 0);
+    fprintf(stderr, "[t2_hook] Installed runtime TribesNext (T2CSRI) server authentication\n");
+}
+
+int usleep(useconds_t microseconds) {
+    static int (*real_usleep)(useconds_t);
+    if (!real_usleep) real_usleep = (int (*)(useconds_t))dlsym(RTLD_NEXT, "usleep");
+    if (target->dedicated && game_main_thread_known && pthread_equal(pthread_self(), game_main_thread))
+        server_tick();
+    return real_usleep ? real_usleep(microseconds) : 0;
+}
+
 /* Observe SDL 1.2 mode changes without replacing its return surface or flags. */
 void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
     if (!real_sdl_set_video_mode)
@@ -2187,6 +2397,115 @@ static const char* hook_tn_ipv4_hex_cb(void *obj, S32 argc, const char **argv) {
         return result;
     bytes_to_hex((const uint8_t *)&address.s_addr, 4, result);
     return result;
+}
+
+/* T2CSRI's eight hex digits back to a dotted IPv4 address, or "". */
+static const char* hook_tn_hex_ipv4_cb(void *obj, S32 argc, const char **argv) {
+    static char result[16];
+    (void)obj;
+    result[0] = 0;
+    if (argc < 2 || !argv[1] || strlen(argv[1]) != 8) return result;
+    int bytes[4];
+    for (int i = 0; i < 4; i++) {
+        int high = hex2nibble(argv[1][2 * i]), low = hex2nibble(argv[1][2 * i + 1]);
+        if (high < 0 || low < 0) return result;
+        bytes[i] = high << 4 | low;
+    }
+    snprintf(result, sizeof(result), "%d.%d.%d.%d", bytes[0], bytes[1], bytes[2], bytes[3]);
+    return result;
+}
+
+/* The TribesNext authentication server's RSA modulus (public exponent 3),
+   from TribesNext's t2Dll.cpp. It signs each account certificate
+   "name\tguid\te\tn\tsignature": signature^3 mod N is the SHA-1 of the
+   first four fields. */
+static const char tribesnext_root_modulus[] =
+    "a2303d7c7d3ff28daa2dfd4f7fddcbb939aa461a3a298f22f4cbc8f87c6e584479861b1a638ea2daf87a18420f65b486"
+    "cbe70453ce4f5f38a55b30026457eab3ef2716aa409d25cb8b809a9ef06e3bcdc5b37f0d975cca972601d6a6d4be10e8"
+    "e5994708e878ab846caa58466eea79ccd1b49f9f06e4d6b335ba2b47b6dc81a04167a2c2fa2b9f847c1375cb6fef1a3c"
+    "7ced04f750a9605fab584d2d2a4bbed6d41d4c2eeb5e223ac3bc6d8ac025f4b25bb1058998f768025baea18272a3bdda"
+    "b58f94a9cb4a14452eaf7a50812e012fc42feb5d986183da134f168b447e4da6e00c351bc679b098b78bfdf3e17efcd6"
+    "5ec3d2098a14426957db5e30fa01292961f3caf3aadb12aff45782dd9f8737953491c90ad4df8b76ef2559b4ef3bae95"
+    "7f964cf4c9ded3d2171c9d190ba5a6a079a3d75f2c583217db626bd4074a2559794b475a9c2384096aa2b4816d2e61c1"
+    "44d1de14164b77428a5329da3a4a8174b6a84d8733495ac6bc7efa981f23b4f401a6216e18771856721c74ff136c1cbe"
+    "7449de0dff26c04f940d3ce31ef369e3b09932ffe7ffb347554bd2171dc5c79337a6d0dad0f8aa5f45bf054d0d0e5b73"
+    "eaa83e6fdcaf4cbf2422697aa570823c682d76087b6815b0212c80e3ed550420a45f70533214619efc468548af45b6e7"
+    "3fec0acbae55b08c978c0c3de09c79a50626502c49b541b7bf002508cc5a8095";
+
+static int is_hex_text(const char *text, size_t length) {
+    if (!length) return 0;
+    for (size_t i = 0; i < length; i++)
+        if (hex2nibble(text[i]) < 0) return 0;
+    return 1;
+}
+
+/* "1" when a T2CSRI account certificate is well formed and signed by the
+   TribesNext root key, else "0". */
+static const char* hook_tn_verify_cert_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 2 || !argv[1]) return "0";
+    const char *cert = argv[1], *fields[5];
+    size_t lengths[5];
+    const char *field = cert;
+    for (int i = 0; i < 5; i++) {
+        const char *tab = strchr(field, '\t');
+        if ((i < 4) != (tab != NULL)) return "0";
+        fields[i] = field;
+        lengths[i] = tab ? (size_t)(tab - field) : strlen(field);
+        if (!lengths[i]) return "0";
+        field = tab ? tab + 1 : field;
+    }
+    for (size_t i = 0; i < lengths[1]; i++)
+        if (fields[1][i] < '0' || fields[1][i] > '9') return "0";
+    if (lengths[1] > 10 || !is_hex_text(fields[2], lengths[2]) || !is_hex_text(fields[3], lengths[3]) ||
+        !is_hex_text(fields[4], lengths[4]) || lengths[4] > sizeof(tribesnext_root_modulus) - 1)
+        return "0";
+    size_t signed_length = (size_t)(fields[4] - cert) - 1;
+    char digest[41], signature[1025], recovered[2048];
+    sha1((const uint8_t *)cert, (int)signed_length, digest);
+    memcpy(signature, fields[4], lengths[4]);
+    signature[lengths[4]] = 0;
+    if (!run_rsa_helper(signature, "3", tribesnext_root_modulus, recovered, sizeof(recovered))) {
+        fprintf(stderr, "[t2_hook] TribesNext certificate check: RSA helper failed\n");
+        return "0";
+    }
+    /* Compare as numbers: both sides without leading zeros, either case. */
+    const char *a = digest, *b = recovered;
+    while (*a == '0' && a[1]) a++;
+    while (*b == '0' && b[1]) b++;
+    return strcasecmp(a, b) == 0 ? "1" : "0";
+}
+
+/* The stock server sends each challenge reply the flag "this server has a
+   WON certificate", and a client without one then refuses to connect
+   (CHR_NOT_AUTHENTICATED). Send it only to clients that sent a WON
+   certificate themselves (the pending connection's certificate at
+   +0x2154), so wonemu players still authenticate both ways while
+   TribesNext players connect and use T2CSRI. A server without a WON
+   certificate also turns away every client off its own Class B network;
+   skip that LAN-only check, as TribesNext servers do. */
+#define SERVER_REPLY_CERT_FLAG 0x0822B604
+#define SERVER_LAN_CHECK       0x0822BC85
+static const unsigned char server_reply_cert_flag_original[] =
+    {0x83, 0x3d, 0x34, 0x60, 0x6b, 0x08, 0x00, 0x0f, 0x95, 0xc0};
+static const unsigned char server_lan_check_original[] =
+    {0x83, 0x3d, 0x34, 0x60, 0x6b, 0x08, 0x00, 0x0f, 0x85, 0x42, 0x03, 0x00, 0x00};
+
+static int install_server_tribesnext_auth(void) {
+    /* cmpl $0,0x2154(%esi), keeping the setne that follows */
+    static const unsigned char client_cert_flag[] = {0x83, 0xbe, 0x54, 0x21, 0x00, 0x00, 0x00};
+    /* jmp to the accept path (0x0822BFD4), then nops */
+    static const unsigned char accept_any[] =
+        {0xe9, 0x4a, 0x03, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const struct code_patch patches[] = {
+        {SERVER_REPLY_CERT_FLAG, server_reply_cert_flag_original, sizeof(server_reply_cert_flag_original),
+         0, client_cert_flag, sizeof(client_cert_flag)},
+        {SERVER_LAN_CHECK, server_lan_check_original, sizeof(server_lan_check_original),
+         0, accept_any, sizeof(accept_any)},
+    };
+    if (!apply_code_patches("TribesNext server", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
+    fprintf(stderr, "[t2_hook] Server: clients without a WON certificate may connect (memory only)\n");
+    return 1;
 }
 
 static int base64_value(unsigned char c) {
@@ -2646,14 +2965,14 @@ static const char *hook_depot_status_cb(void *obj, S32 argc, const char **argv) 
 
 static int register_hook_commands(void) {
     if (registered) return 1;
-    uint32_t console_ptr = *(volatile uint32_t *)CONSOLE_GLOBAL;
+    uint32_t console_ptr = *(volatile uint32_t *)target->string_table;
     if (console_ptr == 0) return 0;
     uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
     if (table_size == 0) return 0;
 
-    Con__addMethodS = (con_addMethodS_t)0x80E85C0;
+    Con__addMethodS = (con_addMethodS_t)target->con_add_method;
     /* Replaces the stock no-op; not one of the optional hook_* commands. */
-    if (hook_option_bool("video.vsync"))
+    if (!target->dedicated && hook_option_bool("video.vsync"))
         Con__addMethodS(NULL, "setVerticalSync", set_vertical_sync_cb,
             "setVerticalSync( <bool> )", 2, 2);
     if (!hook_option_bool("hook.console_commands")) {
@@ -2687,14 +3006,18 @@ static int register_hook_commands(void) {
         "hook_tn_ip_trace <ip> <hex> - safe challenge address diagnostics", 3, 3);
     Con__addMethodS(NULL, "hook_tn_ipv4_hex", hook_tn_ipv4_hex_cb,
         "hook_tn_ipv4_hex <dotted_ipv4> - encode IPv4 in T2CSRI hex order", 2, 2);
-    if (hook_option_bool("net.depot_downloads")) {
+    Con__addMethodS(NULL, "hook_tn_hex_ipv4", hook_tn_hex_ipv4_cb,
+        "hook_tn_hex_ipv4 <hex> - decode a T2CSRI hex IPv4 address", 2, 2);
+    Con__addMethodS(NULL, "hook_tn_verify_cert", hook_tn_verify_cert_cb,
+        "hook_tn_verify_cert <certificate> - 1 if TribesNext signed the account certificate", 2, 2);
+    if (!target->dedicated && hook_option_bool("net.depot_downloads")) {
         Con__addMethodS(NULL, "hook_depot_fetch", hook_depot_fetch_cb,
             "hook_depot_fetch <file> - fetch a missing map file from the TribesNext depot", 2, 2);
         Con__addMethodS(NULL, "hook_depot_status", hook_depot_status_cb,
             "hook_depot_status - running, ok <path> or error <reason>", 1, 1);
     }
     registered = 1;
-    fprintf(stderr, "[t2_hook] Registered 15 commands on the game thread (table_size=%d)\n", table_size);
+    fprintf(stderr, "[t2_hook] Registered the hook commands on the game thread (table_size=%d)\n", table_size);
     return 1;
 }
 
@@ -2750,10 +3073,12 @@ static void __attribute__((constructor)) init(void) {
     game_path(startup_dir, sizeof(startup_dir), "");  /* capture cwd before the game can chdir */
     const char *won = getenv("T2LAUNCH_WONEMU");
     if (!is_supported_game()) {
-        fprintf(stderr, "[t2_hook] Unsupported client: console address check failed\n");
+        fprintf(stderr, "[t2_hook] Unsupported %s: console address check failed\n", target->description);
         if (won && strcmp(won, "1") == 0) _exit(1);
         return;
     }
+    Con__evaluate = (con_evaluate_t)target->con_evaluate;
+    fprintf(stderr, "[t2_hook] Target: %s (%s)\n", target->executable, target->description);
     if (won && strcmp(won, "1") == 0) {
         /* The client copies the embedded verifier during its own global
            initialization, and console_start.cs calls WONInit(), which reads
@@ -2763,8 +3088,15 @@ static void __attribute__((constructor)) init(void) {
     pthread_once(&hook_options_once, load_hook_options);
     /* Before main() calibrates or reads the timer, so game time never jumps. */
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
-    if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
+    if (target->dedicated) {
+        game_main_thread_known = 1;  /* constructors run on the main thread */
+        if (hook_option_bool("server.tribesnext_auth") && hook_option_bool("hook.console_commands"))
+            install_server_tribesnext_auth();
+        fprintf(stderr, "[t2_hook] Console command registration deferred to the server's main loop\n");
+        return;
+    }
+    if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))
         install_native_auth();
     /* SDL reads this when it creates the window; a borderless window has no

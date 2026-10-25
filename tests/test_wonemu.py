@@ -6,6 +6,7 @@ import struct
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1595,6 +1596,38 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual((first, repeated, corrected), ("failed", "recently_failed", "failed"))
         self.assertEqual(attempts, ["wrong", "right"])
         self.assertNotIn("wrong", log_text)
+
+    def test_dedicated_server_login_gets_a_server_certificate(self):
+        key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4, "x": SMALL_AUTH_X,
+               "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
+        payload = (bytes.fromhex("05 0c 00 03 00") + struct.pack("<HH", 1, len(SMALL_AUTH_ENCRYPTED_KEY)) +
+                   SMALL_AUTH_ENCRYPTED_KEY + struct.pack("<H", len(SMALL_AUTH_ENCRYPTED_DATA)) +
+                   SMALL_AUTH_ENCRYPTED_DATA)
+
+        def login(username, password, client):
+            fields = {"key_block_id": 1, "request_kind": 14, "username": username,
+                      "password": password, "flags": (0, 256), "client": client,
+                      "extension_bytes": 2}
+            with mock.patch.object(wonemu, "parse_login_payload", return_value=fields):
+                return wonemu.decode_login_envelope(payload, {"auth": key})
+
+        server = login("Tribes2Server", "Tribes2Server", "Tribes2Server")
+        self.assertEqual((server["account_validation"], server["credential_source"]), ("valid", "server"))
+        # The fixed identity only stands for the dedicated server's own client.
+        self.assertNotEqual(login("Tribes2Server", "Tribes2Server", "Tribes2Client")["account_validation"],
+                            "valid")
+        self.assertNotEqual(login("Tribes2Server", "guess", "Tribes2Server")["account_validation"], "valid")
+        with tempfile.TemporaryDirectory() as directory:
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory))
+            self.assertEqual(emulator.auth_info_tribes("Tribes2Server", "server"), [])
+            emulator.log.close()
+
+    def test_the_dedicated_server_binary_holds_the_same_verifier(self):
+        server = Path.home() / "t2-linux/tribes2d.dynamic"
+        if not server.is_file():
+            self.skipTest("no dedicated server binary")
+        self.assertEqual(woncrypto.verifier_parameters(server),
+                         woncrypto.verifier_parameters(Path.home() / "t2-linux/tribes2.dynamic"))
 
     def test_real_client_small_group_login_decrypts_without_logging_credentials(self):
         # Deterministic Loki #25034 probe capture. The local compatibility auth

@@ -1,0 +1,74 @@
+"""The hook's patch sites hold the expected bytes in the installed binaries.
+
+The addresses mirror game_targets[] and the server-only sites in t2_hook.c.
+Skipped when the Loki #25034 game is not installed in ~/t2-linux.
+"""
+
+import struct
+import unittest
+from pathlib import Path
+
+GAME = Path.home() / "t2-linux"
+PROLOGUE = bytes.fromhex("55 89 e5")
+CLOCK = bytes.fromhex("0f 31 55 89 e5 83 ec 14")
+TARGETS = {
+    "tribes2.dynamic": {
+        "console": (0x080E85C0, 0x080E88F4), "clock": 0x081CFA44,
+        "won": (0x084846B1, 0x084846CD, 0x084846E9), "verifier": 0x0849A860,
+        "rate": 0x08495CEC, "size": 0x08495CF0, "net": (0x081F8EAE, 0x081FB382, 0x081FB683),
+    },
+    "tribes2d.dynamic": {
+        "console": (0x080E74B0, 0x080E77E4), "clock": 0x081CD014,
+        "won": (0x08479751, 0x0847976D, 0x08479789), "verifier": 0x0848F520,
+        "rate": 0x0848ADCC, "size": 0x0848ADD0, "net": (0x081EDB4E, 0x081F0022, 0x081F0323),
+    },
+}
+
+
+def reader(path):
+    data = path.read_bytes()
+    phoff, = struct.unpack_from("<I", data, 28)
+    size, count = struct.unpack_from("<HH", data, 42)
+    segments = [struct.unpack_from("<8I", data, phoff + size * i) for i in range(count)]
+
+    def read(address, length):
+        for kind, offset, vaddr, _, filesz, _, _, _ in segments:
+            if kind == 1 and vaddr <= address and address + length <= vaddr + filesz:
+                return data[offset + address - vaddr:offset + address - vaddr + length]
+        raise AssertionError(f"0x{address:08x} is not in a loaded segment")
+    return read
+
+
+@unittest.skipUnless((GAME / "tribes2d.dynamic").is_file() and (GAME / "tribes2.dynamic").is_file(),
+                     "the Loki #25034 game is not installed in ~/t2-linux")
+class GameBinaryTests(unittest.TestCase):
+    def test_shared_sites_match_in_each_executable(self):
+        for name, target in TARGETS.items():
+            with self.subTest(executable=name):
+                read = reader(GAME / name)
+                for address in target["console"]:
+                    self.assertEqual(read(address, 3), PROLOGUE)
+                self.assertEqual(read(target["clock"], 8), CLOCK)
+                for index, address in enumerate(target["won"], 1):
+                    self.assertEqual(read(address, 28), f"tribes2.m{index}.sierra.com:15104\0".encode())
+                self.assertEqual(read(target["verifier"], 4), bytes.fromhex("30 82 03 2c"))
+                rate, size = struct.pack("<I", target["rate"]), struct.pack("<I", target["size"])
+                for site in target["net"]:
+                    self.assertEqual(read(site, 7), b"\x83\x3d" + rate + b"\x20")
+                    self.assertEqual(read(site + 0x09, 10), b"\xc7\x05" + rate + b"\x20\0\0\0")
+                    self.assertEqual(read(site + 0x26, 10), b"\x81\x3d" + size + b"\xc2\x01\0\0")
+                    self.assertEqual(read(site + 0x32, 10), b"\xc7\x05" + size + b"\xc2\x01\0\0")
+
+    def test_server_auth_sites(self):
+        read = reader(GAME / "tribes2d.dynamic")
+        self.assertEqual(read(0x0822B604, 10), bytes.fromhex("83 3d 34 60 6b 08 00 0f 95 c0"))
+        self.assertEqual(read(0x0822BC85, 13), bytes.fromhex("83 3d 34 60 6b 08 00 0f 85 42 03 00 00"))
+        # The flag replacement reads the pending connection's certificate, which
+        # the challenge reply loads from the same field.
+        self.assertEqual(read(0x0822B625, 6), bytes.fromhex("8b 86 54 21 00 00"))
+        # usleep(1000) ends Platform::process in the server's main loop.
+        self.assertEqual(read(0x081CF44C, 5), bytes.fromhex("68 e8 03 00 00"))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -17,6 +17,10 @@ set -e
 # Re-pick the folder any time:  ASGARD_PICK=1 ./run-game
 # Note: no flags are forced. For offline play pass -nologin yourself, e.g.
 #   ./run-game tribes2 -nologin
+# T2LAUNCH_EXECUTABLE=dedicated runs the dedicated server (tribes2d.dynamic)
+# instead of the client, adding -dedicated when it is missing:
+#   T2LAUNCH_EXECUTABLE=dedicated ./run-game tribes2 -mission Katabatic CTF
+# T2LAUNCH_SERVER_RESTART=1 restarts the server when it crashes.
 read -r -a GAME_ARGS <<< "${GAME_ARGS:-}" # seed from the environment if provided
 POSITIONAL=()
 _collect=0
@@ -202,6 +206,14 @@ if [[ -n "$HOST_GAME_PATH" && -d "$HOST_GAME_PATH" ]]; then
     printf '%s\n' "$HOST_GAME_PATH" > "$SAVED_PATH_FILE" 2>/dev/null || true
 fi
 
+# client (tribes2.dynamic) or dedicated (tribes2d.dynamic); the per-game
+# config picks the binary for each.
+EXECUTABLE="${T2LAUNCH_EXECUTABLE:-client}"
+case "$EXECUTABLE" in
+    client|dedicated) ;;
+    *) echo "ERROR: T2LAUNCH_EXECUTABLE must be client or dedicated (got '$EXECUTABLE')." >&2; exit 2 ;;
+esac
+
 # Defaults (can be overridden by the per-game config, e.g. tribes2.cfg)
 USE_PADSP=${USE_PADSP:-1}
 SOFTWARE_GL=${SOFTWARE_GL:-1}
@@ -219,6 +231,15 @@ if [[ -f "$ROOT_DIR/$GAME_NAME.cfg" ]]; then
 fi
 LOAD_HOOK="${T2LAUNCH_LOAD_HOOK:-${LOAD_HOOK:-0}}"
 SOFTWARE_GL="${T2LAUNCH_SOFTWARE_GL:-$SOFTWARE_GL}"
+SERVER_RESTART=0
+if [[ "$EXECUTABLE" == "dedicated" ]]; then
+    SOFTWARE_GL=0
+    SERVER_RESTART="${T2LAUNCH_SERVER_RESTART:-0}"
+    _dedicated_flag=0
+    for _a in "${GAME_ARGS[@]}"; do [[ "$_a" == "-dedicated" ]] && _dedicated_flag=1; done
+    [[ "$_dedicated_flag" == "1" ]] || GAME_ARGS=(-dedicated "${GAME_ARGS[@]}")
+    unset _a _dedicated_flag
+fi
 T2LAUNCH_MONITOR="${T2LAUNCH_MONITOR:-}"
 # WON emulation: off (the game's own login), local (start wonemu here), or
 # remote (use a wonemu elsewhere). T2LAUNCH_WONEMU=1 is the older spelling of local.
@@ -247,7 +268,7 @@ if [[ "$SOFTWARE_GL" == "1" ]]; then
 fi
 # Drivers need not preserve the back buffer that Torque's partial GUI redraws
 # rely on, so redraw the whole canvas each frame unless told otherwise.
-if [[ "${T2LAUNCH_FULL_REDRAW:-1}" == "1" ]]; then
+if [[ "$EXECUTABLE" == "client" && "${T2LAUNCH_FULL_REDRAW:-1}" == "1" ]]; then
     GAME_ENV+=(T2LAUNCH_FULL_REDRAW=1)
 fi
 if [[ "${USE_SDL_X11_NODIRECTCOLOR:-0}" == "1" ]]; then
@@ -270,6 +291,8 @@ if [[ -n "$EXTRA_ENV" ]]; then
 fi
 
 GAME_ENV+=("T2LAUNCH_WONEMU=$WONEMU")
+# Window, monitor and display settings are the client's; the server has none.
+if [[ "$EXECUTABLE" == "client" ]]; then
 GAME_FULLSCREEN_REQUESTED=0
 GAME_WINDOWED_REQUESTED=0
 for game_arg in "${GAME_ARGS[@]}"; do
@@ -324,6 +347,7 @@ if [[ -z "$DISPLAY" ]]; then
     DISPLAY=":0"
 fi
 export DISPLAY
+fi
 
 mkdir -p "${HOME}/.loki"   # game writes prefs/saves here; ensure it's user-owned
 
@@ -334,7 +358,7 @@ WON_ENDPOINTS="${T2LAUNCH_WON_ENDPOINTS:-}"
 if [[ "$WON_MODE" == "local" ]]; then
     # wonemu reads T2LAUNCH_WON_BIND, _BASE_PORT, _ADVERTISE, and
     # T2LAUNCH_WON_BACKENDS from the environment.
-    python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/tribes2.dynamic"
+    python3 "$REPO_DIR/wonemu.py" --ensure --client-binary "${HOST_GAME_PATH:-$HOME/t2-linux}/${GAME_BINARY#./}"
     WONEMU_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/t2launch/wonemu"
     GAME_ENV+=("T2LAUNCH_WON_VERIFIER=$WONEMU_STATE_DIR/verifier.der")
     if [[ -z "$WON_ENDPOINTS" ]]; then
@@ -400,6 +424,11 @@ launch_game() {
     local missing
     missing=$(LD_LIBRARY_PATH="$compat_dir:$HOST_GAME_PATH" "$loader" --list \
         "$HOST_GAME_PATH/$GAME_BINARY" 2>&1 | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')
+    if [[ -n "$missing" && "$EXECUTABLE" == "dedicated" ]]; then
+        echo "ERROR: missing 32-bit libraries: $missing" >&2
+        install_hint lib32-glibc libc6:i386 glibc.i686
+        exit 1
+    fi
     if [[ -n "$missing" ]]; then
         echo "ERROR: missing 32-bit libraries: $missing" >&2
         install_hint "lib32-libx11 lib32-libxext lib32-libxrandr lib32-freetype2 lib32-mesa lib32-glu" \
@@ -418,10 +447,14 @@ launch_game() {
             install_hint lib32-libpulse pulseaudio-utils:i386 pulseaudio-utils.i686
         fi
     fi
-    preload+=("$compat_dir/libSDL-1.2.so.0")
-    if [[ -z "$MESA_YEAR" ]]; then GAME_ENV+=(MESA_EXTENSION_MAX_YEAR=2000); fi
-    GAME_ENV+=(__GL_ExtensionStringVersion=17700
-               "T2LAUNCH_GAME_DIR=$HOST_GAME_PATH"
+    if [[ "$EXECUTABLE" == "client" ]]; then
+        preload+=("$compat_dir/libSDL-1.2.so.0")
+        if [[ -z "$MESA_YEAR" ]]; then GAME_ENV+=(MESA_EXTENSION_MAX_YEAR=2000); fi
+        GAME_ENV+=(__GL_ExtensionStringVersion=17700)
+    else
+        GAME_ENV+=(T2LAUNCH_GAMESCOPE=0)
+    fi
+    GAME_ENV+=("T2LAUNCH_GAME_DIR=$HOST_GAME_PATH"
                "T2LAUNCH_RSA_HELPER=$support_dir/rsa_helper"
                "T2LAUNCH_DEPOT_HELPER=$REPO_DIR/depot.py"
                "T2LAUNCH_DISCORD_HELPER=$REPO_DIR/discord_presence.py"
@@ -432,6 +465,7 @@ launch_game() {
                "T2_RESIZE_SCRIPT=$ROOT_DIR/window_resize.sh"
                "T2_PREFS_FILE=$HOME/.loki/$GAME_NAME/base/prefs/ClientPrefs.cs"
                "GAME_BINARY=$GAME_BINARY" "PRE_LAUNCH=$PRE_LAUNCH"
+               "T2_SERVER_RESTART=$SERVER_RESTART"
                "USE_GAME_WINDOW_RESIZE=${USE_GAME_WINDOW_RESIZE:-0}")
     if [[ -n "${TRACE_DIR:-}" ]]; then
         GAME_ENV+=("T2LAUNCH_TRACE_DIR=$TRACE_DIR")
@@ -448,7 +482,11 @@ launch_game() {
         GAME_ENV+=(USE_GAME_WINDOW_RESIZE=0)
         echo "[t2launch] Running inside gamescope (filter=${T2LAUNCH_GAMESCOPE_FILTER:-linear})"
     fi
-    echo "[t2launch] Launching from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
+    if [[ "$EXECUTABLE" == "dedicated" ]]; then
+        echo "[t2launch] Launching the dedicated server from $HOST_GAME_PATH (restart on crash=$SERVER_RESTART)"
+    else
+        echo "[t2launch] Launching from $HOST_GAME_PATH (software GL=$SOFTWARE_GL)"
+    fi
     # LD_AUDIT and LD_PRELOAD are set only on the game itself, not the helpers.
     # shellcheck disable=SC2016 # The script is interpreted by the child bash.
     exec env "${GAME_ENV[@]}" bash --norc -c '
@@ -477,7 +515,34 @@ launch_game() {
             [ "${T2LAUNCH_GAMESCOPE_GRAB_CURSOR:-1}" = "1" ] && scope+=(--force-grab-cursor)
             set -- "${scope[@]}" -- "$@"
         fi
-        exec "$@"
+        if [ "$T2_SERVER_RESTART" != "1" ]; then exec "$@"; fi
+        # Restart a server that crashed (a nonzero exit or a signal) after 5 s;
+        # a clean exit, Ctrl+C or a fifth restart within 120 s ends the loop.
+        stopping=0 child=0 restarts=()
+        trap '\''stopping=1; [ "$child" != 0 ] && kill -TERM "$child" 2>/dev/null'\'' INT TERM
+        while :; do
+            "$@" &
+            child=$!
+            status=0
+            wait "$child" || status=$?
+            # A trapped signal interrupts wait; collect the server itself.
+            while kill -0 "$child" 2>/dev/null; do wait "$child" || status=$?; done
+            child=0
+            if [ "$stopping" = 1 ] || [ "$status" = 0 ]; then exit "$status"; fi
+            now=$(date +%s) recent=()
+            for when in "${restarts[@]}"; do [ $((now - when)) -lt 120 ] && recent+=("$when"); done
+            restarts=("${recent[@]}" "$now")
+            if [ "${#restarts[@]}" -gt 5 ]; then
+                echo "[t2launch] The server exited with status $status; 5 restarts in 120 s, giving up." >&2
+                exit "$status"
+            fi
+            echo "[t2launch] The server exited with status $status; restarting in 5 s (Ctrl+C stops)." >&2
+            sleep 5 &
+            child=$!
+            wait "$child" 2>/dev/null
+            child=0
+            if [ "$stopping" = 1 ]; then exit "$status"; fi
+        done
     ' _ "${GAME_ARGS[@]}"
 }
 launch_game

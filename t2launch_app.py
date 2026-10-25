@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -68,6 +69,13 @@ VALUE_OPTIONS = [  # (option, label, a hint per value, advanced)
 
 def default_profile():
     return {"name": "Online", "flags": {"-online": True}, "values": {}, "positional": "", "custom": ""}
+
+
+def server_profile():
+    """A dedicated server on Katabatic CTF with local WON emulation."""
+    return {"name": "Dedicated server", "flags": {}, "values": {"-mission": ["Katabatic", "CTF"]},
+            "positional": "", "custom": "",
+            "options": {"game.executable": "dedicated", "won.mode": "local"}}
 
 
 def read_settings():
@@ -149,6 +157,30 @@ def profile_arguments(profile):
     if any(option in args for option in ("--fullscreen", "-f")) and any(option in args for option in ("--windowed", "-w")):
         raise ValueError("Choose either Fullscreen or Windowed, not both.")
     return args
+
+
+# Terminal emulators and how each takes the command to run: $TERMINAL first,
+# then common ones. gnome-terminal hands the window to a server process that
+# does not inherit our environment, so the command carries its own.
+TERMINALS = (("x-terminal-emulator", ["-e"]), ("konsole", ["-e"]), ("gnome-terminal", ["--"]),
+             ("xfce4-terminal", ["-x"]), ("alacritty", ["-e"]), ("kitty", []), ("foot", []),
+             ("xterm", ["-e"]))
+# Keep the window open after the server stops so its last messages stay readable.
+HOLD_OPEN = ('"$@"; status=$?; echo; read -r -p "The server stopped (exit $status). '
+             'Press Enter to close. " _')
+
+
+def terminal_command(command, environment):
+    """The argv that runs command in a terminal window with environment, or None."""
+    wrapped = ["env", *(f"{key}={value}" for key, value in environment.items()),
+               "bash", "-c", HOLD_OPEN, "t2launch-server", *command]
+    configured = os.environ.get("TERMINAL", "").strip()
+    if configured and shutil.which(shlex.split(configured)[0]):
+        return [*shlex.split(configured), "-e", *wrapped]
+    for name, prefix in TERMINALS:
+        if shutil.which(name):
+            return [name, *prefix, *wrapped]
+    return None
 
 
 def sensitive_profile_arguments(args):
@@ -320,11 +352,20 @@ class ProfileEditor(QWidget):
         tabs = QTabWidget()
         layout.addWidget(tabs, 1)
 
+        # The Game tab starts with the registry's game options (the executable);
+        # the WON emulator and Hook tabs are generated from it below.
+        saved_options = t2options.chosen(t2options.migrate(profile))
+        self.option_widgets = {}
+        self.option_rows = {}
+        self.section_headings = []  # (heading, keys of its options)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
         form = QFormLayout(body)
         self.game_form = form
+        for option in t2options.OPTIONS:
+            if option.tab == "game":
+                form.addRow(self._option_row(option, saved_options[option.key]))
         self.advanced_game_rows = []  # (row widget, is-set check)
         self.flag_boxes = {}
         saved_flags = profile.get("flags", {})
@@ -365,10 +406,6 @@ class ProfileEditor(QWidget):
         scroll.setWidget(body)
         tabs.addTab(scroll, "Game")
 
-        # WON emulator and Hook tabs are generated from the t2options registry.
-        saved_options = t2options.chosen(t2options.migrate(profile))
-        self.option_widgets = {}
-        self.option_rows = {}
         for tab, title in (("won", "WON emulator"), ("hook", "Hook")):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
@@ -382,25 +419,9 @@ class ProfileEditor(QWidget):
                     section = option.section
                     heading = QLabel(f"<b>{section}</b>")
                     column.addWidget(heading)
-                row = QWidget()
-                row_layout = QVBoxLayout(row)
-                row_layout.setContentsMargins(12, 0, 0, 4)
-                widget = self._option_widget(option, saved_options[option.key])
-                widget.setToolTip(option.help)
-                if option.kind == "bool":
-                    row_layout.addWidget(widget)
-                else:
-                    line = QHBoxLayout()
-                    line.addWidget(QLabel(option.label))
-                    line.addWidget(widget, 1)
-                    row_layout.addLayout(line)
-                note = QLabel()
-                note.setStyleSheet("color: gray")
-                note.setWordWrap(True)
-                row_layout.addWidget(note)
-                column.addWidget(row)
-                self.option_widgets[option.key] = widget
-                self.option_rows[option.key] = (row, note)
+                    self.section_headings.append((heading, []))
+                self.section_headings[-1][1].append(option.key)
+                column.addWidget(self._option_row(option, saved_options[option.key]))
             column.addStretch()
             scroll.setWidget(body)
             tabs.addTab(scroll, title)
@@ -431,6 +452,28 @@ class ProfileEditor(QWidget):
         show_advanced = self.show_advanced.isChecked()
         for row, is_set in self.advanced_game_rows:
             self.game_form.setRowVisible(row, show_advanced or is_set())
+
+    def _option_row(self, option, value):
+        """A registry option's widget with its label and requirement note."""
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(12, 0, 0, 4)
+        widget = self._option_widget(option, value)
+        widget.setToolTip(option.help)
+        if option.kind == "bool":
+            row_layout.addWidget(widget)
+        else:
+            line = QHBoxLayout()
+            line.addWidget(QLabel(option.label))
+            line.addWidget(widget, 1)
+            row_layout.addLayout(line)
+        note = QLabel()
+        note.setStyleSheet("color: gray")
+        note.setWordWrap(True)
+        row_layout.addWidget(note)
+        self.option_widgets[option.key] = widget
+        self.option_rows[option.key] = (row, note)
+        return row
 
     @staticmethod
     def _option_widget(option, value):
@@ -483,14 +526,18 @@ class ProfileEditor(QWidget):
         show_advanced = self.show_advanced.isChecked()
         for option in t2options.OPTIONS:
             row, note = self.option_rows[option.key]
-            row.setVisible(show_advanced or not option.advanced)
             # Requirements are judged against effective values, so a chain
             # (TribesNext -> console commands -> hook) disables in one step.
             missing = t2options.unmet(option, effective, context)
+            # Options of the other executable are hidden rather than greyed.
+            other_executable = any(key == "game.executable" for key, _allowed in missing)
+            row.setVisible((show_advanced or not option.advanced) and not other_executable)
             self.option_widgets[option.key].setEnabled(not missing)
             note.setText("Requires: " + ", ".join(requirement_text(key, allowed)
                                                   for key, allowed in missing) if missing else "")
             note.setVisible(bool(missing))
+        for heading, keys in self.section_headings:
+            heading.setVisible(any(not self.option_rows[key][0].isHidden() for key in keys))
         self.changed()
 
     def save_to(self):
@@ -570,11 +617,14 @@ class SettingsDialog(QDialog):
             self.profile_list.addItem(profile.get("name", "Profile"))
         self.profile_list.currentRowChanged.connect(self.show_profile)
         add = QPushButton("Add profile")
+        add_server = QPushButton("Add server profile")
         remove = QPushButton("Remove profile")
         add.clicked.connect(self.add_profile)
+        add_server.clicked.connect(self.add_server_profile)
         remove.clicked.connect(self.remove_profile)
         profile_buttons = QHBoxLayout()
         profile_buttons.addWidget(add)
+        profile_buttons.addWidget(add_server)
         profile_buttons.addWidget(remove)
         profile_column = QVBoxLayout()
         profile_column.addWidget(self.profile_list, 1)
@@ -647,12 +697,16 @@ class SettingsDialog(QDialog):
         self.autolaunch.setCurrentIndex(max(index, 0))
         self.autolaunch.blockSignals(False)
 
-    def add_profile(self):
+    def add_profile(self, profile=None):
         self.commit_editor()
-        self.profiles.append({"name": "New profile", "flags": {}, "values": {}, "positional": "", "custom": ""})
-        self.profile_list.addItem("New profile")
+        profile = profile or {"name": "New profile", "flags": {}, "values": {}, "positional": "", "custom": ""}
+        self.profiles.append(profile)
+        self.profile_list.addItem(profile["name"])
         self.profile_list.setCurrentRow(len(self.profiles) - 1)
         self.refresh_autolaunch_choices()
+
+    def add_server_profile(self):
+        self.add_profile(server_profile())
 
     def remove_profile(self):
         if len(self.profiles) <= 1:
@@ -799,25 +853,37 @@ class Launcher(QApplication):
             return
         process = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
-        env.insert("T2LAUNCH_LOAD_HOOK", "1" if self.settings["load_hook"] else "0")
         context = {"launcher.load_hook": self.settings["load_hook"]}
-        for key, value in t2options.launch_env(options, context).items():
-            env.insert(key, value)
+        launch = {"T2LAUNCH_LOAD_HOOK": "1" if self.settings["load_hook"] else "0",
+                  **t2options.launch_env(options, context)}
         if self.settings["load_hook"]:
-            env.insert("T2LAUNCH_HOOK_CONFIG", str(t2options.write_hook_config(name, options, context)))
-        monitor = self.settings.get("monitor", "")
-        env.insert("T2LAUNCH_MONITOR", monitor)
-        screen_index = next((i for i, screen in enumerate(QApplication.screens()) if screen.name() == monitor), 0)
-        env.insert("T2LAUNCH_MONITOR_INDEX", str(screen_index))
+            launch["T2LAUNCH_HOOK_CONFIG"] = str(t2options.write_hook_config(name, options, context))
+        effective = t2options.effective(options, context)
+        dedicated = effective["game.executable"] == "dedicated"
+        if not dedicated:
+            monitor = self.settings.get("monitor", "")
+            launch["T2LAUNCH_MONITOR"] = monitor
+            screen_index = next((i for i, screen in enumerate(QApplication.screens())
+                                 if screen.name() == monitor), 0)
+            launch["T2LAUNCH_MONITOR_INDEX"] = str(screen_index)
+        for key, value in launch.items():
+            env.insert(key, value)
         process.setProcessEnvironment(env)
-        process.setProgram("bash")
-        process.setArguments([str(RUNTIME / "run-game"), "tribes2", str(game_path), *args])
+        command = ["bash", str(RUNTIME / "run-game"), "tribes2", str(game_path), *args]
+        terminal = None
+        if dedicated and effective["server.console"] == "terminal":
+            terminal = terminal_command(command, launch)
+            if terminal is None:
+                self.tray.showMessage("No terminal found", "Running the server headless; set $TERMINAL "
+                                      "to choose a terminal.", QSystemTrayIcon.Warning)
+        process.setProgram((terminal or command)[0])
+        process.setArguments((terminal or command)[1:])
         process.setProcessChannelMode(QProcess.MergedChannels)
         self.launch_output_states[id(process)] = {
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
         append_launch_diagnostic(
-            f"launch requested; won={options['won.mode']} "
-            f"hook={int(bool(self.settings['load_hook']))}")
+            f"launch requested; executable={effective['game.executable']} won={options['won.mode']} "
+            f"hook={int(bool(self.settings['load_hook']))} terminal={int(terminal is not None)}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))
         process.errorOccurred.connect(lambda error, p=process: self.launch_error(p, error))

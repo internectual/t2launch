@@ -22,7 +22,10 @@ No game file, script, or archive is modified on disk.
 - A local WON emulator: login, server list (TribesNext plus LAN/other Torque
   masters), buddies, T-Mail, tribes, player profiles, news, and chat
 - Optional remote mode, so several machines can share one emulator
-- A system-tray desktop launcher with per-profile options
+- A system-tray desktop launcher with per-profile options, for the game or
+  the dedicated server (`tribes2d.dynamic`)
+- A dedicated server that TribesNext players can join, verified with
+  TribesNext's T2CSRI protocol, with an optional restart after a crash
 - Fixes for running a 2001 binary on current libraries: stack alignment, thread
   joins, GUI redraw, volume sliders, and monitor/mode selection
 
@@ -143,10 +146,56 @@ variable (such as `T2LAUNCH_FULL_REDRAW`), then its default, so command-line
 launches keep working. Unknown keys are kept, and in-game scripts can read any
 option with `hook_option("key")`.
 
+### Dedicated server
+
+A profile's **Game executable** (top of the Game tab) picks the game client
+(`tribes2.dynamic`) or the dedicated server (`tribes2d.dynamic`); **Add server
+profile** makes one for Katabatic CTF with local WON emulation. A server
+profile hides the client-only options (video, gamescope, audio, the server
+browser, Discord, the depot, the TribesNext login) and adds a **Dedicated
+server** section:
+
+- **Server console**: `terminal` opens the server in a terminal window
+  (`$TERMINAL`, else x-terminal-emulator, konsole, gnome-terminal,
+  xfce4-terminal, alacritty, kitty, foot or xterm) so you can type console
+  commands; it stays open after the server stops. `headless` runs it in the
+  background, with its output in the launcher log.
+- **Restart the server if it crashes**: start it again 5 seconds after a crash
+  (a nonzero exit or a signal). A clean `quit();`, Ctrl+C, or a fifth crash
+  within two minutes stops it.
+- **Let TribesNext players join** (on by default): see below.
+- **Public IPv4 address** (advanced): the Internet address players connect to.
+
+`-dedicated` is added when the profile doesn't have it. The server uses the
+same `~/.loki/tribes2` as the game: it reads `prefs/ServerPrefs.cs`, and on exit
+writes back `prefs/ClientPrefs.cs` with the values it loaded, so whichever of
+a running game and server exits last writes that file.
+
+With WON emulation on, the server logs in as `Tribes2Server` (the fixed
+identity every dedicated server sends) and wonemu gives it a server
+certificate. Players with a WON certificate from wonemu authenticate through
+WON as before. TribesNext players have none, so the hook lets them connect and
+runs the server half of TribesNext's T2CSRI 1.1 protocol in memory:
+
+1. It pokes the client and receives its account certificate in chunks.
+2. It checks the certificate's signature against the TribesNext root key in
+   native code.
+3. It encrypts the client's challenge plus its own to the account key.
+4. Once the client returns the server half, it continues the stock connect
+   with the account's name and GUID as the player's AuthInfo, so admin lists,
+   bans and smurf checks work by GUID.
+
+A player who doesn't finish within 15 seconds is dropped with TribesNext's own
+message. TribesNext clients name the address they connected to. When **Public
+IPv4 address** is set, a proof naming another address (other than the bind
+address or the player's own LAN) is refused, as TribesNext servers do. Clan
+tags from TribesNext community certificates are not shown.
+
 ### Command line
 
 ```bash
 ./runtime/run-game tribes2 ~/t2-linux -online
+T2LAUNCH_EXECUTABLE=dedicated T2LAUNCH_WON_MODE=local ./runtime/run-game tribes2 ~/t2-linux -mission Katabatic CTF
 ```
 
 The first launch compiles `t2_hook.so`, `rsa_helper`, and `t2_realign.so` into
@@ -158,6 +207,8 @@ the bundled Loki-era libraries in `runtime/compat-libs/`.
 | Variable | Effect |
 |----------|--------|
 | `T2LAUNCH_WON_MODE` | `off` (default), `local`, or `remote`; see [WON emulator](#won-emulator) |
+| `T2LAUNCH_EXECUTABLE` | `client` (default) or `dedicated`; see [Dedicated server](#dedicated-server) |
+| `T2LAUNCH_SERVER_RESTART=1` | Restart the dedicated server after a crash |
 | `T2LAUNCH_SOFTWARE_GL=1` | Use software GL instead of the hardware driver |
 | `T2LAUNCH_FULL_REDRAW=0` | Turn off the full-canvas redraw (see [Runtime compatibility](#runtime-compatibility)) |
 | `T2LAUNCH_OPENAL_VOLUME_FIX=0` | Turn off the volume-slider fix |
@@ -468,8 +519,9 @@ LD_PRELOAD=games/tribes2/t2_hook.so:/usr/lib32/pulseaudio/libpulsedsp.so:runtime
 ```
 
 Its constructor installs the emulator's verifier when WON emulation is on.
-Everything that touches TorqueScript waits for the render loop: the hook
-interposes `SDL_GL_SwapBuffers`, and on the game's main thread, once the
+Everything that touches TorqueScript waits for the render loop (in the
+dedicated server, its main-loop `usleep`): the hook interposes
+`SDL_GL_SwapBuffers`, and on the game's main thread, once the
 console table exists, it registers its console commands and installs the
 runtime T2CSRI (TribesNext client) handlers. The hook toggle removes only
 `t2_hook.so`. The hook reads `base/*.store` from `T2LAUNCH_GAME_DIR` and runs
@@ -738,6 +790,8 @@ enablewinconsole(true);
 | `hook_tn_join_trace` | `<address> <ready>` | Log the selected server and key-ready state |
 | `hook_tn_ip_trace` | `<ip> <hex>` | Log the parsed IPv4 used in the client challenge |
 | `hook_tn_ipv4_hex` | `<dotted_ipv4>` | Encode the T2CSRI IPv4 challenge suffix |
+| `hook_tn_hex_ipv4` | `<hex>` | Decode a T2CSRI IPv4 suffix to dotted form |
+| `hook_tn_verify_cert` | `<certificate>` | 1 if the TribesNext root key signed the account certificate |
 
 ### Binary addresses (Tribes 2 Linux #25034)
 
@@ -755,6 +809,25 @@ enablewinconsole(true);
 | `WONGetAuthInfo` | `0x0834E804` | console callback |
 | AuthInfo parser | `0x08348FCC` | `__cdecl` |
 | `Auth2Certificate::UnpackData` | `0x083615A4` | `__thiscall` |
+
+The dedicated server (`tribes2d.dynamic`) is a separate build with the same
+engine code at other addresses. The hook picks its address set from the
+executable's name and checks the bytes at every site before patching:
+
+| What | Client | Server |
+|------|--------|--------|
+| `Con::addMethodS` / `Con::evaluate` | `0x080E85C0` / `0x080E88F4` | `0x080E74B0` / `0x080E77E4` |
+| Console global ptr | `0x08493DEC` | `0x0848902C` |
+| `Platform::getRealMilliseconds` | `0x081CFA44` | `0x081CD014` |
+| WON bootstrap strings | `0x084846B1` | `0x08479751` |
+| WON verifier slot | `0x0849A860` | `0x0848F520` |
+| Packet rate/size clamps | `0x081F8EAE`, `0x081FB382`, `0x081FB683` | `0x081EDB4E`, `0x081F0022`, `0x081F0323` |
+| Challenge reply "server has a certificate" flag | — | `0x0822B604` |
+| LAN-only check for servers without a certificate | — | `0x0822BC85` |
+
+The server has no `SDL_GL_SwapBuffers`. `Platform::process` (`0x081CF400`)
+ends each main-loop pass with `usleep(1000)`, so the hook interposes `usleep`
+and does its main-thread work there.
 
 ### AuthInfo (`WONGetAuthInfo`)
 

@@ -152,6 +152,31 @@ class OptionTests(unittest.TestCase):
         unhooked = t2options.hook_config({"won.mode": "off"}, {"launcher.load_hook": False})
         self.assertIn("runtime.monotonic_clock=0", unhooked)
 
+    def test_dedicated_profiles_drop_client_options(self):
+        server = {"game.executable": "dedicated", "won.mode": "local", "video.gamma": True,
+                  "server.auto_restart": True}
+        values = t2options.effective(server, HOOKED)
+        for key in t2options.CLIENT_ONLY:
+            self.assertEqual(values[key], t2options.BY_KEY[key].off_value, key)
+        self.assertTrue(values["net.packet_limits"])
+        self.assertTrue(values["runtime.monotonic_clock"])
+        self.assertTrue(values["server.tribesnext_auth"])
+        env = t2options.launch_env(server, HOOKED)
+        self.assertEqual(env["T2LAUNCH_EXECUTABLE"], "dedicated")
+        self.assertEqual(env["T2LAUNCH_SERVER_RESTART"], "1")
+        self.assertEqual(env["T2LAUNCH_SERVER_CONSOLE"], "terminal")
+        self.assertNotIn("T2LAUNCH_SOFTWARE_GL", env)
+        lines = dict(line.split("=", 1) for line in t2options.hook_config(server, HOOKED).splitlines()
+                     if not line.startswith("#"))
+        self.assertEqual((lines["video.gamma"], lines["server.tribesnext_auth"]), ("0", "1"))
+        # A client profile has no server options, and server-only hook options stay off.
+        client = t2options.effective({"won.mode": "local"}, HOOKED)
+        self.assertFalse(client["server.tribesnext_auth"])
+        self.assertTrue(client["video.gamma"])
+        self.assertNotIn("T2LAUNCH_SERVER_RESTART", t2options.launch_env({"won.mode": "local"}, HOOKED))
+        with self.assertRaises(ValueError):
+            t2options.coerce(t2options.BY_KEY["game.executable"], "server")
+
     def test_gamescope_options_need_gamescope(self):
         profile = {"won.mode": "off", "video.gamescope": True, "video.gamescope_filter": "fsr"}
         with mock.patch.object(t2options.shutil, "which", return_value=None):

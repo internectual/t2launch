@@ -489,6 +489,18 @@ def parse_login_payload(payload, session_key):
             "extension_bytes": extension_bytes}
 
 
+# Dedicated servers log in with this fixed name and password from the WON
+# client "Tribes2Server" (WONServerLogin). Sierra's auth service gave every
+# server a certificate; the server needs one to accept Internet players and
+# to verify their WON certificates.
+SERVER_LOGIN = "Tribes2Server"
+
+
+def is_server_login(fields):
+    return fields["client"] == SERVER_LOGIN and fields["username"] == SERVER_LOGIN and \
+        fields["password"] == SERVER_LOGIN
+
+
 def decode_login_envelope(payload, keys, private_store=None, account_store=None,
                           refresh_tribesnext=None, auth_order=("tribesnext", "native"),
                           recover_tribesnext=None):
@@ -524,7 +536,9 @@ def decode_login_envelope(payload, keys, private_store=None, account_store=None,
         account_validation = "account_missing"
         credential_source = "unknown"
         recovery_status = "not_configured"
-        for backend in auth_order:
+        if is_server_login(fields):
+            account_validation, credential_source = "valid", "server"
+        for backend in (() if credential_source == "server" else auth_order):
             if backend == "tribesnext":
                 tribesnext_validation = woncrypto.verify_private_store_password(
                     private_store, fields["username"], fields["password"])
@@ -3036,7 +3050,7 @@ class Emulator:
                               tribesnext_credentials=None, auth_provider="local"):
         auth_provider = auth_provider or "local"
         community, chat = self.session_backends(auth_provider, tribesnext_credentials)
-        if community == "native":
+        if community == "native" and auth_provider != "server":
             user_id = self.auth_user_id(username)
             self.community.ensure_profile(username, user_id)
         with self.auth_session_lock:
@@ -3082,6 +3096,8 @@ class Emulator:
         A lookup failure yields no tribes rather than failing the login.
         """
         provider = auth_provider or "local"
+        if provider == "server":
+            return []
         try:
             if provider == "tribesnext":
                 guid = self.tribesnext_user_id(username)
@@ -3787,7 +3803,8 @@ def main():
                          help="print a CD key that the game's Create Account dialog accepts")
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
     parser.add_argument("--client-binary", type=Path, default=Path.home() / "t2-linux/tribes2.dynamic",
-                        help="client from which to recover the public cryptographic parameters")
+                        help="game binary (tribes2.dynamic or tribes2d.dynamic) from which to recover "
+                             "the public cryptographic parameters")
     parser.add_argument("--auth-key-profile", choices=("compat", "native"),
                         default=os.environ.get("T2LAUNCH_AUTH_KEY_PROFILE", "compat"),
                         help="auth-key group profile; compat avoids the client's oversized-c2 truncation")

@@ -163,44 +163,142 @@ int main(void) {
     assert(strstr(filter_max_bots_override, "function FilterEditDlg::setMaxBots(%this)") != NULL);
     assert(strstr(filter_max_bots_override, "> 255") != NULL);
 
-    /* Network packet limits: twelve sites over two pages, all or nothing. */
-    {
-        uintptr_t pages[2] = {0x081F8000, 0x081FB000};
+    /* Network packet limits: twelve sites over two pages, all or nothing, at
+       each executable's own sites and variables. */
+    for (size_t t = 0; t < GAME_TARGET_COUNT; t++) {
+        target = &game_targets[t];
+        const uintptr_t *sites = target->net_rate_compare;
+        uintptr_t pages[2] = {sites[0] & ~((uintptr_t)size - 1), sites[1] & ~((uintptr_t)size - 1)};
+        assert(sites[2] + NET_SIZE_STORE_OFFSET + 10 <= pages[1] + (uintptr_t)size);
         for (int i = 0; i < 2; i++)
             assert(mmap((void *)pages[i], size, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)pages[i]);
+        uint32_t rate_variable = (uint32_t)target->net_rate_variable;
+        uint32_t size_variable = (uint32_t)target->net_size_variable;
         for (int i = 0; i < 3; i++) {
-            memcpy((void *)net_rate_compare_sites[i], net_rate_compare_original, sizeof(net_rate_compare_original));
-            memcpy((void *)net_rate_store_sites[i], net_rate_store_original, sizeof(net_rate_store_original));
-            memcpy((void *)net_size_compare_sites[i], net_size_compare_original, sizeof(net_size_compare_original));
-            memcpy((void *)net_size_store_sites[i], net_size_store_original, sizeof(net_size_store_original));
+            unsigned char *site = (unsigned char *)sites[i];
+            memcpy(site, "\x83\x3d", 2); memcpy(site + 2, &rate_variable, 4); site[6] = 0x20;
+            unsigned char *store = site + NET_RATE_STORE_OFFSET;
+            memcpy(store, "\xc7\x05", 2); memcpy(store + 2, &rate_variable, 4);
+            memcpy(store + 6, "\x20\x00\x00\x00", 4);
+            unsigned char *size_compare = site + NET_SIZE_COMPARE_OFFSET;
+            memcpy(size_compare, "\x81\x3d", 2); memcpy(size_compare + 2, &size_variable, 4);
+            memcpy(size_compare + 6, "\xc2\x01\x00\x00", 4);
+            unsigned char *size_store = site + NET_SIZE_STORE_OFFSET;
+            memcpy(size_store, "\xc7\x05", 2); memcpy(size_store + 2, &size_variable, 4);
+            memcpy(size_store + 6, "\xc2\x01\x00\x00", 4);
         }
-        unsigned char *last = (unsigned char *)net_size_store_sites[2];
+        unsigned char *last = (unsigned char *)sites[2] + NET_SIZE_STORE_OFFSET;
         last[6] = 0xc3;
         for (int i = 0; i < 2; i++) assert(mprotect((void *)pages[i], size, PROT_READ | PROT_EXEC) == 0);
         assert(!install_net_packet_limits());
-        assert(((unsigned char *)net_rate_compare_sites[0])[6] == 0x20);
+        assert(((unsigned char *)sites[0])[6] == 0x20);
         assert(mprotect((void *)pages[1], size, PROT_READ | PROT_WRITE) == 0);
         last[6] = 0xc2;
         assert(mprotect((void *)pages[1], size, PROT_READ | PROT_EXEC) == 0);
         assert(install_net_packet_limits());
         for (int i = 0; i < 3; i++) {
+            const unsigned char *site = (const unsigned char *)sites[i];
             uint32_t value;
-            assert(((unsigned char *)net_rate_compare_sites[i])[6] == 64);
-            memcpy(&value, (unsigned char *)net_rate_store_sites[i] + 6, 4);
+            assert(site[6] == 64);
+            memcpy(&value, site + NET_RATE_STORE_OFFSET + 6, 4);
             assert(value == 64);
-            memcpy(&value, (unsigned char *)net_size_compare_sites[i] + 6, 4);
+            memcpy(&value, site + NET_SIZE_COMPARE_OFFSET + 6, 4);
             assert(value == 1000);
-            memcpy(&value, (unsigned char *)net_size_store_sites[i] + 6, 4);
+            memcpy(&value, site + NET_SIZE_STORE_OFFSET + 6, 4);
             assert(value == 1000);
-            assert(memcmp((void *)net_size_store_sites[i], net_size_store_original, 6) == 0);
+            memcpy(&value, site + NET_SIZE_STORE_OFFSET + 2, 4);
+            assert(value == size_variable);
         }
-        assert(readable_range(net_rate_compare_sites[0], 7, &protection) &&
-               protection == (PROT_READ | PROT_EXEC));
+        assert(readable_range(sites[0], 7, &protection) && protection == (PROT_READ | PROT_EXEC));
         for (int i = 0; i < 2; i++) munmap((void *)pages[i], size);
-        assert(strstr(net_options_override, "OP_PacketRateSlider.range = \"2 64\"") != NULL);
-        assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
     }
+    target = &game_targets[0];
+    assert(strstr(net_options_override, "OP_PacketRateSlider.range = \"2 64\"") != NULL);
+    assert(strstr(net_options_override, "\\t64\\t32\\t1000") != NULL);
+
+    /* The dedicated server's WON strings and clock live at its own addresses. */
+    {
+        target = &game_targets[1];
+        assert(target->dedicated && strcmp(target->executable, "tribes2d.dynamic") == 0);
+        uintptr_t won_page = target->won_bootstrap[0] & ~((uintptr_t)size - 1);
+        char *won = mmap((void *)won_page, size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(won == (void *)won_page);
+        strcpy((char *)target->won_bootstrap[0], "tribes2.m1.sierra.com:15104");
+        strcpy((char *)target->won_bootstrap[1], "tribes2.m2.sierra.com:15104");
+        strcpy((char *)target->won_bootstrap[2], "tribes2.m3.sierra.com:15104");
+        assert(mprotect(won, size, PROT_READ) == 0);
+        assert(redirect_won_bootstrap());
+        assert(strcmp((char *)target->won_bootstrap[2], "127.0.0.1:15104") == 0);
+        munmap(won, size);
+        uintptr_t clock_page = target->real_milliseconds & ~((uintptr_t)size - 1);
+        unsigned char *clock = mmap((void *)clock_page, size, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(clock == (void *)clock_page);
+        memcpy((void *)target->real_milliseconds, real_milliseconds_original, sizeof(real_milliseconds_original));
+        assert(mprotect(clock, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_monotonic_clock());
+        assert(((unsigned char *)target->real_milliseconds)[0] == 0xe9);
+        munmap(clock, size);
+
+        /* Clients without a WON certificate: both server patches, all or nothing. */
+        uintptr_t auth_page = SERVER_REPLY_CERT_FLAG & ~((uintptr_t)size - 1);
+        assert((SERVER_LAN_CHECK & ~((uintptr_t)size - 1)) == auth_page);
+        unsigned char *auth = mmap((void *)auth_page, size, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(auth == (void *)auth_page);
+        memcpy((void *)SERVER_REPLY_CERT_FLAG, server_reply_cert_flag_original,
+               sizeof(server_reply_cert_flag_original));
+        memcpy((void *)SERVER_LAN_CHECK, server_lan_check_original, sizeof(server_lan_check_original));
+        ((unsigned char *)SERVER_LAN_CHECK)[9] = 0x43;
+        assert(mprotect(auth, size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_server_tribesnext_auth());
+        assert(memcmp((void *)SERVER_REPLY_CERT_FLAG, server_reply_cert_flag_original, 10) == 0);
+        assert(mprotect(auth, size, PROT_READ | PROT_WRITE) == 0);
+        ((unsigned char *)SERVER_LAN_CHECK)[9] = 0x42;
+        assert(mprotect(auth, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_server_tribesnext_auth());
+        const unsigned char *flag = (const unsigned char *)SERVER_REPLY_CERT_FLAG;
+        assert(memcmp(flag, "\x83\xbe\x54\x21\x00\x00\x00\x0f\x95\xc0", 10) == 0);
+        const unsigned char *lan = (const unsigned char *)SERVER_LAN_CHECK;
+        assert(lan[0] == 0xe9 && SERVER_LAN_CHECK + 5 + (uintptr_t)call_target_offset(SERVER_LAN_CHECK) ==
+               0x0822BFD4);
+        munmap(auth, size);
+        target = &game_targets[0];
+    }
+
+    /* T2CSRI server helpers: hex addresses both ways, and certificates signed
+       by the TribesNext root key (a real one from the game's public.store
+       when there is one). */
+    {
+        const char *hex_args[] = {"hook_tn_hex_ipv4", "7f000001"};
+        assert(strcmp(hook_tn_hex_ipv4_cb(NULL, 2, hex_args), "127.0.0.1") == 0);
+        const char *bad_hex[] = {"hook_tn_hex_ipv4", "7f0000zz"};
+        assert(strcmp(hook_tn_hex_ipv4_cb(NULL, 2, bad_hex), "") == 0);
+        const char *dotted[] = {"hook_tn_ipv4_hex", "10.0.0.7"};
+        assert(strcmp(hook_tn_ipv4_hex_cb(NULL, 2, dotted), "0a000007") == 0);
+        const char *malformed[] = {"hook_tn_verify_cert", "name\t12\t3\tabc"};
+        assert(strcmp(hook_tn_verify_cert_cb(NULL, 2, malformed), "0") == 0);
+        const char *bad_guid[] = {"hook_tn_verify_cert", "name\t1x\t3\tabc\tdef"};
+        assert(strcmp(hook_tn_verify_cert_cb(NULL, 2, bad_guid), "0") == 0);
+        setenv("T2LAUNCH_RSA_HELPER", getenv("T2LAUNCH_TEST_RSA_HELPER") ?
+               getenv("T2LAUNCH_TEST_RSA_HELPER") : "games/tribes2/rsa_helper", 1);
+        char store_path[4096];
+        snprintf(store_path, sizeof(store_path), "%s/t2-linux/base/public.store", getenv("HOME"));
+        FILE *store = fopen(store_path, "r");
+        static char line[20001];
+        if (store && fgets(line, sizeof(line), store)) {
+            line[strcspn(line, "\r\n")] = 0;
+            const char *cert[] = {"hook_tn_verify_cert", line};
+            assert(strcmp(hook_tn_verify_cert_cb(NULL, 2, cert), "1") == 0);
+            line[0] ^= 0x20;  /* another name: the signature no longer matches */
+            assert(strcmp(hook_tn_verify_cert_cb(NULL, 2, cert), "0") == 0);
+        }
+        if (store) fclose(store);
+    }
+    assert(strstr(server_tribesnext_script, "package T2LaunchTribesNextServer") != NULL);
+    assert(strstr(server_tribesnext_script, "function serverCmdt2csri_challengeResponse(%client, %serverChallenge)") != NULL);
 
     /* Native TribesNext handshake: blob layout, nonce search, the three
        BitStream hooks against a real RSA round trip, and the code patches. */

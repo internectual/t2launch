@@ -12,7 +12,7 @@ import json
 import os
 import re
 import shutil
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 WON_MODES = ("off", "local", "remote")
@@ -63,6 +63,11 @@ class Option:
 
 
 OPTIONS = (
+    # Game tab: which executable the profile runs
+    Option("game.executable", "Executable", "Game executable", "choice", "client",
+           choices=("client", "dedicated"), env="T2LAUNCH_EXECUTABLE", tab="game",
+           help="client runs the game (tribes2.dynamic); dedicated runs the dedicated server "
+                "(tribes2d.dynamic) with -dedicated, which has no window, video or sound."),
     # WON emulator
     Option("won.mode", "WON emulator", "WON emulation", "choice", "off", tab="won",
            choices=WON_MODES, env="T2LAUNCH_WON_MODE",
@@ -167,9 +172,10 @@ OPTIONS = (
     # Network
     Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
-           help="Raise the client's 32/s and 450-byte limits so QoL-patched TribesNext servers can "
-                "send more, and add a matching \"TribesNext QoL\" network preset. Stock servers "
-                "still send at their own limits."),
+           help="Raise the 32/s and 450-byte limits: the client asks QoL-patched TribesNext "
+                "servers for more and gets a matching \"TribesNext QoL\" network preset; the "
+                "dedicated server sends up to 64/s and 1000 bytes to clients that ask. Stock "
+                "peers still hold their end to 32/s and 450 bytes."),
     Option("net.depot_downloads", "Network", "Download missing map files from the TribesNext depot",
            "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)), ("hook.console_commands", (True,))),
@@ -236,6 +242,28 @@ OPTIONS = (
            True, hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Time the game with CLOCK_MONOTONIC instead of the CPU's timestamp counter, which "
                 "can run fast or jump between cores on some CPUs and virtual machines."),
+    # Dedicated server
+    Option("server.console", "Dedicated server", "Server console", "choice", "terminal",
+           choices=("terminal", "headless"), env="T2LAUNCH_SERVER_CONSOLE",
+           requires=(("game.executable", ("dedicated",)),),
+           help="terminal opens the server in a terminal window where you can type console "
+                "commands; headless runs it in the background with its output in the launcher log."),
+    Option("server.auto_restart", "Dedicated server", "Restart the server if it crashes", "bool",
+           False, env="T2LAUNCH_SERVER_RESTART", requires=(("game.executable", ("dedicated",)),),
+           help="Start the server again 5 seconds after it crashes; a clean quit, Ctrl+C or a "
+                "fifth crash within two minutes stops it."),
+    Option("server.tribesnext_auth", "Dedicated server", "Let TribesNext players join", "bool", True,
+           hook=True,
+           requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
+                     ("hook.console_commands", (True,))),
+           help="Accept players without a WON certificate and verify their TribesNext accounts "
+                "with T2CSRI, as TribesNext servers do. Players with a WON certificate from "
+                "wonemu still authenticate through WON."),
+    Option("server.public_address", "Dedicated server", "Public IPv4 address", "text", "",
+           hook=True, advanced=True, requires=(("server.tribesnext_auth", (True,)),),
+           help="The Internet address players connect to. TribesNext clients name the address "
+                "they joined; with this set, the server refuses a proof meant for another server. "
+                "Empty accepts any address."),
     # Debugging
     Option("debug.trace_connects", "Debugging", "Trace resolver and connect() calls", "bool",
            False, env="T2LAUNCH_TRACE_CONNECTS", advanced=True,
@@ -243,6 +271,18 @@ OPTIONS = (
     Option("debug.trace_openal", "Debugging", "Trace OpenAL gain calls", "bool", False,
            env="T2LAUNCH_REALIGN_TRACE_AL", advanced=True),
 )
+# Options for the game client only: the dedicated server has no window, video,
+# sound, server browser or account login.
+CLIENT_ONLY = frozenset((
+    "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
+    "video.vsync", "video.gamma", "video.disable_locked_arrays", "video.software_gl",
+    "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
+    "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
+    "audio.launch_reset", "debug.trace_openal",
+    *(option.key for option in OPTIONS if option.section == "Gamescope"),
+))
+OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)
+                if option.key in CLIENT_ONLY else option for option in OPTIONS)
 BY_KEY = {option.key: option for option in OPTIONS}
 HOOK_CONFIG_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "t2launch/hook"
 

@@ -14,7 +14,9 @@ import struct
 import time
 from pathlib import Path
 
-ROOT_ADDRESS = 0x0849A860
+# The embedded WON verifier slot in the client (tribes2.dynamic) and the
+# dedicated server (tribes2d.dynamic); both hold the same key.
+ROOT_ADDRESSES = (0x0849A860, 0x0848F520)
 ROOT_SLOT_SIZE = 817
 LOCAL_AUTH_PARAMETERS = {
     # A local compatibility group avoids the Loki client's oversized c2
@@ -247,13 +249,17 @@ def read_der_public(data):
 def verifier_parameters(binary):
     data = Path(binary).read_bytes()
     if data[:6] != b"\x7fELF\x01\x01":
-        raise ValueError("Expected the Loki ELF32 little-endian client")
+        raise ValueError("Expected a Loki ELF32 little-endian game binary")
     phoff, = struct.unpack_from("<I", data, 28)
     size, count = struct.unpack_from("<HH", data, 42)
-    for index in range(count):
-        kind, offset, address, _, length, _, _, _ = struct.unpack_from("<8I", data, phoff + size * index)
-        if kind == 1 and address <= ROOT_ADDRESS and ROOT_ADDRESS + ROOT_SLOT_SIZE <= address + length:
-            start = offset + ROOT_ADDRESS - address
+    for root in ROOT_ADDRESSES:
+        for index in range(count):
+            kind, offset, address, _, length, _, _, _ = struct.unpack_from("<8I", data, phoff + size * index)
+            if kind != 1 or not address <= root or root + ROOT_SLOT_SIZE > address + length:
+                continue
+            start = offset + root - address
+            if data[start:start + 4] != b"\x30\x82\x03\x2c":
+                continue
             key = read_der_public(data[start:start + ROOT_SLOT_SIZE])
             if key["p"].bit_length() != 2048 or key["q"].bit_length() < 128:
                 raise ValueError("Unsupported embedded WON verifier parameters")
