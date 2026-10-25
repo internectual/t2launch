@@ -3091,6 +3091,9 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
     if (target->dedicated) {
         game_main_thread_known = 1;  /* constructors run on the main thread */
+        /* A headless server's stdout is a pipe or file, which the game would
+           fill in 4 KB blocks and lose on a crash; write its log by line. */
+        setvbuf(stdout, NULL, _IOLBF, 0);
         if (hook_option_bool("server.tribesnext_auth") && hook_option_bool("hook.console_commands"))
             install_server_tribesnext_auth();
         fprintf(stderr, "[t2_hook] Console command registration deferred to the server's main loop\n");
