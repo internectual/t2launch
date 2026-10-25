@@ -12,6 +12,7 @@ import argparse
 import datetime
 import hashlib
 import hmac
+import ipaddress
 import itertools
 import json
 import os
@@ -136,6 +137,55 @@ def read_torque_string(reader):
             return reader.take(length).decode("utf-8")
         shift += 7
     raise ValueError("Malformed Torque master string length")
+
+
+def parse_game_info(data):
+    """The fields of a game-master info response (type 12), in either layout.
+
+    Torque servers send max players, regions, version, info flags, bots, a
+    32-bit CPU speed, then the player count and GUIDs. The Loki #25034
+    Tribes 2 server sends the player count first and a 16-bit CPU speed, two
+    bytes fewer; the layouts differ by two bytes modulo four.
+    """
+    reader = Reader(data)
+    reader.take(6)
+    info = {"game_type": read_torque_string(reader), "mission_type": read_torque_string(reader)}
+    if (len(data) - reader.offset) % 4 == 2:
+        info["player_count"] = reader.number("<B")
+        info.update(max_players=reader.number("<B"), regions=reader.number("<I"),
+                    version=reader.number("<I"), info_flags=reader.number("<B"),
+                    num_bots=reader.number("<B"), cpu_speed=reader.number("<H"))
+    else:
+        info.update(max_players=reader.number("<B"), regions=reader.number("<I"),
+                    version=reader.number("<I"), info_flags=reader.number("<B"),
+                    num_bots=reader.number("<B"), cpu_speed=reader.number("<I"))
+        info["player_count"] = reader.number("<B")
+    info["players"] = [reader.number("<I") for _ in range(info["player_count"])]
+    if reader.offset != len(data):
+        raise ValueError("Trailing bytes in game-info response")
+    return info
+
+
+def tribesnext_heartbeat_path(peer):
+    """The TribesNext master's /add path for a game server at peer.
+
+    The master contacts the server at the address the request comes from,
+    unless the path names one, as a server with $Host::BindAddress does. A
+    loopback or LAN address would send it nowhere, so only another is named.
+    """
+    ip, port = peer
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return f"/add/{port}"
+    local = address.is_loopback or address.is_link_local or address.is_unspecified or any(
+        address in network for network in LOCAL_NETWORKS)
+    return f"/add/{port}" if local else f"/add/{port}/{urllib.parse.quote(ip, safe='')}"
+
+
+LOCAL_NETWORKS = tuple(ipaddress.ip_network(network) for network in
+                       ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"))
+TRIBESNEXT_HEARTBEAT_RESULTS = {"0": "added", "1": "unreachable", "2": "confirmed"}
 
 
 def torque_string(value):
@@ -3397,15 +3447,16 @@ class Emulator:
         return sorted(game_types), sorted(mission_types)
 
     def publish_tribesnext_heartbeat(self, peer, base_url=None):
-        ip, port = peer
-        path = f"/add/{port}/{urllib.parse.quote(ip, safe='')}"
+        path = tribesnext_heartbeat_path(peer)
         try:
             text = self.fetch_tribesnext(path, base_url)
         except (OSError, ValueError) as exc:
             self.log.event("master_upstream_error", operation="heartbeat", error=str(exc))
             return
         result = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        self.log.event("master_upstream_heartbeat", result=result[:32])
+        result = TRIBESNEXT_HEARTBEAT_RESULTS.get(result, result[:32])
+        self.log.event("master_upstream_heartbeat", port=peer[1], result=result)
+        print(f"[wonemu] TribesNext master heartbeat for port {peer[1]}: {result}", flush=True)
 
     def torque_master_exchange(self, address, request, reply_type):
         """Send one Torque master request; return the replies of reply_type."""
@@ -3560,19 +3611,8 @@ class Emulator:
                         time.monotonic() - expected[2] > 30):
                     self.log.event("master_info_ignored", peer=list(peer), reason="session mismatch")
                     return
-                reader = Reader(data)
-                reader.take(6)
-                game_type = read_torque_string(reader)
-                mission_type = read_torque_string(reader)
-                info = {"endpoint": (socket.inet_aton(peer[0]), peer[1]),
-                        "game_type": game_type, "mission_type": mission_type,
-                        "max_players": reader.number("<B"), "regions": reader.number("<I"),
-                        "version": reader.number("<I"), "info_flags": reader.number("<B"),
-                        "num_bots": reader.number("<B"), "cpu_speed": reader.number("<I")}
-                info["player_count"] = reader.number("<B")
-                info["players"] = [reader.number("<I") for _ in range(info["player_count"])]
-                if reader.offset != len(data):
-                    raise ValueError("Trailing bytes in Torque game-info response")
+                info = {"endpoint": (socket.inet_aton(peer[0]), peer[1]), **parse_game_info(data)}
+                game_type, mission_type = info["game_type"], info["mission_type"]
                 info["last_heartbeat"] = time.monotonic()
                 with self.master_lock:
                     self.master_servers[peer] = info

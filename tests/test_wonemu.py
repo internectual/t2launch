@@ -1597,6 +1597,31 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(attempts, ["wrong", "right"])
         self.assertNotIn("wrong", log_text)
 
+    def test_game_info_from_the_loki_server_and_torque_servers(self):
+        # Captured from the Loki #25034 dedicated server: player count first, 16-bit CPU speed.
+        loki = bytes.fromhex("0c 80 34 12 78 56 07 76 61 72 69 61 6e 74 10 43 61 70 74 75 72 65 20 74"
+                             "68 65 20 46 6c 61 67 00 40 02 00 00 00 ca 61 00 00 05 00 05 0e")
+        self.assertEqual(wonemu.parse_game_info(loki), {
+            "game_type": "variant", "mission_type": "Capture the Flag", "player_count": 0,
+            "max_players": 64, "regions": 2, "version": 25034, "info_flags": 5, "num_bots": 0,
+            "cpu_speed": 3589, "players": []})
+        with_player = loki[:31] + b"\x01" + loki[32:] + struct.pack("<I", 2004299)
+        self.assertEqual(wonemu.parse_game_info(with_player)["players"], [2004299])
+        torque = (bytes.fromhex("0c 00 34 12 78 56") + wonemu.torque_string("base") +
+                  wonemu.torque_string("CTF") + struct.pack("<BIIBBIB", 32, 1, 1, 0, 2, 3000, 1) +
+                  struct.pack("<I", 7))
+        info = wonemu.parse_game_info(torque)
+        self.assertEqual((info["max_players"], info["cpu_speed"], info["players"]), (32, 3000, [7]))
+        with self.assertRaises(ValueError):
+            wonemu.parse_game_info(loki + b"\0")
+
+    def test_tribesnext_heartbeat_names_only_reachable_addresses(self):
+        self.assertEqual(wonemu.tribesnext_heartbeat_path(("127.0.0.1", 28000)), "/add/28000")
+        self.assertEqual(wonemu.tribesnext_heartbeat_path(("192.168.1.176", 28000)), "/add/28000")
+        self.assertEqual(wonemu.tribesnext_heartbeat_path(("10.0.0.5", 28001)), "/add/28001")
+        self.assertEqual(wonemu.tribesnext_heartbeat_path(("198.51.100.4", 28000)),
+                         "/add/28000/198.51.100.4")
+
     def test_dedicated_server_login_gets_a_server_certificate(self):
         key = {"p": SMALL_AUTH_P, "q": SMALL_AUTH_Q, "g": 4, "x": SMALL_AUTH_X,
                "y": pow(4, SMALL_AUTH_X, SMALL_AUTH_P)}
