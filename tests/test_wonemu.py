@@ -1267,6 +1267,60 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(store.delete_news(article_id, "author"))
             self.assertEqual(store.list_news(35500), ([], 0))
 
+    def test_local_guids_stay_out_of_the_tribesnext_range(self):
+        for name in ("LouCypher", "a", "Tribes2Server", "x" * 31):
+            user_id = woncrypto.local_auth_user_id(name)
+            self.assertTrue(woncrypto.LOCAL_USER_ID_BASE <= user_id <= woncrypto.LOCAL_USER_ID_LIMIT)
+        with tempfile.TemporaryDirectory() as directory:
+            store = community_store.CommunityStore(Path(directory) / "community.sqlite3")
+            first = store.create_local_account("First", 1_500_000_000, "pw-one")
+            # A second account asking for a taken GUID gets the next free one.
+            second = store.create_local_account("Second", 1_500_000_000, "pw-two")
+            self.assertEqual((first["user_id"], second["user_id"]), (1_500_000_000, 1_500_000_001))
+            self.assertEqual(store.local_account_user_id("second"), 1_500_000_001)
+            self.assertIsNone(store.local_account_user_id("Nobody"))
+            # A TribesNext GUID is never reassigned to another name.
+            store.ensure_profile("TNPlayer", 2004299)
+            with self.assertRaises(ValueError):
+                store.ensure_profile("Someone", 2004299)
+
+    def test_old_local_guids_move_with_everything_that_names_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "community.sqlite3"
+            store = community_store.CommunityStore(path)
+            old = woncrypto.legacy_local_auth_user_id("Native")
+            tn_guid = 2004299
+            with sqlite3.connect(path) as connection:
+                now = int(time.time())
+                for user_id, name in ((old, "Native"), (tn_guid, "TNPlayer")):
+                    connection.execute("INSERT INTO profiles (user_id, username, display_name, graphic, "
+                                       "registered_at, updated_at) VALUES (?, ?, ?, 'g', ?, ?)",
+                                       (user_id, name, name, now, now))
+                connection.execute("INSERT INTO auth_accounts (username, created_at) VALUES ('Native', ?)",
+                                   (now,))
+                connection.execute("INSERT INTO buddies (owner_id, buddy_id, created_at) VALUES (?, ?, ?)",
+                                   (tn_guid, old, now))
+            store = community_store.CommunityStore(path)
+            moved = store.get_profile("Native")["user_id"]
+            self.assertEqual(moved, woncrypto.local_auth_user_id("Native"))
+            self.assertEqual(store.get_profile("TNPlayer")["user_id"], tn_guid)
+            with sqlite3.connect(path) as connection:
+                self.assertEqual(connection.execute("SELECT buddy_id FROM buddies").fetchall(), [(moved,)])
+            # Opening the store again leaves moved GUIDs where they are.
+            self.assertEqual(community_store.CommunityStore(path).get_profile("Native")["user_id"], moved)
+
+    def test_a_wonemu_login_never_takes_a_tribesnext_guid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private_store = Path(directory) / "private.store"
+            (Path(directory) / "public.store").write_text("Shared\t2004299\t3\tab\tcd\n", encoding="ascii")
+            emulator = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(directory),
+                                       private_store=private_store)
+            emulator.community.create_local_account("Shared", woncrypto.local_auth_user_id("Shared"), "pw")
+            local = emulator.auth_user_id("Shared", provider="local")
+            self.assertTrue(community_store.is_local_user_id(local))
+            self.assertEqual(emulator.auth_user_id("Shared", provider="tribesnext"), 2004299)
+            emulator.log.close()
+
     def test_community_store_motd_and_reserved_tribe_ids(self):
         with tempfile.TemporaryDirectory() as directory:
             store = community_store.CommunityStore(Path(directory) / "community.sqlite3")

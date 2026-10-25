@@ -262,8 +262,9 @@ OPTIONS = (
     Option("server.public_address", "Dedicated server", "Public IPv4 address", "text", "",
            hook=True, advanced=True, requires=(("server.tribesnext_auth", (True,)),),
            help="The Internet address players connect to. TribesNext clients name the address "
-                "they joined; with this set, the server refuses a proof meant for another server. "
-                "Empty accepts any address."),
+                "they joined, and the server refuses a login meant for another server. Empty looks "
+                "it up from TribesNext at launch, as TribesNext servers do; if that fails, only "
+                "players on your LAN or using the bind address can join."),
     # Debugging
     Option("debug.trace_connects", "Debugging", "Trace resolver and connect() calls", "bool",
            False, env="T2LAUNCH_TRACE_CONNECTS", advanced=True,

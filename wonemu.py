@@ -1141,7 +1141,7 @@ class IRCHandler(socketserver.BaseRequestHandler):
                 self.relay.close()
             if session.get("presence_registered"):
                 emulator.update_irc_presence(
-                    emulator.auth_user_id(session["username"]), connection, False)
+                    emulator.auth_user_id(session["username"], provider=session.get("auth_provider")), connection, False)
 
     def _send(self, line):
         self.send_raw(line.encode("utf-8"))
@@ -1360,13 +1360,13 @@ class IRCHandler(socketserver.BaseRequestHandler):
             token = woncrypto.build_won_irc_cb35(
                 session["auth1_reply"], response_secret or session["session_key"])
             nickname = session["username"].replace(" ", "_")
-            ident = str(emulator.auth_user_id(session["username"]))
+            ident = str(emulator.auth_user_id(session["username"], provider=session.get("auth_provider")))
             self._send(f":wonemu.local CHALRESP_REPLY {nickname} {ident} {token}\r\n")
             session["irc_authenticated"] = True
             session["irc_nickname"] = nickname
             session["irc_ident"] = ident
             emulator.update_irc_presence(
-                emulator.auth_user_id(session["username"]), connection, True)
+                emulator.auth_user_id(session["username"], provider=session.get("auth_provider")), connection, True)
             session["presence_registered"] = True
             emulator.log.event("irc_authenticated", connection=connection,
                                token_bytes=len(token))
@@ -1906,7 +1906,7 @@ class DBProxyQuery:
                         raise ValueError(f"Player not found: {name}")
                     self.emulator.community.ensure_profile(name, self.emulator.auth_user_id(name))
                 count = self.emulator.community.send_mail(
-                    self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+                    self.session["username"], self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
                     recipients, query_fields[2], "\t".join(query_fields[3:]),
                     ", ".join(to_names), ", ".join(cc_names))
                 status, result, status_code = "0\tMail sent", str(count), 0
@@ -1966,7 +1966,7 @@ class DBProxyQuery:
                 raise ValueError("Invalid news post request")
             article_id = self.emulator.community.post_news(
                 query_fields[0], self.session["username"],
-                self.emulator.auth_user_id(self.session["username"]),
+                self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
                 query_fields[1], "\t".join(query_fields[2:]))
             status, result, status_code = "0\tArticle submitted", str(article_id), 0
         except ValueError as exc:
@@ -2026,7 +2026,7 @@ class DBProxyQuery:
                 raise ValueError("Player not found")
             if self.ordinal == 10:
                 self.emulator.community.add_buddy(
-                    self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+                    self.session["username"], self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
                     buddy_name, self.emulator.auth_user_id(buddy_name))
                 status, result = "0\tBuddy added", ""
             else:
@@ -2239,7 +2239,7 @@ class DBProxyQuery:
                 created = self.emulator.community.create_forum_post(
                     int(query_fields[0]), int(query_fields[1] or "0"),
                     int(query_fields[2] or "0"), self.session["username"],
-                    self.emulator.auth_user_id(self.session["username"]),
+                    self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
                     query_fields[3], "\t".join(query_fields[4:]))
                 status, result, status_code = "0\tPost created", str(created["post_id"]), 0
             except (ValueError, IndexError) as exc:
@@ -2508,7 +2508,7 @@ class DBProxyQuery:
                 self.emulator.community.create_tribe(
                     query_fields[0], query_fields[1], query_fields[2], query_fields[3],
                     description, self.session["username"],
-                    self.emulator.auth_user_id(self.session["username"]))
+                    self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")))
                 status, result, status_code = "0\tCreated", "", 0
             except ValueError as exc:
                 status, result, status_code = f"1\t{exc}", "", 1
@@ -2625,7 +2625,7 @@ class DBProxyQuery:
             primary_tribe = None
         if primary_tribe is not None:
             self.emulator.community.update_profile(self.session["username"],
-                                                   self.emulator.auth_user_id(self.session["username"]),
+                                                   self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
                                                    primary_tribe=primary_tribe)
             status, result, status_code = "0\tPrimary tribe updated", primary_tribe, 0
         return status, result, status_code
@@ -2643,7 +2643,7 @@ class DBProxyQuery:
             self.emulator.community.invite(tribe_name, invited_name,
                                            self.emulator.auth_user_id(invited_name),
                                            self.session["username"],
-                                           self.emulator.auth_user_id(self.session["username"]))
+                                           self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")))
             status, result, status_code = "0\tInvitation sent", "", 0
         except ValueError as exc:
             status, result, status_code = f"1\t{exc}", "", 1
@@ -2676,7 +2676,7 @@ class DBProxyQuery:
         try:
             self.emulator.community.request_invitation(
                 tribe_name, self.session["username"],
-                self.emulator.auth_user_id(self.session["username"]))
+                self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")))
             status, result, status_code = "0\tInvitation request sent", "", 0
         except ValueError as exc:
             status, result, status_code = f"1\t{exc}", "", 1
@@ -2715,7 +2715,7 @@ class DBProxyQuery:
     def profile_field(self):
         field = {17: "description", 31: "graphic", 32: "url", 33: "display_name"}[self.ordinal]
         self.emulator.community.update_profile(
-            self.session["username"], self.emulator.auth_user_id(self.session["username"]),
+            self.session["username"], self.emulator.auth_user_id(self.session["username"], provider=self.session.get("auth_provider")),
             **{field: self.arguments})
         result = ""
         status_code = 0
@@ -3000,7 +3000,8 @@ class AuthHandler(socketserver.BaseRequestHandler):
                     if expected_response and login_username:
                         reply, client_key = woncrypto.auth1_login_reply(
                             emulator.keys, session_key, login_username, return_client_key=True,
-                            user_id=emulator.auth_user_id(login_username, log_selection=True),
+                            user_id=emulator.auth_user_id(login_username, log_selection=True,
+                                                          provider=auth_provider),
                             tribes=emulator.auth_info_tribes(login_username, auth_provider,
                                                              tribesnext_credentials))
                         emulator.register_auth_session(self.client_address[0], login_username,
@@ -3101,7 +3102,7 @@ class Emulator:
         auth_provider = auth_provider or "local"
         community, chat = self.session_backends(auth_provider, tribesnext_credentials)
         if community == "native" and auth_provider != "server":
-            user_id = self.auth_user_id(username)
+            user_id = self.auth_user_id(username, provider=auth_provider)
             self.community.ensure_profile(username, user_id)
         with self.auth_session_lock:
             self.auth_sessions[peer_ip] = {
@@ -3180,8 +3181,21 @@ class Emulator:
                        available=len(memberships))
         return tribes
 
-    def auth_user_id(self, username, log_selection=False):
-        """Use the T2 certificate GUID for WON identity when it is locally stored."""
+    def auth_user_id(self, username, log_selection=False, provider=None):
+        """A player's WON GUID.
+
+        A wonemu login uses its account's stored GUID, from the range
+        TribesNext never uses, even when a TribesNext account here has the
+        same name. Otherwise a TribesNext certificate GUID stored here wins.
+        A name with neither gets the GUID a new wonemu account would ask for.
+        """
+        if provider == "local":
+            user_id = self.community.local_account_user_id(username) if self.community else None
+            if user_id is not None:
+                if log_selection:
+                    self.log.event("auth_identity_selected", source="local_account",
+                                   username_characters=len(str(username)))
+                return user_id
         if self.public_store and self.public_store.is_file():
             try:
                 with self.public_store.open("r", encoding="ascii") as public_store:
@@ -3200,10 +3214,12 @@ class Emulator:
                         break
             except (OSError, UnicodeError):
                 pass
+        user_id = self.community.local_account_user_id(username) if self.community else None
         if log_selection:
-            self.log.event("auth_identity_selected", source="local_fallback",
+            self.log.event("auth_identity_selected",
+                           source="local_account" if user_id is not None else "local_fallback",
                            username_characters=len(str(username)))
-        return woncrypto.local_auth_user_id(username)
+        return user_id if user_id is not None else woncrypto.local_auth_user_id(username)
 
     def tribesnext_user_id(self, username):
         """Resolve a local account name to its TribesNext certificate GUID."""

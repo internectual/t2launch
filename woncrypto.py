@@ -353,7 +353,23 @@ def key_block(keys, now=None):
     return body + sign(keys["root"], body)
 
 
+# wonemu's own accounts take GUIDs from 1,000,000,000 to 2^31 - 1. TribesNext
+# account GUIDs are numbered from 1 and are in the low millions, so the two
+# never meet, and GUIDs stay positive for scripts that read them as signed.
+# The community store keeps each account's GUID and skips one already taken.
+LOCAL_USER_ID_BASE = 1_000_000_000
+LOCAL_USER_ID_LIMIT = 0x7fffffff
+
+
 def local_auth_user_id(username):
+    """The GUID a new wonemu account named username asks for first."""
+    digest = hashlib.sha256(str(username).casefold().encode("utf-8")).digest()
+    return LOCAL_USER_ID_BASE + int.from_bytes(digest[:4], "little") % (
+        LOCAL_USER_ID_LIMIT - LOCAL_USER_ID_BASE + 1)
+
+
+def legacy_local_auth_user_id(username):
+    """The name-hash GUID wonemu gave its accounts before they had their own range."""
     digest = hashlib.sha256(str(username).casefold().encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "little") or 1
 

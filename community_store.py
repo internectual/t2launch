@@ -9,11 +9,23 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+import woncrypto
+
 LOCAL_PASSWORD_ITERATIONS = 310_000
 DEFAULT_PROFILE_GRAPHIC = "texticons/twb/twb_Laserrifle.jpg"
 # Tribe ids the stock client treats as Dynamix staff (1401) and news editors (1402).
 RESERVED_TRIBE_IDS = (1401, 1402)
 MOTD_MAX_CHARACTERS = 1024
+# Every column that holds a profile's user_id.
+USER_ID_COLUMNS = (("memberships", "user_id"), ("invitations", "user_id"), ("invitations", "inviter_id"),
+                   ("mail", "sender_id"), ("mail", "recipient_id"), ("email_blocks", "owner_id"),
+                   ("email_blocks", "blocked_id"), ("buddies", "owner_id"), ("buddies", "buddy_id"),
+                   ("forum_topics", "author_id"), ("forum_posts", "author_id"),
+                   ("news_articles", "author_id"))
+
+
+def is_local_user_id(user_id):
+    return woncrypto.LOCAL_USER_ID_BASE <= int(user_id) <= woncrypto.LOCAL_USER_ID_LIMIT
 
 
 class CommunityStore:
@@ -274,7 +286,71 @@ class CommunityStore:
             """)
             connection.execute("UPDATE profiles SET graphic = ? WHERE graphic = ''",
                                (DEFAULT_PROFILE_GRAPHIC,))
+        self._move_local_user_ids()
         self.path.chmod(0o600)
+
+    @staticmethod
+    def _free_user_id(connection, user_id):
+        """user_id, or for a wonemu account the next free GUID in its range."""
+        user_id = int(user_id)
+        if not is_local_user_id(user_id):
+            if connection.execute("SELECT 1 FROM profiles WHERE user_id = ?", (user_id,)).fetchone():
+                raise ValueError("That GUID already belongs to another profile")
+            return user_id
+        span = woncrypto.LOCAL_USER_ID_LIMIT - woncrypto.LOCAL_USER_ID_BASE + 1
+        for step in range(span):
+            candidate = woncrypto.LOCAL_USER_ID_BASE + (user_id - woncrypto.LOCAL_USER_ID_BASE + step) % span
+            if not connection.execute("SELECT 1 FROM profiles WHERE user_id = ?", (candidate,)).fetchone():
+                return candidate
+        raise ValueError("No free local GUID")
+
+    def _insert_profile(self, connection, username, user_id, now):
+        """Create username's profile unless it exists, with a GUID no one else has."""
+        if connection.execute("SELECT 1 FROM profiles WHERE username = ? COLLATE NOCASE",
+                              (username,)).fetchone():
+            return
+        connection.execute("""
+            INSERT INTO profiles (user_id, username, display_name, graphic, registered_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (self._free_user_id(connection, user_id), username, username, DEFAULT_PROFILE_GRAPHIC,
+              now, now))
+
+    def _move_local_user_ids(self):
+        """Move wonemu accounts' GUIDs into their own range, with everything that names them.
+
+        Earlier wonemu accounts took a name-hash GUID anywhere in 32 bits,
+        where a TribesNext GUID could be the same number.
+        """
+        with self.lock:
+            connection = self._connect()
+            try:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute("BEGIN IMMEDIATE")
+                local_accounts = {row["username"].casefold()
+                                  for row in connection.execute("SELECT username FROM auth_accounts")}
+                rows = connection.execute("SELECT user_id, username FROM profiles").fetchall()
+                moved = 0
+                for row in rows:
+                    user_id, username = int(row["user_id"]), row["username"]
+                    if is_local_user_id(user_id) or not (
+                            username.casefold() in local_accounts or
+                            user_id == woncrypto.legacy_local_auth_user_id(username)):
+                        continue
+                    new_id = self._free_user_id(connection, woncrypto.local_auth_user_id(username))
+                    connection.execute("UPDATE profiles SET user_id = ? WHERE user_id = ?", (new_id, user_id))
+                    for table, column in USER_ID_COLUMNS:
+                        connection.execute(f"UPDATE {table} SET {column} = ? WHERE {column} = ?",
+                                           (new_id, user_id))
+                    moved += 1
+                if connection.execute("PRAGMA foreign_key_check").fetchone():
+                    raise sqlite3.IntegrityError("Moving local GUIDs broke a reference")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+        return moved
 
     @staticmethod
     def _next_forum_update(connection):
@@ -287,12 +363,7 @@ class CommunityStore:
             raise ValueError("Profile username cannot be empty")
         now = int(time.time())
         with self.lock, self._connection() as connection:
-            connection.execute("""
-                INSERT INTO profiles (user_id, username, display_name, graphic,
-                                      registered_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO NOTHING
-            """, (int(user_id), username, username, DEFAULT_PROFILE_GRAPHIC, now, now))
+            self._insert_profile(connection, username, user_id, now)
             row = connection.execute(
                 "SELECT * FROM profiles WHERE username = ? COLLATE NOCASE", (username,)
             ).fetchone()
@@ -313,12 +384,7 @@ class CommunityStore:
         username = self._validate_local_username(username)
         now = int(time.time())
         with self.lock, self._connection() as connection:
-            connection.execute("""
-                INSERT INTO profiles (user_id, username, display_name, graphic,
-                                      registered_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO NOTHING
-            """, (int(user_id), username, username, DEFAULT_PROFILE_GRAPHIC, now, now))
+            self._insert_profile(connection, username, user_id, now)
             cursor = connection.execute("""
                 INSERT OR IGNORE INTO auth_accounts (username, salt, password_hash, created_at)
                 VALUES (?, NULL, NULL, ?)
@@ -341,12 +407,7 @@ class CommunityStore:
         salt, password_hash = self._new_password_hash(password)
         now = int(time.time())
         with self.lock, self._connection() as connection:
-            connection.execute("""
-                INSERT INTO profiles (user_id, username, display_name, graphic,
-                                      registered_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(username) DO NOTHING
-            """, (int(user_id), username, username, DEFAULT_PROFILE_GRAPHIC, now, now))
+            self._insert_profile(connection, username, user_id, now)
             try:
                 connection.execute("""
                     INSERT INTO auth_accounts (username, salt, password_hash, iterations, created_at)
@@ -355,6 +416,16 @@ class CommunityStore:
             except sqlite3.IntegrityError as exc:
                 raise ValueError("A local account with this username already exists") from exc
         return self.get_profile(username)
+
+    def local_account_user_id(self, username):
+        """The GUID of a wonemu account, or None when username is not one."""
+        with self.lock, self._connection() as connection:
+            row = connection.execute("""
+                SELECT p.user_id FROM auth_accounts AS a
+                JOIN profiles AS p ON p.username = a.username COLLATE NOCASE
+                WHERE a.username = ? COLLATE NOCASE
+            """, (str(username),)).fetchone()
+        return int(row["user_id"]) if row is not None else None
 
     def local_account_exists(self, username):
         with self.lock, self._connection() as connection:

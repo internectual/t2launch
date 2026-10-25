@@ -235,6 +235,20 @@ SERVER_RESTART=0
 if [[ "$EXECUTABLE" == "dedicated" ]]; then
     SOFTWARE_GL=0
     SERVER_RESTART="${T2LAUNCH_SERVER_RESTART:-0}"
+    # TribesNext logins name the address the player connected to; the hook
+    # accepts our public one, which TribesNext servers look up the same way.
+    if [[ -z "${T2LAUNCH_DETECTED_PUBLIC_ADDRESS:-}" ]]; then
+        T2LAUNCH_DETECTED_PUBLIC_ADDRESS=$(python3 -c '
+import ipaddress, urllib.request
+request = urllib.request.Request("http://www.tribesnext.com/whatismyip.php", headers={"User-Agent": "Tribes 2"})
+try:
+    text = urllib.request.urlopen(request, timeout=5).read(64).decode("ascii", "replace").strip()
+    print(ipaddress.IPv4Address(text))
+except (OSError, ValueError):
+    pass
+' 2>/dev/null) || T2LAUNCH_DETECTED_PUBLIC_ADDRESS=""
+    fi
+    export T2LAUNCH_DETECTED_PUBLIC_ADDRESS
     _dedicated_flag=0
     for _a in "${GAME_ARGS[@]}"; do [[ "$_a" == "-dedicated" ]] && _dedicated_flag=1; done
     [[ "$_dedicated_flag" == "1" ]] || GAME_ARGS=(-dedicated "${GAME_ARGS[@]}")

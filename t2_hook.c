@@ -459,13 +459,15 @@ static const char server_tribesnext_script[] =
     " return 0;\n"
     "}\n"
     /* The client names the address it connected to, so a proof it gives one
-       server is no good on another. Without a configured public address the
-       hook cannot tell which Internet address is ours, and accepts any. */
+       server is no good on another. Accept our public address (configured,
+       or looked up at launch as TribesNext servers do), the bind address, or
+       the player's own LAN; without a public address only the last two. */
     "function t2launch_tnReasonable(%source, %destination) {\n"
+    " if (%destination $= \"\") return 0;\n"
     " %public = hook_option(\"server.public_address\");\n"
-    " if (%destination $= %public || (%destination $= $Host::BindAddress && $Host::BindAddress !$= \"\")) return 1;\n"
-    " if (t2launch_tnSameLan(%source, %destination)) return 1;\n"
-    " return %public $= \"\";\n"
+    " if (%public !$= \"\" && %destination $= %public) return 1;\n"
+    " if ($Host::BindAddress !$= \"\" && %destination $= $Host::BindAddress) return 1;\n"
+    " return t2launch_tnSameLan(%source, %destination);\n"
     "}\n"
     "function t2launch_tnReject(%client, %reason) {\n"
     " echo(\"T2CSRI: refused \" @ %client.getAddress() @ \": \" @ %reason);\n"
@@ -2498,6 +2500,25 @@ static const unsigned char server_lan_check_original[] =
 static const unsigned char server_ping_query_skip_original[] = {0x0f, 0x85, 0x30, 0x02, 0x00, 0x00};
 static const unsigned char server_info_query_skip_original[] = {0x0f, 0x85, 0xfb, 0x05, 0x00, 0x00};
 
+/* Without a configured public address, use the one run-game looked up from
+   TribesNext (T2LAUNCH_DETECTED_PUBLIC_ADDRESS). */
+static void use_detected_public_address(void) {
+    const char *configured = hook_option_str("server.public_address");
+    const char *detected = getenv("T2LAUNCH_DETECTED_PUBLIC_ADDRESS");
+    struct in_addr address;
+    if (configured && configured[0]) {
+        fprintf(stderr, "[t2_hook] TribesNext logins must name %s, a bind address or the player's LAN\n",
+                configured);
+    } else if (detected && inet_pton(AF_INET, detected, &address) == 1) {
+        store_hook_option("server.public_address", detected);
+        fprintf(stderr, "[t2_hook] TribesNext logins must name %s (looked up), a bind address or the "
+                "player's LAN\n", detected);
+    } else {
+        fprintf(stderr, "[t2_hook] Public address unknown: TribesNext players can join only from the LAN "
+                "or through a bind address; set the server's public IPv4 address\n");
+    }
+}
+
 static int install_server_tribesnext_auth(void) {
     /* cmpl $0,0x2154(%esi), keeping the setne that follows */
     static const unsigned char client_cert_flag[] = {0x83, 0xbe, 0x54, 0x21, 0x00, 0x00, 0x00};
@@ -3107,8 +3128,10 @@ static void __attribute__((constructor)) init(void) {
         /* A headless server's stdout is a pipe or file, which the game would
            fill in 4 KB blocks and lose on a crash; write its log by line. */
         setvbuf(stdout, NULL, _IOLBF, 0);
-        if (hook_option_bool("server.tribesnext_auth") && hook_option_bool("hook.console_commands"))
+        if (hook_option_bool("server.tribesnext_auth") && hook_option_bool("hook.console_commands")) {
             install_server_tribesnext_auth();
+            use_detected_public_address();
+        }
         fprintf(stderr, "[t2_hook] Console command registration deferred to the server's main loop\n");
         return;
     }

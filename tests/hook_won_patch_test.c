@@ -310,6 +310,9 @@ int main(void) {
         if (store) fclose(store);
     }
     assert(strstr(server_tribesnext_script, "package T2LaunchTribesNextServer") != NULL);
+    /* Without a public address the check falls back to the LAN, never to any address. */
+    assert(strstr(server_tribesnext_script, " return t2launch_tnSameLan(%source, %destination);\n") != NULL);
+    assert(strstr(server_tribesnext_script, "return %public $= \"\"") == NULL);
     assert(strstr(server_tribesnext_script, "function serverCmdt2csri_challengeResponse(%client, %serverChallenge)") != NULL);
 
     /* Native TribesNext handshake: blob layout, nonce search, the three

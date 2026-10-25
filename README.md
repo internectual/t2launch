@@ -186,10 +186,24 @@ runs the server half of TribesNext's T2CSRI 1.1 protocol in memory:
    bans and smurf checks work by GUID.
 
 A player who doesn't finish within 15 seconds is dropped with TribesNext's own
-message. TribesNext clients name the address they connected to. When **Public
-IPv4 address** is set, a proof naming another address (other than the bind
-address or the player's own LAN) is refused, as TribesNext servers do. Clan
-tags from TribesNext community certificates are not shown.
+message. TribesNext clients name the address they connected to, and the server
+refuses a login naming any address other than its public one, its bind address
+or the player's own LAN, as TribesNext servers do. The public address is
+**Public IPv4 address**, or, when that's empty, the one run-game looks up from
+TribesNext (`www.tribesnext.com/whatismyip.php`) at launch. If the lookup fails,
+only LAN players and players using the bind address can join until you set it.
+Clan tags from TribesNext community certificates are not shown.
+
+wonemu's own accounts get GUIDs from 1,000,000,000 up, a range TribesNext
+account GUIDs (in the low millions) never reach, so a wonemu account can't
+share a TribesNext player's GUID, and admin and ban lists can't mix them up.
+Each account keeps its GUID in the community database, and a new account whose
+first choice is taken gets the next free one. A wonemu login always uses its own
+account's GUID, even when this machine also holds a TribesNext account with the
+same name. Accounts made before this change are moved into the range the first
+time wonemu starts, along with their tribes, buddies, mail, forum posts and
+news; GUIDs written into a server's `$Host::AdminList` or ban list for those
+accounts must be added again.
 
 A headless server writes its log line by line, so the output in the launcher
 log is current and survives a crash.
