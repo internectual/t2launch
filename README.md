@@ -191,6 +191,35 @@ IPv4 address** is set, a proof naming another address (other than the bind
 address or the player's own LAN) is refused, as TribesNext servers do. Clan
 tags from TribesNext community certificates are not shown.
 
+A headless server writes its log line by line, so the output in the launcher
+log is current and survives a crash.
+
+#### Test results
+
+Tested on 2026-10-25 with the Loki #25034 dedicated server on Katabatic CTF and
+local WON emulation:
+
+| Test | Result |
+|------|--------|
+| Hook in `tribes2d.dynamic` | Pass: WON verifier and redirect, monotonic clock, 64/s and 1000-byte packets, server patches, console commands, T2CSRI handlers |
+| Server login to wonemu (`Tribes2Server`) | Pass: the server gets a certificate, loads the mission and answers browser queries |
+| Join with a WON certificate (Linux client, native authentication off) | Pass: accepted through WON as `LouCypher`, GUID 2004299, not a smurf, no T2CSRI exchange |
+| Join as a TribesNext player (Linux client with **TribesNext native authentication** on, which sends no WON certificate) | Pass: the full T2CSRI exchange (certificate, challenge, response), then in game |
+| T2CSRI checks from the server console | Pass: a real certificate from `public.store` verifies; tampered and forged certificates and a wrong challenge response are refused |
+| Restart after a crash (`SIGSEGV`) | Pass: restarted under a new process after 5 s; `SIGTERM` stopped the loop and the server |
+
+Not yet tested: a Windows TribesNext or QoL client, players connecting from
+outside the LAN, and the terminal console opened from the launcher.
+
+Two server-console quirks turned up while testing:
+
+- The Loki server console keeps the last 32 lines in
+  `~/.loki/tribes2/history.txt`. When its input is not a terminal (a pipe or a
+  FIFO), it runs each new line together with the last saved entry, so a saved
+  `quit();` stops the next server on its first input.
+- A local variable (`%name`) used outside a function crashes the server; wrap
+  console checks in a function.
+
 ### Command line
 
 ```bash
