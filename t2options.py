@@ -169,6 +169,18 @@ OPTIONS = (
     Option("browser.web_links", "Server browser", "Open web links in the default browser", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="The game only knows netscape and mozilla; open links from the game with xdg-open."),
+    # Interface
+    Option("ui.hud_get_value", "Interface", "HUD bars report their value", "bool", True, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Store each HUD bar's fill in its value field, so scripts can read health, energy, "
+                "capacitor and heat with HudDamage.getValue() and the like (for custom HUDs)."),
+    Option("ui.vertical_fill", "Interface", "HUD bars honour verticalFill", "bool", True, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="A HUD bar with verticalFill = 1 fills from the bottom up instead of left to "
+                "right; the game registers the field but never used it."),
+    Option("ui.observer_iff", "Interface", "Observers see IFF markers", "bool", False, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Show the IFF markers over players while observing in camera mode."),
     # Network
     Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
@@ -279,7 +291,8 @@ CLIENT_ONLY = frozenset((
     "video.vsync", "video.gamma", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
-    "audio.launch_reset", "debug.trace_openal",
+    "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill",
+    "ui.observer_iff",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)

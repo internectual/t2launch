@@ -27,6 +27,9 @@ static int32_t call_target_offset(uintptr_t site) {
     memcpy(&offset, (const void *)(site + 1), sizeof(offset));
     return offset;
 }
+/* A HUD bar's value function stand-in (vtable +0x118). */
+static float fake_value;
+static float fake_bar_value(void *control) { (void)control; return fake_value; }
 #define TEST_RSA_MODULUS "8302c77f71653bd46d53472094c45171bbb1b2dc8408bab25ea4b016be4da0869737ea99ca887a4869a09176c43e73eab974ccdbf9a25ab8ccbb86fa343720f600c6cd6be3a4599a2796868790a2051e15607d06b470ad281b57e66fde832e576a760fb757c8ea3f6c82ed0381caeddfcbb6a0e467fc253b1e86d3f50341ea95"
 #define TEST_RSA_PRIVATE "346782ffc6f54b21c55482d9d51b53c717e0adf1ce69e447590eacd5e5b8a69c3c7cc43d843697502a403a2f81b294c44a2eb857fd742449eb7e35fdae7c739506d703ccf3688366bd209480bc8e0a517d37ec89912132399cf3003298fef461bee2565b46084f4983a1f5accf6ead869d3d4c187b6ffa2f04c95250a26c130d"
 
@@ -162,6 +165,71 @@ int main(void) {
     munmap(mapping, size);
     assert(strstr(filter_max_bots_override, "function FilterEditDlg::setMaxBots(%this)") != NULL);
     assert(strstr(filter_max_bots_override, "> 255") != NULL);
+
+    /* HUD bars: the layout matches the stock fill, stores the value and fills
+       vertically when asked; the patch applies only over the stock bytes. */
+    {
+        static unsigned char control[0x100];
+        static void *vtable[0x120 / 4];
+        vtable[0x118 / 4] = (void *)fake_bar_value;
+        memset(control, 0, sizeof(control));
+        *(void **)control = vtable;
+        int32_t bounds[4] = {10, 20, 100, 8};
+        memcpy(control + 0xC4, bounds, sizeof(bounds));
+        int32_t offset[2] = {5, 7}, frame[6];
+        fake_value = 0.5f;
+        hud_bar_store_value = 0; hud_bar_vertical_fill = 1;
+        hud_bar_layout(frame, control, offset);
+        assert(frame[2] == 15 && frame[3] == 27 && frame[4] == 50 && frame[5] == 8);
+        assert(*(float *)(control + HUD_BAR_VALUE_OFFSET) == 0.0f);
+        hud_bar_store_value = 1;
+        control[HUD_BAR_VERTICAL_OFFSET] = 1;
+        int32_t tall[2] = {10, 40};
+        memcpy(control + 0xCC, tall, sizeof(tall));
+        hud_bar_layout(frame, control, offset);
+        assert(frame[2] == 15 && frame[3] == 27 + 20 && frame[4] == 10 && frame[5] == 20);
+        assert(*(float *)(control + HUD_BAR_VALUE_OFFSET) == 0.5f);
+        fake_value = 1.0f / 40.0f;  /* a one-pixel fill is drawn as two, as stock */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[5] == 2 && frame[3] == 27 + 38);
+        hud_bar_vertical_fill = 0;
+        hud_bar_layout(frame, control, offset);
+        assert(frame[4] == 0 && frame[5] == 40);
+
+        uintptr_t hud_page = HUD_BAR_LAYOUT_ADDRESS & ~((uintptr_t)size - 1);
+        assert(HUD_BAR_LAYOUT_ADDRESS + sizeof(hud_bar_layout_original) <= hud_page + (uintptr_t)size);
+        unsigned char *hud = mmap((void *)hud_page, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(hud == (void *)hud_page);
+        unsigned char *site = (unsigned char *)HUD_BAR_LAYOUT_ADDRESS;
+        memcpy(site, hud_bar_layout_original, sizeof(hud_bar_layout_original));
+        site[10] = 0x02;
+        assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_hud_bars(1, 1));
+        assert(mprotect(hud, size, PROT_READ | PROT_WRITE) == 0);
+        site[10] = 0x00;
+        assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_hud_bars(1, 0));
+        assert(hud_bar_store_value == 1 && hud_bar_vertical_fill == 0);
+        assert(memcmp(site, "\x53\x56\x8d\x45\xe8\x50\xe8", 7) == 0);
+        assert(HUD_BAR_LAYOUT_ADDRESS + 11 + (uintptr_t)call_target_offset(HUD_BAR_LAYOUT_ADDRESS + 6) ==
+               (uintptr_t)hud_bar_layout);
+        assert(memcmp(site + 11, "\x83\xc4\x0c\xe9", 4) == 0);
+        assert(HUD_BAR_LAYOUT_ADDRESS + 19 + (uintptr_t)call_target_offset(HUD_BAR_LAYOUT_ADDRESS + 14) ==
+               HUD_BAR_LAYOUT_RESUME);
+        assert(site[19] == 0x90 && site[sizeof(hud_bar_layout_original) - 1] == 0x90);
+        munmap(hud, size);
+
+        uintptr_t iff_page = OBSERVER_IFF_ADDRESS & ~((uintptr_t)size - 1);
+        unsigned char *iff = mmap((void *)iff_page, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(iff == (void *)iff_page);
+        memcpy((void *)OBSERVER_IFF_ADDRESS, observer_iff_original, sizeof(observer_iff_original));
+        assert(mprotect(iff, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_observer_iff());
+        assert(memcmp((void *)OBSERVER_IFF_ADDRESS, "\xeb\x4e\x8b\x88", 4) == 0);
+        munmap(iff, size);
+    }
 
     /* Network packet limits: twelve sites over two pages, all or nothing, at
        each executable's own sites and variables. */

@@ -661,6 +661,18 @@ clocksource. No CPU affinity is needed.
 The TribesNext "QoL fixes" update is Windows only. These hook and launcher
 options bring the parts of it that fit the Linux client:
 
+- **HUD bar values** (`ui.hud_get_value`, on) and **vertical HUD bars**
+  (`ui.vertical_fill`, on). The health, energy, capacitor and heat bars
+  (`HudDamage`, `HudEnergy`, `HudCapacitor`, `HudHeat`, all `HudBarBaseCtrl`)
+  register a `value` and a `verticalFill` field, but the game never stores the
+  fill it draws and only fills left to right. The hook replaces the part of the
+  bar's `onRender` (`0x0818EA5E`) that asks the bar for its fill: the fill is
+  stored in `value`, so a custom HUD can read `HudDamage.getValue()`, and a bar
+  with `verticalFill = 1` fills from the bottom up. This is the Linux version of
+  the Windows `l33thax` patch.
+- **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
+  while the control object is an observer camera; the hook skips that check
+  (`0x081936BF`), as the Windows `l33thax` patch did.
 - **Web links** (`browser.web_links`, on). Loki's `gotoWebPage()` formats
   `$LOKI_BROWSER` with the URL and runs it with `system()`, or searches for
   netscape and mozilla. Unless `LOKI_BROWSER` is already set, the hook sets it

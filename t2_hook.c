@@ -131,6 +131,9 @@ static struct hook_option hook_options[] = {
     {"net.native_auth", "0", NULL, 0, "", 0},
     {"discord.presence", "0", NULL, 0, "", 0},
     {"discord.app_id", "1563045749846056970", NULL, 0, "", 0},
+    {"ui.hud_get_value", "1", NULL, 0, "", 0},
+    {"ui.vertical_fill", "1", NULL, 0, "", 0},
+    {"ui.observer_iff", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
 };
@@ -1203,6 +1206,101 @@ static int install_browser_bot_limit(void) {
                                      sizeof(browser_bot_limit_original), 1, limit, sizeof(limit)};
     if (!apply_code_patches("Browser bot limit", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] Server browser: default maximum bot count 255 instead of 16 (memory only)\n");
+    return 1;
+}
+
+/* HUD bars (HudBarBaseCtrl: HudEnergy, HudCapacitor, HudDamage, HudHeat)
+   register "value" (+0xD4) and "verticalFill" (+0xE0), but onRender
+   (0x0818EA00) never stores the fill it computes and only fills
+   horizontally. Replace the stretch of onRender that asks the bar for its
+   fill (vtable +0x118) and lays out the fill rectangle with a call to
+   hud_bar_layout(), which stores the value and can fill from the bottom, as
+   the Windows l33thax patch did. The stretch leaves {x, y, width, height}
+   at [ebp-0x10] and scratch at [ebp-0x18]; the stock code continues at
+   0x0818EAD1 with the colour and the pulse. */
+#define HUD_BAR_LAYOUT_ADDRESS 0x0818EA5E
+#define HUD_BAR_LAYOUT_RESUME  0x0818EAD1
+#define HUD_BAR_VALUE_OFFSET   0xD4
+#define HUD_BAR_VERTICAL_OFFSET 0xE0
+static const unsigned char hud_bar_layout_original[] = {
+    0x8b, 0x06, 0x83, 0xc4, 0xf4, 0x56, 0x8b, 0x80, 0x18, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x8b, 0x96,
+    0xc4, 0x00, 0x00, 0x00, 0x8b, 0x86, 0xc8, 0x00, 0x00, 0x00, 0x03, 0x13, 0x03, 0x43, 0x04, 0x89,
+    0x55, 0xe8, 0x89, 0x45, 0xec, 0x89, 0x55, 0xf0, 0x89, 0x45, 0xf4, 0x8b, 0x96, 0xcc, 0x00, 0x00,
+    0x00, 0x89, 0x55, 0xf8, 0x8b, 0x86, 0xd0, 0x00, 0x00, 0x00, 0x89, 0x55, 0xe4, 0xdb, 0x45, 0xe4,
+    0xde, 0xc9, 0x83, 0xc4, 0x10, 0x89, 0x45, 0xfc, 0xd9, 0x7d, 0xe2, 0x66, 0x8b, 0x55, 0xe2, 0x66,
+    0x81, 0xca, 0x00, 0x0c, 0x66, 0x89, 0x55, 0xe0, 0xd9, 0x6d, 0xe0, 0xdb, 0x5d, 0xe4, 0x8b, 0x45,
+    0xe4, 0xd9, 0x6d, 0xe2, 0x89, 0x45, 0xf8, 0x83, 0xf8, 0x01, 0x75, 0x07, 0xc7, 0x45, 0xf8, 0x02,
+    0x00, 0x00, 0x00};
+static int hud_bar_store_value, hud_bar_vertical_fill;
+
+/* The stock fill: the length times the value in x87 extended precision,
+   truncated, never exactly 1. */
+static int32_t hud_bar_fill(int32_t length, float value) {
+    int32_t fill = (int32_t)((long double)length * value);
+    return fill == 1 ? 2 : fill;
+}
+
+/* frame is [ebp-0x18]: two scratch words, then the fill rectangle. */
+static void hud_bar_layout(int32_t *frame, unsigned char *control, const int32_t *offset) {
+    typedef float (*bar_value_t)(void *control);
+    bar_value_t bar_value = *(bar_value_t *)(*(unsigned char **)control + 0x118);
+    float value = bar_value(control);
+    if (hud_bar_store_value) *(float *)(control + HUD_BAR_VALUE_OFFSET) = value;
+    int32_t x = *(int32_t *)(control + 0xC4) + offset[0];
+    int32_t y = *(int32_t *)(control + 0xC8) + offset[1];
+    int32_t width = *(int32_t *)(control + 0xCC), height = *(int32_t *)(control + 0xD0);
+    frame[0] = frame[2] = x;
+    frame[1] = frame[3] = y;
+    if (hud_bar_vertical_fill && control[HUD_BAR_VERTICAL_OFFSET]) {
+        int32_t fill = hud_bar_fill(height, value);
+        frame[3] = y + height - fill;  /* fill from the bottom */
+        frame[4] = width;
+        frame[5] = fill;
+    } else {
+        frame[4] = hud_bar_fill(width, value);
+        frame[5] = height;
+    }
+}
+
+static int install_hud_bars(int store_value, int vertical_fill) {
+    /* push ebx (offset); push esi (control); lea eax,[ebp-0x18]; push eax;
+       call hud_bar_layout; add esp,12; jmp to the stock colour code */
+    unsigned char code[sizeof(hud_bar_layout_original)];
+    memset(code, 0x90, sizeof(code));
+    static const unsigned char head[] = {0x53, 0x56, 0x8d, 0x45, 0xe8, 0x50};
+    memcpy(code, head, sizeof(head));
+    size_t at = sizeof(head);
+    int32_t call = (int32_t)((uintptr_t)hud_bar_layout - (HUD_BAR_LAYOUT_ADDRESS + at + 5));
+    code[at] = 0xe8;
+    memcpy(code + at + 1, &call, sizeof(call));
+    at += 5;
+    code[at++] = 0x83; code[at++] = 0xc4; code[at++] = 0x0c;
+    int32_t resume = (int32_t)(HUD_BAR_LAYOUT_RESUME - (HUD_BAR_LAYOUT_ADDRESS + at + 5));
+    code[at] = 0xe9;
+    memcpy(code + at + 1, &resume, sizeof(resume));
+    const struct code_patch patch = {HUD_BAR_LAYOUT_ADDRESS, hud_bar_layout_original,
+                                     sizeof(hud_bar_layout_original), 0, code, sizeof(code)};
+    hud_bar_store_value = store_value;
+    hud_bar_vertical_fill = vertical_fill;
+    if (!apply_code_patches("HUD bar", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] HUD bars:%s%s (memory only)\n",
+            store_value ? " getValue() reports the fill" : "",
+            vertical_fill ? (store_value ? ", verticalFill works" : " verticalFill works") : "");
+    return 1;
+}
+
+/* The IFF render skips its markers when the control object is a Camera
+   (observer mode); jump past that check (je 0x0819370F becomes jmp), as the
+   Windows l33thax patch did at 0x5068EF. */
+#define OBSERVER_IFF_ADDRESS 0x081936BF
+static const unsigned char observer_iff_original[] = {0x74, 0x4e, 0x8b, 0x88, 0xbc, 0x08, 0x00, 0x00};
+
+static int install_observer_iff(void) {
+    static const unsigned char jump[] = {0xeb};
+    const struct code_patch patch = {OBSERVER_IFF_ADDRESS, observer_iff_original,
+                                     sizeof(observer_iff_original), 0, jump, sizeof(jump)};
+    if (!apply_code_patches("Observer IFF", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] Observers see IFF markers (memory only)\n");
     return 1;
 }
 
@@ -3136,6 +3234,9 @@ static void __attribute__((constructor)) init(void) {
         return;
     }
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
+    if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill"))
+        install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"));
+    if (hook_option_bool("ui.observer_iff")) install_observer_iff();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))
         install_native_auth();
     /* SDL reads this when it creates the window; a borderless window has no

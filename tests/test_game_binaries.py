@@ -59,6 +59,15 @@ class GameBinaryTests(unittest.TestCase):
                     self.assertEqual(read(site + 0x26, 10), b"\x81\x3d" + size + b"\xc2\x01\0\0")
                     self.assertEqual(read(site + 0x32, 10), b"\xc7\x05" + size + b"\xc2\x01\0\0")
 
+    def test_client_interface_sites(self):
+        read = reader(GAME / "tribes2.dynamic")
+        # HudBarBaseCtrl::onRender asks the bar for its fill (vtable +0x118) and lays out the rect.
+        stretch = read(0x0818EA5E, 0x73)
+        self.assertEqual(stretch[:14], bytes.fromhex("8b 06 83 c4 f4 56 8b 80 18 01 00 00 ff d0"))
+        self.assertEqual(stretch[-12:], bytes.fromhex("83 f8 01 75 07 c7 45 f8 02 00 00 00"))
+        # The observer IFF camera check: je after dynamic_cast<Camera>.
+        self.assertEqual(read(0x081936BF, 8), bytes.fromhex("74 4e 8b 88 bc 08 00 00"))
+
     def test_server_auth_sites(self):
         read = reader(GAME / "tribes2d.dynamic")
         self.assertEqual(read(0x0822B604, 10), bytes.fromhex("83 3d 34 60 6b 08 00 0f 95 c0"))
