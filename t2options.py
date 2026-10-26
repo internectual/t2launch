@@ -178,6 +178,12 @@ OPTIONS = (
            requires=(("launcher.load_hook", (True,)),),
            help="A HUD bar with verticalFill = 1 fills from the bottom up instead of left to "
                 "right; the game registers the field but never used it."),
+    Option("ui.bar_flip", "Interface", "HUD bars honour flipVertical and flipHorizontal", "bool", True,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="HUD bars inherit flipVertical and flipHorizontal from bitmap controls but ignore "
+                "them. The flip along the fill reverses it (a vertical bar fills from the top, a "
+                "horizontal one from the right); the flip across it inverts the bar, which shows "
+                "the empty part (0% full, 100% empty)."),
     Option("ui.observer_iff", "Interface", "Observers see IFF markers", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="Show the IFF markers over players while observing in camera mode."),
@@ -298,7 +304,7 @@ CLIENT_ONLY = frozenset((
     "video.vsync", "video.gamma", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
-    "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill",
+    "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))

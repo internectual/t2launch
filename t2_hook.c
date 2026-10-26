@@ -133,6 +133,7 @@ static struct hook_option hook_options[] = {
     {"discord.app_id", "1563045749846056970", NULL, 0, "", 0},
     {"ui.hud_get_value", "1", NULL, 0, "", 0},
     {"ui.vertical_fill", "1", NULL, 0, "", 0},
+    {"ui.bar_flip", "1", NULL, 0, "", 0},
     {"ui.observer_iff", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
@@ -1219,11 +1220,15 @@ static int install_browser_bot_limit(void) {
    hud_bar_layout(), which stores the value and can fill from the bottom, as
    the Windows l33thax patch did. The stretch leaves {x, y, width, height}
    at [ebp-0x10] and scratch at [ebp-0x18]; the stock code continues at
-   0x0818EAD1 with the colour and the pulse. */
+   0x0818EAD1 with the colour and the pulse. The rectangle is the bar's
+   subRegion (+0xC4, x y width height) moved to the bar's screen offset, not
+   its extent. */
 #define HUD_BAR_LAYOUT_ADDRESS 0x0818EA5E
 #define HUD_BAR_LAYOUT_RESUME  0x0818EAD1
 #define HUD_BAR_VALUE_OFFSET   0xD4
 #define HUD_BAR_VERTICAL_OFFSET 0xE0
+#define HUD_BAR_FLIP_VERTICAL_OFFSET   0xC2  /* HudBitmapCtrl's flipVertical */
+#define HUD_BAR_FLIP_HORIZONTAL_OFFSET 0xC3  /* and flipHorizontal */
 static const unsigned char hud_bar_layout_original[] = {
     0x8b, 0x06, 0x83, 0xc4, 0xf4, 0x56, 0x8b, 0x80, 0x18, 0x01, 0x00, 0x00, 0xff, 0xd0, 0x8b, 0x96,
     0xc4, 0x00, 0x00, 0x00, 0x8b, 0x86, 0xc8, 0x00, 0x00, 0x00, 0x03, 0x13, 0x03, 0x43, 0x04, 0x89,
@@ -1233,7 +1238,7 @@ static const unsigned char hud_bar_layout_original[] = {
     0x81, 0xca, 0x00, 0x0c, 0x66, 0x89, 0x55, 0xe0, 0xd9, 0x6d, 0xe0, 0xdb, 0x5d, 0xe4, 0x8b, 0x45,
     0xe4, 0xd9, 0x6d, 0xe2, 0x89, 0x45, 0xf8, 0x83, 0xf8, 0x01, 0x75, 0x07, 0xc7, 0x45, 0xf8, 0x02,
     0x00, 0x00, 0x00};
-static int hud_bar_store_value, hud_bar_vertical_fill;
+static int hud_bar_store_value, hud_bar_vertical_fill, hud_bar_flip;
 
 /* The stock fill: the length times the value in x87 extended precision,
    truncated, never exactly 1. */
@@ -1242,7 +1247,12 @@ static int32_t hud_bar_fill(int32_t length, float value) {
     return fill == 1 ? 2 : fill;
 }
 
-/* frame is [ebp-0x18]: two scratch words, then the fill rectangle. */
+/* frame is [ebp-0x18]: two scratch words, then the fill rectangle.
+   With ui.bar_flip, the bars use the flipVertical and flipHorizontal fields
+   they inherit from HudBitmapCtrl, which only mirror a bitmap: the flip
+   along the fill reverses its direction (a vertical bar fills from the top,
+   a horizontal one from the right), and the flip across it inverts the bar,
+   which then shows 1 - value (0% full, 100% empty). */
 static void hud_bar_layout(int32_t *frame, unsigned char *control, const int32_t *offset) {
     typedef float (*bar_value_t)(void *control);
     bar_value_t bar_value = *(bar_value_t *)(*(unsigned char **)control + 0x118);
@@ -1253,13 +1263,24 @@ static void hud_bar_layout(int32_t *frame, unsigned char *control, const int32_t
     int32_t width = *(int32_t *)(control + 0xCC), height = *(int32_t *)(control + 0xD0);
     frame[0] = frame[2] = x;
     frame[1] = frame[3] = y;
-    if (hud_bar_vertical_fill && control[HUD_BAR_VERTICAL_OFFSET]) {
+    int vertical = hud_bar_vertical_fill && control[HUD_BAR_VERTICAL_OFFSET];
+    int reverse = 0;
+    if (hud_bar_flip) {
+        int flip_vertical = control[HUD_BAR_FLIP_VERTICAL_OFFSET] != 0;
+        int flip_horizontal = control[HUD_BAR_FLIP_HORIZONTAL_OFFSET] != 0;
+        reverse = vertical ? flip_vertical : flip_horizontal;
+        if (vertical ? flip_horizontal : flip_vertical)
+            value = value >= 1.0f ? 0.0f : value <= 0.0f ? 1.0f : 1.0f - value;
+    }
+    if (vertical) {
         int32_t fill = hud_bar_fill(height, value);
-        frame[3] = y + height - fill;  /* fill from the bottom */
+        frame[3] = reverse ? y : y + height - fill;  /* from the top, or the bottom */
         frame[4] = width;
         frame[5] = fill;
     } else {
-        frame[4] = hud_bar_fill(width, value);
+        int32_t fill = hud_bar_fill(width, value);
+        frame[2] = reverse ? x + width - fill : x;  /* from the right, or the left */
+        frame[4] = fill;
         frame[5] = height;
     }
 }
@@ -1274,7 +1295,7 @@ static const char *hud_bar_get_value_cb(void *obj, S32 argc, const char **argv) 
     return value;
 }
 
-static int install_hud_bars(int store_value, int vertical_fill) {
+static int install_hud_bars(int store_value, int vertical_fill, int flip) {
     /* push ebx (offset); push esi (control); lea eax,[ebp-0x18]; push eax;
        call hud_bar_layout; add esp,12; jmp to the stock colour code */
     unsigned char code[sizeof(hud_bar_layout_original)];
@@ -1294,13 +1315,15 @@ static int install_hud_bars(int store_value, int vertical_fill) {
                                      sizeof(hud_bar_layout_original), 0, code, sizeof(code)};
     hud_bar_store_value = store_value;
     hud_bar_vertical_fill = vertical_fill;
+    hud_bar_flip = flip;
     if (!apply_code_patches("HUD bar", &patch, 1)) {
-        hud_bar_store_value = hud_bar_vertical_fill = 0;
+        hud_bar_store_value = hud_bar_vertical_fill = hud_bar_flip = 0;
         return 0;
     }
-    fprintf(stderr, "[t2_hook] HUD bars:%s%s (memory only)\n",
-            store_value ? " getValue() reports the fill" : "",
-            vertical_fill ? (store_value ? ", verticalFill works" : " verticalFill works") : "");
+    fprintf(stderr, "[t2_hook] HUD bars:%s%s%s (memory only)\n",
+            store_value ? " getValue() reports the fill;" : "",
+            vertical_fill ? " verticalFill works;" : "",
+            flip ? " flipVertical/flipHorizontal reverse or invert the fill;" : "");
     return 1;
 }
 
@@ -3303,8 +3326,10 @@ static void __attribute__((constructor)) init(void) {
         return;
     }
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
-    if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill"))
-        install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"));
+    if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill") ||
+        hook_option_bool("ui.bar_flip"))
+        install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"),
+                         hook_option_bool("ui.bar_flip"));
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();

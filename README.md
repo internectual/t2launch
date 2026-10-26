@@ -668,8 +668,21 @@ options bring the parts of it that fit the Linux client:
   fill it draws and only fills left to right. The hook replaces the part of the
   bar's `onRender` (`0x0818EA5E`) that asks the bar for its fill: the fill is
   stored in `value`, so a custom HUD can read `HudDamage.getValue()`, and a bar
-  with `verticalFill = 1` fills from the bottom up. This is the Linux version of
-  the Windows `l33thax` patch.
+  with `verticalFill = 1` fills from the bottom up. `getValue()` on a bar
+  returns that stored fill. A bar draws its fill in its `subRegion`
+  (`x y width height`), clipped to its `extent`, so a taller bar needs both
+  set taller. A bar made from script shrinks to its `minExtent`, so set that
+  to the full size as well.
+  This is the Linux version of the Windows `l33thax` patch.
+- **HUD bar directions** (`ui.bar_flip`, on). HUD bars inherit `flipVertical`
+  and `flipHorizontal` from bitmap controls, but the game only uses them to
+  mirror a bitmap; a bar's fill ignores them. With this option each bar can use
+  them; bars that leave them at 0, which includes every stock HUD, fill as
+  before. The flip along the fill reverses it: `flipVertical` makes a vertical
+  bar fill from the top, and `flipHorizontal` makes a horizontal bar fill from
+  the right. The flip across the fill inverts the bar, which then shows the
+  empty part (0% full, 100% empty); `getValue()` still returns the real value.
+  `tests/hudBarDemo.cs` shows every direction with tall bars.
 - **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
   while the control object is an observer camera; the hook skips that check
   (`0x081936BF`), as the Windows `l33thax` patch did.

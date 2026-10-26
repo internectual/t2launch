@@ -197,6 +197,38 @@ int main(void) {
         hud_bar_layout(frame, control, offset);
         assert(frame[4] == 0 && frame[5] == 40);
 
+        /* Flips: along the fill reverses it, across it inverts the value. */
+        fake_value = 0.25f;
+        hud_bar_flip = 1;
+        int32_t wide[2] = {100, 8};
+        memcpy(control + 0xCC, wide, sizeof(wide));
+        control[HUD_BAR_FLIP_HORIZONTAL_OFFSET] = 1;  /* horizontal, from the right */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[2] == 15 + 75 && frame[3] == 27 && frame[4] == 25 && frame[5] == 8);
+        control[HUD_BAR_FLIP_VERTICAL_OFFSET] = 1;    /* and inverted */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[2] == 15 + 25 && frame[4] == 75);
+        assert(*(float *)(control + HUD_BAR_VALUE_OFFSET) == 0.25f);  /* getValue() unchanged */
+        hud_bar_vertical_fill = 1;
+        memcpy(control + 0xCC, tall, sizeof(tall));   /* vertical: flipVertical fills from the top */
+        control[HUD_BAR_FLIP_HORIZONTAL_OFFSET] = 0;
+        hud_bar_layout(frame, control, offset);
+        assert(frame[2] == 15 && frame[3] == 27 && frame[4] == 10 && frame[5] == 10);
+        control[HUD_BAR_FLIP_HORIZONTAL_OFFSET] = 1;  /* inverted, from the top */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[3] == 27 && frame[5] == 30);
+        control[HUD_BAR_FLIP_VERTICAL_OFFSET] = 0;    /* inverted, from the bottom */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[3] == 27 + 10 && frame[5] == 30);
+        fake_value = 1.5f;                            /* inverted overfull is empty */
+        hud_bar_layout(frame, control, offset);
+        assert(frame[5] == 0);
+        hud_bar_flip = 0;                             /* off: flips are ignored */
+        fake_value = 0.25f;
+        hud_bar_layout(frame, control, offset);
+        assert(frame[3] == 27 + 30 && frame[5] == 10);
+        control[HUD_BAR_FLIP_HORIZONTAL_OFFSET] = 0;
+
         uintptr_t hud_page = HUD_BAR_LAYOUT_ADDRESS & ~((uintptr_t)size - 1);
         assert(HUD_BAR_LAYOUT_ADDRESS + sizeof(hud_bar_layout_original) <= hud_page + (uintptr_t)size);
         unsigned char *hud = mmap((void *)hud_page, size, PROT_READ | PROT_WRITE,
@@ -206,12 +238,12 @@ int main(void) {
         memcpy(site, hud_bar_layout_original, sizeof(hud_bar_layout_original));
         site[10] = 0x02;
         assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);
-        assert(!install_hud_bars(1, 1));
-        assert(hud_bar_store_value == 0 && hud_bar_vertical_fill == 0);  /* no getValue() either */
+        assert(!install_hud_bars(1, 1, 1));
+        assert(!hud_bar_store_value && !hud_bar_vertical_fill && !hud_bar_flip);  /* no getValue() either */
         assert(mprotect(hud, size, PROT_READ | PROT_WRITE) == 0);
         site[10] = 0x00;
         assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);
-        assert(install_hud_bars(1, 0));
+        assert(install_hud_bars(1, 0, 1));
         assert(hud_bar_store_value == 1 && hud_bar_vertical_fill == 0);
         assert(memcmp(site, "\x53\x56\x8d\x45\xe8\x50\xe8", 7) == 0);
         assert(HUD_BAR_LAYOUT_ADDRESS + 11 + (uintptr_t)call_target_offset(HUD_BAR_LAYOUT_ADDRESS + 6) ==
