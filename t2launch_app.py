@@ -68,13 +68,14 @@ VALUE_OPTIONS = [  # (option, label, a hint per value, advanced)
 
 
 def default_profile():
-    return {"name": "Online", "flags": {"-online": True}, "values": {}, "positional": "", "custom": ""}
+    return {"name": "Online", "flags": {"-online": True}, "values": {}, "positional": "", "custom": "",
+            "load_hook": True}
 
 
 def server_profile():
     """A dedicated server on Katabatic CTF with local WON emulation."""
     return {"name": "Dedicated server", "flags": {}, "values": {"-mission": ["Katabatic", "CTF"]},
-            "positional": "", "custom": "",
+            "positional": "", "custom": "", "load_hook": True,
             "options": {"game.executable": "dedicated", "won.mode": "local"}}
 
 
@@ -86,10 +87,16 @@ def read_settings():
     profiles = settings.get("profiles")
     if not isinstance(profiles, list) or not profiles:
         profiles = [default_profile()]
+    # load_hook used to be a single launcher-wide toggle; it is now per profile.
+    # Seed any profile that predates the move from the old global value.
+    legacy_hook = bool(settings.get("load_hook", True))
+    for profile in profiles:
+        if isinstance(profile, dict) and "load_hook" not in profile:
+            profile["load_hook"] = legacy_hook
     return {
         "game_directory": settings.get("game_directory", str(Path.home() / "t2-linux")),
         "profiles": profiles,
-        "load_hook": bool(settings.get("load_hook", True)),
+        "load_hook": legacy_hook,  # default for new profiles only
         "monitor": settings.get("monitor", ""),
         "autolaunch_profile": settings.get("autolaunch_profile", ""),
         "autolaunch_delay": int(settings.get("autolaunch_delay", 10)),
@@ -349,6 +356,12 @@ class ProfileEditor(QWidget):
         self.name = QLineEdit(profile.get("name", "New profile"))
         layout.addWidget(QLabel("Profile name"))
         layout.addWidget(self.name)
+        # Per profile: whether to LD_PRELOAD the hook. Options that need the hook
+        # require it against this box, so a profile with the hook off is valid as
+        # long as it enables nothing that depends on it.
+        self.load_hook = QCheckBox("Load t2_hook.so (LD_PRELOAD) for this profile")
+        self.load_hook.setChecked(bool(profile.get("load_hook", True)))
+        layout.addWidget(self.load_hook)
         tabs = QTabWidget()
         layout.addWidget(tabs, 1)
 
@@ -444,8 +457,14 @@ class ProfileEditor(QWidget):
             getattr(widget, signal).connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_game_rows)
+        self.load_hook.toggled.connect(self.refresh_options)
+        self.load_hook.toggled.connect(self.changed)
         self.refresh_options()
         self.refresh_game_rows()
+
+    def hook_context(self):
+        """This profile's requirement context (its own load_hook choice)."""
+        return {**self.context(), "launcher.load_hook": self.load_hook.isChecked()}
 
     def refresh_game_rows(self, *_args):
         """Show advanced Game options when asked, and any that are already set."""
@@ -521,7 +540,7 @@ class ProfileEditor(QWidget):
     def refresh_options(self, *_args):
         """Enable each option only while its requirements hold."""
         values = t2options.chosen(self.option_values())
-        context = self.context()
+        context = self.hook_context()
         effective = t2options.effective(values, context)
         show_advanced = self.show_advanced.isChecked()
         for option in t2options.OPTIONS:
@@ -543,6 +562,7 @@ class ProfileEditor(QWidget):
     def save_to(self):
         result = {
             "name": self.name.text().strip() or "Profile",
+            "load_hook": self.load_hook.isChecked(),
             "flags": {flag: box.isChecked() for flag, box in self.flag_boxes.items()},
             "values": {}, "positional": self.positional.text(), "custom": self.custom.text(),
             # Store every choice, including disabled ones, so re-enabling a
@@ -573,11 +593,6 @@ class SettingsDialog(QDialog):
         path_row.addWidget(self.game_path)
         path_row.addWidget(browse)
         general_form.addRow("Game folder", path_row)
-        self.load_hook = QCheckBox("Load t2_hook.so (LD_PRELOAD)")
-        self.load_hook.setChecked(app.settings["load_hook"])
-        self.load_hook.toggled.connect(
-            lambda _checked: self.profile_editor and self.profile_editor.refresh_options())
-        general_form.addRow(self.load_hook)
         self.monitor = QComboBox()
         self.monitor.addItem("Default display", "")
         for screen in QApplication.screens():
@@ -665,8 +680,7 @@ class SettingsDialog(QDialog):
         self.editor_row = row
         if 0 <= row < len(self.profiles):
             self.profile_editor = ProfileEditor(
-                self.profiles[row], self.update_profile_name,
-                lambda: {"launcher.load_hook": self.load_hook.isChecked()})
+                self.profiles[row], self.update_profile_name, lambda: {})
             # Keep "Show advanced options" as it was when switching profiles.
             self.profile_editor.show_advanced.setChecked(show_advanced)
             self.profile_widget_layout.addWidget(self.profile_editor)
@@ -699,7 +713,8 @@ class SettingsDialog(QDialog):
 
     def add_profile(self, profile=None):
         self.commit_editor()
-        profile = profile or {"name": "New profile", "flags": {}, "values": {}, "positional": "", "custom": ""}
+        profile = profile or {"name": "New profile", "flags": {}, "values": {}, "positional": "",
+                              "custom": "", "load_hook": bool(self.app.settings.get("load_hook", True))}
         self.profiles.append(profile)
         self.profile_list.addItem(profile["name"])
         self.profile_list.setCurrentRow(len(self.profiles) - 1)
@@ -734,14 +749,14 @@ class SettingsDialog(QDialog):
             for profile in self.profiles:
                 profile_arguments(profile)
             for profile in self.profiles:
+                hooked = bool(profile.get("load_hook", True))
                 try:
                     t2options.validate(t2options.migrate(profile),
-                                       {"launcher.load_hook": self.load_hook.isChecked()})
+                                       {"launcher.load_hook": hooked})
+                    if t2options.migrate(profile)["won.mode"] != "off" and not hooked:
+                        raise ValueError("Local WON emulation requires Load t2_hook.so for this profile.")
                 except ValueError as exc:
                     raise ValueError(f"{profile.get('name', 'Profile')}: {exc}") from exc
-            if any(t2options.migrate(profile)["won.mode"] != "off" for profile in self.profiles) \
-                    and not self.load_hook.isChecked():
-                raise ValueError("Local WON emulator profiles require Load t2_hook.so to be enabled.")
             names = [p["name"].strip() for p in self.profiles]
             if len({name.casefold() for name in names}) != len(names):
                 raise ValueError("Profile names must be unique.")
@@ -751,7 +766,6 @@ class SettingsDialog(QDialog):
             self.app.settings.update({
                 "game_directory": self.game_path.text().strip(),
                 "profiles": sorted(self.profiles, key=lambda p: p["name"].casefold()),
-                "load_hook": self.load_hook.isChecked(),
                 "monitor": self.monitor.currentData() or "",
                 "autolaunch_profile": selected_auto,
                 "autolaunch_delay": self.delay.value(),
@@ -841,11 +855,12 @@ class Launcher(QApplication):
             self.tray.showMessage("Game folder needed", "Choose the Tribes 2 folder in Settings.", QSystemTrayIcon.Warning)
             self.open_settings()
             return
+        hooked = bool(profile.get("load_hook", True))
         try:
             args = profile_arguments(profile)
             options = t2options.migrate(profile)
-            t2options.validate(options, {"launcher.load_hook": self.settings["load_hook"]})
-            if options["won.mode"] != "off" and not self.settings["load_hook"]:
+            t2options.validate(options, {"launcher.load_hook": hooked})
+            if options["won.mode"] != "off" and not hooked:
                 raise ValueError("Local WON emulation requires the hook.")
         except ValueError as exc:
             self.tray.showMessage("Invalid profile", str(exc), QSystemTrayIcon.Warning)
@@ -853,10 +868,10 @@ class Launcher(QApplication):
             return
         process = QProcess(self)
         env = QProcessEnvironment.systemEnvironment()
-        context = {"launcher.load_hook": self.settings["load_hook"]}
-        launch = {"T2LAUNCH_LOAD_HOOK": "1" if self.settings["load_hook"] else "0",
+        context = {"launcher.load_hook": hooked}
+        launch = {"T2LAUNCH_LOAD_HOOK": "1" if hooked else "0",
                   **t2options.launch_env(options, context)}
-        if self.settings["load_hook"]:
+        if hooked:
             launch["T2LAUNCH_HOOK_CONFIG"] = str(t2options.write_hook_config(name, options, context))
         effective = t2options.effective(options, context)
         dedicated = effective["game.executable"] == "dedicated"
@@ -883,7 +898,7 @@ class Launcher(QApplication):
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
         append_launch_diagnostic(
             f"launch requested; executable={effective['game.executable']} won={options['won.mode']} "
-            f"hook={int(bool(self.settings['load_hook']))} terminal={int(terminal is not None)}")
+            f"hook={int(hooked)} terminal={int(terminal is not None)}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))
         process.errorOccurred.connect(lambda error, p=process: self.launch_error(p, error))
