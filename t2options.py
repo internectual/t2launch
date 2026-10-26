@@ -152,6 +152,24 @@ OPTIONS = (
            requires=(("launcher.load_hook", (True,)),),
            help="Apply the Video options gamma in a shader pass; the game's X11 gamma ramps do "
                 "nothing under Wayland and most compositors."),
+    Option("video.render_scale", "Video", "Fullscreen below native resolution", "choice", "off",
+           choices=("off", "fit", "stretch"), hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="When the game goes fullscreen (alt+enter) at a resolution below the monitor's, open "
+                "the fullscreen at the native size and scale the game's picture up to fill it: fit "
+                "keeps the aspect ratio (bars where it differs), stretch fills the screen. The game "
+                "keeps rendering at its own resolution, so the HUD stays large, and windowed mode is "
+                "unchanged. Works on Wayland, where a real mode switch is impossible."),
+    Option("video.sharpen", "Video", "Sharpening (0 = off)", "float", 0.0, minimum=0.0, maximum=1.0,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Contrast-adaptive sharpening in the post pass, 0 to 1. Useful with a scaled "
+                "fullscreen."),
+    Option("video.msaa", "Video", "Anti-aliasing (MSAA samples)", "choice", "0",
+           choices=("0", "2", "4", "8"), hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Draw the game into a multisampled framebuffer and resolve it at each frame, which "
+                "smooths polygon edges. Costs GPU time; 4 is a good start."),
+    Option("video.mangohud", "Video", "MangoHud overlay", "bool", False, env="T2LAUNCH_MANGOHUD",
+           help="Show MangoHud's frame rate and frame time overlay (needs 32-bit MangoHud, "
+                "lib32-mangohud on Arch)."),
     Option("video.disable_locked_arrays", "Video", "Hide EXT_compiled_vertex_array", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="For drivers that tear or flicker once the game locks vertex arrays: hide the "
@@ -332,7 +350,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",

@@ -780,6 +780,30 @@ options bring the parts of it that fit the Linux client:
   through a GLSL shader computing `pow(colour, 1/gamma)`, saving and
   restoring the GL state around the pass. Neutral is near the middle of the
   slider.
+- **Fullscreen below native resolution** (`video.render_scale`, off; `fit` or
+  `stretch`). On Wayland an X11 game can't switch the monitor's mode, so a
+  fullscreen below the native resolution lands as a small window in a corner.
+  With this option, when the game asks for such a fullscreen (alt+enter), the
+  hook opens it at the monitor's native size (which fills the panel) and binds
+  its own framebuffer in place of the window's, at the game's resolution — the
+  game never uses framebuffer objects, so it draws there unchanged and keeps
+  its own resolution and large HUD. Before each swap the frame is scaled into
+  the window, keeping the aspect ratio with black bars (`fit`) or filling it
+  (`stretch`). The hook also points the game's `glDrawBuffer`/`glReadBuffer`
+  at that framebuffer and maps absolute mouse positions in `SDL_PollEvent`
+  events back to the game's resolution (relative motion, which steers, is
+  untouched). Windowed mode is unchanged, so alt+enter toggles between a
+  normal window and a filled fullscreen.
+- **Sharpening** (`video.sharpen`, 0 = off, up to 1). AMD-style
+  contrast-adaptive sharpening added to the gamma shader pass; useful with a
+  scaled fullscreen.
+- **Anti-aliasing** (`video.msaa`, 0/2/4/8). The game draws into a
+  multisampled framebuffer that is resolved each frame (window-system MSAA
+  would break the copy-based gamma pass and the game's `glReadPixels`
+  screenshots, which read a resolved copy instead).
+- **MangoHud overlay** (`video.mangohud`, off). `run-game` preloads the
+  32-bit `libMangoHud_shim.so` (`lib32-mangohud` on Arch) with `MANGOHUD=1`;
+  its overlay draws at the real swap, after the hook's post pass.
 - **Hide `EXT_compiled_vertex_array`** (`video.disable_locked_arrays`, off).
   Some drivers (AMD's rewritten Windows OpenGL driver, per TribesNext forum
   thread 4362) tear and flicker after the game first calls `glLockArraysEXT`,

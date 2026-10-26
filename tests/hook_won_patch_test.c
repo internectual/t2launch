@@ -332,6 +332,38 @@ int main(void) {
         assert(memcmp(wo_site, "\xd9\xee\x90\x90\x90\x90", 6) == 0);
         munmap(wo, size);
 
+        /* Render scale: where the frame goes, and mouse positions back to the game. */
+        struct render_rect fit = render_fit_rect(1920, 1080, 2560, 1600, 0);
+        assert(fit.x == 0 && fit.y == 80 && fit.w == 2560 && fit.h == 1440);  /* width-limited */
+        fit = render_fit_rect(1024, 768, 2560, 1600, 0);
+        assert(fit.h == 1600 && fit.w == 2133 && fit.x == 213 && fit.y == 0);  /* height-limited */
+        struct render_rect full = render_fit_rect(1920, 1080, 2560, 1600, 1);
+        assert(full.x == 0 && full.y == 0 && full.w == 2560 && full.h == 1600);
+        struct render_rect letterbox = render_fit_rect(1920, 1080, 2560, 1600, 0);
+        int mx = 1280, my = 800;
+        map_mouse_point(&mx, &my, letterbox, 1600, 1920, 1080);
+        assert(mx == 960 && my == 540);                  /* centre stays centre */
+        mx = 0; my = 10;                                 /* in the top bar: clamped */
+        map_mouse_point(&mx, &my, letterbox, 1600, 1920, 1080);
+        assert(mx == 0 && my == 0);
+        mx = 2559; my = 1599;
+        map_mouse_point(&mx, &my, letterbox, 1600, 1920, 1080);
+        assert(mx == 1919 && my == 1079);
+        assert(remap_draw_buffer(0x0405, 1) == GL_COLOR_ATTACHMENT0_);  /* GL_BACK */
+        assert(remap_draw_buffer(0x0404, 1) == GL_COLOR_ATTACHMENT0_);  /* GL_FRONT */
+        assert(remap_draw_buffer(0x0405, 0) == 0x0405);
+        assert(remap_draw_buffer(0, 1) == 0);                          /* GL_NONE */
+        unsigned char motion[20] = {4, 0, 0, 0};
+        uint16_t ex = 1280, ey = 800;
+        memcpy(motion + 4, &ex, 2); memcpy(motion + 6, &ey, 2);
+        motion[8] = 7;                                   /* xrel untouched */
+        scale_mouse_event(motion, letterbox, 1600, 1920, 1080);
+        memcpy(&ex, motion + 4, 2); memcpy(&ey, motion + 6, 2);
+        assert(ex == 960 && ey == 540 && motion[8] == 7);
+        unsigned char key[20] = {2, 0, 0, 0, 0x34, 0x12};  /* SDL_KEYDOWN: not a mouse event */
+        scale_mouse_event(key, letterbox, 1600, 1920, 1080);
+        assert(key[4] == 0x34 && key[5] == 0x12);
+
         /* No fog: the glEnable wrapper drops GL_FOG and passes everything else. */
         real_gl_enable = fake_gl_enable;
         gl_enable_calls = 0;

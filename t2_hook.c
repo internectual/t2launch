@@ -30,6 +30,7 @@ typedef sdl_rect_t **(*sdl_list_modes_t)(void *format, uint32_t flags);
 
 #define SDL_FULLSCREEN_FLAG 0x80000000u
 #define SDL_NOFRAME_FLAG 0x00000020u
+#define SDL_OPENGL_FLAG 0x00000002u
 
 /* ── Executables ─────────────────────────────────────────────────────────
  * The hook runs in the Loki #25034 client (tribes2.dynamic) and in its
@@ -126,6 +127,9 @@ static struct hook_option hook_options[] = {
     {"video.borderless", "0", NULL, 0, "", 0},
     {"video.vsync", "1", NULL, 0, "", 0},
     {"video.gamma", "1", NULL, 0, "", 0},
+    {"video.render_scale", "off", NULL, 0, "", 0},
+    {"video.sharpen", "0.0", NULL, 0, "", 0},
+    {"video.msaa", "0", NULL, 0, "", 0},
     {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
     {"net.depot_downloads", "0", NULL, 0, "", 0},
     {"net.native_auth", "0", NULL, 0, "", 0},
@@ -2095,10 +2099,32 @@ int pthread_detach(pthread_t thread) {
 #define GL_STENCIL_TEST_ 0x0B90
 #define GL_FOG_ 0x0B60
 #define GL_LIGHTING_ 0x0B50
+#define GL_LINEAR_ 0x2601
+#define GL_TEXTURE_WRAP_S_ 0x2802
+#define GL_TEXTURE_WRAP_T_ 0x2803
+#define GL_CLAMP_TO_EDGE_ 0x812F
+#define GL_TEXTURE_BINDING_2D_ 0x8069
+#define GL_RGBA_ 0x1908
+#define GL_RGBA8_ 0x8058
+#define GL_COLOR_BUFFER_BIT_ 0x4000
+#define GL_SCISSOR_BIT_ 0x00080000
+#define GL_FRAMEBUFFER_ 0x8D40
+#define GL_READ_FRAMEBUFFER_ 0x8CA8
+#define GL_DRAW_FRAMEBUFFER_ 0x8CA9
+#define GL_RENDERBUFFER_ 0x8D41
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
+#define GL_DEPTH_STENCIL_ATTACHMENT_ 0x821A
+#define GL_DEPTH24_STENCIL8_ 0x88F0
+#define GL_FRAMEBUFFER_COMPLETE_ 0x8CD5
+#define GL_MAX_SAMPLES_ 0x8D57
 
 static volatile float gamma_requested = 1.0f;
-static int gamma_width, gamma_height;
+static int gamma_width, gamma_height;  /* the real window */
 
+/* Post pass: one shader draw before each swap. It applies the gamma slider
+   (video.gamma) and sharpening (video.sharpen), and with a render target
+   (video.render_scale / video.msaa) it also scales the game's frame into the
+   window. With neither gamma nor sharpening it does nothing. */
 static struct {
     int state;  /* 0 unresolved, 1 ready, -1 unavailable */
     void (*GetIntegerv)(unsigned, int *);
@@ -2138,17 +2164,32 @@ static struct {
     int (*GetUniformLocation)(unsigned, const char *);
     void (*Uniform1i)(int, int);
     void (*Uniform1f)(int, float);
+    void (*Uniform2f)(int, float, float);
     unsigned program, texture;
-    int texture_width, texture_height, exponent_location;
+    int texture_width, texture_height, exponent_location, sharpness_location, texel_location;
 } gl_gamma;
 
 static const char gamma_vertex_shader[] =
     "void main() { gl_TexCoord[0] = gl_MultiTexCoord0; gl_Position = gl_Vertex; }\n";
+/* Sharpening follows AMD's contrast-adaptive sharpening: a cross of four
+   neighbours, weighted down where local contrast is already high. */
 static const char gamma_fragment_shader[] =
-    "uniform sampler2D frame; uniform float exponent;\n"
+    "uniform sampler2D frame; uniform float exponent; uniform float sharpness; uniform vec2 texel;\n"
     "void main() {\n"
-    " vec3 colour = texture2D(frame, gl_TexCoord[0].xy).rgb;\n"
-    " gl_FragColor = vec4(pow(colour, vec3(exponent)), 1.0);\n"
+    " vec2 uv = gl_TexCoord[0].xy;\n"
+    " vec3 c = texture2D(frame, uv).rgb;\n"
+    " if (sharpness > 0.0) {\n"
+    "  vec3 n = texture2D(frame, uv + vec2(0.0, texel.y)).rgb;\n"
+    "  vec3 s = texture2D(frame, uv - vec2(0.0, texel.y)).rgb;\n"
+    "  vec3 e = texture2D(frame, uv + vec2(texel.x, 0.0)).rgb;\n"
+    "  vec3 w = texture2D(frame, uv - vec2(texel.x, 0.0)).rgb;\n"
+    "  vec3 lo = min(c, min(min(n, s), min(e, w)));\n"
+    "  vec3 hi = max(c, max(max(n, s), max(e, w)));\n"
+    "  vec3 amount = sqrt(clamp(min(lo, 1.0 - hi) / max(hi, vec3(0.0001)), 0.0, 1.0));\n"
+    "  vec3 weight = amount * (-1.0 / mix(8.0, 5.0, sharpness));\n"
+    "  c = clamp((c + (n + s + e + w) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);\n"
+    " }\n"
+    " gl_FragColor = vec4(pow(c, vec3(exponent)), 1.0);\n"
     "}\n";
 
 static int resolve_gl_gamma(void) {
@@ -2163,7 +2204,7 @@ static int resolve_gl_gamma(void) {
         *(void **)&gl_gamma.field = get_proc ? get_proc((const unsigned char *)name) : NULL; \
         if (!gl_gamma.field) *(void **)&gl_gamma.field = dlsym(scope, name); \
         if (!gl_gamma.field) { \
-            fprintf(stderr, "[t2_hook] Gamma unavailable: no %s\n", name); \
+            fprintf(stderr, "[t2_hook] Post pass unavailable: no %s\n", name); \
             return 0; \
         } \
     } while (0)
@@ -2184,7 +2225,7 @@ static int resolve_gl_gamma(void) {
     GL_FN(AttachShader, "glAttachShader"); GL_FN(LinkProgram, "glLinkProgram");
     GL_FN(GetProgramiv, "glGetProgramiv"); GL_FN(UseProgram, "glUseProgram");
     GL_FN(GetUniformLocation, "glGetUniformLocation"); GL_FN(Uniform1i, "glUniform1i");
-    GL_FN(Uniform1f, "glUniform1f");
+    GL_FN(Uniform1f, "glUniform1f"); GL_FN(Uniform2f, "glUniform2f");
 #undef GL_FN
     const char *sources[2] = {gamma_vertex_shader, gamma_fragment_shader};
     unsigned types[2] = {GL_VERTEX_SHADER_, GL_FRAGMENT_SHADER_};
@@ -2196,7 +2237,7 @@ static int resolve_gl_gamma(void) {
         gl_gamma.CompileShader(shader);
         gl_gamma.GetShaderiv(shader, GL_COMPILE_STATUS_, &ok);
         if (!ok) {
-            fprintf(stderr, "[t2_hook] Gamma unavailable: shader did not compile\n");
+            fprintf(stderr, "[t2_hook] Post pass unavailable: shader did not compile\n");
             return 0;
         }
         gl_gamma.AttachShader(program, shader);
@@ -2205,11 +2246,13 @@ static int resolve_gl_gamma(void) {
     gl_gamma.LinkProgram(program);
     gl_gamma.GetProgramiv(program, GL_LINK_STATUS_, &linked);
     if (!linked) {
-        fprintf(stderr, "[t2_hook] Gamma unavailable: shader did not link\n");
+        fprintf(stderr, "[t2_hook] Post pass unavailable: shader did not link\n");
         return 0;
     }
     gl_gamma.program = program;
     gl_gamma.exponent_location = gl_gamma.GetUniformLocation(program, "exponent");
+    gl_gamma.sharpness_location = gl_gamma.GetUniformLocation(program, "sharpness");
+    gl_gamma.texel_location = gl_gamma.GetUniformLocation(program, "texel");
     int previous = 0;
     gl_gamma.GetIntegerv(GL_CURRENT_PROGRAM_, &previous);
     gl_gamma.UseProgram(program);
@@ -2220,14 +2263,34 @@ static int resolve_gl_gamma(void) {
     return 1;
 }
 
-/* Called before each swap on the game thread with the game's context current. */
-static void apply_gamma_pass(void) {
+/* video.sharpen: 0 (off) to 1 (strongest). */
+static float post_sharpness(void) {
+    static float sharpness = -1.0f;
+    if (sharpness < 0.0f) {
+        const char *value = hook_option_str("video.sharpen");
+        sharpness = value ? (float)atof(value) : 0.0f;
+        if (!(sharpness > 0.0f)) sharpness = 0.0f;
+        if (sharpness > 1.0f) sharpness = 1.0f;
+        if (sharpness > 0.0f) fprintf(stderr, "[t2_hook] Sharpening %.2f\n", (double)sharpness);
+    }
+    return sharpness;
+}
+
+/* The gamma exponent to apply, or 0 when neither gamma nor sharpening needs
+   the shader. */
+static float post_exponent(void) {
     float gamma = gamma_requested;
-    if (gamma > 0.999f && gamma < 1.001f) return;
-    if (gamma_width <= 0 || gamma_height <= 0 || !resolve_gl_gamma()) return;
-    int previous_program = 0, previous_unit = 0;
-    gl_gamma.GetIntegerv(GL_CURRENT_PROGRAM_, &previous_program);
-    gl_gamma.GetIntegerv(GL_ACTIVE_TEXTURE_, &previous_unit);
+    int flat = gamma > 0.999f && gamma < 1.001f;
+    if (flat && post_sharpness() <= 0.0f) return 0.0f;
+    return flat ? 1.0f : 1.0f / gamma;
+}
+
+static int post_previous_program, post_previous_unit;
+
+/* Save the game's state and set up a plain textured draw. */
+static void post_begin(void) {
+    gl_gamma.GetIntegerv(GL_CURRENT_PROGRAM_, &post_previous_program);
+    gl_gamma.GetIntegerv(GL_ACTIVE_TEXTURE_, &post_previous_unit);
     gl_gamma.PushAttrib(GL_ALL_ATTRIB_BITS_);
     gl_gamma.PushClientAttrib(GL_CLIENT_ALL_ATTRIB_BITS_);
     gl_gamma.ActiveTexture(GL_TEXTURE0_);
@@ -2238,9 +2301,43 @@ static void apply_gamma_pass(void) {
                            GL_STENCIL_TEST_, GL_FOG_, GL_LIGHTING_};
     for (size_t i = 0; i < sizeof(disabled) / sizeof(disabled[0]); i++) gl_gamma.Disable(disabled[i]);
     gl_gamma.ColorMask(1, 1, 1, 1);
+    gl_gamma.Enable(GL_TEXTURE_2D_);
+}
+
+/* Draw texture (src_w x src_h) over the current viewport through the shader. */
+static void post_quad(unsigned texture, int src_w, int src_h, float exponent, float sharpness) {
+    gl_gamma.BindTexture(GL_TEXTURE_2D_, texture);
+    gl_gamma.UseProgram(gl_gamma.program);
+    gl_gamma.Uniform1f(gl_gamma.exponent_location, exponent);
+    gl_gamma.Uniform1f(gl_gamma.sharpness_location, sharpness);
+    gl_gamma.Uniform2f(gl_gamma.texel_location, 1.0f / (float)src_w, 1.0f / (float)src_h);
+    gl_gamma.Begin(GL_QUADS_);
+    gl_gamma.TexCoord2f(0, 0); gl_gamma.Vertex2f(-1, -1);
+    gl_gamma.TexCoord2f(1, 0); gl_gamma.Vertex2f(1, -1);
+    gl_gamma.TexCoord2f(1, 1); gl_gamma.Vertex2f(1, 1);
+    gl_gamma.TexCoord2f(0, 1); gl_gamma.Vertex2f(-1, 1);
+    gl_gamma.End();
+}
+
+static void post_end(void) {
+    gl_gamma.UseProgram((unsigned)post_previous_program);
+    gl_gamma.MatrixMode(GL_TEXTURE_); gl_gamma.PopMatrix();
+    gl_gamma.MatrixMode(GL_PROJECTION_); gl_gamma.PopMatrix();
+    gl_gamma.MatrixMode(GL_MODELVIEW_); gl_gamma.PopMatrix();
+    gl_gamma.PopClientAttrib();
+    gl_gamma.PopAttrib();
+    gl_gamma.ActiveTexture((unsigned)post_previous_unit);
+}
+
+/* Without a render target: copy the back buffer and draw it back through the
+   shader. Called before each swap on the game thread with its context current. */
+static void apply_gamma_pass(void) {
+    float exponent = post_exponent();
+    if (exponent <= 0.0f) return;
+    if (gamma_width <= 0 || gamma_height <= 0 || !resolve_gl_gamma()) return;
+    post_begin();
     gl_gamma.Viewport(0, 0, gamma_width, gamma_height);
     if (!gl_gamma.texture) gl_gamma.GenTextures(1, &gl_gamma.texture);
-    gl_gamma.Enable(GL_TEXTURE_2D_);
     gl_gamma.BindTexture(GL_TEXTURE_2D_, gl_gamma.texture);
     if (gl_gamma.texture_width != gamma_width || gl_gamma.texture_height != gamma_height) {
         gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_NEAREST_);
@@ -2252,21 +2349,387 @@ static void apply_gamma_pass(void) {
     }
     gl_gamma.ReadBuffer(GL_BACK_);
     gl_gamma.CopyTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, 0, 0, gamma_width, gamma_height);
-    gl_gamma.UseProgram(gl_gamma.program);
-    gl_gamma.Uniform1f(gl_gamma.exponent_location, 1.0f / gamma);
-    gl_gamma.Begin(GL_QUADS_);
-    gl_gamma.TexCoord2f(0, 0); gl_gamma.Vertex2f(-1, -1);
-    gl_gamma.TexCoord2f(1, 0); gl_gamma.Vertex2f(1, -1);
-    gl_gamma.TexCoord2f(1, 1); gl_gamma.Vertex2f(1, 1);
-    gl_gamma.TexCoord2f(0, 1); gl_gamma.Vertex2f(-1, 1);
-    gl_gamma.End();
-    gl_gamma.UseProgram((unsigned)previous_program);
-    gl_gamma.MatrixMode(GL_TEXTURE_); gl_gamma.PopMatrix();
-    gl_gamma.MatrixMode(GL_PROJECTION_); gl_gamma.PopMatrix();
-    gl_gamma.MatrixMode(GL_MODELVIEW_); gl_gamma.PopMatrix();
-    gl_gamma.PopClientAttrib();
+    post_quad(gl_gamma.texture, gamma_width, gamma_height, exponent, post_sharpness());
+    post_end();
+}
+
+/* ── Render target (video.render_scale, video.msaa) ──────────────────────
+ * The game never uses framebuffer objects, so it always draws to framebuffer
+ * 0. With a render target the hook binds its own FBO in that place, at the
+ * resolution the game asked for, and draws it into the real window at swap:
+ * - video.render_scale: a fullscreen below the monitor's native size opens
+ *   at the native size (which fills the panel, even on Wayland where a mode
+ *   switch is impossible) while the game keeps rendering at its own
+ *   resolution, scaled up to fit (keeping the aspect ratio) or stretched;
+ * - video.msaa: the FBO is multisampled and resolved at swap (window-system
+ *   MSAA would break the copy-based gamma pass and the game's glReadPixels).
+ * The game keeps its own size (it stores the size it asked SDL for), so only
+ * glDrawBuffer/glReadBuffer, reads from a multisampled target and absolute
+ * mouse positions need translating. */
+struct render_rect { int x, y, w, h; };  /* GL window coordinates, origin bottom-left */
+
+/* Where a game_w x game_h frame goes in a real_w x real_h window: centred
+   and as large as fits without changing the aspect ratio, or stretched. */
+static struct render_rect render_fit_rect(int game_w, int game_h, int real_w, int real_h, int stretch) {
+    struct render_rect rect = {0, 0, real_w, real_h};
+    if (stretch || game_w <= 0 || game_h <= 0) return rect;
+    if ((long long)game_w * real_h > (long long)game_h * real_w) {
+        rect.h = (int)((long long)game_h * real_w / game_w);  /* width-limited */
+        rect.y = (real_h - rect.h) / 2;
+    } else {
+        rect.w = (int)((long long)game_w * real_h / game_h);  /* height-limited */
+        rect.x = (real_w - rect.w) / 2;
+    }
+    return rect;
+}
+
+/* An SDL mouse position in the real window (origin top-left) to the game's. */
+static void map_mouse_point(int *x, int *y, struct render_rect rect, int real_h, int game_w, int game_h) {
+    if (rect.w <= 0 || rect.h <= 0) return;
+    int top = real_h - rect.y - rect.h;
+    int gx = (int)((long long)(*x - rect.x) * game_w / rect.w);
+    int gy = (int)((long long)(*y - top) * game_h / rect.h);
+    *x = gx < 0 ? 0 : gx >= game_w ? game_w - 1 : gx;
+    *y = gy < 0 ? 0 : gy >= game_h ? game_h - 1 : gy;
+}
+
+/* The window's colour buffers are not valid while an FBO is bound; the
+   FBO's own colour attachment stands in for them. */
+static unsigned remap_draw_buffer(unsigned mode, int redirected) {
+    if (redirected && mode >= 0x0400 && mode <= 0x0408) return GL_COLOR_ATTACHMENT0_;
+    return mode;
+}
+
+static struct {
+    int state;  /* 0 unresolved, 1 ready, -1 unavailable */
+    void (*GenFramebuffers)(int, unsigned *);
+    void (*DeleteFramebuffers)(int, const unsigned *);
+    void (*BindFramebuffer)(unsigned, unsigned);
+    void (*FramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+    void (*FramebufferRenderbuffer)(unsigned, unsigned, unsigned, unsigned);
+    unsigned (*CheckFramebufferStatus)(unsigned);
+    void (*GenRenderbuffers)(int, unsigned *);
+    void (*DeleteRenderbuffers)(int, const unsigned *);
+    void (*BindRenderbuffer)(unsigned, unsigned);
+    void (*RenderbufferStorage)(unsigned, unsigned, int, int);
+    void (*RenderbufferStorageMultisample)(unsigned, int, unsigned, int, int);
+    void (*BlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
+    void (*ClearColor)(float, float, float, float);
+    void (*Clear)(unsigned);
+} gl_rt;
+
+static int resolve_gl_rt(void) {
+    if (gl_rt.state) return gl_rt.state > 0;
+    gl_rt.state = -1;
+    void *gl = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    void *scope = gl ? gl : RTLD_DEFAULT;
+    void *(*get_proc)(const unsigned char *) =
+        (void *(*)(const unsigned char *))dlsym(scope, "glXGetProcAddressARB");
+    /* The core name first, then the EXT one from before OpenGL 3.0. */
+#define RT_FN(field, name) \
+    do { \
+        static const char *const names[2] = {name, name "EXT"}; \
+        for (int i = 0; i < 2 && !gl_rt.field; i++) { \
+            *(void **)&gl_rt.field = get_proc ? get_proc((const unsigned char *)names[i]) : NULL; \
+            if (!gl_rt.field) *(void **)&gl_rt.field = dlsym(scope, names[i]); \
+        } \
+        if (!gl_rt.field) { \
+            fprintf(stderr, "[t2_hook] Render target unavailable: no %s\n", name); \
+            return 0; \
+        } \
+    } while (0)
+    RT_FN(GenFramebuffers, "glGenFramebuffers"); RT_FN(DeleteFramebuffers, "glDeleteFramebuffers");
+    RT_FN(BindFramebuffer, "glBindFramebuffer");
+    RT_FN(FramebufferTexture2D, "glFramebufferTexture2D");
+    RT_FN(FramebufferRenderbuffer, "glFramebufferRenderbuffer");
+    RT_FN(CheckFramebufferStatus, "glCheckFramebufferStatus");
+    RT_FN(GenRenderbuffers, "glGenRenderbuffers"); RT_FN(DeleteRenderbuffers, "glDeleteRenderbuffers");
+    RT_FN(BindRenderbuffer, "glBindRenderbuffer"); RT_FN(RenderbufferStorage, "glRenderbufferStorage");
+    RT_FN(RenderbufferStorageMultisample, "glRenderbufferStorageMultisample");
+    RT_FN(BlitFramebuffer, "glBlitFramebuffer"); RT_FN(ClearColor, "glClearColor");
+    RT_FN(Clear, "glClear");
+#undef RT_FN
+    gl_rt.state = 1;
+    return 1;
+}
+
+static struct {
+    int active, scaling, samples;
+    int game_w, game_h, real_w, real_h;
+    struct render_rect rect;
+    unsigned fbo, color_texture, depth;             /* single-sampled, sampled at swap */
+    unsigned ms_fbo, ms_color, ms_depth;            /* multisampled, what the game draws to */
+} rt;
+
+/* video.render_scale: 0 off, 1 fit, 2 stretch. */
+static int render_scale_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *value = hook_option_str("video.render_scale");
+        mode = value && strcmp(value, "fit") == 0 ? 1 : value && strcmp(value, "stretch") == 0 ? 2 : 0;
+    }
+    return mode;
+}
+
+/* video.msaa: 0 or a sample count. */
+static int msaa_samples(void) {
+    static int samples = -1;
+    if (samples < 0) {
+        const char *value = hook_option_str("video.msaa");
+        samples = value ? atoi(value) : 0;
+        if (samples < 2) samples = 0;
+        if (samples > 16) samples = 16;
+    }
+    return samples;
+}
+
+static int render_target_wanted(void) {
+    return render_scale_mode() || msaa_samples();
+}
+
+/* The fullscreen display's largest mode: its native size. */
+static int native_fullscreen_size(int *width, int *height) {
+    if (!real_sdl_list_modes)
+        real_sdl_list_modes = (sdl_list_modes_t)dlsym(RTLD_NEXT, "SDL_ListModes");
+    if (!real_sdl_list_modes) return 0;
+    sdl_rect_t **modes = real_sdl_list_modes(NULL, SDL_FULLSCREEN_FLAG | SDL_OPENGL_FLAG);
+    if (!modes || modes == (sdl_rect_t **)-1) return 0;
+    int best_w = 0, best_h = 0;
+    for (int i = 0; modes[i]; i++)
+        if ((long long)modes[i]->w * modes[i]->h > (long long)best_w * best_h) {
+            best_w = modes[i]->w;
+            best_h = modes[i]->h;
+        }
+    if (best_w <= 0 || best_h <= 0) return 0;
+    *width = best_w;
+    *height = best_h;
+    return 1;
+}
+
+static unsigned rt_draw_fbo(void) { return rt.samples ? rt.ms_fbo : rt.fbo; }
+
+/* Delete the targets while the context that owns them is still current. */
+static void rt_teardown(void) {
+    if (gl_rt.state > 0 && (rt.fbo || rt.ms_fbo)) {
+        gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+        if (rt.ms_fbo) gl_rt.DeleteFramebuffers(1, &rt.ms_fbo);
+        if (rt.ms_color) gl_rt.DeleteRenderbuffers(1, &rt.ms_color);
+        if (rt.ms_depth) gl_rt.DeleteRenderbuffers(1, &rt.ms_depth);
+        if (rt.fbo) gl_rt.DeleteFramebuffers(1, &rt.fbo);
+        if (rt.depth) gl_rt.DeleteRenderbuffers(1, &rt.depth);
+        if (rt.color_texture && gl_gamma.DeleteTextures) gl_gamma.DeleteTextures(1, &rt.color_texture);
+    }
+    memset(&rt, 0, sizeof(rt));
+}
+
+static unsigned rt_renderbuffer(int samples, unsigned format, int width, int height) {
+    unsigned buffer = 0;
+    gl_rt.GenRenderbuffers(1, &buffer);
+    gl_rt.BindRenderbuffer(GL_RENDERBUFFER_, buffer);
+    if (samples) gl_rt.RenderbufferStorageMultisample(GL_RENDERBUFFER_, samples, format, width, height);
+    else gl_rt.RenderbufferStorage(GL_RENDERBUFFER_, format, width, height);
+    return buffer;
+}
+
+/* After SDL_SetVideoMode, with the new context current. */
+static void rt_setup(int game_w, int game_h, int real_w, int real_h, int scale_mode, int samples) {
+    int scaling = scale_mode && (real_w != game_w || real_h != game_h);
+    if ((!scaling && !samples) || game_w <= 0 || game_h <= 0) return;
+    if (!resolve_gl_gamma() || !resolve_gl_rt()) return;
+    int previous_texture = 0;
+    gl_gamma.GetIntegerv(GL_TEXTURE_BINDING_2D_, &previous_texture);
+    gl_gamma.GenTextures(1, &rt.color_texture);
+    gl_gamma.BindTexture(GL_TEXTURE_2D_, rt.color_texture);
+    gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, scaling ? GL_LINEAR_ : GL_NEAREST_);
+    gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, scaling ? GL_LINEAR_ : GL_NEAREST_);
+    gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+    gl_gamma.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+    gl_gamma.TexImage2D(GL_TEXTURE_2D_, 0, GL_RGBA8_, game_w, game_h, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, NULL);
+    gl_gamma.BindTexture(GL_TEXTURE_2D_, (unsigned)previous_texture);
+    rt.depth = rt_renderbuffer(0, GL_DEPTH24_STENCIL8_, game_w, game_h);
+    gl_rt.GenFramebuffers(1, &rt.fbo);
+    gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt.fbo);
+    gl_rt.FramebufferTexture2D(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, rt.color_texture, 0);
+    gl_rt.FramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, GL_RENDERBUFFER_, rt.depth);
+    if (gl_rt.CheckFramebufferStatus(GL_FRAMEBUFFER_) != GL_FRAMEBUFFER_COMPLETE_) {
+        fprintf(stderr, "[t2_hook] Render target unavailable: framebuffer incomplete\n");
+        rt_teardown();
+        return;
+    }
+    if (samples) {
+        int most = 0;
+        gl_gamma.GetIntegerv(GL_MAX_SAMPLES_, &most);
+        if (samples > most) samples = most;
+        if (samples >= 2) {
+            rt.ms_color = rt_renderbuffer(samples, GL_RGBA8_, game_w, game_h);
+            rt.ms_depth = rt_renderbuffer(samples, GL_DEPTH24_STENCIL8_, game_w, game_h);
+            gl_rt.GenFramebuffers(1, &rt.ms_fbo);
+            gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt.ms_fbo);
+            gl_rt.FramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_RENDERBUFFER_, rt.ms_color);
+            gl_rt.FramebufferRenderbuffer(GL_FRAMEBUFFER_, GL_DEPTH_STENCIL_ATTACHMENT_, GL_RENDERBUFFER_,
+                                          rt.ms_depth);
+            if (gl_rt.CheckFramebufferStatus(GL_FRAMEBUFFER_) != GL_FRAMEBUFFER_COMPLETE_) {
+                fprintf(stderr, "[t2_hook] MSAA unavailable: multisampled framebuffer incomplete\n");
+                gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt.fbo);
+                gl_rt.DeleteFramebuffers(1, &rt.ms_fbo);
+                gl_rt.DeleteRenderbuffers(1, &rt.ms_color);
+                gl_rt.DeleteRenderbuffers(1, &rt.ms_depth);
+                rt.ms_fbo = rt.ms_color = rt.ms_depth = 0;
+                samples = 0;
+            }
+        } else {
+            samples = 0;
+        }
+    }
+    gl_rt.BindRenderbuffer(GL_RENDERBUFFER_, 0);
+    if (!scaling && !samples) {  /* nothing left to do */
+        rt_teardown();
+        return;
+    }
+    rt.samples = samples;
+    rt.scaling = scaling;
+    rt.game_w = game_w; rt.game_h = game_h;
+    rt.real_w = real_w; rt.real_h = real_h;
+    rt.rect = render_fit_rect(game_w, game_h, real_w, real_h, scale_mode == 2);
+    gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt_draw_fbo());
+    rt.active = 1;
+    fprintf(stderr, "[t2_hook] Rendering %dx%d into a %dx%d window%s%s\n", game_w, game_h, real_w, real_h,
+            scaling ? (scale_mode == 2 ? ", stretched" : ", scaled to fit") : "",
+            samples ? ", multisampled" : "");
+    if (samples) fprintf(stderr, "[t2_hook] MSAA %dx\n", samples);
+}
+
+/* Resolve the multisampled target into the single-sampled one. */
+static void rt_resolve(void) {
+    if (!rt.samples) return;
+    gl_gamma.PushAttrib(GL_SCISSOR_BIT_);
+    gl_gamma.Disable(GL_SCISSOR_TEST_);
+    gl_rt.BindFramebuffer(GL_READ_FRAMEBUFFER_, rt.ms_fbo);
+    gl_rt.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, rt.fbo);
+    gl_rt.BlitFramebuffer(0, 0, rt.game_w, rt.game_h, 0, 0, rt.game_w, rt.game_h,
+                          GL_COLOR_BUFFER_BIT_, GL_NEAREST_);
     gl_gamma.PopAttrib();
-    gl_gamma.ActiveTexture((unsigned)previous_unit);
+}
+
+/* Before the swap: draw the game's frame into the window. */
+static void rt_present(void) {
+    float exponent = post_exponent();
+    gl_gamma.PushAttrib(GL_ALL_ATTRIB_BITS_);
+    gl_gamma.Disable(GL_SCISSOR_TEST_);
+    gl_gamma.ColorMask(1, 1, 1, 1);
+    rt_resolve();
+    gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+    gl_gamma.Viewport(0, 0, rt.real_w, rt.real_h);
+    if (rt.rect.w != rt.real_w || rt.rect.h != rt.real_h) {  /* the bars */
+        gl_rt.ClearColor(0, 0, 0, 1);
+        gl_rt.Clear(GL_COLOR_BUFFER_BIT_);
+    }
+    if (exponent > 0.0f && gl_gamma.state > 0) {
+        post_begin();
+        gl_gamma.Viewport(rt.rect.x, rt.rect.y, rt.rect.w, rt.rect.h);
+        post_quad(rt.color_texture, rt.game_w, rt.game_h, exponent, post_sharpness());
+        post_end();
+    } else {
+        gl_rt.BindFramebuffer(GL_READ_FRAMEBUFFER_, rt.fbo);
+        gl_rt.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, 0);
+        gl_rt.BlitFramebuffer(0, 0, rt.game_w, rt.game_h, rt.rect.x, rt.rect.y,
+                              rt.rect.x + rt.rect.w, rt.rect.y + rt.rect.h, GL_COLOR_BUFFER_BIT_,
+                              rt.scaling ? GL_LINEAR_ : GL_NEAREST_);
+        gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, 0);
+    }
+    gl_gamma.PopAttrib();
+}
+
+/* GL entry points the game resolves through SDL_GL_GetProcAddress. */
+static void (*real_gl_draw_buffer)(unsigned);
+static void (*real_gl_read_buffer)(unsigned);
+static void (*real_gl_read_pixels)(int, int, int, int, unsigned, unsigned, void *);
+static void (*real_gl_copy_tex_sub_image)(unsigned, int, int, int, int, int, int, int);
+
+static void gl_draw_buffer_rt(unsigned mode) {
+    if (real_gl_draw_buffer) real_gl_draw_buffer(remap_draw_buffer(mode, rt.active));
+}
+
+static void gl_read_buffer_rt(unsigned mode) {
+    if (real_gl_read_buffer) real_gl_read_buffer(remap_draw_buffer(mode, rt.active));
+}
+
+/* Reads from a multisampled framebuffer are invalid: resolve and read the
+   single-sampled copy (glReadPixels for screenshots, glCopyTexSubImage2D). */
+static int rt_begin_read(void) {
+    if (!rt.active || !rt.samples) return 0;
+    rt_resolve();
+    gl_rt.BindFramebuffer(GL_READ_FRAMEBUFFER_, rt.fbo);
+    gl_rt.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, rt.ms_fbo);
+    return 1;
+}
+
+static void rt_end_read(int resolved) {
+    if (resolved) gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt.ms_fbo);
+}
+
+static void gl_read_pixels_rt(int x, int y, int width, int height, unsigned format, unsigned type, void *pixels) {
+    int resolved = rt_begin_read();
+    if (real_gl_read_pixels) real_gl_read_pixels(x, y, width, height, format, type, pixels);
+    rt_end_read(resolved);
+}
+
+static void gl_copy_tex_sub_image_rt(unsigned target, int level, int xoffset, int yoffset,
+                                     int x, int y, int width, int height) {
+    int resolved = rt_begin_read();
+    if (real_gl_copy_tex_sub_image)
+        real_gl_copy_tex_sub_image(target, level, xoffset, yoffset, x, y, width, height);
+    rt_end_read(resolved);
+}
+
+/* A wrapper for one of those entry points, or NULL to keep the original. */
+static void *render_target_proc(const char *proc, void *address) {
+    if (!address || !render_target_wanted()) return NULL;
+    if (strcmp(proc, "glDrawBuffer") == 0) {
+        real_gl_draw_buffer = (void (*)(unsigned))address;
+        return (void *)gl_draw_buffer_rt;
+    }
+    if (strcmp(proc, "glReadBuffer") == 0) {
+        real_gl_read_buffer = (void (*)(unsigned))address;
+        return (void *)gl_read_buffer_rt;
+    }
+    if (strcmp(proc, "glReadPixels") == 0) {
+        real_gl_read_pixels = (void (*)(int, int, int, int, unsigned, unsigned, void *))address;
+        return (void *)gl_read_pixels_rt;
+    }
+    if (strcmp(proc, "glCopyTexSubImage2D") == 0) {
+        real_gl_copy_tex_sub_image = (void (*)(unsigned, int, int, int, int, int, int, int))address;
+        return (void *)gl_copy_tex_sub_image_rt;
+    }
+    return NULL;
+}
+
+/* SDL 1.2 mouse events carry absolute positions in the real window: Uint16 x
+   and y at offsets 4 and 6 of SDL_MOUSEMOTION (4), SDL_MOUSEBUTTONDOWN (5)
+   and SDL_MOUSEBUTTONUP (6). Map them to the game's resolution; the relative
+   motion that steers in-game is left alone. */
+static void scale_mouse_event(unsigned char *event, struct render_rect rect, int real_h,
+                              int game_w, int game_h) {
+    if (event[0] != 4 && event[0] != 5 && event[0] != 6) return;
+    uint16_t x, y;
+    memcpy(&x, event + 4, sizeof(x));
+    memcpy(&y, event + 6, sizeof(y));
+    int mx = x, my = y;
+    map_mouse_point(&mx, &my, rect, real_h, game_w, game_h);
+    x = (uint16_t)mx;
+    y = (uint16_t)my;
+    memcpy(event + 4, &x, sizeof(x));
+    memcpy(event + 6, &y, sizeof(y));
+}
+
+int SDL_PollEvent(void *event) {
+    static int (*real_poll_event)(void *);
+    if (!real_poll_event) real_poll_event = (int (*)(void *))dlsym(RTLD_NEXT, "SDL_PollEvent");
+    if (!real_poll_event) return 0;
+    int pending = real_poll_event(event);
+    if (pending && event && rt.active && rt.scaling)
+        scale_mouse_event((unsigned char *)event, rt.rect, rt.real_h, rt.game_w, rt.game_h);
+    return pending;
 }
 
 int SDL_SetGamma(float red, float green, float blue) {
@@ -2352,6 +2815,8 @@ void *SDL_GL_GetProcAddress(const char *proc) {
     if (!real_get_proc) return NULL;
     void *address = real_get_proc(proc);
     if (!proc) return address;
+    void *wrapper = render_target_proc(proc, address);
+    if (wrapper) return wrapper;
     if (address && hook_option_bool("ui.no_fog") && strcmp(proc, "glEnable") == 0) {
         real_gl_enable = (void (*)(unsigned))address;
         return (void *)gl_enable_no_fog;
@@ -2406,9 +2871,11 @@ void SDL_GL_SwapBuffers(void) {
             RTLD_NEXT, "SDL_GL_SwapBuffers");
     if (!real_sdl_gl_swap_buffers) return;
 
-    if (game_main_thread_known && pthread_equal(pthread_self(), game_main_thread))
-        apply_gamma_pass();
+    int on_game_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
+    if (on_game_thread && rt.active) rt_present();
+    else if (on_game_thread) apply_gamma_pass();
     real_sdl_gl_swap_buffers();
+    if (on_game_thread && rt.active) gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt_draw_fbo());
     cap_frame_rate();
     if (!sdl_gl_swap_hook_reported) {
         sdl_gl_swap_hook_reported = 1;
@@ -2575,15 +3042,37 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
     if (!real_sdl_set_video_mode) return NULL;
     if (!(flags & SDL_FULLSCREEN_FLAG) && hook_option_bool("video.borderless"))
         flags |= SDL_NOFRAME_FLAG;
-    void *surface = real_sdl_set_video_mode(width, height, bpp, flags);
+    /* video.render_scale: a fullscreen below the native size opens at the
+       native size, and the game's frame is scaled into it at swap. */
+    int real_w = width, real_h = height, scale = 0;
+    if ((flags & SDL_OPENGL_FLAG) && (flags & SDL_FULLSCREEN_FLAG) && render_scale_mode() &&
+        width > 0 && height > 0) {
+        int native_w, native_h;
+        if (native_fullscreen_size(&native_w, &native_h) && (native_w > width || native_h > height)) {
+            real_w = native_w;
+            real_h = native_h;
+            scale = render_scale_mode();
+        }
+    }
+    rt_teardown();
+    void *surface = real_sdl_set_video_mode(real_w, real_h, bpp, flags);
+    if (!surface && scale) {  /* the native mode was refused: do what the game asked */
+        real_w = width;
+        real_h = height;
+        scale = 0;
+        surface = real_sdl_set_video_mode(width, height, bpp, flags);
+    }
     if (surface && vsync_requested >= 0) vsync_reapply = 1;
     if (surface) {
         /* A new context needs a new texture; the old one went with its context. */
-        gamma_width = width;
-        gamma_height = height;
+        gamma_width = real_w;
+        gamma_height = real_h;
         gl_gamma.texture = 0;
         gl_gamma.texture_width = gl_gamma.texture_height = 0;
         if (gl_gamma.state > 0) gl_gamma.state = 0;
+        if (gl_rt.state > 0) gl_rt.state = 0;
+        if ((flags & SDL_OPENGL_FLAG) && render_target_wanted())
+            rt_setup(width, height, real_w, real_h, scale, msaa_samples());
     }
     if (surface && width > 0 && height > 0) {
         __sync_lock_test_and_set(&video_mode_repaint_frames, 120);

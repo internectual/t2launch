@@ -464,6 +464,23 @@ launch_game() {
     fi
     if [[ "$EXECUTABLE" == "client" ]]; then
         preload+=("$compat_dir/libSDL-1.2.so.0")
+        # MangoHud's 32-bit shim layers its overlay on the game's OpenGL. It
+        # draws at the real swap, after the hook's post pass.
+        if [[ "${T2LAUNCH_MANGOHUD:-0}" == "1" ]]; then
+            mangohud_shim=""
+            for candidate in /usr/lib32/mangohud/libMangoHud_shim.so \
+                             /usr/lib/i386-linux-gnu/mangohud/libMangoHud_shim.so \
+                             /usr/lib/mangohud/libMangoHud_shim.so.i686; do
+                [[ -f "$candidate" ]] && { mangohud_shim=$candidate; break; }
+            done
+            if [[ -n "$mangohud_shim" ]]; then
+                preload+=("$mangohud_shim")
+                GAME_ENV+=(MANGOHUD=1)
+            else
+                echo "NOTE: MangoHud is on, but no 32-bit MangoHud was found. Install it:" >&2
+                install_hint lib32-mangohud mangohud:i386 mangohud.i686
+            fi
+        fi
         if [[ -z "$MESA_YEAR" ]]; then GAME_ENV+=(MESA_EXTENSION_MAX_YEAR=2000); fi
         GAME_ENV+=(__GL_ExtensionStringVersion=17700)
     else
