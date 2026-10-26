@@ -315,6 +315,23 @@ int main(void) {
         assert(memcmp(vd_site, "\x90\x90", 2) == 0);
         munmap(vd, size);
 
+        /* No whiteout: the 1.5 scale load becomes fldz + nops. */
+        uintptr_t wo_page = NO_WHITEOUT_ADDRESS & ~((uintptr_t)size - 1);
+        unsigned char *wo = mmap((void *)wo_page, size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(wo == (void *)wo_page);
+        unsigned char *wo_site = (unsigned char *)NO_WHITEOUT_ADDRESS;
+        memcpy(wo_site, no_whiteout_original, sizeof(no_whiteout_original));
+        wo_site[1] = 0x04;
+        assert(mprotect(wo, size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_no_whiteout());
+        assert(mprotect(wo, size, PROT_READ | PROT_WRITE) == 0);
+        wo_site[1] = 0x05;
+        assert(mprotect(wo, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_no_whiteout());
+        assert(memcmp(wo_site, "\xd9\xee\x90\x90\x90\x90", 6) == 0);
+        munmap(wo, size);
+
         /* No fog: the glEnable wrapper drops GL_FOG and passes everything else. */
         real_gl_enable = fake_gl_enable;
         gl_enable_calls = 0;

@@ -138,6 +138,7 @@ static struct hook_option hook_options[] = {
     {"ui.lan_join_anywhere", "0", NULL, 0, "", 0},
     {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.visible_distance", "0", NULL, 0, "", 0},
+    {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -1495,6 +1496,26 @@ static int install_visible_distance(void) {
                                      sizeof(visdist_clamp_original), 0, nops, sizeof(nops)};
     if (!apply_code_patches("Visible distance", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] visibleDistanceMod is no longer capped at 1.0 (memory only)\n");
+    return 1;
+}
+
+/* GameConnection::readPacket stores the control object's whiteout (the
+   concussion/flash blind) as readFloat(7) * 1.5 at +0x844c, the same offset
+   as the Windows build. Load 0 instead of the 1.5 scale (fldl -> fldz), so
+   the received whiteout is always 0: the 7 bits are still read, so the
+   stream stays in sync, and the FPU stack depth is unchanged. Only what this
+   client receives changes; a listen server it hosts still sends real values
+   (those come from ShapeBase +0x7b0 through getWhiteOut). The Linux
+   equivalent of HappyMod 2's "no whiteout". Client only. */
+#define NO_WHITEOUT_ADDRESS 0x08275B38
+static const unsigned char no_whiteout_original[] = {0xdd, 0x05, 0xa8, 0xc8, 0x45, 0x08};
+
+static int install_no_whiteout(void) {
+    static const unsigned char zero[] = {0xd9, 0xee, 0x90, 0x90, 0x90, 0x90};
+    const struct code_patch patch = {NO_WHITEOUT_ADDRESS, no_whiteout_original,
+                                     sizeof(no_whiteout_original), 0, zero, sizeof(zero)};
+    if (!apply_code_patches("No whiteout", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] Received flash whiteout is dropped (memory only)\n");
     return 1;
 }
 
@@ -3509,6 +3530,7 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
     if (hook_option_bool("ui.lan_join_anywhere")) install_lan_join_anywhere();
     if (hook_option_bool("ui.visible_distance")) install_visible_distance();
+    if (hook_option_bool("ui.no_whiteout")) install_no_whiteout();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))

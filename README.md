@@ -709,6 +709,14 @@ options bring the parts of it that fit the Linux client:
   clamp writes back to the pref, so every reader picks up the larger value, and
   the 0.5 lower bound is kept. This is the Linux equivalent of PenguinOfDoom's
   Windows `visdist` patch. Many servers consider this a cheat.
+- **Disable flash whiteout** (`ui.no_whiteout`, off). `GameConnection::readPacket`
+  stores the white flash the server sends for your player (concussion grenades
+  and the like) as `readFloat(7) * 1.5` at `+0x844c`, the same offset as on
+  Windows. The hook loads 0 instead of the 1.5 scale (`0x08275B38`), so the
+  received flash is always 0; the bits are still read, so the stream stays in
+  sync. Only your client changes: a listen server you host still sends real
+  flash values to other players. This is the Linux equivalent of HappyMod 2's
+  "no whiteout". Many servers consider this a cheat.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.

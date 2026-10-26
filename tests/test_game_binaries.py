@@ -72,6 +72,11 @@ class GameBinaryTests(unittest.TestCase):
         # The visibleDistanceMod upper clamp: and $0x45,%ah ; je (to force 1.0).
         self.assertEqual(read(0x081DC7EF, 5), bytes.fromhex("80 e4 45 74 1a"))
         self.assertEqual(struct.unpack("<f", read(0x084492D4, 4))[0], 0.5)
+        # GameConnection::readPacket whiteout: readFloat(7) * 1.5 -> +0x844c.
+        self.assertEqual(read(0x08275B30, 2), bytes.fromhex("6a 07"))
+        self.assertEqual(read(0x08275B38, 6), bytes.fromhex("dd 05 a8 c8 45 08"))
+        self.assertEqual(read(0x08275B46, 6), bytes.fromhex("d9 99 4c 84 00 00"))
+        self.assertEqual(struct.unpack("<d", read(0x0845C8A8, 8))[0], 1.5)
         # setFov's 179-degree maximum and fld1 minimum.
         self.assertEqual(read(0x08234171, 6), bytes.fromhex("d9 05 28 20 45 08"))
         self.assertEqual(struct.unpack("<f", read(0x08452028, 4))[0], 179.0)
