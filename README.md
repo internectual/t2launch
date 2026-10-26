@@ -913,29 +913,30 @@ enablewinconsole(true);
 
 ### Binary addresses (Tribes 2 Linux #25034)
 
-| Function | Address | Convention |
-|----------|---------|------------|
-| `Con::addMethodS` | `0x080E85C0` | `__cdecl` |
-| `Con::addMethodV` | `0x080E8618` | `__cdecl` |
-| `Con::addMethodI` | `0x080E8670` | `__cdecl` |
-| `Con::addMethodB` | `0x080E8720` | `__cdecl` |
-| `Con::evaluate` | `0x080E88F4` | `__cdecl` |
-| `Con::execute` | `0x080E7560` | `__cdecl` |
-| `Con::getReturnBuffer` | `0x080F1C9C` | `__cdecl` |
-| Console global ptr | `0x08493DEC` | — |
-| `Sim::postEvent` | `0x080FE264` | `__cdecl` |
-| `WONGetAuthInfo` | `0x0834E804` | console callback |
-| AuthInfo parser | `0x08348FCC` | `__cdecl` |
-| `Auth2Certificate::UnpackData` | `0x083615A4` | `__thiscall` |
+The client (`tribes2.dynamic`) and the dedicated server (`tribes2d.dynamic`)
+are separate builds of the same engine code at different addresses. The hook
+picks its address set from the executable's name and byte-checks every site
+before patching. Both columns, verified against each binary:
 
-The dedicated server (`tribes2d.dynamic`) is a separate build with the same
-engine code at other addresses. The hook picks its address set from the
-executable's name and checks the bytes at every site before patching:
+| Function | Client | Server | Convention |
+|----------|--------|--------|------------|
+| `Con::addMethodS` | `0x080E85C0` | `0x080E74B0` | `__cdecl` |
+| `Con::addMethodV` | `0x080E8618` | `0x080E7508` | `__cdecl` |
+| `Con::addMethodI` | `0x080E8670` | `0x080E7560` | `__cdecl` |
+| `Con::addMethodB` | `0x080E8720` | `0x080E7610` | `__cdecl` |
+| `Con::evaluate` | `0x080E88F4` | `0x080E77E4` | `__cdecl` |
+| `Con::execute` | `0x080E7560` | `0x080E6450` | `__cdecl` |
+| `Con::getReturnBuffer` | `0x080F1C9C` | `0x080F0B8C` | `__cdecl` |
+| Console global ptr | `0x08493DEC` | `0x0848902C` | — |
+| `Sim::postEvent` | `0x080FE264` | `0x080FD154` | `__cdecl` |
+| `WONGetAuthInfo` | `0x0834E804` | `0x083434A4` | console callback |
+| AuthInfo parser | `0x08348FCC` | `0x0833DC6C` | `__cdecl` |
+| `Auth2Certificate::UnpackData` | `0x083615A4` | `0x08355504` | `__thiscall` |
+
+Further patch sites, by target (a dash means the site exists only there):
 
 | What | Client | Server |
 |------|--------|--------|
-| `Con::addMethodS` / `Con::evaluate` | `0x080E85C0` / `0x080E88F4` | `0x080E74B0` / `0x080E77E4` |
-| Console global ptr | `0x08493DEC` | `0x0848902C` |
 | `Platform::getRealMilliseconds` | `0x081CFA44` | `0x081CD014` |
 | WON bootstrap strings | `0x084846B1` | `0x08479751` |
 | WON verifier slot | `0x0849A860` | `0x0848F520` |
