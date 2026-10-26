@@ -189,6 +189,7 @@ int main(void) {
         hud_bar_layout(frame, control, offset);
         assert(frame[2] == 15 && frame[3] == 27 + 20 && frame[4] == 10 && frame[5] == 20);
         assert(*(float *)(control + HUD_BAR_VALUE_OFFSET) == 0.5f);
+        assert(strcmp(hud_bar_get_value_cb(control, 2, NULL), "0.5") == 0);
         fake_value = 1.0f / 40.0f;  /* a one-pixel fill is drawn as two, as stock */
         hud_bar_layout(frame, control, offset);
         assert(frame[5] == 2 && frame[3] == 27 + 38);
@@ -206,6 +207,7 @@ int main(void) {
         site[10] = 0x02;
         assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);
         assert(!install_hud_bars(1, 1));
+        assert(hud_bar_store_value == 0 && hud_bar_vertical_fill == 0);  /* no getValue() either */
         assert(mprotect(hud, size, PROT_READ | PROT_WRITE) == 0);
         site[10] = 0x00;
         assert(mprotect(hud, size, PROT_READ | PROT_EXEC) == 0);

@@ -1264,6 +1264,16 @@ static void hud_bar_layout(int32_t *frame, unsigned char *control, const int32_t
     }
 }
 
+/* GuiControl::getValue() asks the control for a script value, which HUD bars
+   don't have, so it returns "". HudBarBaseCtrl::getValue() returns the fill
+   hud_bar_layout() stored instead. */
+static const char *hud_bar_get_value_cb(void *obj, S32 argc, const char **argv) {
+    (void)argc; (void)argv;
+    static char value[32];
+    snprintf(value, sizeof(value), "%g", *(float *)((unsigned char *)obj + HUD_BAR_VALUE_OFFSET));
+    return value;
+}
+
 static int install_hud_bars(int store_value, int vertical_fill) {
     /* push ebx (offset); push esi (control); lea eax,[ebp-0x18]; push eax;
        call hud_bar_layout; add esp,12; jmp to the stock colour code */
@@ -1284,7 +1294,10 @@ static int install_hud_bars(int store_value, int vertical_fill) {
                                      sizeof(hud_bar_layout_original), 0, code, sizeof(code)};
     hud_bar_store_value = store_value;
     hud_bar_vertical_fill = vertical_fill;
-    if (!apply_code_patches("HUD bar", &patch, 1)) return 0;
+    if (!apply_code_patches("HUD bar", &patch, 1)) {
+        hud_bar_store_value = hud_bar_vertical_fill = 0;
+        return 0;
+    }
     fprintf(stderr, "[t2_hook] HUD bars:%s%s (memory only)\n",
             store_value ? " getValue() reports the fill" : "",
             vertical_fill ? (store_value ? ", verticalFill works" : " verticalFill works") : "");
@@ -3160,6 +3173,9 @@ static int register_hook_commands(void) {
     if (!target->dedicated && hook_option_bool("video.vsync"))
         Con__addMethodS(NULL, "setVerticalSync", set_vertical_sync_cb,
             "setVerticalSync( <bool> )", 2, 2);
+    if (hud_bar_store_value)
+        Con__addMethodS("HudBarBaseCtrl", "getValue", hud_bar_get_value_cb,
+            "bar.getValue() - the bar's current fill, 0 to 1", 2, 2);
     if (!hook_option_bool("hook.console_commands")) {
         registered = 1;  /* the console is ready; only the commands are skipped */
         fprintf(stderr, "[t2_hook] Console commands disabled by hook.console_commands\n");
