@@ -194,6 +194,13 @@ OPTIONS = (
            hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
            help="Let client scripts call getDataBlock(), setDataBlock() and setTargetId() on "
                 "ghosted (client) objects, which the game refuses."),
+    # Security
+    Option("security.safe_soundpacks", "Security", "Block malicious ~w soundpack sounds", "bool", True,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="A \"~w<file>\" chat message plays <file> as a sound. A malicious player or server "
+                "can point it at a file that exists but is not a WAV (a config, a .vl2, a library), "
+                "which the audio loader mis-parses and crashes the client. This blocks any ~w sound "
+                "that is not a valid WAV; real soundpacks still play."),
     # Network
     Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
@@ -305,7 +312,7 @@ CLIENT_ONLY = frozenset((
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
-    "ui.observer_iff", "ui.fov_range", "ui.client_datablocks",
+    "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "security.safe_soundpacks",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)

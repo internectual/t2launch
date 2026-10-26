@@ -18,6 +18,7 @@
 
 typedef int S32;
 
+typedef const char *(*con_cb_t)(void *obj, S32 argc, const char **argv);
 typedef void (*con_addMethodS_t)(const char *nsName, const char *name,
     const char *(*cb)(void *obj, S32 argc, const char **argv),
     const char *usage, S32 minArgs, S32 maxArgs);
@@ -139,6 +140,7 @@ static struct hook_option hook_options[] = {
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
+    {"security.safe_soundpacks", "1", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1293,6 +1295,94 @@ static const char *hud_bar_get_value_cb(void *obj, S32 argc, const char **argv) 
     static char value[32];
     snprintf(value, sizeof(value), "%g", *(float *)((unsigned char *)obj + HUD_BAR_VALUE_OFFSET));
     return value;
+}
+
+/* ── ~w soundpack crash guard (security.safe_soundpacks) ──────────────────
+ * A chat message carrying "~w<path>" makes the client play <path> as a sound:
+ * scripts/client.cs hands <path> to the console functions alxGetWaveLen and
+ * alxCreateSource, which, for a name that is not a registered audio object,
+ * parse it as a WAV file through the Loki OpenAL loader. Pointing ~w at a file
+ * that exists but is not a WAV (a config, a .vl2, a shared library) makes the
+ * loader trust bogus RIFF/WAVE chunk sizes and crash the client with a signal
+ * (no Windows-style dialog, but just as forceful an exit). Any player, relayed
+ * by the server, or the server itself can send such a line.
+ *
+ * The hook overrides both console functions with wrappers that return the
+ * engine's own safe "0" when the argument names a loose file that is not a
+ * valid WAV, so the fragile parser never sees it. Registered sounds, files
+ * inside .vl2 volumes and real .wav soundpacks pass through to the original
+ * unchanged: the guard only ever blocks a file it positively opened and
+ * positively rejected, which could not have produced audio anyway, so it can
+ * never silence a legitimate sound. */
+#define ALX_GET_WAVE_LEN_CB   0x080CE9B4
+#define ALX_CREATE_SOURCE_CB  0x080CDD10
+static con_cb_t real_alx_get_wave_len, real_alx_create_source;
+
+/* 1 = a loose file that is definitely not a valid WAV, so block it; 0 = pass
+ * through (not a loose file at all — an object name, a volume entry or missing
+ * — or a well-formed WAV). */
+static int file_blocked_as_nonwav(const char *path) {
+    if (!path || !path[0]) return 0;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;                        /* not a loose file: pass through */
+    off_t size = lseek(fd, 0, SEEK_END);
+    unsigned char head[12];
+    int valid = 0;
+    if (size >= 44 && pread(fd, head, sizeof(head), 0) == (ssize_t)sizeof(head) &&
+        memcmp(head, "RIFF", 4) == 0 && memcmp(head + 8, "WAVE", 4) == 0) {
+        off_t off = 12;
+        int fmt_ok = 0, data_ok = 0;
+        for (int i = 0; i < 32 && off + 8 <= size; i++) {
+            unsigned char chunk[8];
+            if (pread(fd, chunk, 8, off) != 8) break;
+            uint32_t len = chunk[4] | chunk[5] << 8 | chunk[6] << 16 | (uint32_t)chunk[7] << 24;
+            if (memcmp(chunk, "fmt ", 4) == 0 && len >= 16) fmt_ok = 1;
+            if (memcmp(chunk, "data", 4) == 0) {   /* the audio bytes; must fit the file */
+                data_ok = (uint64_t)off + 8 + len <= (uint64_t)size;
+                break;
+            }
+            off += 8 + len + (len & 1);            /* RIFF chunks are word-aligned */
+        }
+        valid = fmt_ok && data_ok;
+    }
+    close(fd);
+    return !valid;                               /* opened but not a valid WAV: block */
+}
+
+static const char *alx_get_wave_len_safe_cb(void *obj, S32 argc, const char **argv) {
+    if (argc >= 2 && file_blocked_as_nonwav(argv[1])) return "0";
+    return real_alx_get_wave_len ? real_alx_get_wave_len(obj, argc, argv) : "0";
+}
+
+/* alxCreateSource(description, filename, [x y z]): argv[2] is the filename.
+ * The profile/position forms put an object name or a number there, which is
+ * not a loose file and passes through. */
+static const char *alx_create_source_safe_cb(void *obj, S32 argc, const char **argv) {
+    if (argc >= 3 && file_blocked_as_nonwav(argv[2])) return "0";
+    return real_alx_create_source ? real_alx_create_source(obj, argc, argv) : "0";
+}
+
+static int install_safe_soundpacks(void) {
+    int prot;
+    if (!(readable_range(ALX_GET_WAVE_LEN_CB, 3, &prot) && (prot & PROT_EXEC) &&
+          memcmp((void *)ALX_GET_WAVE_LEN_CB, "\x55\x89\xe5", 3) == 0 &&
+          readable_range(ALX_CREATE_SOURCE_CB, 3, &prot) && (prot & PROT_EXEC) &&
+          memcmp((void *)ALX_CREATE_SOURCE_CB, "\x55\x89\xe5", 3) == 0)) {
+        fprintf(stderr, "[t2_hook] Safe soundpacks refused: audio callback bytes mismatch\n");
+        return 0;
+    }
+    real_alx_get_wave_len = (con_cb_t)ALX_GET_WAVE_LEN_CB;
+    real_alx_create_source = (con_cb_t)ALX_CREATE_SOURCE_CB;
+    /* Re-register the global functions so script calls reach the wrappers; the
+     * arg counts match the engine's so normal calls still validate. The engine
+     * registers these at audio init, before this runs, so the override wins. */
+    Con__addMethodS(NULL, "alxGetWaveLen", alx_get_wave_len_safe_cb,
+        "alxGetWaveLen( profile|filename )", 2, 2);
+    Con__addMethodS(NULL, "alxCreateSource", alx_create_source_safe_cb,
+        "alxCreateSource( description, [filename], [x y z] )", 2, 6);
+    fprintf(stderr, "[t2_hook] Safe soundpacks: ~w chat sounds that are not valid WAV files are "
+            "blocked (memory only)\n");
+    return 1;
 }
 
 static int install_hud_bars(int store_value, int vertical_fill, int flip) {
@@ -3199,6 +3289,9 @@ static int register_hook_commands(void) {
     if (hud_bar_store_value)
         Con__addMethodS("HudBarBaseCtrl", "getValue", hud_bar_get_value_cb,
             "bar.getValue() - the bar's current fill, 0 to 1", 2, 2);
+    /* A safety override, not one of the optional hook_* commands. */
+    if (!target->dedicated && hook_option_bool("security.safe_soundpacks"))
+        install_safe_soundpacks();
     if (!hook_option_bool("hook.console_commands")) {
         registered = 1;  /* the console is ready; only the commands are skipped */
         fprintf(stderr, "[t2_hook] Console commands disabled by hook.console_commands\n");

@@ -694,6 +694,20 @@ options bring the parts of it that fit the Linux client:
   objects with "can't get/set the datablock of a client object!", and
   `setTargetId()` ignores them; with this on, client scripts can use all three
   on ghosts, as with the Windows `l33thax` patch.
+- **Safe soundpacks** (`security.safe_soundpacks`, on). A chat message carrying
+  `~w<file>` makes the client play `<file>` as a sound: `scripts/client.cs`
+  hands `<file>` to `alxGetWaveLen` and `alxCreateSource`, which parse it as a
+  WAV through the Loki OpenAL loader. A malicious player (relayed by the server)
+  or the server itself can point `~w` at a file that exists but is not a WAV — a
+  config, a `.vl2`, a shared library — and the loader trusts the bogus
+  RIFF/WAVE chunk sizes and crashes the client with a signal (Windows showed an
+  unhandled-exception dialog; Linux just exits). The hook overrides both console
+  functions so that when the name is a loose file that is not a valid WAV it
+  returns the engine's own safe `0` instead of letting the fragile parser see
+  it. This covers both the system-message and player-chat `~w` paths. Registered
+  sounds, files inside `.vl2` volumes and real `.wav` soundpacks pass through
+  unchanged; the guard only ever blocks a file that could not have produced
+  audio anyway, so it cannot silence a legitimate soundpack.
 - **Web links** (`browser.web_links`, on). Loki's `gotoWebPage()` formats
   `$LOKI_BROWSER` with the URL and runs it with `system()`, or searches for
   netscape and mozilla. Unless `LOKI_BROWSER` is already set, the hook sets it

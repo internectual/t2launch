@@ -75,6 +75,10 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(read(0x0825C995, 5), bytes.fromhex("74 11 83 c4 f4"))
         self.assertEqual(read(0x0825BB17, 5), bytes.fromhex("74 17 83 c4 f4"))
         self.assertEqual(read(0x0825BBE2, 6), bytes.fromhex("0f 85 db 00 00 00"))
+        # The alxGetWaveLen and alxCreateSource callbacks the safe-soundpacks
+        # wrappers pass through to; both start with the function prologue.
+        self.assertEqual(read(0x080CE9B4, 3), PROLOGUE)
+        self.assertEqual(read(0x080CDD10, 3), PROLOGUE)
 
     def test_server_auth_sites(self):
         read = reader(GAME / "tribes2d.dynamic")

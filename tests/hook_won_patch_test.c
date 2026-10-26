@@ -30,6 +30,14 @@ static int32_t call_target_offset(uintptr_t site) {
 /* A HUD bar's value function stand-in (vtable +0x118). */
 static float fake_value;
 static float fake_bar_value(void *control) { (void)control; return fake_value; }
+
+/* A stand-in for the engine's original alx* callback, to see pass-through. */
+static int soundpack_test_calls;
+static const char *fake_alx_original(void *obj, int argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    soundpack_test_calls++;
+    return "FAKE";
+}
 #define TEST_RSA_MODULUS "8302c77f71653bd46d53472094c45171bbb1b2dc8408bab25ea4b016be4da0869737ea99ca887a4869a09176c43e73eab974ccdbf9a25ab8ccbb86fa343720f600c6cd6be3a4599a2796868790a2051e15607d06b470ad281b57e66fde832e576a760fb757c8ea3f6c82ed0381caeddfcbb6a0e467fc253b1e86d3f50341ea95"
 #define TEST_RSA_PRIVATE "346782ffc6f54b21c55482d9d51b53c717e0adf1ce69e447590eacd5e5b8a69c3c7cc43d843697502a403a2f81b294c44a2eb857fd742449eb7e35fdae7c739506d703ccf3688366bd209480bc8e0a517d37ec89912132399cf3003298fef461bee2565b46084f4983a1f5accf6ead869d3d4c187b6ffa2f04c95250a26c130d"
 
@@ -293,6 +301,57 @@ int main(void) {
         assert(((unsigned char *)CLIENT_SET_DATABLOCK_CHECK)[0] == 0xeb);
         assert(memcmp((void *)CLIENT_SET_TARGET_CHECK, "\x90\x90\x90\x90\x90\x90", 6) == 0);
         munmap((void *)data_page, 2 * size);
+    }
+
+    /* Safe soundpacks: file_blocked_as_nonwav passes real WAVs and names that
+       are not loose files, and blocks existing non-WAV files; the wrappers
+       return "0" only when the file is blocked and otherwise call through. */
+    {
+        char tmpl[256];
+        const char *tdir = getenv("TMPDIR");
+        snprintf(tmpl, sizeof(tmpl), "%s/t2sp_XXXXXX", tdir && tdir[0] ? tdir : "/tmp");
+        int fd = mkstemp(tmpl);
+        assert(fd >= 0);
+        unsigned char wav[44] = {
+            'R','I','F','F', 36,0,0,0, 'W','A','V','E',
+            'f','m','t',' ', 16,0,0,0, 1,0, 1,0, 0x44,0xac,0,0, 0x88,0x58,1,0, 2,0, 16,0,
+            'd','a','t','a', 0,0,0,0};
+        assert(write(fd, wav, sizeof(wav)) == (ssize_t)sizeof(wav));
+        close(fd);
+        assert(file_blocked_as_nonwav(tmpl) == 0);         /* a valid WAV passes */
+
+        fd = open(tmpl, O_WRONLY | O_TRUNC); assert(fd >= 0);
+        wav[40] = 0xff; wav[41] = 0xff; wav[42] = 0xff; wav[43] = 0x7f;  /* data past EOF */
+        assert(write(fd, wav, sizeof(wav)) == (ssize_t)sizeof(wav));
+        close(fd);
+        assert(file_blocked_as_nonwav(tmpl) == 1);
+
+        fd = open(tmpl, O_WRONLY | O_TRUNC); assert(fd >= 0);
+        const char *junk = "#!/bin/sh\necho definitely not a wave file, just text\n";
+        assert(write(fd, junk, strlen(junk)) == (ssize_t)strlen(junk));  /* existing non-WAV */
+        close(fd);
+        assert(file_blocked_as_nonwav(tmpl) == 1);
+
+        assert(file_blocked_as_nonwav("AudioChat") == 0);      /* an object name, not a file */
+        assert(file_blocked_as_nonwav("no/such/file.wav") == 0);
+        assert(file_blocked_as_nonwav("") == 0);
+
+        soundpack_test_calls = 0;
+        real_alx_get_wave_len = fake_alx_original;
+        real_alx_create_source = fake_alx_original;
+        const char *len_block[] = {"alxGetWaveLen", tmpl};
+        assert(strcmp(alx_get_wave_len_safe_cb(NULL, 2, len_block), "0") == 0);
+        assert(soundpack_test_calls == 0);                     /* original never reached */
+        const char *len_pass[] = {"alxGetWaveLen", "AudioChat"};
+        assert(strcmp(alx_get_wave_len_safe_cb(NULL, 2, len_pass), "FAKE") == 0);
+        assert(soundpack_test_calls == 1);
+        const char *create_block[] = {"alxCreateSource", "AudioChat", tmpl};
+        assert(strcmp(alx_create_source_safe_cb(NULL, 3, create_block), "0") == 0);
+        const char *create_pass[] = {"alxCreateSource", "AudioChat", "AnAudioObject"};
+        assert(strcmp(alx_create_source_safe_cb(NULL, 3, create_pass), "FAKE") == 0);
+        assert(soundpack_test_calls == 2);
+        real_alx_get_wave_len = real_alx_create_source = NULL;
+        unlink(tmpl);
     }
 
     /* Network packet limits: twelve sites over two pages, all or nothing, at
