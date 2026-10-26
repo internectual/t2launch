@@ -345,8 +345,9 @@ if result.returncode == 0:
     T2_SDL_HEAD_LOG=$SDL_FULLSCREEN_HEAD
     unset SDL_FULLSCREEN_HEAD XRANDR_HEAD
 fi
-# SDL 1.2 disables XRandR enumeration by default. Enable it so the hook can
-# query real host modes for both windowed listings and fullscreen selection.
+# SDL 1.2 disables XRandR enumeration by default. Enable it so the game (and
+# the hook's mode list) see the display's real modes up to native, not the
+# built-in 4:3 fallback list.
 GAME_ENV+=(SDL_VIDEO_X11_XRANDR=1)
 GAME_ENV+=("T2LAUNCH_MONITOR_NAME=$T2LAUNCH_MONITOR"
           "T2LAUNCH_FORCE_FULLSCREEN=$GAME_FULLSCREEN_REQUESTED"
@@ -494,6 +495,44 @@ launch_game() {
         fi
         # gamescope sizes and places the game's window itself.
         GAME_ENV+=(USE_GAME_WINDOW_RESIZE=0)
+        # Option A (gamescope on): the game renders fullscreen at the gamescope
+        # size and gamescope upscales that to fill the monitor. Pick the render
+        # size from the gamescope Game width/height, or, when those are 0, from
+        # the game's own $pref::Video::resolution (so it follows game settings).
+        # Then write that resolution and fullscreen back to the prefs the game
+        # owns, so it boots fullscreen at exactly the gamescope size and fills
+        # it (no in-game resolution hunting, no centered-with-bars). ClientPrefs
+        # is user state the game rewrites every run; only these two prefs change.
+        _prefs="$HOME/.loki/${GAME_NAME:-tribes2}/base/prefs/ClientPrefs.cs"
+        _gw="${T2LAUNCH_GAMESCOPE_WIDTH:-0}"; _gh="${T2LAUNCH_GAMESCOPE_HEIGHT:-0}"
+        if [[ "$_gw" == "0" && "$_gh" == "0" && -f "$_prefs" ]]; then
+            _res=$(sed -n 's/.*\$pref::Video::resolution[^"]*"\([0-9][0-9]*\)[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1 \2/p' "$_prefs" | head -1)
+            if [[ "$_res" =~ ^[0-9]+\ [0-9]+$ ]]; then _gw="${_res% *}"; _gh="${_res#* }"; fi
+        fi
+        if [[ "$_gw" =~ ^[0-9]+$ && "$_gh" =~ ^[0-9]+$ && "$_gw" -gt 0 && "$_gh" -gt 0 ]]; then
+            export T2LAUNCH_GAMESCOPE_WIDTH="$_gw" T2LAUNCH_GAMESCOPE_HEIGHT="$_gh"
+            if [[ -f "$_prefs" ]] && command -v python3 >/dev/null 2>&1; then
+                python3 -I - "$_prefs" "$_gw" "$_gh" <<'PY' || true
+import re, sys
+path, w, h = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    text = open(path).read()
+except OSError:
+    sys.exit(0)
+def set_pref(text, name, value):
+    line = '$pref::%s = "%s";' % (name, value)
+    pattern = re.compile(r'(?m)^\$pref::' + re.escape(name) + r'\s*=.*$')
+    if pattern.search(text):
+        return pattern.sub(lambda _m: line, text, count=1)
+    return text + ('' if text.endswith('\n') else '\n') + line + '\n'
+text = set_pref(text, 'Video::resolution', '%s %s 32' % (w, h))
+text = set_pref(text, 'Video::fullScreen', '1')
+open(path, 'w').write(text)
+PY
+            fi
+            echo "[t2launch] gamescope renders the game fullscreen at ${_gw}x${_gh}, upscaled to the monitor"
+        fi
+        unset _prefs _res _gw _gh
         echo "[t2launch] Running inside gamescope (filter=${T2LAUNCH_GAMESCOPE_FILTER:-linear})"
     fi
     if [[ "$EXECUTABLE" == "dedicated" ]]; then

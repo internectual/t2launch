@@ -786,8 +786,19 @@ options bring the parts of it that fit the Linux client:
   `nis`, ...), fullscreen, and relative mouse mode. gamescope itself runs
   without the game's `LD_*` settings, and `window_resize.sh` is skipped.
   Rendering the game below the output size and upscaling it is the Linux
-  stand-in for the update's UI scaling; keep the game windowed at the game
-  size.
+  stand-in for the update's UI scaling (a larger HUD on a high-DPI screen).
+  When no gamescope render size is set, `run-game` reads the game's own
+  `$pref::Video::resolution` and renders at that; either way it writes that
+  resolution and `$pref::Video::fullScreen = 1` back to `ClientPrefs.cs` (user
+  state the game rewrites anyway) so the game boots fullscreen at exactly the
+  gamescope size and gamescope upscales it to fill the monitor — no in-game
+  resolution picking and no centered-with-bars. **On Wayland this is the only
+  way to upscale a sub-native resolution to fill the screen:** XWayland apps
+  can't switch the physical monitor mode, so a classic alt+enter mode switch
+  (what fills a low resolution to the whole panel on Xorg) does not work, and
+  KWin centers an X11 fullscreen rather than scaling it. gamescope is always
+  fullscreen, so it is not a windowed/fullscreen toggle; for that, and for a
+  real mode switch, use an Xorg session.
 - **Missing map files** (`net.depot_downloads`, off). When a server's map
   uses an interior, shape, or terrain the client lacks, the game disconnects
   with "Unable to load interior: X", "Unable to load shape: X", or "You are
