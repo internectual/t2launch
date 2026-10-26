@@ -213,16 +213,16 @@ OPTIONS = (
     Option("ui.no_fog", "Interface", "Disable distance fog", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Drop glEnable(GL_FOG) so the engine's OpenGL distance fog is never applied, the "
-                "Linux equivalent of the Windows T2NoFog patch. Many servers consider this a cheat."),
+                "Linux equivalent of the Windows T2NoFog patch."),
     Option("ui.visible_distance", "Interface", "Unlock visible distance past 1.0", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="The game clamps $pref::visibleDistanceMod to at most 1.0; this removes the cap so a "
                 "larger value (set it in the console, e.g. $pref::visibleDistanceMod = 2;) renders "
-                "terrain farther, as the Windows visdist patch did. Many servers consider this a cheat."),
+                "terrain farther, as the Windows visdist patch did."),
     Option("ui.no_whiteout", "Interface", "Disable flash whiteout", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Drop the white flash (concussion grenades and the like) the server sends for your "
-                "player, as HappyMod 2's no-whiteout did. Many servers consider this a cheat."),
+                "player, as HappyMod 2's no-whiteout did."),
     Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="setFov() normally clamps the field of view to 1-179 degrees; allow 0-360."),

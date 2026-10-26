@@ -700,8 +700,7 @@ options bring the parts of it that fit the Linux client:
   functions through `SDL_GL_GetProcAddress` (which the hook already wraps), the
   hook returns a `glEnable` that drops `GL_FOG` and passes every other
   capability through, so fog is never applied — no engine code patched. This is
-  the Linux equivalent of the Windows `T2NoFog` patch. Many servers consider
-  removing fog a cheat.
+  the Linux equivalent of the Windows `T2NoFog` patch.
 - **Unlock visible distance** (`ui.visible_distance`, off). The game clamps
   `$pref::visibleDistanceMod` to the range 0.5–1.0 in a small clamp routine; the
   upper branch (`0x081DC7F2`, taken only when the value exceeds 1.0) forces it
@@ -709,7 +708,7 @@ options bring the parts of it that fit the Linux client:
   the console (`$pref::visibleDistanceMod = 2;`) to render terrain farther. The
   clamp writes back to the pref, so every reader picks up the larger value, and
   the 0.5 lower bound is kept. This is the Linux equivalent of PenguinOfDoom's
-  Windows `visdist` patch. Many servers consider this a cheat.
+  Windows `visdist` patch.
 - **Disable flash whiteout** (`ui.no_whiteout`, off). `GameConnection::readPacket`
   stores the white flash the server sends for your player (concussion grenades
   and the like) as `readFloat(7) * 1.5` at `+0x844c`, the same offset as on
@@ -717,7 +716,7 @@ options bring the parts of it that fit the Linux client:
   received flash is always 0; the bits are still read, so the stream stays in
   sync. Only your client changes: a listen server you host still sends real
   flash values to other players. This is the Linux equivalent of HappyMod 2's
-  "no whiteout". Many servers consider this a cheat.
+  "no whiteout".
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.
