@@ -135,6 +135,7 @@ static struct hook_option hook_options[] = {
     {"ui.vertical_fill", "1", NULL, 0, "", 0},
     {"ui.bar_flip", "1", NULL, 0, "", 0},
     {"ui.observer_iff", "0", NULL, 0, "", 0},
+    {"ui.lan_join_anywhere", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -1452,6 +1453,26 @@ static int install_observer_iff(void) {
                                      sizeof(observer_iff_original), 0, jump, sizeof(jump)};
     if (!apply_code_patches("Observer IFF", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] Observers see IFF markers (memory only)\n");
+    return 1;
+}
+
+/* The client refuses to connect to a server flagged LAN when the server's
+   address is not in one of the client's own class-B subnets ("Cannot join a
+   LAN server with no matching Class B IP address"). After the interface-match
+   loop, a "no match" flag at -0x26b9(%ebp) is still set and the error path
+   runs; the success path is at 0x08237190. Make the post-loop branch
+   unconditional so the join always succeeds, as the Windows t2classbpatch did
+   for tribes2.exe. Client only. */
+#define LAN_JOIN_CHECK_ADDRESS 0x082370CE
+static const unsigned char lan_join_check_original[] = {0x0f, 0x84, 0xbc, 0x00, 0x00, 0x00};
+
+static int install_lan_join_anywhere(void) {
+    /* je 0x08237190 (0f 84 bc 00 00 00) -> jmp 0x08237190 (e9 bd 00 00 00) + nop */
+    static const unsigned char jump[] = {0xe9, 0xbd, 0x00, 0x00, 0x00, 0x90};
+    const struct code_patch patch = {LAN_JOIN_CHECK_ADDRESS, lan_join_check_original,
+                                     sizeof(lan_join_check_original), 0, jump, sizeof(jump)};
+    if (!apply_code_patches("LAN join", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] Connect to LAN servers outside the local subnet (memory only)\n");
     return 1;
 }
 
@@ -3447,6 +3468,7 @@ static void __attribute__((constructor)) init(void) {
         install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"),
                          hook_option_bool("ui.bar_flip"));
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
+    if (hook_option_bool("ui.lan_join_anywhere")) install_lan_join_anywhere();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))

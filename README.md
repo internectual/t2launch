@@ -686,6 +686,14 @@ options bring the parts of it that fit the Linux client:
 - **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
   while the control object is an observer camera; the hook skips that check
   (`0x081936BF`), as the Windows `l33thax` patch did.
+- **Join LAN servers outside your subnet** (`ui.lan_join_anywhere`, off). When
+  connecting to a server flagged LAN, the client matches the server's first two
+  address octets against its own interfaces and, on no match, refuses with
+  "Cannot join a LAN server with no matching Class B IP address". The hook makes
+  the post-check branch (`0x082370CE`) unconditional so the join always
+  proceeds, the Linux equivalent of PenguinOfDoom's Windows `t2classbpatch`.
+  Client-side; the dedicated server's own LAN restriction is handled separately
+  by `server.tribesnext_auth`.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.

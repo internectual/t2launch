@@ -272,6 +272,26 @@ int main(void) {
         assert(memcmp((void *)OBSERVER_IFF_ADDRESS, "\xeb\x4e\x8b\x88", 4) == 0);
         munmap(iff, size);
 
+        /* LAN class-B join: the je becomes a jmp to the same target plus a nop;
+           refused if the branch opcode is not the expected je. */
+        uintptr_t lan_page = LAN_JOIN_CHECK_ADDRESS & ~((uintptr_t)size - 1);
+        unsigned char *lan = mmap((void *)lan_page, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(lan == (void *)lan_page);
+        unsigned char *lan_site = (unsigned char *)LAN_JOIN_CHECK_ADDRESS;
+        memcpy(lan_site, lan_join_check_original, sizeof(lan_join_check_original));
+        lan_site[1] = 0x85;  /* jne instead of je -> refuse */
+        assert(mprotect(lan, size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_lan_join_anywhere());
+        assert(mprotect(lan, size, PROT_READ | PROT_WRITE) == 0);
+        lan_site[1] = 0x84;
+        assert(mprotect(lan, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_lan_join_anywhere());
+        assert(memcmp(lan_site, "\xe9\xbd\x00\x00\x00\x90", 6) == 0);
+        int32_t lan_rel; memcpy(&lan_rel, lan_site + 1, 4);  /* jmp keeps the je's target */
+        assert(LAN_JOIN_CHECK_ADDRESS + 5 + lan_rel == LAN_JOIN_CHECK_ADDRESS + 6 + 0xbc);
+        munmap(lan, size);
+
         /* setFov's limits: the max load points at 360.0, fld1 becomes fldz. */
         uintptr_t fov_page = FOV_MAX_LOAD & ~((uintptr_t)size - 1);
         unsigned char *fov = mmap((void *)fov_page, size, PROT_READ | PROT_WRITE,
