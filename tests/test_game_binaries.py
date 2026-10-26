@@ -67,6 +67,14 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(stretch[-12:], bytes.fromhex("83 f8 01 75 07 c7 45 f8 02 00 00 00"))
         # The observer IFF camera check: je after dynamic_cast<Camera>.
         self.assertEqual(read(0x081936BF, 8), bytes.fromhex("74 4e 8b 88 bc 08 00 00"))
+        # setFov's 179-degree maximum and fld1 minimum.
+        self.assertEqual(read(0x08234171, 6), bytes.fromhex("d9 05 28 20 45 08"))
+        self.assertEqual(struct.unpack("<f", read(0x08452028, 4))[0], 179.0)
+        self.assertEqual(read(0x08234186, 4), bytes.fromhex("d9 e8 d8 d1"))
+        # getDataBlock, setDataBlock and setTargetId client-object checks.
+        self.assertEqual(read(0x0825C995, 5), bytes.fromhex("74 11 83 c4 f4"))
+        self.assertEqual(read(0x0825BB17, 5), bytes.fromhex("74 17 83 c4 f4"))
+        self.assertEqual(read(0x0825BBE2, 6), bytes.fromhex("0f 85 db 00 00 00"))
 
     def test_server_auth_sites(self):
         read = reader(GAME / "tribes2d.dynamic")

@@ -673,6 +673,14 @@ options bring the parts of it that fit the Linux client:
 - **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
   while the control object is an observer camera; the hook skips that check
   (`0x081936BF`), as the Windows `l33thax` patch did.
+- **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
+  1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
+  allowed.
+- **Datablock access on client objects** (`ui.client_datablocks`, off,
+  advanced). `getDataBlock()` and `setDataBlock()` refuse client (ghost)
+  objects with "can't get/set the datablock of a client object!", and
+  `setTargetId()` ignores them; with this on, client scripts can use all three
+  on ghosts, as with the Windows `l33thax` patch.
 - **Web links** (`browser.web_links`, on). Loki's `gotoWebPage()` formats
   `$LOKI_BROWSER` with the URL and runs it with `system()`, or searches for
   netscape and mozilla. Unless `LOKI_BROWSER` is already set, the hook sets it

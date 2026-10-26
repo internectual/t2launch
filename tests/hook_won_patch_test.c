@@ -229,6 +229,36 @@ int main(void) {
         assert(install_observer_iff());
         assert(memcmp((void *)OBSERVER_IFF_ADDRESS, "\xeb\x4e\x8b\x88", 4) == 0);
         munmap(iff, size);
+
+        /* setFov's limits: the max load points at 360.0, fld1 becomes fldz. */
+        uintptr_t fov_page = FOV_MAX_LOAD & ~((uintptr_t)size - 1);
+        unsigned char *fov = mmap((void *)fov_page, size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(fov == (void *)fov_page);
+        memcpy((void *)FOV_MAX_LOAD, fov_max_load_original, sizeof(fov_max_load_original));
+        memcpy((void *)FOV_MIN_LOAD, fov_min_load_original, sizeof(fov_min_load_original));
+        assert(mprotect(fov, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_fov_range());
+        uint32_t max_address;
+        memcpy(&max_address, (void *)(FOV_MAX_LOAD + 2), 4);
+        assert(*(const float *)(uintptr_t)max_address == 360.0f);
+        assert(memcmp((void *)FOV_MIN_LOAD, "\xd9\xee\xd8\xd1", 4) == 0);
+        munmap(fov, size);
+
+        /* Client datablocks: two je become jmp, the jne becomes nops. */
+        uintptr_t data_page = CLIENT_SET_DATABLOCK_CHECK & ~((uintptr_t)size - 1);
+        assert(mmap((void *)data_page, 2 * size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == (void *)data_page);
+        assert(CLIENT_GET_DATABLOCK_CHECK + 5 <= data_page + 2 * (uintptr_t)size);
+        memcpy((void *)CLIENT_GET_DATABLOCK_CHECK, client_get_datablock_original, 5);
+        memcpy((void *)CLIENT_SET_DATABLOCK_CHECK, client_set_datablock_original, 5);
+        memcpy((void *)CLIENT_SET_TARGET_CHECK, client_set_target_original, 6);
+        assert(mprotect((void *)data_page, 2 * size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_client_datablocks());
+        assert(((unsigned char *)CLIENT_GET_DATABLOCK_CHECK)[0] == 0xeb);
+        assert(((unsigned char *)CLIENT_SET_DATABLOCK_CHECK)[0] == 0xeb);
+        assert(memcmp((void *)CLIENT_SET_TARGET_CHECK, "\x90\x90\x90\x90\x90\x90", 6) == 0);
+        munmap((void *)data_page, 2 * size);
     }
 
     /* Network packet limits: twelve sites over two pages, all or nothing, at

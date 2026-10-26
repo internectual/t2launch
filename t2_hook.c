@@ -134,6 +134,8 @@ static struct hook_option hook_options[] = {
     {"ui.hud_get_value", "1", NULL, 0, "", 0},
     {"ui.vertical_fill", "1", NULL, 0, "", 0},
     {"ui.observer_iff", "0", NULL, 0, "", 0},
+    {"ui.fov_range", "0", NULL, 0, "", 0},
+    {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
 };
@@ -1301,6 +1303,57 @@ static int install_observer_iff(void) {
                                      sizeof(observer_iff_original), 0, jump, sizeof(jump)};
     if (!apply_code_patches("Observer IFF", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] Observers see IFF markers (memory only)\n");
+    return 1;
+}
+
+/* setFov() (0x0823415C) clamps the field of view to 1-179 degrees: a load
+   of 179.0 at 0x08452028, then fld1. Load 360.0 from here and 0.0 (fldz)
+   instead, as the Windows l33thax patch did. */
+#define FOV_MAX_LOAD 0x08234171
+#define FOV_MIN_LOAD 0x08234186
+static const unsigned char fov_max_load_original[] = {0xd9, 0x05, 0x28, 0x20, 0x45, 0x08};
+static const unsigned char fov_min_load_original[] = {0xd9, 0xe8, 0xd8, 0xd1};  /* fld1; fcom st(1) */
+static const float fov_range_max = 360.0f;
+
+static int install_fov_range(void) {
+    unsigned char max_load[6] = {0xd9, 0x05};
+    uint32_t address = (uint32_t)(uintptr_t)&fov_range_max;
+    memcpy(max_load + 2, &address, sizeof(address));
+    static const unsigned char fldz[] = {0xd9, 0xee};
+    const struct code_patch patches[] = {
+        {FOV_MAX_LOAD, fov_max_load_original, sizeof(fov_max_load_original), 0, max_load, sizeof(max_load)},
+        {FOV_MIN_LOAD, fov_min_load_original, sizeof(fov_min_load_original), 0, fldz, sizeof(fldz)},
+    };
+    if (!apply_code_patches("FOV range", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
+    fprintf(stderr, "[t2_hook] setFov() accepts 0-360 degrees (memory only)\n");
+    return 1;
+}
+
+/* GameBase refuses getDataBlock() and setDataBlock() on client (ghost)
+   objects with an error, and setTargetId() returns silently; let all three
+   act on client objects, as the Windows l33thax patch did. Each check tests
+   the client-object flag (byte +0x40, bit 2). */
+#define CLIENT_GET_DATABLOCK_CHECK 0x0825C995  /* je past the error */
+#define CLIENT_SET_DATABLOCK_CHECK 0x0825BB17  /* je past the error */
+#define CLIENT_SET_TARGET_CHECK    0x0825BBE2  /* jne to the return */
+static const unsigned char client_get_datablock_original[] = {0x74, 0x11, 0x83, 0xc4, 0xf4};
+static const unsigned char client_set_datablock_original[] = {0x74, 0x17, 0x83, 0xc4, 0xf4};
+static const unsigned char client_set_target_original[] = {0x0f, 0x85, 0xdb, 0x00, 0x00, 0x00};
+
+static int install_client_datablocks(void) {
+    static const unsigned char jump[] = {0xeb};
+    static const unsigned char nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    const struct code_patch patches[] = {
+        {CLIENT_GET_DATABLOCK_CHECK, client_get_datablock_original, sizeof(client_get_datablock_original),
+         0, jump, sizeof(jump)},
+        {CLIENT_SET_DATABLOCK_CHECK, client_set_datablock_original, sizeof(client_set_datablock_original),
+         0, jump, sizeof(jump)},
+        {CLIENT_SET_TARGET_CHECK, client_set_target_original, sizeof(client_set_target_original),
+         0, nops, sizeof(nops)},
+    };
+    if (!apply_code_patches("Client datablock", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
+    fprintf(stderr, "[t2_hook] getDataBlock(), setDataBlock() and setTargetId() work on client objects "
+            "(memory only)\n");
     return 1;
 }
 
@@ -3237,6 +3290,8 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill"))
         install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"));
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
+    if (hook_option_bool("ui.fov_range")) install_fov_range();
+    if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))
         install_native_auth();
     /* SDL reads this when it creates the window; a borderless window has no

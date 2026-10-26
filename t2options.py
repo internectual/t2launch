@@ -181,6 +181,13 @@ OPTIONS = (
     Option("ui.observer_iff", "Interface", "Observers see IFF markers", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="Show the IFF markers over players while observing in camera mode."),
+    Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="setFov() normally clamps the field of view to 1-179 degrees; allow 0-360."),
+    Option("ui.client_datablocks", "Interface", "Datablock access on client objects", "bool", False,
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Let client scripts call getDataBlock(), setDataBlock() and setTargetId() on "
+                "ghosted (client) objects, which the game refuses."),
     # Network
     Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
@@ -292,7 +299,7 @@ CLIENT_ONLY = frozenset((
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill",
-    "ui.observer_iff",
+    "ui.observer_iff", "ui.fov_range", "ui.client_datablocks",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)
