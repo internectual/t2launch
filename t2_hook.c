@@ -141,6 +141,7 @@ static struct hook_option hook_options[] = {
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
     {"security.safe_soundpacks", "1", NULL, 0, "", 0},
+    {"security.max_soundpack_kbytes", "8192", NULL, 0, "", 0},
 };
 #define HOOK_OPTION_COUNT (sizeof(hook_options) / sizeof(hook_options[0]))
 #define HOOK_EXTRA_OPTION_LIMIT 64
@@ -1317,6 +1318,10 @@ static const char *hud_bar_get_value_cb(void *obj, S32 argc, const char **argv) 
 #define ALX_GET_WAVE_LEN_CB   0x080CE9B4
 #define ALX_CREATE_SOURCE_CB  0x080CDD10
 static con_cb_t real_alx_get_wave_len, real_alx_create_source;
+/* A loose ~w file larger than this is blocked before it is parsed, so a valid
+ * but enormous WAV cannot be used to stall or exhaust memory; 0 = no cap. The
+ * engine's own $MaxMessageWavLength still caps playback duration. */
+static off_t soundpack_max_bytes;
 
 /* 1 = a loose file that is definitely not a valid WAV, so block it; 0 = pass
  * through (not a loose file at all — an object name, a volume entry or missing
@@ -1326,6 +1331,10 @@ static int file_blocked_as_nonwav(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return 0;                        /* not a loose file: pass through */
     off_t size = lseek(fd, 0, SEEK_END);
+    if (soundpack_max_bytes > 0 && size > soundpack_max_bytes) {
+        close(fd);                               /* valid or not, too big to load */
+        return 1;
+    }
     unsigned char head[12];
     int valid = 0;
     if (size >= 44 && pread(fd, head, sizeof(head), 0) == (ssize_t)sizeof(head) &&
@@ -1373,6 +1382,8 @@ static int install_safe_soundpacks(void) {
     }
     real_alx_get_wave_len = (con_cb_t)ALX_GET_WAVE_LEN_CB;
     real_alx_create_source = (con_cb_t)ALX_CREATE_SOURCE_CB;
+    long kbytes = strtol(hook_option_str("security.max_soundpack_kbytes"), NULL, 10);
+    soundpack_max_bytes = kbytes > 0 ? (off_t)kbytes * 1024 : 0;
     /* Re-register the global functions so script calls reach the wrappers; the
      * arg counts match the engine's so normal calls still validate. The engine
      * registers these at audio init, before this runs, so the override wins. */
@@ -1380,8 +1391,12 @@ static int install_safe_soundpacks(void) {
         "alxGetWaveLen( profile|filename )", 2, 2);
     Con__addMethodS(NULL, "alxCreateSource", alx_create_source_safe_cb,
         "alxCreateSource( description, [filename], [x y z] )", 2, 6);
-    fprintf(stderr, "[t2_hook] Safe soundpacks: ~w chat sounds that are not valid WAV files are "
-            "blocked (memory only)\n");
+    if (soundpack_max_bytes > 0)
+        fprintf(stderr, "[t2_hook] Safe soundpacks: ~w chat sounds that are not valid WAV files, or "
+                "larger than %ld KiB, are blocked (memory only)\n", kbytes);
+    else
+        fprintf(stderr, "[t2_hook] Safe soundpacks: ~w chat sounds that are not valid WAV files are "
+                "blocked, no size cap (memory only)\n");
     return 1;
 }
 

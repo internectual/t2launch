@@ -318,7 +318,16 @@ int main(void) {
             'd','a','t','a', 0,0,0,0};
         assert(write(fd, wav, sizeof(wav)) == (ssize_t)sizeof(wav));
         close(fd);
+        soundpack_max_bytes = 0;
         assert(file_blocked_as_nonwav(tmpl) == 0);         /* a valid WAV passes */
+
+        /* The byte ceiling blocks even a valid WAV that is too big, and only
+           when a cap is set. */
+        soundpack_max_bytes = 16;
+        assert(file_blocked_as_nonwav(tmpl) == 1);         /* 44 bytes > 16 */
+        soundpack_max_bytes = 44;
+        assert(file_blocked_as_nonwav(tmpl) == 0);         /* exactly at the cap passes */
+        soundpack_max_bytes = 0;
 
         fd = open(tmpl, O_WRONLY | O_TRUNC); assert(fd >= 0);
         wav[40] = 0xff; wav[41] = 0xff; wav[42] = 0xff; wav[43] = 0x7f;  /* data past EOF */

@@ -201,6 +201,12 @@ OPTIONS = (
                 "can point it at a file that exists but is not a WAV (a config, a .vl2, a library), "
                 "which the audio loader mis-parses and crashes the client. This blocks any ~w sound "
                 "that is not a valid WAV; real soundpacks still play."),
+    Option("security.max_soundpack_kbytes", "Security", "Largest ~w sound to load (KiB, 0 = no cap)",
+           "int", 8192, hook=True, minimum=0,
+           requires=(("launcher.load_hook", (True,)), ("security.safe_soundpacks", (True,))),
+           help="Also refuse a ~w sound whose file is larger than this many KiB before it is loaded, "
+                "so a valid but enormous WAV can't be used to stall or exhaust memory. The game's own "
+                "duration limit still applies. 8192 KiB is far above any real soundpack clip."),
     # Network
     Option("net.packet_limits", "Network", "Allow 64 packets/s and 1000-byte packets", "bool", True,
            hook=True, requires=(("launcher.load_hook", (True,)),),
@@ -313,6 +319,7 @@ CLIENT_ONLY = frozenset((
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "security.safe_soundpacks",
+    "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)

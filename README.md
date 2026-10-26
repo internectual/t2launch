@@ -708,6 +708,11 @@ options bring the parts of it that fit the Linux client:
   sounds, files inside `.vl2` volumes and real `.wav` soundpacks pass through
   unchanged; the guard only ever blocks a file that could not have produced
   audio anyway, so it cannot silence a legitimate soundpack.
+  `security.max_soundpack_kbytes` (8192 KiB by default, `0` disables) adds a
+  size ceiling: a `~w` file larger than that is refused before it is loaded, so
+  a valid but enormous WAV cannot be used to stall the client or exhaust memory
+  even though it would pass the game's own `$MaxMessageWavLength` duration cap.
+  The ceiling is far above any real soundpack clip.
 - **Web links** (`browser.web_links`, on). Loki's `gotoWebPage()` formats
   `$LOKI_BROWSER` with the URL and runs it with `system()`, or searches for
   netscape and mozilla. Unless `LOKI_BROWSER` is already set, the hook sets it
