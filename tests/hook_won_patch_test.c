@@ -31,12 +31,12 @@ static int32_t call_target_offset(uintptr_t site) {
 static float fake_value;
 static float fake_bar_value(void *control) { (void)control; return fake_value; }
 
-/* A stand-in for the engine's original alx* callback, to see pass-through. */
+/* A stand-in for the engine's original alx* int callback, to see pass-through. */
 static int soundpack_test_calls;
-static const char *fake_alx_original(void *obj, int argc, const char **argv) {
+static int fake_alx_original(void *obj, int argc, const char **argv) {
     (void)obj; (void)argc; (void)argv;
     soundpack_test_calls++;
-    return "FAKE";
+    return 1060;
 }
 #define TEST_RSA_MODULUS "8302c77f71653bd46d53472094c45171bbb1b2dc8408bab25ea4b016be4da0869737ea99ca887a4869a09176c43e73eab974ccdbf9a25ab8ccbb86fa343720f600c6cd6be3a4599a2796868790a2051e15607d06b470ad281b57e66fde832e576a760fb757c8ea3f6c82ed0381caeddfcbb6a0e467fc253b1e86d3f50341ea95"
 #define TEST_RSA_PRIVATE "346782ffc6f54b21c55482d9d51b53c717e0adf1ce69e447590eacd5e5b8a69c3c7cc43d843697502a403a2f81b294c44a2eb857fd742449eb7e35fdae7c739506d703ccf3688366bd209480bc8e0a517d37ec89912132399cf3003298fef461bee2565b46084f4983a1f5accf6ead869d3d4c187b6ffa2f04c95250a26c130d"
@@ -352,12 +352,14 @@ int main(void) {
         assert(strcmp(alx_get_wave_len_safe_cb(NULL, 2, len_block), "0") == 0);
         assert(soundpack_test_calls == 0);                     /* original never reached */
         const char *len_pass[] = {"alxGetWaveLen", "AudioChat"};
-        assert(strcmp(alx_get_wave_len_safe_cb(NULL, 2, len_pass), "FAKE") == 0);
+        /* Pass-through returns the int result formatted as a string, not the
+           raw int treated as a pointer (the bug that crashed the client). */
+        assert(strcmp(alx_get_wave_len_safe_cb(NULL, 2, len_pass), "1060") == 0);
         assert(soundpack_test_calls == 1);
         const char *create_block[] = {"alxCreateSource", "AudioChat", tmpl};
         assert(strcmp(alx_create_source_safe_cb(NULL, 3, create_block), "0") == 0);
         const char *create_pass[] = {"alxCreateSource", "AudioChat", "AnAudioObject"};
-        assert(strcmp(alx_create_source_safe_cb(NULL, 3, create_pass), "FAKE") == 0);
+        assert(strcmp(alx_create_source_safe_cb(NULL, 3, create_pass), "1060") == 0);
         assert(soundpack_test_calls == 2);
         real_alx_get_wave_len = real_alx_create_source = NULL;
         unlink(tmpl);

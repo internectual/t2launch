@@ -18,7 +18,6 @@
 
 typedef int S32;
 
-typedef const char *(*con_cb_t)(void *obj, S32 argc, const char **argv);
 typedef void (*con_addMethodS_t)(const char *nsName, const char *name,
     const char *(*cb)(void *obj, S32 argc, const char **argv),
     const char *usage, S32 minArgs, S32 maxArgs);
@@ -1317,7 +1316,10 @@ static const char *hud_bar_get_value_cb(void *obj, S32 argc, const char **argv) 
  * never silence a legitimate sound. */
 #define ALX_GET_WAVE_LEN_CB   0x080CE9B4
 #define ALX_CREATE_SOURCE_CB  0x080CDD10
-static con_cb_t real_alx_get_wave_len, real_alx_create_source;
+/* Both are int console functions (a length in ms, an audio handle), not string
+ * ones, so the originals return S32 and the wrappers format the result. */
+typedef S32 (*alx_int_cb_t)(void *obj, S32 argc, const char **argv);
+static alx_int_cb_t real_alx_get_wave_len, real_alx_create_source;
 /* A loose ~w file larger than this is blocked before it is parsed, so a valid
  * but enormous WAV cannot be used to stall or exhaust memory; 0 = no cap. The
  * engine's own $MaxMessageWavLength still caps playback duration. */
@@ -1359,16 +1361,22 @@ static int file_blocked_as_nonwav(const char *path) {
 }
 
 static const char *alx_get_wave_len_safe_cb(void *obj, S32 argc, const char **argv) {
+    static char result[16];
     if (argc >= 2 && file_blocked_as_nonwav(argv[1])) return "0";
-    return real_alx_get_wave_len ? real_alx_get_wave_len(obj, argc, argv) : "0";
+    snprintf(result, sizeof(result), "%d",
+             real_alx_get_wave_len ? real_alx_get_wave_len(obj, argc, argv) : 0);
+    return result;
 }
 
 /* alxCreateSource(description, filename, [x y z]): argv[2] is the filename.
  * The profile/position forms put an object name or a number there, which is
  * not a loose file and passes through. */
 static const char *alx_create_source_safe_cb(void *obj, S32 argc, const char **argv) {
+    static char result[16];
     if (argc >= 3 && file_blocked_as_nonwav(argv[2])) return "0";
-    return real_alx_create_source ? real_alx_create_source(obj, argc, argv) : "0";
+    snprintf(result, sizeof(result), "%d",
+             real_alx_create_source ? real_alx_create_source(obj, argc, argv) : 0);
+    return result;
 }
 
 static int install_safe_soundpacks(void) {
@@ -1380,8 +1388,8 @@ static int install_safe_soundpacks(void) {
         fprintf(stderr, "[t2_hook] Safe soundpacks refused: audio callback bytes mismatch\n");
         return 0;
     }
-    real_alx_get_wave_len = (con_cb_t)ALX_GET_WAVE_LEN_CB;
-    real_alx_create_source = (con_cb_t)ALX_CREATE_SOURCE_CB;
+    real_alx_get_wave_len = (alx_int_cb_t)ALX_GET_WAVE_LEN_CB;
+    real_alx_create_source = (alx_int_cb_t)ALX_CREATE_SOURCE_CB;
     long kbytes = strtol(hook_option_str("security.max_soundpack_kbytes"), NULL, 10);
     soundpack_max_bytes = kbytes > 0 ? (off_t)kbytes * 1024 : 0;
     /* Re-register the global functions so script calls reach the wrappers; the
