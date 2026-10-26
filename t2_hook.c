@@ -3055,7 +3055,104 @@ int usleep(useconds_t microseconds) {
 }
 
 /* Observe SDL 1.2 mode changes without replacing its return surface or flags. */
+/* ── Windowed position across fullscreen toggles ─────────────────────────
+ * SDL 1.2.11 (the bundled one) re-maps its windowed window after a
+ * fullscreen without remembering where it was, so the window manager places
+ * it, which on a multi-monitor desktop can be another monitor. Remember the
+ * window's frame position when leaving windowed mode and put it back on
+ * return: as SDL_VIDEO_WINDOW_POS (SDL reads it as a USPosition hint) and
+ * with XMoveWindow in case the window stayed mapped. */
+typedef struct {
+    unsigned char major, minor, patch;
+    int subsystem;
+    void *display;
+    unsigned long window;
+    void (*lock_func)(void);
+    void (*unlock_func)(void);
+    unsigned long fswindow, wmwindow;
+    unsigned char spare[64];  /* later SDL versions add fields */
+} sdl_syswm_info_t;
+
+static int windowed_pos_saved, windowed_x, windowed_y;
+
+static void window_pos_text(int x, int y, char *buffer, size_t size) {
+    snprintf(buffer, size, "%d,%d", x, y);
+}
+
+/* SDL's X display and windowed (WM-managed) window, or 0. */
+static int sdl_wm_window(sdl_syswm_info_t *info) {
+    static int (*get_wm_info)(sdl_syswm_info_t *);
+    if (!get_wm_info) *(void **)&get_wm_info = dlsym(RTLD_DEFAULT, "SDL_GetWMInfo");
+    if (!get_wm_info) return 0;
+    memset(info, 0, sizeof(*info));
+    info->major = 1; info->minor = 2; info->patch = 0;
+    return get_wm_info(info) == 1 && info->display && info->wmwindow;
+}
+
+static struct {
+    int state;
+    int (*QueryTree)(void *, unsigned long, unsigned long *, unsigned long *, unsigned long **, unsigned *);
+    int (*GetWindowAttributes)(void *, unsigned long, void *);
+    int (*MoveWindow)(void *, unsigned long, int, int);
+    int (*Flush)(void *);
+    int (*Free)(void *);
+} xlib;
+
+static int resolve_xlib(void) {
+    if (xlib.state) return xlib.state > 0;
+    xlib.state = -1;
+    *(void **)&xlib.QueryTree = dlsym(RTLD_DEFAULT, "XQueryTree");
+    *(void **)&xlib.GetWindowAttributes = dlsym(RTLD_DEFAULT, "XGetWindowAttributes");
+    *(void **)&xlib.MoveWindow = dlsym(RTLD_DEFAULT, "XMoveWindow");
+    *(void **)&xlib.Flush = dlsym(RTLD_DEFAULT, "XFlush");
+    *(void **)&xlib.Free = dlsym(RTLD_DEFAULT, "XFree");
+    if (!xlib.QueryTree || !xlib.GetWindowAttributes || !xlib.MoveWindow || !xlib.Flush || !xlib.Free)
+        return 0;
+    xlib.state = 1;
+    return 1;
+}
+
+/* Remember where the windowed window's frame (its ancestor just below the
+   root) sits on the desktop. */
+static void save_windowed_position(void) {
+    sdl_syswm_info_t info;
+    if (!sdl_wm_window(&info) || !resolve_xlib()) return;
+    if (info.lock_func) info.lock_func();
+    unsigned long window = info.wmwindow, root = 0, parent = 0, *children = NULL;
+    unsigned count = 0;
+    for (int depth = 0; depth < 8; depth++) {
+        if (!xlib.QueryTree(info.display, window, &root, &parent, &children, &count)) {
+            parent = 0;
+            break;
+        }
+        if (children) xlib.Free(children);
+        children = NULL;
+        if (!parent || parent == root) break;
+        window = parent;
+    }
+    /* XWindowAttributes starts with int x, y; leave room for the rest. */
+    int attributes[64] = {0};
+    if (parent == root && root && xlib.GetWindowAttributes(info.display, window, attributes)) {
+        windowed_x = attributes[0];
+        windowed_y = attributes[1];
+        windowed_pos_saved = 1;
+    }
+    if (info.unlock_func) info.unlock_func();
+}
+
+static void move_windowed_window(void) {
+    sdl_syswm_info_t info;
+    if (!sdl_wm_window(&info) || !resolve_xlib()) return;
+    if (info.lock_func) info.lock_func();
+    xlib.MoveWindow(info.display, info.wmwindow, windowed_x, windowed_y);
+    xlib.Flush(info.display);
+    if (info.unlock_func) info.unlock_func();
+    fprintf(stderr, "[t2_hook] Windowed position restored to %d,%d\n", windowed_x, windowed_y);
+}
+
 void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
+    static int have_mode;
+    static uint32_t last_flags;
     if (!real_sdl_set_video_mode)
         real_sdl_set_video_mode = (sdl_set_video_mode_t)next_symbol(
             "SDL_SetVideoMode");
@@ -3074,6 +3171,21 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
             scale = render_scale_mode();
         }
     }
+    int was_fullscreen = have_mode && (last_flags & SDL_FULLSCREEN_FLAG);
+    int to_fullscreen = (flags & SDL_FULLSCREEN_FLAG) != 0;
+    if (have_mode && !was_fullscreen && to_fullscreen) save_windowed_position();
+    int restore = was_fullscreen && !to_fullscreen && windowed_pos_saved;
+    char previous_pos[64] = "", position[32];
+    int had_pos = 0;
+    if (restore) {
+        const char *current = getenv("SDL_VIDEO_WINDOW_POS");
+        if (current) {
+            had_pos = 1;
+            snprintf(previous_pos, sizeof(previous_pos), "%s", current);
+        }
+        window_pos_text(windowed_x, windowed_y, position, sizeof(position));
+        setenv("SDL_VIDEO_WINDOW_POS", position, 1);
+    }
     rt_teardown();
     void *surface = real_sdl_set_video_mode(real_w, real_h, bpp, flags);
     if (!surface && scale) {  /* the native mode was refused: do what the game asked */
@@ -3081,6 +3193,15 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         real_h = height;
         scale = 0;
         surface = real_sdl_set_video_mode(width, height, bpp, flags);
+    }
+    if (restore) {
+        if (had_pos) setenv("SDL_VIDEO_WINDOW_POS", previous_pos, 1);
+        else unsetenv("SDL_VIDEO_WINDOW_POS");
+        if (surface) move_windowed_window();
+    }
+    if (surface) {
+        have_mode = 1;
+        last_flags = flags;
     }
     if (surface && vsync_requested >= 0) vsync_reapply = 1;
     if (surface) {

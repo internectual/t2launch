@@ -505,6 +505,13 @@ launch_game() {
             GAME_ENV+=("T2_STRACE_LOG=$TRACE_DIR/tribes2-connect.strace")
         fi
     fi
+    # With render scale the hook opens and fills the fullscreen itself;
+    # window_resize.sh would move and resize that window and, through SDL's
+    # reused windowed window, misplace it after alt+enter.
+    if [[ "${T2LAUNCH_RENDER_SCALE:-off}" == "fit" || "${T2LAUNCH_RENDER_SCALE:-off}" == "stretch" ]]; then
+        GAME_ENV+=(USE_GAME_WINDOW_RESIZE=0)
+        echo "[t2launch] window_resize.sh skipped: the hook scales the fullscreen"
+    fi
     if [[ "${T2LAUNCH_GAMESCOPE:-0}" == "1" ]]; then
         if ! command -v gamescope >/dev/null 2>&1; then
             echo "ERROR: Run inside gamescope is on, but gamescope is not installed." >&2

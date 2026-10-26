@@ -364,6 +364,12 @@ int main(void) {
         scale_mouse_event(key, letterbox, 1600, 1920, 1080);
         assert(key[4] == 0x34 && key[5] == 0x12);
 
+        char pos_text[32];
+        window_pos_text(0, 2160, pos_text, sizeof(pos_text));
+        assert(strcmp(pos_text, "0,2160") == 0);
+        window_pos_text(-5, 12, pos_text, sizeof(pos_text));
+        assert(strcmp(pos_text, "-5,12") == 0);
+
         /* No fog: the glEnable wrapper drops GL_FOG and passes everything else. */
         real_gl_enable = fake_gl_enable;
         gl_enable_calls = 0;

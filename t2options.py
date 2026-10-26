@@ -153,7 +153,7 @@ OPTIONS = (
            help="Apply the Video options gamma in a shader pass; the game's X11 gamma ramps do "
                 "nothing under Wayland and most compositors."),
     Option("video.render_scale", "Video", "Fullscreen below native resolution", "choice", "off",
-           choices=("off", "fit", "stretch"), hook=True, requires=(("launcher.load_hook", (True,)),),
+           choices=("off", "fit", "stretch"), hook=True, env="T2LAUNCH_RENDER_SCALE", requires=(("launcher.load_hook", (True,)),),
            help="When the game goes fullscreen (alt+enter) at a resolution below the monitor's, open "
                 "the fullscreen at the native size and scale the game's picture up to fill it: fit "
                 "keeps the aspect ratio (bars where it differs), stretch fills the screen. The game "

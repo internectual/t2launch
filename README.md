@@ -266,7 +266,8 @@ Tribes 2 runs windowed at its selected resolution with hardware OpenGL unless
 fullscreen is requested. An X11 watcher (`runtime/window_resize.sh`) keeps the
 window on the selected monitor and scales fullscreen output while preserving
 the game's aspect ratio; in windowed mode it follows the saved game resolution
-when SDL 1.2 leaves the window at its previous size.
+when SDL 1.2 leaves the window at its previous size. It is skipped with
+gamescope or `video.render_scale`, which size the fullscreen themselves.
 
 SDL 1.2's windowed `SDL_ListModes` may report "any size", and Tribes 2 then
 falls back to a short built-in 4:3 list. The launcher enables SDL XRandR
@@ -781,8 +782,9 @@ options bring the parts of it that fit the Linux client:
   restoring the GL state around the pass. Neutral is near the middle of the
   slider.
 - **Fullscreen below native resolution** (`video.render_scale`, off; `fit` or
-  `stretch`). On Wayland an X11 game can't switch the monitor's mode, so a
-  fullscreen below the native resolution lands as a small window in a corner.
+  `stretch`). On Wayland the game's fullscreen (its bundled SDL 1.2.11) can't
+  switch the physical monitor's mode, and below the native resolution it can
+  land unscaled in a corner.
   With this option, when the game asks for such a fullscreen (alt+enter), the
   hook opens it at the monitor's native size (which fills the panel) and binds
   its own framebuffer in place of the window's, at the game's resolution — the
@@ -793,7 +795,11 @@ options bring the parts of it that fit the Linux client:
   at that framebuffer and maps absolute mouse positions in `SDL_PollEvent`
   events back to the game's resolution (relative motion, which steers, is
   untouched). Windowed mode is unchanged, so alt+enter toggles between a
-  normal window and a filled fullscreen.
+  normal window and a filled fullscreen. While it is on, `run-game` skips
+  `window_resize.sh`. Whatever the fullscreen path, the hook remembers the
+  window's position when you leave windowed mode and puts it back on return
+  (SDL 1.2 would otherwise let the window manager place it, possibly on
+  another monitor).
 - **Sharpening** (`video.sharpen`, 0 = off, up to 1). AMD-style
   contrast-adaptive sharpening added to the gamma shader pass; useful with a
   scaled fullscreen.
@@ -824,13 +830,12 @@ options bring the parts of it that fit the Linux client:
   resolution and `$pref::Video::fullScreen = 1` back to `ClientPrefs.cs` (user
   state the game rewrites anyway) so the game boots fullscreen at exactly the
   gamescope size and gamescope upscales it to fill the monitor — no in-game
-  resolution picking and no centered-with-bars. **On Wayland this is the only
-  way to upscale a sub-native resolution to fill the screen:** XWayland apps
-  can't switch the physical monitor mode, so a classic alt+enter mode switch
-  (what fills a low resolution to the whole panel on Xorg) does not work, and
-  KWin centers an X11 fullscreen rather than scaling it. gamescope is always
-  fullscreen, so it is not a windowed/fullscreen toggle; for that, and for a
-  real mode switch, use an Xorg session.
+  resolution picking and no centered-with-bars. gamescope is always
+  fullscreen, so it is not a windowed/fullscreen toggle. On Wayland the game's
+  own fullscreen (through its bundled SDL 1.2.11, not the system's
+  sdl12-compat) can't switch the physical monitor's mode, and below the native
+  resolution it was seen landing unscaled in a corner; `video.render_scale`
+  fills it while keeping alt+enter between a window and fullscreen.
 - **Missing map files** (`net.depot_downloads`, off). When a server's map
   uses an interior, shape, or terrain the client lacks, the game disconnects
   with "Unable to load interior: X", "Unable to load shape: X", or "You are
