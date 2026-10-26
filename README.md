@@ -701,6 +701,14 @@ options bring the parts of it that fit the Linux client:
   capability through, so fog is never applied — no engine code patched. This is
   the Linux equivalent of the Windows `T2NoFog` patch. Many servers consider
   removing fog a cheat.
+- **Unlock visible distance** (`ui.visible_distance`, off). The game clamps
+  `$pref::visibleDistanceMod` to the range 0.5–1.0 in a small clamp routine; the
+  upper branch (`0x081DC7F2`, taken only when the value exceeds 1.0) forces it
+  back to 1.0. The hook NOPs that branch so a larger value survives — set it in
+  the console (`$pref::visibleDistanceMod = 2;`) to render terrain farther. The
+  clamp writes back to the pref, so every reader picks up the larger value, and
+  the 0.5 lower bound is kept. This is the Linux equivalent of PenguinOfDoom's
+  Windows `visdist` patch. Many servers consider this a cheat.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.

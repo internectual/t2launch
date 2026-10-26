@@ -69,6 +69,9 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(read(0x081936BF, 8), bytes.fromhex("74 4e 8b 88 bc 08 00 00"))
         # The LAN class-B join check: je 0x08237190 after the no-match flag test.
         self.assertEqual(read(0x082370CE, 6), bytes.fromhex("0f 84 bc 00 00 00"))
+        # The visibleDistanceMod upper clamp: and $0x45,%ah ; je (to force 1.0).
+        self.assertEqual(read(0x081DC7EF, 5), bytes.fromhex("80 e4 45 74 1a"))
+        self.assertEqual(struct.unpack("<f", read(0x084492D4, 4))[0], 0.5)
         # setFov's 179-degree maximum and fld1 minimum.
         self.assertEqual(read(0x08234171, 6), bytes.fromhex("d9 05 28 20 45 08"))
         self.assertEqual(struct.unpack("<f", read(0x08452028, 4))[0], 179.0)

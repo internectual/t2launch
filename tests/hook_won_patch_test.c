@@ -297,6 +297,24 @@ int main(void) {
         assert(LAN_JOIN_CHECK_ADDRESS + 5 + lan_rel == LAN_JOIN_CHECK_ADDRESS + 6 + 0xbc);
         munmap(lan, size);
 
+        /* Visible distance: the upper-clamp je becomes two nops; refused if the
+           branch opcode is not the expected je. */
+        uintptr_t vd_page = VISDIST_CLAMP_ADDRESS & ~((uintptr_t)size - 1);
+        unsigned char *vd = mmap((void *)vd_page, size, PROT_READ | PROT_WRITE,
+                                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        assert(vd == (void *)vd_page);
+        unsigned char *vd_site = (unsigned char *)VISDIST_CLAMP_ADDRESS;
+        memcpy(vd_site, visdist_clamp_original, sizeof(visdist_clamp_original));
+        vd_site[0] = 0x75;  /* jne instead of je -> refuse */
+        assert(mprotect(vd, size, PROT_READ | PROT_EXEC) == 0);
+        assert(!install_visible_distance());
+        assert(mprotect(vd, size, PROT_READ | PROT_WRITE) == 0);
+        vd_site[0] = 0x74;
+        assert(mprotect(vd, size, PROT_READ | PROT_EXEC) == 0);
+        assert(install_visible_distance());
+        assert(memcmp(vd_site, "\x90\x90", 2) == 0);
+        munmap(vd, size);
+
         /* No fog: the glEnable wrapper drops GL_FOG and passes everything else. */
         real_gl_enable = fake_gl_enable;
         gl_enable_calls = 0;

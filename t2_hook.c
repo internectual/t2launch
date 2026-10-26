@@ -137,6 +137,7 @@ static struct hook_option hook_options[] = {
     {"ui.observer_iff", "0", NULL, 0, "", 0},
     {"ui.lan_join_anywhere", "0", NULL, 0, "", 0},
     {"ui.no_fog", "0", NULL, 0, "", 0},
+    {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -1474,6 +1475,26 @@ static int install_lan_join_anywhere(void) {
                                      sizeof(lan_join_check_original), 0, jump, sizeof(jump)};
     if (!apply_code_patches("LAN join", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] Connect to LAN servers outside the local subnet (memory only)\n");
+    return 1;
+}
+
+/* The game clamps $pref::visibleDistanceMod (the float at 0x0849518C) to
+   [0.5, 1.0] in a small clamp function: at 0x081DC7F2 `je 0x081DC80E` is taken
+   only when the value is above 1.0 and forces it back to 1.0. NOP that branch
+   so a value above 1.0 survives (farther visible distance), the Linux
+   equivalent of PenguinOfDoom's Windows visdist patch. The write-back is to the
+   pref itself, so every reader picks up the larger value with no further
+   change; the 0.5 lower bound is left intact and the FPU stack stays balanced.
+   Client only. */
+#define VISDIST_CLAMP_ADDRESS 0x081DC7F2
+static const unsigned char visdist_clamp_original[] = {0x74, 0x1a};
+
+static int install_visible_distance(void) {
+    static const unsigned char nops[] = {0x90, 0x90};
+    const struct code_patch patch = {VISDIST_CLAMP_ADDRESS, visdist_clamp_original,
+                                     sizeof(visdist_clamp_original), 0, nops, sizeof(nops)};
+    if (!apply_code_patches("Visible distance", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] visibleDistanceMod is no longer capped at 1.0 (memory only)\n");
     return 1;
 }
 
@@ -3487,6 +3508,7 @@ static void __attribute__((constructor)) init(void) {
                          hook_option_bool("ui.bar_flip"));
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
     if (hook_option_bool("ui.lan_join_anywhere")) install_lan_join_anywhere();
+    if (hook_option_bool("ui.visible_distance")) install_visible_distance();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();
     if (hook_option_bool("net.native_auth") && hook_option_bool("hook.tribesnext"))

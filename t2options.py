@@ -196,6 +196,11 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Drop glEnable(GL_FOG) so the engine's OpenGL distance fog is never applied, the "
                 "Linux equivalent of the Windows T2NoFog patch. Many servers consider this a cheat."),
+    Option("ui.visible_distance", "Interface", "Unlock visible distance past 1.0", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="The game clamps $pref::visibleDistanceMod to at most 1.0; this removes the cap so a "
+                "larger value (set it in the console, e.g. $pref::visibleDistanceMod = 2;) renders "
+                "terrain farther, as the Windows visdist patch did. Many servers consider this a cheat."),
     Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="setFov() normally clamps the field of view to 1-179 degrees; allow 0-360."),
@@ -328,7 +333,7 @@ CLIENT_ONLY = frozenset((
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
-    "security.safe_soundpacks", "security.max_soundpack_kbytes",
+    "ui.visible_distance", "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)
