@@ -18,6 +18,26 @@
 
 typedef int S32;
 
+/* next_symbol(name), but through glibc's own dlsym. glibc resolves
+   RTLD_NEXT from its caller; an overlay that interposes dlsym (MangoHud's
+   shim does) becomes that caller, so the lookup would start after the
+   overlay instead of after the hook and miss what lies between, such as the
+   game's SDL. dlvsym, which those overlays leave alone, finds the real one. */
+static void *next_symbol(const char *name) {
+    static void *(*libc_dlsym)(void *, const char *);
+    if (!libc_dlsym) {
+        static const char *const owners[] = {"libc.so.6", "libdl.so.2"};
+        static const char *const versions[] = {"GLIBC_2.34", "GLIBC_2.0"};
+        for (size_t i = 0; i < 2 && !libc_dlsym; i++) {
+            void *library = dlopen(owners[i], RTLD_NOW | RTLD_NOLOAD);
+            for (size_t v = 0; library && v < 2 && !libc_dlsym; v++)
+                *(void **)&libc_dlsym = dlvsym(library, "dlsym", versions[v]);
+        }
+        if (!libc_dlsym) libc_dlsym = dlsym;
+    }
+    return libc_dlsym(RTLD_NEXT, name);
+}
+
 typedef void (*con_addMethodS_t)(const char *nsName, const char *name,
     const char *(*cb)(void *obj, S32 argc, const char **argv),
     const char *usage, S32 minArgs, S32 maxArgs);
@@ -329,7 +349,7 @@ int system(const char *command) {
         fprintf(stderr, "[t2_hook] Refused web link with an unsupported or unsafe URL\n");
         return -1;
     }
-    if (!real_system) real_system = (int (*)(const char *))dlsym(RTLD_NEXT, "system");
+    if (!real_system) real_system = (int (*)(const char *))next_symbol("system");
     return real_system ? real_system(command) : -1;
 }
 
@@ -1976,7 +1996,7 @@ int getaddrinfo(const char *node, const char *service,
                                   const struct addrinfo *, struct addrinfo **);
     static getaddrinfo_fn real_getaddrinfo;
     if (!real_getaddrinfo)
-        real_getaddrinfo = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
+        real_getaddrinfo = (getaddrinfo_fn)next_symbol("getaddrinfo");
     trace_resolver_name(node, service);
     if (!real_getaddrinfo) return EAI_SYSTEM;
     if (is_won_bootstrap_host(node)) node = "127.0.0.1";
@@ -1987,7 +2007,7 @@ struct hostent *gethostbyname(const char *name) {
     typedef struct hostent *(*gethostbyname_fn)(const char *);
     static gethostbyname_fn real_gethostbyname;
     if (!real_gethostbyname)
-        real_gethostbyname = (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
+        real_gethostbyname = (gethostbyname_fn)next_symbol("gethostbyname");
     trace_resolver_name(name, NULL);
     if (!real_gethostbyname) return NULL;
     if (is_won_bootstrap_host(name)) name = "127.0.0.1";
@@ -2028,7 +2048,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     if (!real_create) {
         /* The client imports pthread_create@GLIBC_2.1. */
         real_create = (pthread_create_t)dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.1");
-        if (!real_create) real_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
+        if (!real_create) real_create = (pthread_create_t)next_symbol("pthread_create");
         if (!real_create) return EAGAIN;
     }
     int result = real_create(thread, attr, start, arg);
@@ -2045,7 +2065,7 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
 
 int pthread_join(pthread_t thread, void **value) {
     static pthread_join_t real_join;
-    if (!real_join) real_join = (pthread_join_t)dlsym(RTLD_NEXT, "pthread_join");
+    if (!real_join) real_join = (pthread_join_t)next_symbol("pthread_join");
     if (!real_join) return ESRCH;
     /* Past the table limit untracked threads may be joinable, so trust the caller. */
     if (!take_joinable_thread(thread) && !joinable_overflow &&
@@ -2058,7 +2078,7 @@ int pthread_join(pthread_t thread, void **value) {
 
 int pthread_detach(pthread_t thread) {
     static pthread_detach_t real_detach;
-    if (!real_detach) real_detach = (pthread_detach_t)dlsym(RTLD_NEXT, "pthread_detach");
+    if (!real_detach) real_detach = (pthread_detach_t)next_symbol("pthread_detach");
     if (!real_detach) return ESRCH;
     take_joinable_thread(thread);
     return real_detach(thread);
@@ -2490,7 +2510,7 @@ static int render_target_wanted(void) {
 /* The fullscreen display's largest mode: its native size. */
 static int native_fullscreen_size(int *width, int *height) {
     if (!real_sdl_list_modes)
-        real_sdl_list_modes = (sdl_list_modes_t)dlsym(RTLD_NEXT, "SDL_ListModes");
+        real_sdl_list_modes = (sdl_list_modes_t)next_symbol("SDL_ListModes");
     if (!real_sdl_list_modes) return 0;
     sdl_rect_t **modes = real_sdl_list_modes(NULL, SDL_FULLSCREEN_FLAG | SDL_OPENGL_FLAG);
     if (!modes || modes == (sdl_rect_t **)-1) return 0;
@@ -2724,7 +2744,7 @@ static void scale_mouse_event(unsigned char *event, struct render_rect rect, int
 
 int SDL_PollEvent(void *event) {
     static int (*real_poll_event)(void *);
-    if (!real_poll_event) real_poll_event = (int (*)(void *))dlsym(RTLD_NEXT, "SDL_PollEvent");
+    if (!real_poll_event) real_poll_event = (int (*)(void *))next_symbol("SDL_PollEvent");
     if (!real_poll_event) return 0;
     int pending = real_poll_event(event);
     if (pending && event && rt.active && rt.scaling)
@@ -2735,7 +2755,7 @@ int SDL_PollEvent(void *event) {
 int SDL_SetGamma(float red, float green, float blue) {
     static int (*real_set_gamma)(float, float, float);
     if (!hook_option_bool("video.gamma")) {
-        if (!real_set_gamma) real_set_gamma = (int (*)(float, float, float))dlsym(RTLD_NEXT, "SDL_SetGamma");
+        if (!real_set_gamma) real_set_gamma = (int (*)(float, float, float))next_symbol("SDL_SetGamma");
         return real_set_gamma ? real_set_gamma(red, green, blue) : -1;
     }
     (void)green; (void)blue;  /* the game passes one value for all three */
@@ -2811,7 +2831,7 @@ static const unsigned char *filtered_gl_get_string(unsigned name) {
 
 void *SDL_GL_GetProcAddress(const char *proc) {
     static void *(*real_get_proc)(const char *);
-    if (!real_get_proc) real_get_proc = (void *(*)(const char *))dlsym(RTLD_NEXT, "SDL_GL_GetProcAddress");
+    if (!real_get_proc) real_get_proc = (void *(*)(const char *))next_symbol("SDL_GL_GetProcAddress");
     if (!real_get_proc) return NULL;
     void *address = real_get_proc(proc);
     if (!proc) return address;
@@ -2867,8 +2887,8 @@ static void cap_frame_rate(void) {
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
-        real_sdl_gl_swap_buffers = (sdl_gl_swap_buffers_t)dlsym(
-            RTLD_NEXT, "SDL_GL_SwapBuffers");
+        real_sdl_gl_swap_buffers = (sdl_gl_swap_buffers_t)next_symbol(
+            "SDL_GL_SwapBuffers");
     if (!real_sdl_gl_swap_buffers) return;
 
     int on_game_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
@@ -3028,7 +3048,7 @@ static void server_tick(void) {
 
 int usleep(useconds_t microseconds) {
     static int (*real_usleep)(useconds_t);
-    if (!real_usleep) real_usleep = (int (*)(useconds_t))dlsym(RTLD_NEXT, "usleep");
+    if (!real_usleep) real_usleep = (int (*)(useconds_t))next_symbol("usleep");
     if (target->dedicated && game_main_thread_known && pthread_equal(pthread_self(), game_main_thread))
         server_tick();
     return real_usleep ? real_usleep(microseconds) : 0;
@@ -3037,8 +3057,8 @@ int usleep(useconds_t microseconds) {
 /* Observe SDL 1.2 mode changes without replacing its return surface or flags. */
 void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
     if (!real_sdl_set_video_mode)
-        real_sdl_set_video_mode = (sdl_set_video_mode_t)dlsym(
-            RTLD_NEXT, "SDL_SetVideoMode");
+        real_sdl_set_video_mode = (sdl_set_video_mode_t)next_symbol(
+            "SDL_SetVideoMode");
     if (!real_sdl_set_video_mode) return NULL;
     if (!(flags & SDL_FULLSCREEN_FLAG) && hook_option_bool("video.borderless"))
         flags |= SDL_NOFRAME_FLAG;
@@ -3953,7 +3973,7 @@ static unsigned int sdl_mode_count(sdl_rect_t **modes) {
 #ifndef T2_HOOK_TEST
 sdl_rect_t **SDL_ListModes(void *format, uint32_t flags) {
     if (!real_sdl_list_modes)
-        real_sdl_list_modes = (sdl_list_modes_t)dlsym(RTLD_NEXT, "SDL_ListModes");
+        real_sdl_list_modes = (sdl_list_modes_t)next_symbol("SDL_ListModes");
     if (!real_sdl_list_modes) return NULL;
 
     sdl_rect_t **modes = real_sdl_list_modes(format, flags);
