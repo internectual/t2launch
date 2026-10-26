@@ -31,6 +31,11 @@ static int32_t call_target_offset(uintptr_t site) {
 static float fake_value;
 static float fake_bar_value(void *control) { (void)control; return fake_value; }
 
+/* A stand-in for the real glEnable, to see which caps the no-fog wrapper drops. */
+static int gl_enable_calls;
+static unsigned gl_enable_last_cap;
+static void fake_gl_enable(unsigned cap) { gl_enable_calls++; gl_enable_last_cap = cap; }
+
 /* A stand-in for the engine's original alx* int callback, to see pass-through. */
 static int soundpack_test_calls;
 static int fake_alx_original(void *obj, int argc, const char **argv) {
@@ -291,6 +296,15 @@ int main(void) {
         int32_t lan_rel; memcpy(&lan_rel, lan_site + 1, 4);  /* jmp keeps the je's target */
         assert(LAN_JOIN_CHECK_ADDRESS + 5 + lan_rel == LAN_JOIN_CHECK_ADDRESS + 6 + 0xbc);
         munmap(lan, size);
+
+        /* No fog: the glEnable wrapper drops GL_FOG and passes everything else. */
+        real_gl_enable = fake_gl_enable;
+        gl_enable_calls = 0;
+        gl_enable_no_fog(GL_FOG_CAP);
+        assert(gl_enable_calls == 0);                 /* fog enable dropped */
+        gl_enable_no_fog(0x0BE2);                      /* GL_BLEND passes through */
+        assert(gl_enable_calls == 1 && gl_enable_last_cap == 0x0BE2);
+        real_gl_enable = NULL;
 
         /* setFov's limits: the max load points at 360.0, fld1 becomes fldz. */
         uintptr_t fov_page = FOV_MAX_LOAD & ~((uintptr_t)size - 1);

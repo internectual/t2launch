@@ -192,6 +192,10 @@ OPTIONS = (
            help="The client refuses to connect to a LAN-flagged server whose IP is not in your own "
                 "class-B subnet (\"Cannot join a LAN server with no matching Class B IP address\"); "
                 "this lets the connection through, as the Windows t2classbpatch did."),
+    Option("ui.no_fog", "Interface", "Disable distance fog", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Drop glEnable(GL_FOG) so the engine's OpenGL distance fog is never applied, the "
+                "Linux equivalent of the Windows T2NoFog patch. Many servers consider this a cheat."),
     Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="setFov() normally clamps the field of view to 1-179 degrees; allow 0-360."),
@@ -323,7 +327,7 @@ CLIENT_ONLY = frozenset((
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
-    "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere",
+    "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
     "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))

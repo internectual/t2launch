@@ -694,6 +694,13 @@ options bring the parts of it that fit the Linux client:
   proceeds, the Linux equivalent of PenguinOfDoom's Windows `t2classbpatch`.
   Client-side; the dedicated server's own LAN restriction is handled separately
   by `server.tribesnext_auth`.
+- **Disable distance fog** (`ui.no_fog`, off). The engine turns on OpenGL
+  distance fog with `glEnable(GL_FOG)`. Since the game resolves even core GL
+  functions through `SDL_GL_GetProcAddress` (which the hook already wraps), the
+  hook returns a `glEnable` that drops `GL_FOG` and passes every other
+  capability through, so fog is never applied — no engine code patched. This is
+  the Linux equivalent of the Windows `T2NoFog` patch. Many servers consider
+  removing fog a cheat.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.

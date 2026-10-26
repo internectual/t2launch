@@ -136,6 +136,7 @@ static struct hook_option hook_options[] = {
     {"ui.bar_flip", "1", NULL, 0, "", 0},
     {"ui.observer_iff", "0", NULL, 0, "", 0},
     {"ui.lan_join_anywhere", "0", NULL, 0, "", 0},
+    {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -2273,6 +2274,18 @@ static void remove_extension(const char *extensions, const char *token, char *ou
 
 static const unsigned char *(*real_gl_get_string)(unsigned);
 
+/* No fog (ui.no_fog): the engine enables OpenGL distance fog with
+   glEnable(GL_FOG). The hook returns this wrapper for glEnable so that
+   enabling GL_FOG is dropped and every other capability passes through,
+   removing fog without patching engine code (the Linux equivalent of the
+   Windows T2NoFog patcher). */
+#define GL_FOG_CAP 0x0B60u
+static void (*real_gl_enable)(unsigned);
+static void gl_enable_no_fog(unsigned cap) {
+    if (cap == GL_FOG_CAP) return;
+    if (real_gl_enable) real_gl_enable(cap);
+}
+
 static const unsigned char *filtered_gl_get_string(unsigned name) {
     static const unsigned char *source;
     static char *filtered;
@@ -2296,7 +2309,12 @@ void *SDL_GL_GetProcAddress(const char *proc) {
     if (!real_get_proc) real_get_proc = (void *(*)(const char *))dlsym(RTLD_NEXT, "SDL_GL_GetProcAddress");
     if (!real_get_proc) return NULL;
     void *address = real_get_proc(proc);
-    if (!proc || !hook_option_bool("video.disable_locked_arrays")) return address;
+    if (!proc) return address;
+    if (address && hook_option_bool("ui.no_fog") && strcmp(proc, "glEnable") == 0) {
+        real_gl_enable = (void (*)(unsigned))address;
+        return (void *)gl_enable_no_fog;
+    }
+    if (!hook_option_bool("video.disable_locked_arrays")) return address;
     if (strcmp(proc, "glLockArraysEXT") == 0 || strcmp(proc, "glUnlockArraysEXT") == 0) return NULL;
     if (strcmp(proc, "glGetString") == 0 && address) {
         real_gl_get_string = (const unsigned char *(*)(unsigned))address;
