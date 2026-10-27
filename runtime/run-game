@@ -524,13 +524,24 @@ launch_game() {
                 if [[ ! -d "$review_cache" || "$review_src" -nt "$review_cache" ]]; then
                     rm -rf "$review_cache"; mkdir -p "$review_cache"
                     python3 -I - "$review_src" "$review_cache" <<'PY'
-import sys, zipfile, os
+import sys, zipfile, os, struct
 z = zipfile.ZipFile(sys.argv[1]); out = sys.argv[2]
+# This engine build loads DTS up to version 23; a newer shape (e.g. hm2's
+# vehicle_air_scout.dts at v24) crashes the engine when the map spawns it, so
+# skip any over-new model and fall back to the stock one for it.
+MAX_DTS_VER = 23
 for info in z.infolist():
     if info.is_dir(): continue
+    data = z.read(info.filename)
+    if info.filename.lower().endswith(".dts") and len(data) >= 2:
+        ver = struct.unpack("<H", data[:2])[0]
+        if ver > MAX_DTS_VER:
+            print("[t2launch] demo review: skipping %s (DTS v%d > %d)" %
+                  (info.filename, ver, MAX_DTS_VER))
+            continue
     dst = os.path.join(out, info.filename)
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    open(dst, "wb").write(z.read(info.filename))
+    open(dst, "wb").write(data)
 PY
                     touch -r "$review_src" "$review_cache" 2>/dev/null || true
                 fi
