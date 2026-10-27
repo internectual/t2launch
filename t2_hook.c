@@ -106,6 +106,7 @@ static volatile int net_options_override_installed = 0;
 static volatile int depot_downloads_installed = 0;
 static volatile int vsync_support_installed = 0;
 static volatile int discord_presence_installed = 0;
+static volatile int datablock_overrides_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -163,6 +164,7 @@ static struct hook_option hook_options[] = {
     {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
+    {"review.cheat_view", "0", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -2884,6 +2886,98 @@ static void cap_frame_rate(void) {
     }
 }
 
+/* ---- Datablock overrides (presentational, config-driven) -------------------
+   An external file lists "Object.field = value" entries the hook applies
+   in-game through the engine's own script interface: shape swaps (e.g. point a
+   flag's datablock at a replacement model), Sun/Sky weather, and so on. It is
+   not a cheat -- it changes only how datablocks look/render, never gameplay
+   state. The file path comes from T2LAUNCH_DATABLOCK_CONFIG, or the
+   datablock.config hook option. Format, one entry per line:
+       Flag.shapeFile = hm2_flag.dts     # bare string -> quoted
+       Sky.fogDistance = 200             # number/vector -> passed through
+   A field set to an already-"quoted" value is passed through verbatim. */
+static char datablock_override_body[8192];
+
+static void db_format_value(const char *raw, char *out, size_t outlen) {
+    if (*raw == '"') { snprintf(out, outlen, "%s", raw); return; }
+    int numeric = *raw != 0;
+    for (const char *p = raw; *p; p++) {
+        if ((*p >= '0' && *p <= '9') || *p == ' ' || *p == '.' ||
+            *p == '-' || *p == '+' || *p == 'e' || *p == 'E') continue;
+        numeric = 0; break;
+    }
+    if (numeric) snprintf(out, outlen, "%s", raw);
+    else snprintf(out, outlen, "\"%s\"", raw);
+}
+
+/* Parse the config into a TorqueScript statement list (returns entry count). */
+static int build_datablock_override_body(void) {
+    const char *path = getenv("T2LAUNCH_DATABLOCK_CONFIG");
+    if (!path || !*path) path = hook_option_str("datablock.config");
+    datablock_override_body[0] = 0;
+    if (!path || !*path) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[t2_hook] datablock config unavailable: %s (%s)\n",
+                path, strerror(errno));
+        return 0;
+    }
+    char line[512];
+    size_t used = 0;
+    int count = 0;
+    while (fgets(line, sizeof line, f)) {
+        char *text = trim_space(line);
+        if (!*text || *text == '#') continue;
+        char *eq = strchr(text, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *lhs = trim_space(text);
+        char *rhs = trim_space(eq + 1);
+        char *dot = strrchr(lhs, '.');
+        if (!dot) continue;
+        *dot = 0;
+        char *obj = trim_space(lhs);
+        char *field = trim_space(dot + 1);
+        if (!*obj || !*field) continue;
+        char val[320];
+        db_format_value(rhs, val, sizeof val);
+        int n = snprintf(datablock_override_body + used,
+                         sizeof datablock_override_body - used,
+                         " if(isObject(%s)) %s.%s = %s;", obj, obj, field, val);
+        if (n < 0 || (size_t)n >= sizeof datablock_override_body - used) {
+            fprintf(stderr, "[t2_hook] datablock overrides truncated after %d entries\n", count);
+            break;
+        }
+        used += n;
+        count++;
+    }
+    fclose(f);
+    fprintf(stderr, "[t2_hook] datablock overrides: %d entries from %s\n", count, path);
+    return count;
+}
+
+/* Install a self-rescheduling watcher that re-applies the overrides every
+   half second, so they take hold as soon as the datablocks arrive (on connect
+   or at demo-playback start) and stay applied across mission changes. */
+static void install_datablock_overrides(void) {
+    if (build_datablock_override_body() <= 0) return;
+    size_t need = strlen(datablock_override_body) + 1024;
+    char *script = malloc(need);
+    if (!script) return;
+    snprintf(script, need,
+        "function t2launch_applyDatablocks(){%s}"
+        "function t2launch_datablockWatch(){"
+        " t2launch_applyDatablocks();"
+        " $T2Launch::DBWatch = schedule(500, 0, \"t2launch_datablockWatch\");"
+        "}"
+        "if($T2Launch::DBWatch $= \"\")"
+        " $T2Launch::DBWatch = schedule(500, 0, \"t2launch_datablockWatch\");",
+        datablock_override_body);
+    Con__evaluate(script, 0, "t2launch/datablocks.cs", 0);
+    free(script);
+    fprintf(stderr, "[t2_hook] datablock overrides watcher installed\n");
+}
+
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
@@ -2998,6 +3092,10 @@ void SDL_GL_SwapBuffers(void) {
                 Con__evaluate(discord_presence_script, 0, "t2launch/discord.cs", 0);
                 start_discord_presence();
             }
+            if (!datablock_overrides_installed) {
+                datablock_overrides_installed = 1;
+                install_datablock_overrides();
+            }
             if (!vsync_support_installed && hook_option_bool("video.vsync")) {
                 Con__evaluate("$SwapIntervalSupported = 1;"
                               " setVerticalSync(!$pref::Video::disableVerticalSync);", 0, NULL, 0);
@@ -3013,6 +3111,27 @@ void SDL_GL_SwapBuffers(void) {
             const char *audio_state = Con__evaluate("t2launch_audioState();", 0, NULL, 0);
             fprintf(stderr, "[t2_hook] Audio state initialized|active|available: %s\n",
                     audio_state ? audio_state : "unavailable");
+            /* Demo-review automation: once the shell is up, auto-start playback
+               of a named demo, replicating StartSelectedDemo() (recordings.cs)
+               without the UI list. Gated by env so it is inert otherwise. */
+            const char *autoplay = getenv("T2LAUNCH_AUTOPLAY_DEMO");
+            if (autoplay && *autoplay && !strchr(autoplay, '"')) {
+                char script[768];
+                snprintf(script, sizeof script,
+                    "$T2Launch::AutoplayDemo = \"%s\";"
+                    "function t2launch_autoplayDemo() {"
+                    " if (playDemo($T2Launch::AutoplayDemo)) {"
+                    "  alxEnableForceFeedback(false); resetGameState();"
+                    "  Canvas.setContent(PlayGui); loadDemoSettings();"
+                    "  $DemoPlaybackIndex = 5;"
+                    "  echo(\"t2launch: autoplay demo started\");"
+                    " } else { echo(\"t2launch: autoplay demo FAILED to load\"); }"
+                    "}"
+                    "schedule(1500, 0, \"t2launch_autoplayDemo\");",
+                    autoplay);
+                Con__evaluate(script, 0, "t2launch/autoplay.cs", 0);
+                fprintf(stderr, "[t2_hook] Demo autoplay scheduled: %s\n", autoplay);
+            }
             shell_audio_setup_done = 1;
         }
     }
