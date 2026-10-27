@@ -1251,13 +1251,24 @@ static const unsigned char rv_gbeacons_orig[] = {0x0f, 0x84, 0x7a, 0x01, 0x00, 0
 static const unsigned char rv_gbeacons_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 #define RV_GBEACONS_ADDR 0x082FC844
 
+/* Candidate FFI-always site: in the player-indicator enumeration, reject
+   players whose team differs from the local team. NOP the conditional skip
+   so opposing-team player indicators reach the common draw routine. */
+static const unsigned char rv_ffi_team_skip[] = {0x75, 0x43};
+static const unsigned char rv_ffi_team_nops[] = {0x90, 0x90};
+#define RV_FFI_TEAM_ADDR 0x082FC6BA
+
 static const struct code_patch review_patches_on[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_orig, sizeof rv_gbeacons_orig, 0,
      rv_gbeacons_nops, sizeof rv_gbeacons_nops},
+    {RV_FFI_TEAM_ADDR, rv_ffi_team_skip, sizeof rv_ffi_team_skip, 0,
+     rv_ffi_team_nops, sizeof rv_ffi_team_nops},
 };
 static const struct code_patch review_patches_off[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_nops, sizeof rv_gbeacons_nops, 0,
      rv_gbeacons_orig, sizeof rv_gbeacons_orig},
+    {RV_FFI_TEAM_ADDR, rv_ffi_team_nops, sizeof rv_ffi_team_nops, 0,
+     rv_ffi_team_skip, sizeof rv_ffi_team_skip},
 };
 #define REVIEW_PATCH_COUNT (sizeof review_patches_on / sizeof review_patches_on[0])
 
