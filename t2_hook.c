@@ -1258,17 +1258,27 @@ static const unsigned char rv_ffi_team_skip[] = {0x75, 0x43};
 static const unsigned char rv_ffi_team_nops[] = {0x90, 0x90};
 #define RV_FFI_TEAM_ADDR 0x082FC6BA
 
+/* Candidate FFI-far site: the squared-distance comparison sets dl when the
+   player is outside the HUD indicator range; this branch then skips drawing. */
+static const unsigned char rv_ffi_dist_skip[] = {0x0f, 0x85, 0x7c, 0x08, 0x00, 0x00};
+static const unsigned char rv_ffi_dist_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+#define RV_FFI_DIST_ADDR 0x082FBC0B
+
 static const struct code_patch review_patches_on[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_orig, sizeof rv_gbeacons_orig, 0,
      rv_gbeacons_nops, sizeof rv_gbeacons_nops},
     {RV_FFI_TEAM_ADDR, rv_ffi_team_skip, sizeof rv_ffi_team_skip, 0,
      rv_ffi_team_nops, sizeof rv_ffi_team_nops},
+    {RV_FFI_DIST_ADDR, rv_ffi_dist_skip, sizeof rv_ffi_dist_skip, 0,
+     rv_ffi_dist_nops, sizeof rv_ffi_dist_nops},
 };
 static const struct code_patch review_patches_off[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_nops, sizeof rv_gbeacons_nops, 0,
      rv_gbeacons_orig, sizeof rv_gbeacons_orig},
     {RV_FFI_TEAM_ADDR, rv_ffi_team_nops, sizeof rv_ffi_team_nops, 0,
      rv_ffi_team_skip, sizeof rv_ffi_team_skip},
+    {RV_FFI_DIST_ADDR, rv_ffi_dist_nops, sizeof rv_ffi_dist_nops, 0,
+     rv_ffi_dist_skip, sizeof rv_ffi_dist_skip},
 };
 #define REVIEW_PATCH_COUNT (sizeof review_patches_on / sizeof review_patches_on[0])
 
