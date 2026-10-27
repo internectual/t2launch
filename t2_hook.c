@@ -1235,6 +1235,53 @@ static int apply_code_patches(const char *name, const struct code_patch *patches
     return 1;
 }
 
+/* ---- Demo-review overlay patches (review.cheat_view) ----------------------
+   Memory patches that reconstruct what a suspected cheater saw -- ported from
+   HappyMod 2 -- applied ONLY while a demo is playing (isPlayingDemo()) and
+   reverted the moment playback stops, so they are structurally inert in live
+   play (a live server connection is never demo playback). Display only; no
+   autoaim. The same apply_code_patches() verifier runs both directions, so a
+   site is touched only when it holds the bytes we expect.
+
+   global beacons: the beacon-HUD render (0x082FC7xx) calls a per-beacon
+   visibility filter (0x0815F994, sensor/mask bits) and skips the beacon when
+   it returns false (je at 0x082FC844). NOP that skip so every beacon draws --
+   the suspect's beacons, including enemy ones, become visible in the review. */
+static const unsigned char rv_gbeacons_orig[] = {0x0f, 0x84, 0x7a, 0x01, 0x00, 0x00};
+static const unsigned char rv_gbeacons_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+#define RV_GBEACONS_ADDR 0x082FC844
+
+static const struct code_patch review_patches_on[] = {
+    {RV_GBEACONS_ADDR, rv_gbeacons_orig, sizeof rv_gbeacons_orig, 0,
+     rv_gbeacons_nops, sizeof rv_gbeacons_nops},
+};
+static const struct code_patch review_patches_off[] = {
+    {RV_GBEACONS_ADDR, rv_gbeacons_nops, sizeof rv_gbeacons_nops, 0,
+     rv_gbeacons_orig, sizeof rv_gbeacons_orig},
+};
+#define REVIEW_PATCH_COUNT (sizeof review_patches_on / sizeof review_patches_on[0])
+
+static int review_patches_applied = 0;
+
+/* Apply/revert the review patches to track demo-playback state. Called on a
+   throttle from the swap hook (game thread). */
+static void update_review_patches(void) {
+    int want;
+    if (!hook_option_bool("review.cheat_view")) {
+        want = 0;
+    } else {
+        const char *r = Con__evaluate("isPlayingDemo();", 0, NULL, 0);
+        want = (r && strcmp(r, "1") == 0);
+    }
+    if (want && !review_patches_applied) {
+        if (apply_code_patches("Demo review overlay", review_patches_on, REVIEW_PATCH_COUNT))
+            review_patches_applied = 1;
+    } else if (!want && review_patches_applied) {
+        if (apply_code_patches("Demo review overlay (revert)", review_patches_off, REVIEW_PATCH_COUNT))
+            review_patches_applied = 0;
+    }
+}
+
 static int install_browser_bot_limit(void) {
     static const unsigned char limit[] = {0xff};
     const struct code_patch patch = {BROWSER_BOT_LIMIT_ADDRESS, browser_bot_limit_original,
@@ -3137,6 +3184,12 @@ void SDL_GL_SwapBuffers(void) {
     }
     if (shell_audio_setup_done && now != (time_t)-1)
         poll_discord_presence(now);
+    /* Toggle the demo-review patches with playback state (~1 s throttle). */
+    static time_t last_review_check;
+    if (now != (time_t)-1 && now != last_review_check) {
+        last_review_check = now;
+        update_review_patches();
+    }
 }
 
 /* The dedicated server never swaps buffers. Platform::process (0x081CF400)
