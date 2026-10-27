@@ -1264,6 +1264,18 @@ static const unsigned char rv_ffi_dist_skip[] = {0x0f, 0x85, 0x7c, 0x08, 0x00, 0
 static const unsigned char rv_ffi_dist_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
 #define RV_FFI_DIST_ADDR 0x082FBC0B
 
+/* No-cloak site: the ShapeBase render function (0x8253xxx) checks a cloak-data
+   flag at +0xd0d and, when zero, skips directly to the full-opacity path.  When
+   the flag is set it reads cloakLevel (+0x810) and applies alpha blending and
+   a cloak shimmer texture.  Patching the setter alone doesn't work because the
+   advanceTime tick has its own interpolation that keeps writing cloakLevel.
+   Instead, force the top-level render branch at 0x8253e5e from je (0x74, "skip
+   cloak when no data") to jmp (0xeb, "always skip cloak"), so cloaked players
+   render fully opaque regardless of the cloak-level value. */
+static const unsigned char rv_nocloak_je[] = {0x74, 0x52};
+static const unsigned char rv_nocloak_jmp[] = {0xeb, 0x52};
+#define RV_NOCLOAK_ADDR 0x08253E5E
+
 static const struct code_patch review_patches_on[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_orig, sizeof rv_gbeacons_orig, 0,
      rv_gbeacons_nops, sizeof rv_gbeacons_nops},
@@ -1271,6 +1283,8 @@ static const struct code_patch review_patches_on[] = {
      rv_ffi_team_nops, sizeof rv_ffi_team_nops},
     {RV_FFI_DIST_ADDR, rv_ffi_dist_skip, sizeof rv_ffi_dist_skip, 0,
      rv_ffi_dist_nops, sizeof rv_ffi_dist_nops},
+    {RV_NOCLOAK_ADDR, rv_nocloak_je, sizeof rv_nocloak_je, 0,
+     rv_nocloak_jmp, sizeof rv_nocloak_jmp},
 };
 static const struct code_patch review_patches_off[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_nops, sizeof rv_gbeacons_nops, 0,
@@ -1279,6 +1293,8 @@ static const struct code_patch review_patches_off[] = {
      rv_ffi_team_skip, sizeof rv_ffi_team_skip},
     {RV_FFI_DIST_ADDR, rv_ffi_dist_nops, sizeof rv_ffi_dist_nops, 0,
      rv_ffi_dist_skip, sizeof rv_ffi_dist_skip},
+    {RV_NOCLOAK_ADDR, rv_nocloak_jmp, sizeof rv_nocloak_jmp, 0,
+     rv_nocloak_je, sizeof rv_nocloak_je},
 };
 #define REVIEW_PATCH_COUNT (sizeof review_patches_on / sizeof review_patches_on[0])
 
