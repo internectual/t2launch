@@ -717,6 +717,18 @@ options bring the parts of it that fit the Linux client:
   sync. Only your client changes: a listen server you host still sends real
   flash values to other players. This is the Linux equivalent of HappyMod 2's
   "no whiteout".
+- **Demo review — replacement assets** (`review.cheat_view` + `review.replace_models`, off). A launch
+  for reviewing a suspected cheater's recorded demo: render the demo with an hm2-style replacement
+  pack (`_hm2.vl2`: bright/visible models, visible cloak) so it looks the way the suspect saw it, which
+  helps tell a shot lined up on an artificial target from a lucky one. On this build a mounted `.vl2`
+  cannot override a model in a core volume like `shapes.vl2`, so the pack is instead extracted as
+  **loose files** under `base/` (`shapes/` and `textures/`) -- a loose file does override the volume
+  copy when the shape preloads. `run-game` extracts the pack to a launcher-managed cache
+  (`~/.local/share/t2launch/review/`), copies each top-level dir into the game's `base/` as real files
+  on a review launch, tracks what it added in an ownership sentinel, and removes it on non-review
+  launches, so the stock install keeps no copy (models replace for the whole launch, so a review launch
+  is for watching demos, not live play). The playback-gated marker overlays (beacons/IFF) are a
+  separate, later step.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.

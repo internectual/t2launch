@@ -483,6 +483,86 @@ launch_game() {
         fi
         if [[ -z "$MESA_YEAR" ]]; then GAME_ENV+=(MESA_EXTENSION_MAX_YEAR=2000); fi
         GAME_ENV+=(__GL_ExtensionStringVersion=17700)
+        # Demo review: show hm2's replacement models during playback by
+        # extracting the WHOLE pack as LOOSE files under base/ (shapes/ and
+        # textures/). Reverse-engineered on this build, confirmed by the project
+        # owner and CRC-probed:
+        #   * A .vl2 mounted under base/ cannot override a model in a core volume
+        #     like shapes.vl2 (core volumes load before the base/ scan).
+        #   * A LOOSE file at base/<path> DOES override the volume copy. It must
+        #     be a real file in a real directory -- a symlinked dir is not
+        #     recursed and symlinked files are not registered.
+        #   * Mounting the pack AND laying down loose shapes creates two
+        #     registrations of the same shape and breaks the override for the
+        #     whole set, so we use loose files only, no volume.
+        # Textures come along as loose files too (the hm2 shapes reference new
+        # happy_* textures). The hook's datablock-override config
+        # (T2LAUNCH_DATABLOCK_CONFIG) is a separate general feature (live shape
+        # redirects, Sun/Sky weather, ...) kept wired for future review tweaks.
+        # Everything is launcher-owned (a sentinel lists the base/ dirs we add)
+        # and removed on non-review launches; use review launches for playback.
+        review_cache="${XDG_DATA_HOME:-$HOME/.local/share}/t2launch/review/loose"
+        review_owned="${XDG_DATA_HOME:-$HOME/.local/share}/t2launch/review/.loose-owned"
+        # Remove our previously-extracted loose trees, and old-approach stragglers.
+        if [[ -f "$review_owned" ]]; then
+            while IFS= read -r _d; do
+                [[ -n "$_d" ]] && rm -rf "$HOST_GAME_PATH/base/$_d"
+            done < "$review_owned"
+            rm -f "$review_owned"; unset _d
+        fi
+        rm -f "$HOST_GAME_PATH/base/_hm2.vl2" "$HOST_GAME_PATH/base/_hm2_real.vl2" \
+              "$HOST_GAME_PATH/base/zzzz_hm2.vl2" "$HOST_GAME_PATH/base/_hm2.stored.vl2" \
+              "$HOST_GAME_PATH/base/000_t2review.vl2"
+        [[ -L "$HOST_GAME_PATH/base/shapes" ]] && rm -f "$HOST_GAME_PATH/base/shapes"
+        rm -rf "$HOST_GAME_PATH/base/t2launch_review"
+        [[ -L "$HOST_GAME_PATH/t2launch_review" ]] && rm -f "$HOST_GAME_PATH/t2launch_review"
+        if [[ "${T2LAUNCH_REVIEW_MODELS:-0}" == "1" ]]; then
+            review_dir="${XDG_DATA_HOME:-$HOME/.local/share}/t2launch/review"
+            review_src="$review_dir/_hm2.vl2"
+            if [[ -f "$review_src" ]]; then
+                # (re)extract the whole pack to the cache when it changes.
+                if [[ ! -d "$review_cache" || "$review_src" -nt "$review_cache" ]]; then
+                    rm -rf "$review_cache"; mkdir -p "$review_cache"
+                    python3 -I - "$review_src" "$review_cache" <<'PY'
+import sys, zipfile, os
+z = zipfile.ZipFile(sys.argv[1]); out = sys.argv[2]
+for info in z.infolist():
+    if info.is_dir(): continue
+    dst = os.path.join(out, info.filename)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    open(dst, "wb").write(z.read(info.filename))
+PY
+                    touch -r "$review_src" "$review_cache" 2>/dev/null || true
+                fi
+                # Copy each top-level dir (shapes/, textures/) in as real files,
+                # unless a non-owned one already exists (don't clobber anything).
+                : > "$review_owned"
+                for _d in "$review_cache"/*/; do
+                    [[ -d "$_d" ]] || continue
+                    _d=$(basename "$_d")
+                    if [[ -e "$HOST_GAME_PATH/base/$_d" ]]; then
+                        echo "NOTE: base/$_d already exists; skipping hm2 loose $_d" >&2
+                        echo "  (remove it to enable review models)." >&2
+                        continue
+                    fi
+                    cp -r "$review_cache/$_d" "$HOST_GAME_PATH/base/$_d"
+                    echo "$_d" >> "$review_owned"
+                done
+                unset _d
+                echo "[t2launch] Demo review: hm2 models+textures extracted as loose files under base/"
+                # datablock-override feature (general: shape redirects, weather,
+                # ...). Seed the user's editable copy from the repo template.
+                review_cfg="$review_dir/datablocks.cfg"
+                [[ -f "$review_cfg" ]] || cp "$ROOT_DIR/datablocks-review.cfg" "$review_cfg" 2>/dev/null
+                [[ -f "$review_cfg" ]] && GAME_ENV+=("T2LAUNCH_DATABLOCK_CONFIG=$review_cfg")
+                unset review_cfg
+            else
+                echo "NOTE: demo-review model replacement is on, but no pack at" >&2
+                echo "  $review_src -- put the hm2 _hm2.vl2 there to use it." >&2
+            fi
+            unset review_dir review_src
+        fi
+        unset review_cache review_owned
     else
         GAME_ENV+=(T2LAUNCH_GAMESCOPE=0)
     fi

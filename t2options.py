@@ -223,6 +223,19 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Drop the white flash (concussion grenades and the like) the server sends for your "
                 "player, as HappyMod 2's no-whiteout did."),
+    # Demo review (anti-cheat forensics): reconstruct what a suspect saw. Use a
+    # review launch to watch demos, not to play live.
+    Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="A launch for reviewing a suspected cheater's demo: show what their hacked client "
+                "would have shown. Enable the pieces below. Marker overlays (beacons/IFF) come later."),
+    Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
+           env="T2LAUNCH_REVIEW_MODELS", requires=(("review.cheat_view", (True,)),),
+           help="Render demos with the hm2 asset pack (_hm2.vl2: bright/visible models, visible cloak, "
+                "hm2's HUD) so a demo looks the way the suspect saw it. The pack is mounted for the "
+                "whole launch via the engine's -mod at startup (runtime mounting crashes the engine), "
+                "so this is a review-only launch, not for live play. Put _hm2.vl2 in the launcher's "
+                "review directory (~/.local/share/t2launch/review/)."),
     Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)),),
            help="setFov() normally clamps the field of view to 1-179 degrees; allow 0-360."),
@@ -355,7 +368,8 @@ CLIENT_ONLY = frozenset((
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
-    "ui.visible_distance", "ui.no_whiteout", "security.safe_soundpacks", "security.max_soundpack_kbytes",
+    "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.replace_models",
+    "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
 OPTIONS = tuple(replace(option, requires=(("game.executable", ("client",)),) + option.requires)
