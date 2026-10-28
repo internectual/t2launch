@@ -228,7 +228,27 @@ OPTIONS = (
     Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="A launch for reviewing a suspected cheater's demo: show what their hacked client "
-                "would have shown. Enable the pieces below. Marker overlays (beacons/IFF) come later."),
+                "would have shown. During playback, apply hm2-style beacon visibility, FFI checks "
+                "and range, and mesh alpha. Replacement assets can be enabled below."),
+    Option("review.autobeacon", "Demo review", "Reconstruct hm2 autobeacon targets", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)),),
+           help="During demo playback, borrow up to 32 recorded beacons to mark enemy players, "
+                "selected structures and waypoints, ranked by horizontal angle as in hm2. "
+                "The recorded beacon positions and types are restored after each draw. "
+                "The demo must contain beacon objects."),
+    Option("review.extended_range", "Demo review", "Extend review indicator range", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)),),
+           help="Use a 20000-unit camera/HUD range during demo review. This can be compared with "
+                "the recorded mission's stock range using hook_review_range(0) and hook_review_range(1)."),
+    Option("review.global_beacons", "Demo review", "Show all recorded beacons", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)),),
+           help="Show recorded beacons across sensor groups during demo review. Compare with "
+                "stock visibility using hook_review_global_beacons(0) and hook_review_global_beacons(1)."),
+    Option("review.shortcuts", "Demo review", "Playback review shortcuts", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)), ("hook.console_commands", (True,))),
+           help="During review playback, Ctrl+Shift+F6 toggles extended range and Ctrl+Shift+F7 "
+                "toggles global-beacon visibility. Status appears on the HUD. Existing bindings "
+                "are preserved, and the review bindings are removed when playback ends."),
     Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
            env="T2LAUNCH_REVIEW_MODELS", requires=(("review.cheat_view", (True,)),),
            help="Render demos with the hm2 asset pack (_hm2.vl2: bright/visible models, visible cloak, "
@@ -368,7 +388,8 @@ CLIENT_ONLY = frozenset((
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
-    "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.replace_models",
+    "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.autobeacon", "review.replace_models",
+    "review.extended_range", "review.global_beacons", "review.shortcuts",
     "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))

@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <math.h>
 
 typedef int S32;
 
@@ -165,6 +166,10 @@ static struct hook_option hook_options[] = {
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
+    {"review.autobeacon", "1", NULL, 0, "", 0},
+    {"review.extended_range", "1", NULL, 0, "", 0},
+    {"review.global_beacons", "1", NULL, 0, "", 0},
+    {"review.shortcuts", "1", NULL, 0, "", 0},
     {"ui.fov_range", "0", NULL, 0, "", 0},
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
@@ -1235,88 +1240,604 @@ static int apply_code_patches(const char *name, const struct code_patch *patches
     return 1;
 }
 
-/* ---- Demo-review overlay patches (review.cheat_view) ----------------------
-   Memory patches that reconstruct what a suspected cheater saw -- ported from
-   HappyMod 2 -- applied ONLY while a demo is playing (isPlayingDemo()) and
-   reverted the moment playback stops, so they are structurally inert in live
-   play (a live server connection is never demo playback). Display only; no
-   autoaim. The same apply_code_patches() verifier runs both directions, so a
-   site is touched only when it holds the bytes we expect.
+/* ---- Demo-review reconstruction (review.cheat_view) -----------------------
+   Loki #25034 CLIENT ONLY. RESEARCH.md records executable hashes, Windows
+   counterparts, disassembly evidence and rejected earlier candidates. These
+   are static-verified equivalents; visual playback verification is separate.
+   Apply/revert at each swap according to the native isPlayingDemo callback.
+   Display only; no autoaim. Autobeacon borrows recorded beacons during the
+   native beacon draw, then restores their positions and types before returning.
 
-   global beacons: the beacon-HUD render (0x082FC7xx) calls a per-beacon
-   visibility filter (0x0815F994, sensor/mask bits) and skips the beacon when
-   it returns false (je at 0x082FC844). NOP that skip so every beacon draws --
-   the suspect's beacons, including enemy ones, become visible in the review. */
-static const unsigned char rv_gbeacons_orig[] = {0x0f, 0x84, 0x7a, 0x01, 0x00, 0x00};
-static const unsigned char rv_gbeacons_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-#define RV_GBEACONS_ADDR 0x082FC844
+   Global beacons: remove the sensor-group comparison's skip in the beacon
+   enumeration. Keep the projection/depth guard at 0x082FC844 intact. */
+static const unsigned char rv_gbeacons_orig[] = {0x75, 0x43};
+static const unsigned char rv_nops[] = {0x90, 0x90};
+#define RV_GBEACONS_ADDR 0x082FC6BA
 
-/* Candidate FFI-always site: in the player-indicator enumeration, reject
-   players whose team differs from the local team. NOP the conditional skip
-   so opposing-team player indicators reach the common draw routine. */
-static const unsigned char rv_ffi_team_skip[] = {0x75, 0x43};
-static const unsigned char rv_ffi_team_nops[] = {0x90, 0x90};
-#define RV_FFI_TEAM_ADDR 0x082FC6BA
+/* hm2's FFI visibility-byte check is split into bit 0 and bits 1..7 by GCC.
+   A set target-mask bit can mark the object friendly without requiring the
+   matching object-info visibility byte. Retain the zero-mask rejection. */
+static const unsigned char rv_ffi_bit0_orig[] = {0x75, 0x19};
+static const unsigned char rv_ffi_bit0_jump[] = {0xeb, 0x19};
+static const unsigned char rv_ffi_loop_orig[] = {0x74, 0xe8};
+#define RV_FFI_BIT0_ADDR 0x0819103D
+#define RV_FFI_LOOP_ADDR 0x08191056
 
-/* Candidate FFI-far site: the squared-distance comparison sets dl when the
-   player is outside the HUD indicator range; this branch then skips drawing. */
-static const unsigned char rv_ffi_dist_skip[] = {0x0f, 0x85, 0x7c, 0x08, 0x00, 0x00};
-static const unsigned char rv_ffi_dist_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-#define RV_FFI_DIST_ADDR 0x082FBC0B
+/* Camera-query far plane (the direct Windows ffi-far counterpart), plus the
+   HUD's independent read of the same scene +0xe2c distance. Substitute fld
+   [hook constant], preserving x87 stack depth and the existing fallbacks. */
+static const unsigned char rv_far_orig[] = {0xd9, 0x80, 0x2c, 0x0e, 0x00, 0x00};
+static const float rv_far_distance = 20000.0f;
+static unsigned char rv_far_load[] = {0xd9, 0x05, 0, 0, 0, 0};
+#define RV_CAMERA_FAR_ADDR 0x08232A68
+#define RV_HUD_FAR_ADDR 0x081939D3
 
-/* No-cloak site: the ShapeBase render function (0x8253xxx) checks a cloak-data
-   flag at +0xd0d and, when zero, skips directly to the full-opacity path.  When
-   the flag is set it reads cloakLevel (+0x810) and applies alpha blending and
-   a cloak shimmer texture.  Patching the setter alone doesn't work because the
-   advanceTime tick has its own interpolation that keeps writing cloakLevel.
-   Instead, force the top-level render branch at 0x8253e5e from je (0x74, "skip
-   cloak when no data") to jmp (0xeb, "always skip cloak"), so cloaked players
-   render fully opaque regardless of the cloak-level value. */
-static const unsigned char rv_nocloak_je[] = {0x74, 0x52};
-static const unsigned char rv_nocloak_jmp[] = {0xeb, 0x52};
-#define RV_NOCLOAK_ADDR 0x08253E5E
+/* Shared mesh alpha setup, corresponding to Windows 0x006A56F4. Load 0.9f
+   instead of the shape-instance alpha; leave the following fstp and all
+   cloak state/interpolation untouched. The old mounted-image-only branch at
+   0x08253E5E was not the Windows patch's counterpart. */
+static const unsigned char rv_alpha_orig[] = {0xd9, 0x05, 0x94, 0xf8, 0x6b, 0x08};
+static const float rv_alpha = 0.9f;
+static unsigned char rv_alpha_load[] = {0xd9, 0x05, 0, 0, 0, 0};
+#define RV_ALPHA_ADDR 0x0831EE13
+
+#define RV_DEMO_CALLBACK_ADDR 0x082395EC
+static const unsigned char rv_demo_callback_orig[] = {
+    0x55, 0x8b, 0x15, 0xdc, 0x5c, 0x49, 0x08, 0x89, 0xe5, 0xb0, 0x00,
+    0x85, 0xd2, 0x74, 0x0a, 0x83, 0xba, 0x20, 0x82, 0x00, 0x00, 0x00,
+    0x0f, 0x95, 0xc0, 0x89, 0xec, 0x5d, 0xc3
+};
+
+#define RV_BEACON_CALL_ADDR 0x082FD00E
+#define RV_BEACON_RENDER_ADDR 0x082FC49C
+static const unsigned char rv_beacon_call_orig[] = {0xe8, 0x89, 0xf4, 0xff, 0xff};
+static const unsigned char rv_beacon_render_orig[] = {
+    0x55, 0x89, 0xe5, 0x81, 0xec, 0x8c, 0x00, 0x00, 0x00, 0x8b, 0x45, 0x08
+};
+static unsigned char rv_beacon_call[] = {0xe8, 0, 0, 0, 0};
+static void review_beacon_render(void *hud);
+typedef unsigned char (*rv_demo_callback_t)(void *, S32, const char **);
+static int review_demo_playing(void) {
+    static const char *args[] = {"isPlayingDemo"};
+    return ((rv_demo_callback_t)RV_DEMO_CALLBACK_ADDR)(NULL, 1, args) != 0;
+}
 
 static const struct code_patch review_patches_on[] = {
     {RV_GBEACONS_ADDR, rv_gbeacons_orig, sizeof rv_gbeacons_orig, 0,
-     rv_gbeacons_nops, sizeof rv_gbeacons_nops},
-    {RV_FFI_TEAM_ADDR, rv_ffi_team_skip, sizeof rv_ffi_team_skip, 0,
-     rv_ffi_team_nops, sizeof rv_ffi_team_nops},
-    {RV_FFI_DIST_ADDR, rv_ffi_dist_skip, sizeof rv_ffi_dist_skip, 0,
-     rv_ffi_dist_nops, sizeof rv_ffi_dist_nops},
-    {RV_NOCLOAK_ADDR, rv_nocloak_je, sizeof rv_nocloak_je, 0,
-     rv_nocloak_jmp, sizeof rv_nocloak_jmp},
+     rv_nops, sizeof rv_nops},
+    {RV_FFI_BIT0_ADDR, rv_ffi_bit0_orig, sizeof rv_ffi_bit0_orig, 0,
+     rv_ffi_bit0_jump, sizeof rv_ffi_bit0_jump},
+    {RV_FFI_LOOP_ADDR, rv_ffi_loop_orig, sizeof rv_ffi_loop_orig, 0,
+     rv_nops, sizeof rv_nops},
+    {RV_CAMERA_FAR_ADDR, rv_far_orig, sizeof rv_far_orig, 0,
+     rv_far_load, sizeof rv_far_load},
+    {RV_HUD_FAR_ADDR, rv_far_orig, sizeof rv_far_orig, 0,
+     rv_far_load, sizeof rv_far_load},
+    {RV_ALPHA_ADDR, rv_alpha_orig, sizeof rv_alpha_orig, 0,
+     rv_alpha_load, sizeof rv_alpha_load},
+    {RV_BEACON_CALL_ADDR, rv_beacon_call_orig, sizeof rv_beacon_call_orig, 0,
+     rv_beacon_call, sizeof rv_beacon_call},
 };
 static const struct code_patch review_patches_off[] = {
-    {RV_GBEACONS_ADDR, rv_gbeacons_nops, sizeof rv_gbeacons_nops, 0,
+    {RV_GBEACONS_ADDR, rv_nops, sizeof rv_nops, 0,
      rv_gbeacons_orig, sizeof rv_gbeacons_orig},
-    {RV_FFI_TEAM_ADDR, rv_ffi_team_nops, sizeof rv_ffi_team_nops, 0,
-     rv_ffi_team_skip, sizeof rv_ffi_team_skip},
-    {RV_FFI_DIST_ADDR, rv_ffi_dist_nops, sizeof rv_ffi_dist_nops, 0,
-     rv_ffi_dist_skip, sizeof rv_ffi_dist_skip},
-    {RV_NOCLOAK_ADDR, rv_nocloak_jmp, sizeof rv_nocloak_jmp, 0,
-     rv_nocloak_je, sizeof rv_nocloak_je},
+    {RV_FFI_BIT0_ADDR, rv_ffi_bit0_jump, sizeof rv_ffi_bit0_jump, 0,
+     rv_ffi_bit0_orig, sizeof rv_ffi_bit0_orig},
+    {RV_FFI_LOOP_ADDR, rv_nops, sizeof rv_nops, 0,
+     rv_ffi_loop_orig, sizeof rv_ffi_loop_orig},
+    {RV_CAMERA_FAR_ADDR, rv_far_load, sizeof rv_far_load, 0,
+     rv_far_orig, sizeof rv_far_orig},
+    {RV_HUD_FAR_ADDR, rv_far_load, sizeof rv_far_load, 0,
+     rv_far_orig, sizeof rv_far_orig},
+    {RV_ALPHA_ADDR, rv_alpha_load, sizeof rv_alpha_load, 0,
+     rv_alpha_orig, sizeof rv_alpha_orig},
+    {RV_BEACON_CALL_ADDR, rv_beacon_call, sizeof rv_beacon_call, 0,
+     rv_beacon_call_orig, sizeof rv_beacon_call_orig},
 };
 #define REVIEW_PATCH_COUNT (sizeof review_patches_on / sizeof review_patches_on[0])
 
 static int review_patches_applied = 0;
+static uint32_t review_applied_mask;
+enum review_patch_group { REVIEW_CORE, REVIEW_GLOBAL_BEACONS, REVIEW_RANGE };
+static enum review_patch_group review_group(size_t index) {
+    uintptr_t address = review_patches_on[index].address;
+    if (address == RV_GBEACONS_ADDR) return REVIEW_GLOBAL_BEACONS;
+    if (address == RV_CAMERA_FAR_ADDR || address == RV_HUD_FAR_ADDR) return REVIEW_RANGE;
+    return REVIEW_CORE;
+}
+static uint32_t review_group_mask(enum review_patch_group group) {
+    uint32_t mask = 0;
+    for (size_t i = 0; i < REVIEW_PATCH_COUNT; i++)
+        if (review_group(i) == group) mask |= 1u << i;
+    return mask;
+}
 
-/* Apply/revert the review patches to track demo-playback state. Called on a
-   throttle from the swap hook (game thread). */
+/* Playback uses $globalActionMapOnly, so a console can open without accepting
+   text. Use that supported input path for review A/B keys instead. Bind only
+   vacant keys, and remove only bindings that still point to our functions.
+   Loki separates modifier tokens with hyphens before the first space. */
+static const char review_shortcuts_script[] =
+    "function t2launch_reviewRangeKey(%pressed) {\n"
+    " if (!%pressed || !isPlayingDemo()) return;\n"
+    " %status = hook_review_range(!hook_option(\"review.extended_range\"));\n"
+    " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
+    "}\n"
+    "function t2launch_reviewBeaconKey(%pressed) {\n"
+    " if (!%pressed || !isPlayingDemo()) return;\n"
+    " %status = hook_review_global_beacons(!hook_option(\"review.global_beacons\"));\n"
+    " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
+    "}\n"
+    "function t2launch_reviewKeysSet(%active) {\n"
+    " if (!isObject(GlobalActionMap)) return \"global action map unavailable\";\n"
+    " %keys = \"shift-ctrl f6\\tshift-ctrl f7\";\n"
+    " %commands = \"t2launch_reviewRangeKey\\tt2launch_reviewBeaconKey\";\n"
+    " %result = \"\";\n"
+    " for (%i = 0; %i < 2; %i++) {\n"
+    "  %key = getField(%keys, %i); %command = getField(%commands, %i);\n"
+    "  %existing = GlobalActionMap.getCommand(\"keyboard\", %key);\n"
+    "  if (%active) {\n"
+    "   if (%existing $= \"\") GlobalActionMap.bind(\"keyboard\", %key, %command);\n"
+    "   else if (%existing !$= %command)\n"
+    "    echo(\"[t2_hook] Review shortcut already bound, leaving it alone: \" @ %key);\n"
+    "  } else if (%existing $= %command) GlobalActionMap.unbind(\"keyboard\", %key);\n"
+    "  %after = GlobalActionMap.getCommand(\"keyboard\", %key);\n"
+    "  if (%active) {\n"
+    "   if (%after $= %command) %state = \"bound\";\n"
+    "   else if (%existing !$= \"\") %state = \"occupied\";\n"
+    "   else %state = \"failed\";\n"
+    "  } else {\n"
+    "   if (%after $= %command) %state = \"still-bound\"; else %state = \"released\";\n"
+    "  }\n"
+    "  if (%i == 0) %label = \"range\"; else %label = \"global_beacons\";\n"
+    "  %result = trim(%result @ \" \" @ %label @ \"=\" @ %state);\n"
+    " }\n"
+    " return %result;\n"
+    "}\n";
+static int review_shortcuts_installed, review_shortcuts_active;
+static void update_review_shortcuts(int active) {
+    if (!registered || !Con__evaluate || !game_main_thread_known ||
+        !pthread_equal(pthread_self(), game_main_thread)) return;
+    int wanted = active && !target->dedicated && hook_option_bool("review.shortcuts") &&
+                 hook_option_bool("hook.console_commands");
+    if (wanted == review_shortcuts_active) return;
+    if (!review_shortcuts_installed) {
+        if (!wanted) return;
+        review_shortcuts_installed = 1;
+        Con__evaluate(review_shortcuts_script, 0, "t2launch/review-keys.cs", 0);
+    }
+    review_shortcuts_active = wanted;
+    const char *status = Con__evaluate(wanted ? "t2launch_reviewKeysSet(1);" : "t2launch_reviewKeysSet(0);",
+                                       0, NULL, 0);
+    fprintf(stderr, "[t2_hook] Demo review shortcuts %s: %s (Ctrl+Shift+F6 range, Ctrl+Shift+F7 global beacons)\n",
+            wanted ? "setup" : "cleanup", status && *status ? status : "no binding status returned");
+}
+
+/* A native bool callback through Con::evaluate need not produce a fresh string
+   result. Verify and call the engine's callback directly instead. */
 static void update_review_patches(void) {
-    int want;
-    if (!hook_option_bool("review.cheat_view")) {
-        want = 0;
+    static int prepared;
+    int enabled = hook_option_bool("review.cheat_view");
+    if (target->dedicated || (!enabled && !review_patches_applied)) return;
+    if (!prepared) {
+        int protection;
+        if (!readable_range(RV_DEMO_CALLBACK_ADDR, sizeof rv_demo_callback_orig, &protection) ||
+            !(protection & PROT_EXEC) ||
+            memcmp((void *)RV_DEMO_CALLBACK_ADDR, rv_demo_callback_orig,
+                   sizeof rv_demo_callback_orig) != 0) {
+            fprintf(stderr, "[t2_hook] Demo review refused: unsupported playback callback\n");
+            prepared = -1;
+            return;
+        }
+        if (!readable_range(RV_BEACON_RENDER_ADDR, sizeof rv_beacon_render_orig, &protection) ||
+            !(protection & PROT_EXEC) ||
+            memcmp((void *)RV_BEACON_RENDER_ADDR, rv_beacon_render_orig,
+                   sizeof rv_beacon_render_orig) != 0) {
+            fprintf(stderr, "[t2_hook] Demo review refused: unsupported beacon renderer\n");
+            prepared = -1;
+            return;
+        }
+        uint32_t far_address = (uint32_t)(uintptr_t)&rv_far_distance;
+        uint32_t alpha_address = (uint32_t)(uintptr_t)&rv_alpha;
+        memcpy(rv_far_load + 2, &far_address, sizeof far_address);
+        memcpy(rv_alpha_load + 2, &alpha_address, sizeof alpha_address);
+        int32_t call_offset = (int32_t)((uintptr_t)review_beacon_render -
+                                       (RV_BEACON_CALL_ADDR + sizeof rv_beacon_call));
+        memcpy(rv_beacon_call + 1, &call_offset, sizeof call_offset);
+        prepared = 1;
+    }
+    if (prepared < 0) return;
+    uint32_t wanted = 0;
+    if (enabled && review_demo_playing()) {
+        wanted = review_group_mask(REVIEW_CORE);
+        if (hook_option_bool("review.global_beacons")) wanted |= review_group_mask(REVIEW_GLOBAL_BEACONS);
+        if (hook_option_bool("review.extended_range")) wanted |= review_group_mask(REVIEW_RANGE);
+    }
+    update_review_shortcuts(wanted != 0 && review_patches_applied);
+    if (wanted == review_applied_mask) return;
+    /* A refused patch must not flood the log at the frame rate. State checks
+       remain per-frame; only a failed write/verification delays its retry. */
+    static time_t retry_after;
+    time_t now = time(NULL);
+    if (now != (time_t)-1 && now < retry_after) return;
+    retry_after = now == (time_t)-1 ? 0 : now + 1;
+    struct code_patch transitions[REVIEW_PATCH_COUNT];
+    size_t count = 0;
+    for (size_t i = 0; i < REVIEW_PATCH_COUNT; i++) {
+        uint32_t bit = 1u << i;
+        if ((wanted ^ review_applied_mask) & bit)
+            transitions[count++] = wanted & bit ? review_patches_on[i] : review_patches_off[i];
+    }
+    if (apply_code_patches(wanted ? "Demo review overlay" : "Demo review overlay (revert)",
+                           transitions, count)) {
+        review_applied_mask = wanted;
+        review_patches_applied = wanted != 0;
+        retry_after = 0;
+        if (wanted)
+            fprintf(stderr, "[t2_hook] Demo review: reconstruction patches enabled (range=%d, global_beacons=%d)\n",
+                    (wanted & review_group_mask(REVIEW_RANGE)) != 0,
+                    (wanted & review_group_mask(REVIEW_GLOBAL_BEACONS)) != 0);
+        else
+            fprintf(stderr, "[t2_hook] Demo review: original rendering restored\n");
+    }
+    update_review_shortcuts(wanted != 0 && review_patches_applied);
+}
+
+/* ---- hm2 autobeacon ------------------------------------------------------
+   Engine-owned registries are read on the render/game thread. Cache IDs, not
+   unguarded position pointers: a ghost can disappear between ranking frames.
+   Windows' 64 players + 64 objects, 32 beacons and 20-frame ranking cadence
+   are retained. RESEARCH.md documents every field and the render-call ABI. */
+#define RV_ID_DICTIONARY 0x084E3320
+#define RV_CLIENT_TARGET_SET 0x084E32DC
+#define RV_CONNECTION 0x08495CDC
+#define RV_PLAYER_LIMIT 64
+#define RV_OBJECT_LIMIT 64
+#define RV_TARGET_LIMIT (RV_PLAYER_LIMIT + RV_OBJECT_LIMIT)
+#define RV_BEACON_LIMIT 32
+#define RV_REFRESH_FRAMES 20
+#define RV_OTHER_TEAM 69
+
+struct rv_map { uintptr_t start, end; int protection; };
+struct rv_memory { struct rv_map maps[512]; size_t count; };
+enum rv_kind { RV_PLAYER, RV_SHAPE, RV_WAYPOINT };
+struct rv_target {
+    void *object;
+    uint32_t id;
+    enum rv_kind kind;
+    int type;
+    double rank;
+};
+static struct {
+    uintptr_t connection, stream;
+    uint32_t self_id;
+    int team;
+    unsigned int frame;
+    struct rv_target targets[RV_TARGET_LIMIT];
+    size_t count;
+    int reported, last_beacons, last_targets;
+} rv_tracking;
+typedef void (*rv_beacon_render_t)(void *);
+static rv_beacon_render_t rv_native_beacon_render = (rv_beacon_render_t)RV_BEACON_RENDER_ADDR;
+
+/* One /proc read per draw, rather than opening maps for every object field. */
+static int rv_memory_snapshot(struct rv_memory *memory) {
+    memory->count = 0;
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+    char line[512], permissions[5];
+    unsigned long start, end;
+    while (fgets(line, sizeof line, maps)) {
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, permissions) != 3 || permissions[0] != 'r')
+            continue;
+        if (memory->count == sizeof memory->maps / sizeof memory->maps[0]) {
+            fclose(maps);
+            return 0;
+        }
+        struct rv_map *map = &memory->maps[memory->count++];
+        map->start = start; map->end = end; map->protection = PROT_READ;
+        if (permissions[1] == 'w') map->protection |= PROT_WRITE;
+        if (permissions[2] == 'x') map->protection |= PROT_EXEC;
+    }
+    fclose(maps);
+    return 1;
+}
+
+static const struct rv_map *rv_memory_range(const struct rv_memory *memory,
+                                           const void *pointer, size_t length, int protection) {
+    uintptr_t address = (uintptr_t)pointer;
+    if (!address || length > UINTPTR_MAX - address) return NULL;
+    /* /proc/self/maps is address-ordered; field checks are frequent while
+       walking the ID dictionary, so avoid a linear scan per field. */
+    size_t low = 0, high = memory->count;
+    while (low < high) {
+        size_t middle = low + (high - low) / 2;
+        const struct rv_map *map = &memory->maps[middle];
+        if (address < map->start) high = middle;
+        else if (address >= map->end) low = middle + 1;
+        else return address + length <= map->end &&
+                    (map->protection & protection) == protection ? map : NULL;
+    }
+    return NULL;
+}
+
+static uint32_t rv_word(const void *object, size_t offset) {
+    uint32_t value;
+    memcpy(&value, (const unsigned char *)object + offset, sizeof value);
+    return value;
+}
+static void *rv_pointer(const void *object, size_t offset) {
+    return (void *)(uintptr_t)rv_word(object, offset);
+}
+static float rv_float(const void *object, size_t offset) {
+    float value;
+    memcpy(&value, (const unsigned char *)object + offset, sizeof value);
+    return value;
+}
+static const char *rv_string(const struct rv_memory *memory, const void *pointer, size_t limit) {
+    const struct rv_map *map = rv_memory_range(memory, pointer, 1, PROT_READ);
+    if (!map) return NULL;
+    size_t available = map->end - (uintptr_t)pointer;
+    if (available > limit) available = limit;
+    return memchr(pointer, 0, available) ? pointer : NULL;
+}
+
+/* Equivalent to SimObject::getClassName: virtual getClassRep, then +0x18. */
+static const char *rv_class_name(const struct rv_memory *memory, void *object) {
+    if (!rv_memory_range(memory, object, 0x30, PROT_READ)) return NULL;
+    void *vtable = rv_pointer(object, 0);
+    if (!rv_memory_range(memory, vtable, 12, PROT_READ)) return NULL;
+    void *getter = rv_pointer(vtable, 8);
+    if (!rv_memory_range(memory, getter, 1, PROT_EXEC)) return NULL;
+    void *class_rep = ((void *(*)(void *))getter)(object);
+    if (!rv_memory_range(memory, class_rep, 0x1c, PROT_READ)) return NULL;
+    return rv_string(memory, rv_pointer(class_rep, 0x18), 64);
+}
+
+static void *rv_find_object(const struct rv_memory *memory, void *dictionary, uint32_t id) {
+    void *object = rv_pointer(dictionary, (id & 0xfff) * 4);
+    for (unsigned int visited = 0; object && visited < 4096; visited++) {
+        if (!rv_memory_range(memory, object, 0x24, PROT_READ)) return NULL;
+        if (rv_word(object, 0x20) == id) return object;
+        object = rv_pointer(object, 0x10);
+    }
+    return NULL;
+}
+
+static int rv_position(const struct rv_memory *memory, void *object, enum rv_kind kind, float xyz[3]) {
+    size_t base = kind == RV_WAYPOINT ? 0x38 : 0xa8;
+    size_t stride = kind == RV_WAYPOINT ? 4 : 16;
+    if (!rv_memory_range(memory, (unsigned char *)object + base, stride * 2 + 4, PROT_READ)) return 0;
+    for (int i = 0; i < 3; i++) {
+        xyz[i] = rv_float(object, base + i * stride);
+        if (!isfinite(xyz[i])) return 0;
+    }
+    return 1;
+}
+
+static int rv_team(const struct rv_memory *memory, void *object) {
+    void *info = rv_pointer(object, 0x26c);
+    return rv_memory_range(memory, info, 0x1c, PROT_READ)
+        ? (int32_t)rv_word(info, 0x18) : RV_OTHER_TEAM;
+}
+
+/* Return the hm2 target category and beacon type; all ShapeBase reads follow
+   exact class-name and ghost checks. Waypoints are plain SimObjects. */
+static int rv_target_info(const struct rv_memory *memory, void *object,
+                          uint32_t self_id, int local_team, struct rv_target *out) {
+    const char *name = rv_class_name(memory, object);
+    if (!name) return 0;
+    uint32_t id = rv_word(object, 0x20);
+    if (!id || id == self_id) return 0;
+    enum rv_kind kind;
+    int type = 0, team;
+    if (strcmp(name, "ClientTarget") == 0) {
+        if (!rv_memory_range(memory, object, 0x44, PROT_READ) || rv_word(object, 0x30) != 2) return 0;
+        kind = RV_WAYPOINT; team = RV_OTHER_TEAM;
     } else {
-        const char *r = Con__evaluate("isPlayingDemo();", 0, NULL, 0);
-        want = (r && strcmp(r, "1") == 0);
+        if (strcmp(name, "Player") == 0) kind = RV_PLAYER;
+        else if (strcmp(name, "Turret") == 0 || strcmp(name, "StaticShape") == 0) kind = RV_SHAPE;
+        else return 0;
+        if (!rv_memory_range(memory, object, 0x2d4, PROT_READ) || !(rv_word(object, 0x40) & 2)) return 0;
+        team = rv_team(memory, object);
+        if (kind == RV_SHAPE) {
+            void *data = rv_pointer(object, 0x2d0);
+            if (!rv_memory_range(memory, data, 0x48, PROT_READ)) return 0;
+            const char *file = rv_string(memory, rv_pointer(data, 0x44), 256);
+            if (!file) return 0;
+            const char *base = strrchr(file, '/');
+            file = base ? base + 1 : file;
+            if (strcmp(file, "deploy_inventory.dts") == 0 ||
+                strcmp(file, "turret_outdoor_deploy.dts") == 0 ||
+                strcmp(file, "turret_indoor_deployc.dts") == 0 ||
+                strcmp(file, "turret_indoor_deployf.dts") == 0 ||
+                strcmp(file, "turret_indoor_deployw.dts") == 0) type = 2;
+            else if (strcmp(file, "turret_base_large.dts") != 0 &&
+                     strcmp(file, "sensor_pulse_large.dts") != 0 &&
+                     strcmp(file, "ext_flagstand.dts") != 0 &&
+                     strcmp(file, "vehicle_pad_station.dts") != 0) return 0;
+        }
     }
-    if (want && !review_patches_applied) {
-        if (apply_code_patches("Demo review overlay", review_patches_on, REVIEW_PATCH_COUNT))
-            review_patches_applied = 1;
-    } else if (!want && review_patches_applied) {
-        if (apply_code_patches("Demo review overlay (revert)", review_patches_off, REVIEW_PATCH_COUNT))
-            review_patches_applied = 0;
+    if (kind == RV_PLAYER ? team == local_team : team <= 0 || (team == local_team && team != RV_OTHER_TEAM))
+        return 0;
+    float position[3];
+    if (!rv_position(memory, object, kind, position)) return 0;
+    *out = (struct rv_target){object, id, kind, type, 0};
+    return 1;
+}
+
+/* -cos(theta)*abs(cos(theta)), up to a common view-vector magnitude factor,
+   orders absolute yaw exactly like hm2's acos without needing libm calls. */
+static double rv_yaw_rank(const float position[3], const float origin[3], float view_x, float view_y) {
+    double x = (double)position[0] - origin[0], y = (double)position[1] - origin[1];
+    double length = x * x + y * y;
+    if (!length) return -((double)view_x * view_x + (double)view_y * view_y);
+    double dot = x * view_x + y * view_y;
+    return -dot * (dot < 0 ? -dot : dot) / length;
+}
+static int rv_compare_targets(const void *left, const void *right) {
+    const struct rv_target *a = left, *b = right;
+    if (a->rank != b->rank) return a->rank < b->rank ? -1 : 1;
+    return a->id < b->id ? -1 : a->id != b->id;
+}
+
+/* Match the reference's separate 64-player/64-object pools, keeping lowest
+   IDs when a pool fills so bucket enumeration order does not affect selection. */
+static void rv_add_target(const struct rv_target *candidate) {
+    size_t same_kind = 0, largest = 0;
+    int player = candidate->kind == RV_PLAYER;
+    for (size_t i = 0; i < rv_tracking.count; i++) {
+        struct rv_target *t = &rv_tracking.targets[i];
+        if ((t->kind == RV_PLAYER) != player) continue;
+        if (!same_kind || t->id > rv_tracking.targets[largest].id) largest = i;
+        same_kind++;
     }
+    size_t limit = player ? RV_PLAYER_LIMIT : RV_OBJECT_LIMIT;
+    if (same_kind < limit) rv_tracking.targets[rv_tracking.count++] = *candidate;
+    else if (candidate->id < rv_tracking.targets[largest].id) rv_tracking.targets[largest] = *candidate;
+}
+
+static void rv_rank_targets(const struct rv_memory *memory, void *dictionary,
+                            uint32_t self_id, int team, const float origin[3], float vx, float vy) {
+    rv_tracking.count = 0;
+    unsigned int visited = 0;
+    for (size_t bucket = 0; bucket < 4096; bucket++) {
+        void *object = rv_pointer(dictionary, bucket * 4);
+        for (unsigned int chain = 0; object && chain < 4096 && visited++ < 131072; chain++) {
+            if (!rv_memory_range(memory, object, 0x24, PROT_READ)) break;
+            void *next = rv_pointer(object, 0x10);
+            struct rv_target candidate;
+            if (rv_target_info(memory, object, self_id, team, &candidate)) {
+                float position[3];
+                rv_position(memory, object, candidate.kind, position);
+                candidate.rank = rv_yaw_rank(position, origin, vx, vy);
+                rv_add_target(&candidate);
+            }
+            object = next;
+        }
+    }
+    qsort(rv_tracking.targets, rv_tracking.count, sizeof rv_tracking.targets[0], rv_compare_targets);
+}
+
+struct rv_beacon_backup { void *object; uint32_t id, type; float xyz[3]; };
+static int rv_compare_beacons(const void *left, const void *right) {
+    const struct rv_beacon_backup *a = left, *b = right;
+    return a->id < b->id ? -1 : a->id != b->id;
+}
+static size_t rv_collect_beacons(const struct rv_memory *memory, void *dictionary,
+                                 void *set, struct rv_beacon_backup beacons[RV_BEACON_LIMIT]) {
+    if (!rv_memory_range(memory, set, 0x3c, PROT_READ)) return 0;
+    uint32_t count = rv_word(set, 0x30);
+    void *data = rv_pointer(set, 0x38);
+    if (count > 4096 || !rv_memory_range(memory, data, count * 4, PROT_READ)) return 0;
+    size_t used = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        void *object = rv_pointer(data, i * 4);
+        const char *name = rv_class_name(memory, object);
+        if (!name || strcmp(name, "BeaconObject") != 0 ||
+            !rv_memory_range(memory, object, 0x88c, PROT_READ | PROT_WRITE) ||
+            !(rv_word(object, 0x40) & 2)) continue;
+        struct rv_beacon_backup candidate = {object, rv_word(object, 0x20), rv_word(object, 0x888), {0}};
+        if (!candidate.id || rv_find_object(memory, dictionary, candidate.id) != object ||
+            !rv_position(memory, object, RV_SHAPE, candidate.xyz)) continue;
+        size_t slot = used;
+        if (used == RV_BEACON_LIMIT) {
+            slot = 0;
+            for (size_t j = 1; j < used; j++) if (beacons[j].id > beacons[slot].id) slot = j;
+            if (candidate.id >= beacons[slot].id) continue;
+        } else used++;
+        beacons[slot] = candidate;
+    }
+    qsort(beacons, used, sizeof beacons[0], rv_compare_beacons);
+    return used;
+}
+
+static void rv_set_beacon(void *object, const float xyz[3], uint32_t type) {
+    for (int i = 0; i < 3; i++) memcpy((unsigned char *)object + 0xa8 + i * 16, &xyz[i], 4);
+    memcpy((unsigned char *)object + 0x888, &type, 4);
+}
+
+static void review_beacon_render(void *hud) {
+    static int drawing;
+    if (drawing || target->dedicated || !review_patches_applied ||
+        !hook_option_bool("review.cheat_view") || !hook_option_bool("review.autobeacon") ||
+        !review_demo_playing()) {
+        if (!drawing) memset(&rv_tracking, 0, sizeof rv_tracking);
+        rv_native_beacon_render(hud);
+        return;
+    }
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (void *)RV_CONNECTION, 4, PROT_READ) ||
+        !rv_memory_range(&memory, (void *)RV_ID_DICTIONARY, 4, PROT_READ) ||
+        !rv_memory_range(&memory, (void *)RV_CLIENT_TARGET_SET, 4, PROT_READ)) {
+        rv_native_beacon_render(hud);
+        return;
+    }
+    void *connection = rv_pointer((void *)RV_CONNECTION, 0);
+    void *dictionary = rv_pointer((void *)RV_ID_DICTIONARY, 0);
+    if (!rv_memory_range(&memory, connection, 0x8438, PROT_READ) ||
+        !rv_memory_range(&memory, dictionary, 0x4000, PROT_READ)) {
+        rv_native_beacon_render(hud);
+        return;
+    }
+    void *self = rv_pointer(connection, 0x825c);
+    int team = (int32_t)rv_word(connection, 0x8434);
+    float origin[3];
+    if (team <= 0 || !rv_memory_range(&memory, self, 0xcc, PROT_READ) ||
+        !rv_position(&memory, self, RV_PLAYER, origin)) {
+        memset(&rv_tracking, 0, sizeof rv_tracking);
+        rv_native_beacon_render(hud);
+        return;
+    }
+    float vx = rv_float(self, 0xa0), vy = rv_float(self, 0x9c);
+    if (!isfinite(vx) || !isfinite(vy) || (vx == 0 && vy == 0)) {
+        rv_native_beacon_render(hud);
+        return;
+    }
+    uint32_t self_id = rv_word(self, 0x20);
+    uintptr_t stream = rv_word(connection, 0x8220);
+    if (rv_tracking.connection != (uintptr_t)connection || rv_tracking.stream != stream ||
+        rv_tracking.self_id != self_id || rv_tracking.team != team) {
+        memset(&rv_tracking, 0, sizeof rv_tracking);
+        rv_tracking.connection = (uintptr_t)connection; rv_tracking.stream = stream;
+        rv_tracking.self_id = self_id; rv_tracking.team = team;
+    }
+    if (rv_tracking.frame++ % RV_REFRESH_FRAMES == 0)
+        rv_rank_targets(&memory, dictionary, self_id, team, origin, vx, vy);
+
+    struct rv_beacon_backup beacons[RV_BEACON_LIMIT];
+    size_t count = rv_collect_beacons(&memory, dictionary,
+        rv_pointer((void *)RV_CLIENT_TARGET_SET, 0), beacons);
+    size_t next = 0, assigned = 0;
+    for (size_t i = 0; i < count; i++) {
+        float xyz[3];
+        uint32_t type = 1;  /* hm2's unassigned marker-beacon type */
+        memcpy(xyz, beacons[i].xyz, sizeof xyz);
+        while (next < rv_tracking.count) {
+            const struct rv_target *cached = &rv_tracking.targets[next++];
+            void *object = rv_find_object(&memory, dictionary, cached->id);
+            struct rv_target live;
+            if (object != cached->object ||
+                !rv_target_info(&memory, object, self_id, team, &live) || live.kind != cached->kind ||
+                !rv_position(&memory, object, live.kind, xyz)) continue;
+            type = live.type;
+            assigned++;
+            break;
+        }
+        rv_set_beacon(beacons[i].object, xyz, type);
+    }
+    if (!rv_tracking.reported || rv_tracking.last_beacons != (int)count ||
+        rv_tracking.last_targets != (int)assigned) {
+        fprintf(stderr, "[t2_hook] Autobeacon: %zu recorded beacons, %zu assigned targets (%zu ranked)\n",
+                count, assigned, rv_tracking.count);
+        rv_tracking.reported = 1;
+        rv_tracking.last_beacons = count; rv_tracking.last_targets = assigned;
+    }
+    drawing = 1;
+    rv_native_beacon_render(hud);
+    drawing = 0;
+    for (size_t i = 0; i < count; i++)
+        rv_set_beacon(beacons[i].object, beacons[i].xyz, beacons[i].type);
 }
 
 static int install_browser_bot_limit(void) {
@@ -3221,12 +3742,7 @@ void SDL_GL_SwapBuffers(void) {
     }
     if (shell_audio_setup_done && now != (time_t)-1)
         poll_discord_presence(now);
-    /* Toggle the demo-review patches with playback state (~1 s throttle). */
-    static time_t last_review_check;
-    if (now != (time_t)-1 && now != last_review_check) {
-        last_review_check = now;
-        update_review_patches();
-    }
+    update_review_patches();
 }
 
 /* The dedicated server never swaps buffers. Platform::process (0x081CF400)
@@ -4102,6 +4618,52 @@ static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
     return value ? value : "";
 }
 
+/* Session-only A/B controls. The configured value changes immediately; code
+   changes use the same verified, demo-gated transition path as each swap. */
+static const char *review_feature_cb(enum review_patch_group group, const char *key,
+                                     S32 argc, const char **argv) {
+    static char result[160];
+    if (target->dedicated) return "client only";
+    if (argc < 1 || argc > 2 || (argc == 2 && (!argv[1] ||
+        (strcmp(argv[1], "0") != 0 && strcmp(argv[1], "1") != 0))))
+        return "expected 0 or 1, or no argument to query";
+    if (argc == 2) store_hook_option(key, argv[1]);
+    int main_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
+    if (main_thread) update_review_patches();
+    size_t length = (size_t)snprintf(result, sizeof result, "%s configured=%d applied=%d", key,
+        hook_option_bool(key), (review_applied_mask & review_group_mask(group)) != 0);
+    /* Expose the actual recorded mission's stock far distance for range tests,
+       rather than assuming every mission uses the 1000-unit fallback. */
+    if (group == REVIEW_RANGE && main_thread) {
+        struct rv_memory memory;
+        const char *unknown = " stock_far=unknown";
+        float stock = 0;
+        if (rv_memory_snapshot(&memory) &&
+            rv_memory_range(&memory, (void *)0x08495184, 4, PROT_READ)) {
+            void *graph = rv_pointer((void *)0x08495184, 0);
+            if (rv_memory_range(&memory, graph, 0xe8, PROT_READ)) {
+                void *scene = rv_pointer(graph, 0xe4);
+                if (rv_memory_range(&memory, scene, 0xe30, PROT_READ)) stock = rv_float(scene, 0xe2c);
+                else if (!scene) stock = 1000.0f;  /* camera-query fallback */
+            }
+        }
+        if (isfinite(stock) && stock > 0)
+            snprintf(result + length, sizeof result - length, " stock_far=%.1f review_far=20000", stock);
+        else
+            snprintf(result + length, sizeof result - length, "%s", unknown);
+    }
+    if (argc == 2) fprintf(stderr, "[t2_hook] Review control: %s\n", result);
+    return result;
+}
+static const char *hook_review_range_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return review_feature_cb(REVIEW_RANGE, "review.extended_range", argc, argv);
+}
+static const char *hook_review_global_beacons_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return review_feature_cb(REVIEW_GLOBAL_BEACONS, "review.global_beacons", argc, argv);
+}
+
 /* ── Registration thread ─────────────────────────────────────────────── */
 
 /* ── VSync (video.vsync) ─────────────────────────────────────────────────
@@ -4243,6 +4805,12 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
+    if (!target->dedicated) {
+        Con__addMethodS(NULL, "hook_review_range", hook_review_range_cb,
+            "hook_review_range([0|1]) - query or change demo-review range for this session", 1, 2);
+        Con__addMethodS(NULL, "hook_review_global_beacons", hook_review_global_beacons_cb,
+            "hook_review_global_beacons([0|1]) - query or change demo beacon visibility for this session", 1, 2);
+    }
     Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
     Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
     Con__addMethodS(NULL, "hook_rand64", hook_rand64_cb, "hook_rand64 - random 64-bit hex", 1, 1);

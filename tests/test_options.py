@@ -49,6 +49,22 @@ class OptionTests(unittest.TestCase):
         self.assertEqual([key for key, _ in t2options.unmet(option, values, HOOKED)],
                          ["won.mode", "hook.console_commands"])
 
+    def test_review_range_and_beacons_are_independent_and_require_review(self):
+        keys = ("review.extended_range", "review.global_beacons")
+        normal = t2options.effective({}, HOOKED)
+        self.assertTrue(all(not normal[key] for key in keys))
+        review = t2options.effective({"review.cheat_view": True}, HOOKED)
+        self.assertTrue(all(review[key] for key in keys))
+        selected = t2options.effective({"review.cheat_view": True,
+                                       "review.extended_range": False}, HOOKED)
+        self.assertFalse(selected["review.extended_range"])
+        self.assertTrue(selected["review.global_beacons"])
+        self.assertTrue(all(key in t2options.CLIENT_ONLY for key in keys))
+        self.assertTrue(review["review.shortcuts"])
+        no_commands = t2options.effective({"review.cheat_view": True,
+                                           "hook.console_commands": False}, HOOKED)
+        self.assertFalse(no_commands["review.shortcuts"])
+
     def test_values_are_coerced_and_validated(self):
         self.assertTrue(t2options.chosen({"video.software_gl": "yes"})["video.software_gl"])
         # A bad stored value falls back to the default instead of breaking launch.

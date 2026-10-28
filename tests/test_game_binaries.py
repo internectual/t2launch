@@ -4,7 +4,10 @@ The addresses mirror game_targets[] and the server-only sites in t2_hook.c.
 Skipped when the Loki #25034 game is not installed in ~/t2-linux.
 """
 
+import shutil
 import struct
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -42,6 +45,26 @@ def reader(path):
 @unittest.skipUnless((GAME / "tribes2d.dynamic").is_file() and (GAME / "tribes2.dynamic").is_file(),
                      "the Loki #25034 game is not installed in ~/t2-linux")
 class GameBinaryTests(unittest.TestCase):
+    def test_review_shortcut_descriptors_with_native_parser(self):
+        compiler = shutil.which("gcc")
+        if not compiler:
+            self.skipTest("gcc is unavailable for the native shortcut fixture")
+        with tempfile.TemporaryDirectory(prefix="t2-shortcut-") as directory:
+            output = Path(directory) / "review_shortcut_test"
+            probe = subprocess.run([compiler, "-m32", "-x", "c", "-", "-o", str(output)],
+                                   input="#include <stdio.h>\nint main(void) { return 0; }\n",
+                                   text=True, capture_output=True, timeout=30)
+            if probe.returncode:
+                self.skipTest("a working 32-bit C development toolchain is required")
+            fixture = Path(__file__).with_name("review_shortcut_test.c")
+            build = subprocess.run([compiler, "-m32", "-O2", "-std=c99", "-mstackrealign",
+                                    "-fPIE", "-pie", str(fixture), "-o", str(output), "-pthread", "-ldl"],
+                                   text=True, capture_output=True, timeout=60)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            result = subprocess.run([str(output)], text=True, capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("native parser rejects old descriptors", result.stdout)
+
     def test_shared_sites_match_in_each_executable(self):
         for name, target in TARGETS.items():
             with self.subTest(executable=name):
@@ -102,6 +125,37 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(read(0x0823601B, 9), bytes.fromhex("f6 c3 01 0f 85 fb 05 00 00"))
         # usleep(1000) ends Platform::process in the server's main loop.
         self.assertEqual(read(0x081CF44C, 5), bytes.fromhex("68 e8 03 00 00"))
+
+    def test_review_sites_and_semantic_anchors(self):
+        read = reader(GAME / "tribes2.dynamic")
+        # Native isPlayingDemo returns connection && connection->playbackStream.
+        self.assertEqual(read(0x082395EC, 29), bytes.fromhex(
+            "55 8b 15 dc 5c 49 08 89 e5 b0 00 85 d2 74 0a "
+            "83 ba 20 82 00 00 00 0f 95 c0 89 ec 5d c3"))
+        # Mesh renderer: instance alpha -> active alpha, not a cloak setter.
+        self.assertEqual(read(0x0831EE13, 12), bytes.fromhex(
+            "d9 05 94 f8 6b 08 d9 1d 10 f9 6b 08"))
+        # FFI mask bit zero and remaining bits have separate visibility checks.
+        self.assertEqual(read(0x08191036, 9), bytes.fromhex(
+            "80 bb 04 02 00 00 00 75 19"))
+        self.assertEqual(read(0x0819104E, 10), bytes.fromhex(
+            "80 bc 1a 04 02 00 00 00 74 e8"))
+        # Camera query and HUD independently load the scene's far distance.
+        self.assertEqual(read(0x08232A68, 6), bytes.fromhex("d9 80 2c 0e 00 00"))
+        self.assertEqual(read(0x081939D3, 6), bytes.fromhex("d9 80 2c 0e 00 00"))
+        # Beacon sensor-group comparison; projection and near-zero guards stay.
+        self.assertEqual(read(0x082FC6B7, 5), bytes.fromhex("3b 45 98 75 43"))
+        self.assertEqual(read(0x082FC844, 6), bytes.fromhex("0f 84 7a 01 00 00"))
+        self.assertEqual(struct.unpack("<d", read(0x08478710, 8))[0], 0.0001)
+        # Autobeacon wraps the line renderer; the following pass keeps copied XYZ.
+        self.assertEqual(read(0x082FD00D, 6), bytes.fromhex("53 e8 89 f4 ff ff"))
+        self.assertEqual(read(0x082FC49C, 12), bytes.fromhex(
+            "55 89 e5 81 ec 8c 00 00 00 8b 45 08"))
+        self.assertEqual(read(0x082FD025, 6), bytes.fromhex("53 e8 fd f6 ff ff"))
+        # Independent class-name/ID/field anchors used by the snapshot reader.
+        self.assertEqual(read(0x080FBC77, 8), bytes.fromhex("8b 42 08 ff d0 8b 40 18"))
+        self.assertEqual(read(0x080FD5AE, 8), bytes.fromhex("8b 41 20 25 ff 0f 00 00"))
+        self.assertEqual(read(0x0831D365, 5), bytes.fromhex("68 88 08 00 00"))
 
 
 if __name__ == "__main__":

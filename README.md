@@ -727,8 +727,43 @@ options bring the parts of it that fit the Linux client:
   (`~/.local/share/t2launch/review/`), copies each top-level dir into the game's `base/` as real files
   on a review launch, tracks what it added in an ownership sentinel, and removes it on non-review
   launches, so the stock install keeps no copy (models replace for the whole launch, so a review launch
-  is for watching demos, not live play). The playback-gated marker overlays (beacons/IFF) are a
-  separate, later step.
+  is for watching demos, not live play). `review.cheat_view` also applies the Linux equivalents of
+  hm2's global-beacon visibility, FFI visibility checks, extended range, and 0.9 mesh alpha during
+  demo playback, restoring the original instructions when playback ends. No-cloak and player
+  IFF indicators with autobeacon disabled, plus global-beacon visibility through a profile
+  on/off comparison, have been confirmed in playback. Extended range and its Ctrl+Shift+F6 HUD
+  control have also been confirmed by toggling IFF visibility while demo playback was paused.
+- **Demo review — autobeacon** (`review.autobeacon`, on with demo-review reconstruction).
+  Reconstructs hm2's assignment of up to 32 recorded beacons to enemy players, selected structures,
+  and waypoints. Targets are ranked by horizontal angle every 20 rendered frames and their current
+  positions are followed between rankings. Beacon coordinates and types are borrowed only for the
+  native HUD draw and restored before it returns. The demo must contain beacon objects; the hook
+  logs how many recorded beacons and assigned targets it found. This path has static binary and
+  synthetic native tests; beacon assignment and tracking of moving players have been confirmed
+  in demo playback.
+- **Demo review — range and beacon visibility** (`review.extended_range` and
+  `review.global_beacons`, both on with demo review). These can be disabled independently while
+  keeping the player IFF and no-cloak reconstruction enabled. During playback,
+  **Ctrl+Shift+F6** toggles range and **Ctrl+Shift+F7** toggles global beacons, with status on the
+  HUD (`review.shortcuts`, on). The shortcuts use playback's global action map, so console typing
+  is unnecessary. They bind only vacant keys and remove only their own bindings on playback exit.
+  Setup logs report each binding as `bound`, `occupied`, or `failed`; accepted key/console changes
+  also log configured/applied state. The Loki action descriptor is `shift-ctrl f6` / `shift-ctrl f7`
+  for these physical key combinations.
+  Space pauses the recording for a comparison from the same viewpoint. If a shortcut is already
+  assigned, use the profile checkbox before launching. Console commands are also available:
+  `echo(hook_review_range(0));` / `echo(hook_review_range(1));`, or
+  `echo(hook_review_global_beacons(0));` / `echo(hook_review_global_beacons(1));`.
+  No argument queries the current setting. Output distinguishes the configured value from the
+  currently applied state; range output also shows the mission's stock far distance. Console
+  changes last for this process and still require review mode plus active demo playback to apply.
+  Disable autobeacon when comparing native beacon visibility so targets remain at recorded locations.
+
+  Ordinary review IFF remains enabled when both beacon options are off. The separate
+  `ui.observer_iff` option controls the camera-mode HUD gate; fog and visible-distance options
+  affect the world scene and clipping. These use different patch sites from review beacon
+  group filtering and the review far-distance loads. A range toggle changes a cutoff, not
+  marker color or shape, so targets within the stock range can look identical in both states.
 - **FOV range** (`ui.fov_range`, off). `setFov()` clamps the field of view to
   1-179 degrees; with this on it accepts 0-360, as the Windows `l33thax` patch
   allowed.
@@ -953,7 +988,9 @@ enablewinconsole(true);
 | Command | Args | Description |
 |---------|------|-------------|
 | `hook_test` | none | Returns "ok_from_c" |
-| `hook_option` | `<key>` | Value of a hook option from the profile config |
+| `hook_option` | `<key>` | Current hook option value, including session overrides |
+| `hook_review_range` | `[0|1]` | Query/change session review range; report configured/applied state and stock far distance (client only) |
+| `hook_review_global_beacons` | `[0|1]` | Query/change session beacon visibility; report configured/applied state (client only) |
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
 | `hook_rand64` | none | Random unpadded 64-bit hex |
