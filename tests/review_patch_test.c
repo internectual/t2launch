@@ -18,10 +18,10 @@ static const char *fake_evaluate(const char *code, unsigned char echo,
         shortcut_definitions++;
     } else if (strcmp(code, "t2launch_reviewKeysSet(1);") == 0) {
         shortcut_enables++;
-        return "range=bound global_beacons=bound";
+        return "range=bound global_beacons=bound ffi=bound no_cloak=bound autobeacon=bound";
     } else if (strcmp(code, "t2launch_reviewKeysSet(0);") == 0) {
         shortcut_disables++;
-        return "range=released global_beacons=released";
+        return "range=released global_beacons=released ffi=released no_cloak=released autobeacon=released";
     } else assert(!"unexpected script evaluation in the review fixture");
     return "";
 }
@@ -108,18 +108,34 @@ static uint32_t far_load_bits(void *scene, uintptr_t address) {
     memcpy(&bits, &value, sizeof bits);
     return bits;
 }
+static void check_ffi_boundaries(int patched) {
+    unsigned char info[0x40] = {0}, object_info[0x20c] = {0}, frame[0x84] = {0};
+    void *object_pointer = object_info;
+    memcpy(frame + 4, &object_pointer, sizeof object_pointer);
+    const uint32_t masks[] = {0, 1, 0x20, 0x100, 0x200};
+    for (size_t i = 0; i < sizeof masks / sizeof masks[0]; i++) {
+        memcpy(info + 0x1c, &masks[i], 4);
+        frame[3] = 0;
+        int expected = (masks[i] & 0x100) != 0 || (patched && (masks[i] & 0xff) != 0);
+        assert(run_ffi_classifier(info, frame + 0x80, FFI_CLASSIFIER_ADDRESS) == expected);
+    }
+}
 static void check_feature_combination(int range, int global_beacons, void *stock_scene, uint32_t stock_bits) {
     assert(review_patches_applied);
+    int ffi = hook_option_bool("review.ffi"), no_cloak = hook_option_bool("review.no_cloak");
     uint32_t expected = review_group_mask(REVIEW_CORE);
     if (range) expected |= review_group_mask(REVIEW_RANGE);
     if (global_beacons) expected |= review_group_mask(REVIEW_GLOBAL_BEACONS);
+    if (ffi) expected |= review_group_mask(REVIEW_FFI);
+    if (no_cloak) expected |= review_group_mask(REVIEW_NO_CLOAK);
     assert(review_applied_mask == expected);
     for (size_t i = 0; i < REVIEW_PATCH_COUNT; i++) {
         const struct code_patch *p = &review_patches_on[i];
         const void *bytes = expected & (1u << i) ? p->replacement : p->expected;
         assert(memcmp((void *)p->address, bytes, p->expected_length) == 0);
     }
-    assert(loaded_float_bits(RV_ALPHA_ADDR) == 0x3f666666);
+    assert(loaded_float_bits(RV_ALPHA_ADDR) == (no_cloak ? 0x3f666666 : 0x3e000000));
+    check_ffi_boundaries(ffi);
     assert(far_load_bits(stock_scene, RV_CAMERA_FAR_ADDR) == (range ? 0x469c4000 : stock_bits));
     assert(far_load_bits(stock_scene, RV_HUD_FAR_ADDR) == (range ? 0x469c4000 : stock_bits));
     /* Native global-beacon compare/skip: equal and differing sensor groups.
@@ -153,8 +169,11 @@ int main(void) {
     map_page(RV_BEACON_RENDER_ADDR);
     memcpy((void *)RV_BEACON_RENDER_ADDR, rv_beacon_render_orig, sizeof rv_beacon_render_orig);
     map_page(0x08495cdc);
+    map_page(0x086bf894);
+    *(float *)0x086bf894 = 0.125f;  /* native shape alpha, distinct from forced 0.9 */
     for (size_t i = 0; i < page_count; i++) {
-        int protection = pages[i] == (0x08495cdc & ~(page_size - 1))
+        int protection = pages[i] == (0x08495cdc & ~(page_size - 1)) ||
+                         pages[i] == (0x086bf894 & ~(page_size - 1))
             ? PROT_READ | PROT_WRITE : PROT_READ | PROT_EXEC;
         assert(mprotect((void *)pages[i], page_size, protection) == 0);
     }
@@ -213,6 +232,10 @@ int main(void) {
     const char *global_off[] = {"hook_review_global_beacons", "0"};
     const char *global_on[] = {"hook_review_global_beacons", "1"};
     const char *query[] = {"hook_review_range"}, *invalid[] = {"hook_review_range", "yes"};
+    const char *ffi_off[] = {"hook_review_ffi", "0"}, *ffi_on[] = {"hook_review_ffi", "1"};
+    const char *cloak_off[] = {"hook_review_no_cloak", "0"}, *cloak_on[] = {"hook_review_no_cloak", "1"};
+    const char *auto_off[] = {"hook_review_autobeacon", "0"}, *auto_on[] = {"hook_review_autobeacon", "1"};
+    const char *auto_query[] = {"hook_review_autobeacon"};
     check_feature_combination(1, 1, stock_scene, stock_bits);
     assert(shortcut_definitions == 1 && shortcut_enables == 1 && !shortcut_disables);
     assert(strstr(hook_review_range_cb(NULL, 2, range_off), "configured=0 applied=0 stock_far=750.0") != NULL);
@@ -225,6 +248,34 @@ int main(void) {
     check_feature_combination(1, 1, stock_scene, stock_bits);
     assert(strstr(hook_review_range_cb(NULL, 2, invalid), "expected 0 or 1") != NULL);
     check_feature_combination(1, 1, stock_scene, stock_bits);
+    assert(strstr(hook_review_ffi_cb(NULL, 2, ffi_off), "configured=0 applied=0") != NULL);
+    check_feature_combination(1, 1, stock_scene, stock_bits);
+    assert(strstr(hook_review_no_cloak_cb(NULL, 2, cloak_off), "configured=0 applied=0") != NULL);
+    check_feature_combination(1, 1, stock_scene, stock_bits);
+    assert(strstr(hook_review_ffi_cb(NULL, 2, ffi_on), "configured=1 applied=1") != NULL);
+    check_feature_combination(1, 1, stock_scene, stock_bits);
+    assert(strstr(hook_review_no_cloak_cb(NULL, 2, cloak_on), "configured=1 applied=1") != NULL);
+    check_feature_combination(1, 1, stock_scene, stock_bits);
+    uint32_t dispatcher_mask = review_applied_mask;
+    assert(strstr(hook_review_autobeacon_cb(NULL, 2, auto_off), "configured=0 applied=0") != NULL);
+    assert(review_applied_mask == dispatcher_mask);
+    assert(strstr(hook_review_autobeacon_cb(NULL, 2, auto_on), "configured=1 applied=1") != NULL);
+    assert(review_applied_mask == dispatcher_mask);
+
+    /* Exercise every combination, including only the dispatcher CALL active:
+       shortcut access remains available with all visual groups turned off. */
+    for (unsigned int combination = 0; combination < 32; combination++) {
+        store_hook_option("review.extended_range", combination & 1 ? "1" : "0");
+        store_hook_option("review.global_beacons", combination & 2 ? "1" : "0");
+        store_hook_option("review.ffi", combination & 4 ? "1" : "0");
+        store_hook_option("review.no_cloak", combination & 8 ? "1" : "0");
+        store_hook_option("review.autobeacon", combination & 16 ? "1" : "0");
+        update_review_patches();
+        check_feature_combination((combination & 1) != 0, (combination & 2) != 0, stock_scene, stock_bits);
+        assert(review_shortcuts_active && shortcut_definitions == 1 && shortcut_enables == 1);
+        assert(strstr(hook_review_autobeacon_cb(NULL, 1, auto_query), combination & 16
+                      ? "configured=1 applied=1" : "configured=0 applied=0") != NULL);
+    }
     /* An off-thread request updates the request only, not executable pages. */
     game_main_thread_known = 0;
     assert(strstr(hook_review_range_cb(NULL, 2, range_off), "configured=0 applied=1") != NULL);
@@ -233,7 +284,10 @@ int main(void) {
     assert(strstr(hook_review_range_cb(NULL, 1, query), "configured=0 applied=0") != NULL);
     check_feature_combination(0, 1, stock_scene, stock_bits);
 
-    /* End playback from a mixed mask, query live, then restart and disable. */
+    /* End playback with IFF/alpha already restored; don't try to restore them
+       twice. New setters also remain inert outside playback. */
+    hook_review_ffi_cb(NULL, 2, ffi_off); hook_review_no_cloak_cb(NULL, 2, cloak_off);
+    check_feature_combination(0, 1, stock_scene, stock_bits);
     *(uint32_t *)(connection + 0x8220) = 0;
     update_review_patches();
     assert(!review_patches_applied);
@@ -242,6 +296,9 @@ int main(void) {
     assert(!review_shortcuts_active && shortcut_disables == 1);
     assert(strstr(hook_review_range_cb(NULL, 2, range_on), "configured=1 applied=0") != NULL);
     assert(strstr(hook_review_global_beacons_cb(NULL, 2, global_on), "configured=1 applied=0") != NULL);
+    assert(strstr(hook_review_ffi_cb(NULL, 2, ffi_on), "configured=1 applied=0") != NULL);
+    assert(strstr(hook_review_no_cloak_cb(NULL, 2, cloak_on), "configured=1 applied=0") != NULL);
+    assert(strstr(hook_review_autobeacon_cb(NULL, 2, auto_on), "configured=1 applied=0") != NULL);
     assert_originals();
     *(uint32_t *)(connection + 0x8220) = 1;
     update_review_patches();
@@ -269,6 +326,8 @@ int main(void) {
     store_hook_option("review.cheat_view", "1");
     target = &game_targets[1];
     assert(strcmp(hook_review_range_cb(NULL, 2, range_off), "client only") == 0);
+    assert(strcmp(hook_review_autobeacon_cb(NULL, 2, auto_off), "client only") == 0);
+    assert(hook_option_bool("review.autobeacon"));
     assert(hook_option_bool("review.extended_range"));
     update_review_patches();
     assert(!review_patches_applied);
@@ -291,6 +350,6 @@ int main(void) {
         assert(munmap((void *)pages[i], page_size) == 0);
     free(connection);
     free(graph); free(stock_scene);
-    puts("Review patches: exhaustive FFI, independent range/global controls, live gates, stock loads, restoration and mismatch refusal passed");
+    puts("Review patches: exhaustive FFI, 32 independent feature combinations, live gates, stock loads and restoration passed");
     return 0;
 }

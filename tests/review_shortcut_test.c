@@ -86,6 +86,9 @@ int main(void) {
     struct action_descriptor result = {0};
     assert(!parse("ctrl shift f6", &result));
     assert(!parse("ctrl shift f7", &result));
+    assert(!parse("ctrl shift f8", &result));
+    assert(!parse("ctrl shift f9", &result));
+    assert(!parse("ctrl shift f10", &result));
 
     /* Read the descriptors from the ACTUAL in-memory script, so regression to
        an unsupported spelling fails even if test-only examples remain valid. */
@@ -96,15 +99,18 @@ int main(void) {
     char keys[128];
     assert(end && (size_t)(end - start) < sizeof keys);
     memcpy(keys, start, end - start); keys[end - start] = 0;
-    char *second = strstr(keys, "\\t");
-    assert(second); *second = 0; second += 2;
-    assert(parse(keys, &result));
-    assert(result.modifiers == 0x0f && result.type == 10 && result.code == 0x5c);
-    assert(parse(second, &result));
-    assert(result.modifiers == 0x0f && result.type == 10 && result.code == 0x5d);
+    char *current = keys;
+    for (int i = 0; i < 5; i++) {
+        char *next = strstr(current, "\\t");
+        assert((next != NULL) == (i < 4));
+        if (next) { *next = 0; next += 2; }
+        assert(parse(current, &result));
+        assert(result.modifiers == 0x0f && result.type == 10 && result.code == 0x5c + i);
+        current = next;
+    }
     assert(parse("f6", &result) && result.modifiers == 0 && result.code == 0x5c);
     for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++)
         assert(munmap((void *)pages[i], page_size) == 0);
-    puts("Review shortcuts: native parser rejects old descriptors and accepts script Ctrl+Shift+F6/F7 bindings");
+    puts("Review shortcuts: native parser rejects old descriptors and accepts script Ctrl+Shift+F6/F7/F8/F9/F10 bindings");
     return 0;
 }

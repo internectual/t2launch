@@ -228,13 +228,22 @@ OPTIONS = (
     Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="A launch for reviewing a suspected cheater's demo: show what their hacked client "
-                "would have shown. During playback, apply hm2-style beacon visibility, FFI checks "
-                "and range, and mesh alpha. Replacement assets can be enabled below."),
+                "would have shown. During playback, apply the selected hm2-style visibility, "
+                "range and mesh-alpha effects. Enable individual pieces below."),
+    Option("review.ffi", "Demo review", "Reconstruct hm2 IFF/FFI visibility", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)),),
+           help="Use hm2-style player IFF/FFI visibility checks during demo review. "
+                "Ctrl+Shift+F8 toggles this effect when playback review shortcuts are enabled."),
+    Option("review.no_cloak", "Demo review", "Reconstruct hm2 no-cloak", "bool", True,
+           hook=True, requires=(("review.cheat_view", (True,)),),
+           help="Use hm2's 0.9 mesh alpha during demo review. Ctrl+Shift+F9 toggles this effect "
+                "when playback review shortcuts are enabled; off restores the native alpha load."),
     Option("review.autobeacon", "Demo review", "Reconstruct hm2 autobeacon targets", "bool", True,
            hook=True, requires=(("review.cheat_view", (True,)),),
            help="During demo playback, borrow up to 32 recorded beacons to mark enemy players, "
                 "selected structures and waypoints, ranked by horizontal angle as in hm2. "
                 "The recorded beacon positions and types are restored after each draw. "
+                "Ctrl+Shift+F10 toggles target reassignment when playback shortcuts are enabled. "
                 "The demo must contain beacon objects."),
     Option("review.extended_range", "Demo review", "Extend review indicator range", "bool", True,
            hook=True, requires=(("review.cheat_view", (True,)),),
@@ -247,13 +256,15 @@ OPTIONS = (
     Option("review.shortcuts", "Demo review", "Playback review shortcuts", "bool", True,
            hook=True, requires=(("review.cheat_view", (True,)), ("hook.console_commands", (True,))),
            help="During review playback, Ctrl+Shift+F6 toggles extended range and Ctrl+Shift+F7 "
-                "toggles global-beacon visibility. Status appears on the HUD. Existing bindings "
+                "toggles global beacons; Ctrl+Shift+F8 toggles IFF, F9 toggles no-cloak, and F10 toggles "
+                "autobeacon (all with Ctrl+Shift). "
+                "Status appears on the HUD. Existing bindings "
                 "are preserved, and the review bindings are removed when playback ends."),
     Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
            env="T2LAUNCH_REVIEW_MODELS", requires=(("review.cheat_view", (True,)),),
            help="Render demos with the hm2 asset pack (_hm2.vl2: bright/visible models, visible cloak, "
-                "hm2's HUD) so a demo looks the way the suspect saw it. The pack is mounted for the "
-                "whole launch via the engine's -mod at startup (runtime mounting crashes the engine), "
+                "hm2's HUD) so a demo looks the way the suspect saw it. The launcher installs the "
+                "replacement shapes/textures as loose files for the whole launch, "
                 "so this is a review-only launch, not for live play. Put _hm2.vl2 in the launcher's "
                 "review directory (~/.local/share/t2launch/review/)."),
     Option("ui.fov_range", "Interface", "setFov() accepts 0-360 degrees", "bool", False, hook=True,
@@ -390,6 +401,7 @@ CLIENT_ONLY = frozenset((
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
     "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.autobeacon", "review.replace_models",
     "review.extended_range", "review.global_beacons", "review.shortcuts",
+    "review.ffi", "review.no_cloak",
     "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))

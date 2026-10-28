@@ -50,7 +50,7 @@ class OptionTests(unittest.TestCase):
                          ["won.mode", "hook.console_commands"])
 
     def test_review_range_and_beacons_are_independent_and_require_review(self):
-        keys = ("review.extended_range", "review.global_beacons")
+        keys = ("review.extended_range", "review.global_beacons", "review.ffi", "review.no_cloak", "review.autobeacon")
         normal = t2options.effective({}, HOOKED)
         self.assertTrue(all(not normal[key] for key in keys))
         review = t2options.effective({"review.cheat_view": True}, HOOKED)
@@ -59,6 +59,13 @@ class OptionTests(unittest.TestCase):
                                        "review.extended_range": False}, HOOKED)
         self.assertFalse(selected["review.extended_range"])
         self.assertTrue(selected["review.global_beacons"])
+        self.assertTrue(selected["review.ffi"])
+        selected = t2options.effective({"review.cheat_view": True, "review.ffi": False,
+                                       "review.no_cloak": False}, HOOKED)
+        self.assertFalse(selected["review.ffi"])
+        self.assertFalse(selected["review.no_cloak"])
+        self.assertTrue(selected["review.extended_range"])
+        self.assertTrue(selected["review.autobeacon"])
         self.assertTrue(all(key in t2options.CLIENT_ONLY for key in keys))
         self.assertTrue(review["review.shortcuts"])
         no_commands = t2options.effective({"review.cheat_view": True,

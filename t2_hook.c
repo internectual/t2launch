@@ -166,6 +166,8 @@ static struct hook_option hook_options[] = {
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
+    {"review.ffi", "1", NULL, 0, "", 0},
+    {"review.no_cloak", "1", NULL, 0, "", 0},
     {"review.autobeacon", "1", NULL, 0, "", 0},
     {"review.extended_range", "1", NULL, 0, "", 0},
     {"review.global_beacons", "1", NULL, 0, "", 0},
@@ -1338,11 +1340,13 @@ static const struct code_patch review_patches_off[] = {
 
 static int review_patches_applied = 0;
 static uint32_t review_applied_mask;
-enum review_patch_group { REVIEW_CORE, REVIEW_GLOBAL_BEACONS, REVIEW_RANGE };
+enum review_patch_group { REVIEW_CORE, REVIEW_GLOBAL_BEACONS, REVIEW_RANGE, REVIEW_FFI, REVIEW_NO_CLOAK };
 static enum review_patch_group review_group(size_t index) {
     uintptr_t address = review_patches_on[index].address;
     if (address == RV_GBEACONS_ADDR) return REVIEW_GLOBAL_BEACONS;
     if (address == RV_CAMERA_FAR_ADDR || address == RV_HUD_FAR_ADDR) return REVIEW_RANGE;
+    if (address == RV_FFI_BIT0_ADDR || address == RV_FFI_LOOP_ADDR) return REVIEW_FFI;
+    if (address == RV_ALPHA_ADDR) return REVIEW_NO_CLOAK;
     return REVIEW_CORE;
 }
 static uint32_t review_group_mask(enum review_patch_group group) {
@@ -1367,12 +1371,28 @@ static const char review_shortcuts_script[] =
     " %status = hook_review_global_beacons(!hook_option(\"review.global_beacons\"));\n"
     " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
     "}\n"
+    "function t2launch_reviewFFIKey(%pressed) {\n"
+    " if (!%pressed || !isPlayingDemo()) return;\n"
+    " %status = hook_review_ffi(!hook_option(\"review.ffi\"));\n"
+    " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
+    "}\n"
+    "function t2launch_reviewCloakKey(%pressed) {\n"
+    " if (!%pressed || !isPlayingDemo()) return;\n"
+    " %status = hook_review_no_cloak(!hook_option(\"review.no_cloak\"));\n"
+    " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
+    "}\n"
+    "function t2launch_reviewAutobeaconKey(%pressed) {\n"
+    " if (!%pressed || !isPlayingDemo()) return;\n"
+    " %status = hook_review_autobeacon(!hook_option(\"review.autobeacon\"));\n"
+    " clientCmdBottomPrint(\"REVIEW: \" @ %status, 3, 2);\n"
+    "}\n"
     "function t2launch_reviewKeysSet(%active) {\n"
     " if (!isObject(GlobalActionMap)) return \"global action map unavailable\";\n"
-    " %keys = \"shift-ctrl f6\\tshift-ctrl f7\";\n"
-    " %commands = \"t2launch_reviewRangeKey\\tt2launch_reviewBeaconKey\";\n"
+    " %keys = \"shift-ctrl f6\\tshift-ctrl f7\\tshift-ctrl f8\\tshift-ctrl f9\\tshift-ctrl f10\";\n"
+    " %commands = \"t2launch_reviewRangeKey\\tt2launch_reviewBeaconKey\\tt2launch_reviewFFIKey\\tt2launch_reviewCloakKey\\tt2launch_reviewAutobeaconKey\";\n"
+    " %labels = \"range\\tglobal_beacons\\tffi\\tno_cloak\\tautobeacon\";\n"
     " %result = \"\";\n"
-    " for (%i = 0; %i < 2; %i++) {\n"
+    " for (%i = 0; %i < getFieldCount(%keys); %i++) {\n"
     "  %key = getField(%keys, %i); %command = getField(%commands, %i);\n"
     "  %existing = GlobalActionMap.getCommand(\"keyboard\", %key);\n"
     "  if (%active) {\n"
@@ -1388,7 +1408,7 @@ static const char review_shortcuts_script[] =
     "  } else {\n"
     "   if (%after $= %command) %state = \"still-bound\"; else %state = \"released\";\n"
     "  }\n"
-    "  if (%i == 0) %label = \"range\"; else %label = \"global_beacons\";\n"
+    "  %label = getField(%labels, %i);\n"
     "  %result = trim(%result @ \" \" @ %label @ \"=\" @ %state);\n"
     " }\n"
     " return %result;\n"
@@ -1408,7 +1428,7 @@ static void update_review_shortcuts(int active) {
     review_shortcuts_active = wanted;
     const char *status = Con__evaluate(wanted ? "t2launch_reviewKeysSet(1);" : "t2launch_reviewKeysSet(0);",
                                        0, NULL, 0);
-    fprintf(stderr, "[t2_hook] Demo review shortcuts %s: %s (Ctrl+Shift+F6 range, Ctrl+Shift+F7 global beacons)\n",
+    fprintf(stderr, "[t2_hook] Demo review shortcuts %s: %s (Ctrl+Shift+F6 range, F7 global beacons, F8 IFF, F9 no-cloak, F10 autobeacon)\n",
             wanted ? "setup" : "cleanup", status && *status ? status : "no binding status returned");
 }
 
@@ -1451,6 +1471,8 @@ static void update_review_patches(void) {
         wanted = review_group_mask(REVIEW_CORE);
         if (hook_option_bool("review.global_beacons")) wanted |= review_group_mask(REVIEW_GLOBAL_BEACONS);
         if (hook_option_bool("review.extended_range")) wanted |= review_group_mask(REVIEW_RANGE);
+        if (hook_option_bool("review.ffi")) wanted |= review_group_mask(REVIEW_FFI);
+        if (hook_option_bool("review.no_cloak")) wanted |= review_group_mask(REVIEW_NO_CLOAK);
     }
     update_review_shortcuts(wanted != 0 && review_patches_applied);
     if (wanted == review_applied_mask) return;
@@ -1473,9 +1495,11 @@ static void update_review_patches(void) {
         review_patches_applied = wanted != 0;
         retry_after = 0;
         if (wanted)
-            fprintf(stderr, "[t2_hook] Demo review: reconstruction patches enabled (range=%d, global_beacons=%d)\n",
+            fprintf(stderr, "[t2_hook] Demo review: reconstruction patches enabled (range=%d, global_beacons=%d, ffi=%d, no_cloak=%d)\n",
                     (wanted & review_group_mask(REVIEW_RANGE)) != 0,
-                    (wanted & review_group_mask(REVIEW_GLOBAL_BEACONS)) != 0);
+                    (wanted & review_group_mask(REVIEW_GLOBAL_BEACONS)) != 0,
+                    (wanted & review_group_mask(REVIEW_FFI)) != 0,
+                    (wanted & review_group_mask(REVIEW_NO_CLOAK)) != 0);
         else
             fprintf(stderr, "[t2_hook] Demo review: original rendering restored\n");
     }
@@ -4630,8 +4654,14 @@ static const char *review_feature_cb(enum review_patch_group group, const char *
     if (argc == 2) store_hook_option(key, argv[1]);
     int main_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
     if (main_thread) update_review_patches();
+    int configured = hook_option_bool(key);
+    int applied = (review_applied_mask & review_group_mask(group)) != 0;
+    /* Autobeacon uses the core dispatcher, which stays installed even when
+       target reassignment is disabled. Report its actual playback gate. */
+    if (group == REVIEW_CORE)
+        applied = applied && configured && hook_option_bool("review.cheat_view") && review_demo_playing();
     size_t length = (size_t)snprintf(result, sizeof result, "%s configured=%d applied=%d", key,
-        hook_option_bool(key), (review_applied_mask & review_group_mask(group)) != 0);
+        configured, applied);
     /* Expose the actual recorded mission's stock far distance for range tests,
        rather than assuming every mission uses the 1000-unit fallback. */
     if (group == REVIEW_RANGE && main_thread) {
@@ -4662,6 +4692,18 @@ static const char *hook_review_range_cb(void *obj, S32 argc, const char **argv) 
 static const char *hook_review_global_beacons_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     return review_feature_cb(REVIEW_GLOBAL_BEACONS, "review.global_beacons", argc, argv);
+}
+static const char *hook_review_ffi_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return review_feature_cb(REVIEW_FFI, "review.ffi", argc, argv);
+}
+static const char *hook_review_no_cloak_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return review_feature_cb(REVIEW_NO_CLOAK, "review.no_cloak", argc, argv);
+}
+static const char *hook_review_autobeacon_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return review_feature_cb(REVIEW_CORE, "review.autobeacon", argc, argv);
 }
 
 /* ── Registration thread ─────────────────────────────────────────────── */
@@ -4810,6 +4852,12 @@ static int register_hook_commands(void) {
             "hook_review_range([0|1]) - query or change demo-review range for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_global_beacons", hook_review_global_beacons_cb,
             "hook_review_global_beacons([0|1]) - query or change demo beacon visibility for this session", 1, 2);
+        Con__addMethodS(NULL, "hook_review_ffi", hook_review_ffi_cb,
+            "hook_review_ffi([0|1]) - query or change demo IFF reconstruction for this session", 1, 2);
+        Con__addMethodS(NULL, "hook_review_no_cloak", hook_review_no_cloak_cb,
+            "hook_review_no_cloak([0|1]) - query or change demo no-cloak reconstruction for this session", 1, 2);
+        Con__addMethodS(NULL, "hook_review_autobeacon", hook_review_autobeacon_cb,
+            "hook_review_autobeacon([0|1]) - query or change demo target reassignment for this session", 1, 2);
     }
     Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
     Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);

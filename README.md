@@ -741,15 +741,33 @@ options bring the parts of it that fit the Linux client:
   logs how many recorded beacons and assigned targets it found. This path has static binary and
   synthetic native tests; beacon assignment and tracking of moving players have been confirmed
   in demo playback.
+  **Ctrl+Shift+F10** switches target reassignment on/off during playback. Off shows the
+  recording's original beacon placement; ordinary beacons can still be visible. The HUD reports
+  whether reassignment is selected for active review playback, rather than merely whether the
+  shared dispatcher is installed. Live switching, HUD feedback, and the change between recorded
+  and target-assigned beacon placement have been confirmed in playback.
+  The same native renderer also supplies weapon-trajectory aim indicators when the recorded
+  weapon has a valid projectile aim solution: a line to an aim point marked by a beacon circle.
+  This display has been observed in grounded and airborne playback and depends on the mounted
+  weapon and pilot state. As in the hm2 reference, borrowed beacons retain their native zero
+  velocity; these indicators are not a separate moving-target velocity predictor.
+- **Demo review — IFF and no-cloak** (`review.ffi` and `review.no_cloak`, both on with
+  demo review). Select these independently to reconstruct a particular combination of effects.
+  **Ctrl+Shift+F8** toggles the hm2 IFF/FFI checks; **Ctrl+Shift+F9** toggles the 0.9 mesh-alpha
+  override. Independent IFF and no-cloak switching, plus no-cloak HUD feedback, have been confirmed
+  in playback.
+  Turning either off restores its native instructions. Native IFF can still show
+  teammates and other ordinarily visible targets, and replacement assets remain a separate setting.
 - **Demo review — range and beacon visibility** (`review.extended_range` and
   `review.global_beacons`, both on with demo review). These can be disabled independently while
   keeping the player IFF and no-cloak reconstruction enabled. During playback,
-  **Ctrl+Shift+F6** toggles range and **Ctrl+Shift+F7** toggles global beacons, with status on the
-  HUD (`review.shortcuts`, on). The shortcuts use playback's global action map, so console typing
+  **Ctrl+Shift+F6** toggles range and **Ctrl+Shift+F7** toggles global beacons. Together with the
+  F8/F9/F10 controls above, status appears on the HUD (`review.shortcuts`, on). All five shortcuts
+  use Ctrl+Shift. The shortcuts use playback's global action map, so console typing
   is unnecessary. They bind only vacant keys and remove only their own bindings on playback exit.
   Setup logs report each binding as `bound`, `occupied`, or `failed`; accepted key/console changes
-  also log configured/applied state. The Loki action descriptor is `shift-ctrl f6` / `shift-ctrl f7`
-  for these physical key combinations.
+  also log configured/applied state. Loki uses `shift-ctrl f6` through `shift-ctrl f10` as the
+  action descriptors for these physical key combinations.
   Space pauses the recording for a comparison from the same viewpoint. If a shortcut is already
   assigned, use the profile checkbox before launching. Console commands are also available:
   `echo(hook_review_range(0));` / `echo(hook_review_range(1));`, or
@@ -759,7 +777,7 @@ options bring the parts of it that fit the Linux client:
   changes last for this process and still require review mode plus active demo playback to apply.
   Disable autobeacon when comparing native beacon visibility so targets remain at recorded locations.
 
-  Ordinary review IFF remains enabled when both beacon options are off. The separate
+  Ordinary review IFF is controlled by `review.ffi` independently of both beacon options. The separate
   `ui.observer_iff` option controls the camera-mode HUD gate; fog and visible-distance options
   affect the world scene and clipping. These use different patch sites from review beacon
   group filtering and the review far-distance loads. A range toggle changes a cutoff, not
@@ -991,6 +1009,9 @@ enablewinconsole(true);
 | `hook_option` | `<key>` | Current hook option value, including session overrides |
 | `hook_review_range` | `[0|1]` | Query/change session review range; report configured/applied state and stock far distance (client only) |
 | `hook_review_global_beacons` | `[0|1]` | Query/change session beacon visibility; report configured/applied state (client only) |
+| `hook_review_ffi` | `[0|1]` | Query/change session IFF/FFI reconstruction; report configured/applied state (client only) |
+| `hook_review_no_cloak` | `[0|1]` | Query/change session no-cloak alpha override; report configured/applied state (client only) |
+| `hook_review_autobeacon` | `[0|1]` | Query/change session beacon target reassignment; report configured/playback-active state (client only) |
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
 | `hook_rand64` | none | Random unpadded 64-bit hex |

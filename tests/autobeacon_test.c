@@ -109,6 +109,7 @@ int main(void) {
     put_word(connection, 0x8220, 1);
     store_hook_option("review.cheat_view", "1"); store_hook_option("review.autobeacon", "1");
     review_patches_applied = 1;
+    review_applied_mask = review_group_mask(REVIEW_CORE);
     rv_native_beacon_render = fake_render;
 
     expected_count = 3;
@@ -116,6 +117,21 @@ int main(void) {
     render_and_check_restore();
     assert(rv_tracking.count == 3);  /* self/friend/beacon/unlisted shape excluded */
     assert(copied_xyz[0][1] == 100 && rv_float(&beacon[0], 0xb8) == 2000);
+
+    /* The real session setter selects native placement versus target tracking
+       without removing the dispatcher or leaving modified objects behind. */
+    const char *auto_off[] = {"hook_review_autobeacon", "0"};
+    const char *auto_on[] = {"hook_review_autobeacon", "1"};
+    const char *auto_query[] = {"hook_review_autobeacon"};
+    uint32_t dispatcher_mask = review_applied_mask;
+    assert(strstr(hook_review_autobeacon_cb(NULL, 2, auto_off), "configured=0 applied=0") != NULL);
+    for (int i = 0; i < 3; i++) expect_position(i, &beacon[i], 0, i);
+    render_and_check_restore();
+    assert(rv_tracking.count == 0 && review_applied_mask == dispatcher_mask);
+    assert(strstr(hook_review_autobeacon_cb(NULL, 2, auto_on), "configured=1 applied=1") != NULL);
+    expect_position(0, &enemy, 0, 0); expect_position(1, &deployable, 0, 2); expect_position(2, &behind, 0, 0);
+    render_and_check_restore();
+    assert(rv_tracking.count == 3 && review_applied_mask == dispatcher_mask);
 
     /* Cached targets follow current positions on intervening frames. */
     put_float(&enemy, 0xb8, 150);
@@ -165,6 +181,9 @@ int main(void) {
     for (int i = 0; i < 3; i++) expect_position(i, &beacon[i], 0, i);
     store_hook_option("review.autobeacon", "0"); render_and_check_restore();
     store_hook_option("review.autobeacon", "1"); put_word(connection, 0x8220, 0); render_and_check_restore();
+    /* Even before the swap removes the dispatcher, active-state feedback must
+       agree with the algorithm's native demo gate. */
+    assert(strstr(hook_review_autobeacon_cb(NULL, 1, auto_query), "configured=1 applied=0") != NULL);
     put_word(connection, 0x8220, 1); put_word(connection, 0x8434, 0); render_and_check_restore();
     put_word(connection, 0x8434, 1); put_pointer(connection, 0x825c, NULL); render_and_check_restore();
 
