@@ -735,6 +735,10 @@ options bring the parts of it that fit the Linux client:
   IFF indicators with autobeacon disabled, plus global-beacon visibility through a profile
   on/off comparison, have been confirmed in playback. Extended range and its Ctrl+Shift+F6 HUD
   control have also been confirmed by toggling IFF visibility while demo playback was paused.
+  The corrected lookup has restored the replacement flag in playback. A full cache audit of
+  the supplied pack verified all 15 compatible models loaded loose, with cached CRCs matching
+  the pack payloads. The pack's scout-vehicle model is DTS v24; this client supports up to v23,
+  so that model is deliberately skipped in favor of stock.
   Review playback automatically logs a model-cache snapshot once, after the first gameplay HUD
   draw, so console typing during playback is unnecessary. Loading-screen swaps do not trigger it.
   It logs each cached DTS resource's logical name and backing
