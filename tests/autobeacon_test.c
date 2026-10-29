@@ -68,6 +68,7 @@ static void render_and_check_restore(void) {
     review_beacon_render(beacon_set);
     assert(calls == previous + 1);
     assert(review_model_hud_seen == (review_demo_playing() != 0));
+    if (review_model_hud_seen) assert(review_model_hud_id == 9999);
     assert(memcmp(before, beacon, sizeof before) == 0);
 }
 
@@ -107,6 +108,7 @@ int main(void) {
         beacon_array[2-i] = (uint32_t)(uintptr_t)&beacon[i];  /* set order differs from ID order */
     }
     put_word(beacon_set, 0x30, 3); put_pointer(beacon_set, 0x38, beacon_array);
+    put_word(beacon_set, 0x20, 9999);
     put_pointer(connection, 0x825c, &self); put_word(connection, 0x8434, 1);
     put_word(connection, 0x8220, 1);
     store_hook_option("review.cheat_view", "1"); store_hook_option("review.autobeacon", "1");

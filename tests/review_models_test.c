@@ -8,6 +8,7 @@ static uint32_t buckets[3];
 static uint32_t object_dictionary[4096];
 static unsigned char objects[3][0x2d4], datablocks[2][0xbc], item_class[0x1c];
 static void *item_vtable[3];
+static unsigned char textures[4][0x40], hud[0x204];
 static void *get_item_class(void *unused) { (void)unused; return item_class; }
 
 static void put_word(void *object, size_t offset, uint32_t value) {
@@ -117,6 +118,52 @@ int main(void) {
     assert(rv_dump_model_users(&memory, (void *)1, "", uses_stream, &count));
     assert(fclose(uses_stream) == 0); free(uses);
 
+    /* Texture cache and HUD handles are a different cache from DTS resources.
+       Report loaded keys independently of configured names, without GL calls. */
+    for (int i = 0; i < 4; i++) {
+        put_word(textures[i], 0xc, 17 + i);
+        put_word(textures[i], 0x24, 64); put_word(textures[i], 0x28, 32);
+        put_word(textures[i], 0x3c, 1);
+        if (i < 3) put_pointer(textures[i], 0, textures[i + 1]);
+    }
+    put_pointer(textures[0], 0x14, "textures/happy_mine");
+    put_pointer(textures[1], 0x14, "gui/beacon_base");
+    put_pointer(textures[2], 0x14, "textures/unrelated"); /* fourth entry is procedural */
+    put_word(hud, 0x20, 9001);
+    put_pointer(hud, 0x1fc, "gui/beacon_base"); put_pointer(hud, 0x200, "gui/crosshairs");
+    put_pointer(hud, 0x1f4, textures[1]); put_pointer(hud, 0x1f8, textures[0]);
+    object_dictionary[9001 & 0xfff] = (uint32_t)(uintptr_t)hud;
+    assert(rv_memory_snapshot(&memory));
+    unsigned char before_textures[sizeof textures], before_hud[sizeof hud];
+    memcpy(before_textures, textures, sizeof textures); memcpy(before_hud, hud, sizeof hud);
+    char *texture_log = NULL; size_t texture_length = 0;
+    FILE *texture_stream = open_memstream(&texture_log, &texture_length); assert(texture_stream);
+    assert(!rv_dump_texture_cache(&memory, textures[0], NULL, texture_stream, &count) && count == 2);
+    assert(fflush(texture_stream) == 0);
+    assert(strstr(texture_log, "key=\"textures/happy_mine\" gl=0x11"));
+    assert(!strstr(texture_log, "unrelated"));
+    assert(!rv_dump_texture_cache(&memory, textures[0], "UnReLaTeD", texture_stream, &count) && count == 1);
+    assert(!rv_dump_hud_textures(&memory, object_dictionary, 9001, texture_stream));
+    assert(fflush(texture_stream) == 0);
+    assert(strstr(texture_log, "role=target configured=\"gui/crosshairs\" loaded_key=\"textures/happy_mine\" gl=0x11"));
+    assert(memcmp(textures, before_textures, sizeof textures) == 0);
+    assert(memcmp(hud, before_hud, sizeof hud) == 0);
+    put_word(hud, 0x1f8, 0);
+    assert(!rv_dump_hud_textures(&memory, object_dictionary, 9001, texture_stream));
+    assert(fflush(texture_stream) == 0 && strstr(texture_log, "loaded_key=\"<unloaded>\" gl=0x0"));
+    put_word(hud, 0x1f8, 1);
+    assert(rv_dump_hud_textures(&memory, object_dictionary, 9001, texture_stream));
+    assert(rv_dump_hud_textures(&memory, object_dictionary, 9002, texture_stream));
+    assert(rv_dump_hud_textures(&memory, (void *)1, 9001, texture_stream));
+    put_word(textures[0], 0x14, 1);
+    assert(rv_dump_texture_cache(&memory, textures[0], NULL, texture_stream, &count));
+    memcpy(textures, before_textures, sizeof textures);
+    put_pointer(textures[3], 0, textures[0]);
+    error = rv_dump_texture_cache(&memory, textures[0], "missing", texture_stream, &count);
+    assert(error && strcmp(error, "texture traversal limit reached") == 0);
+    assert(rv_dump_texture_cache(&memory, (void *)1, NULL, texture_stream, &count));
+    assert(fclose(texture_stream) == 0); free(texture_log);
+
     /* Reject malformed/unmapped dictionaries and strings; bound cyclic chains. */
     put_word(manager, 0x88c, UINT32_MAX);
     text = dump("", &error, &count);
@@ -140,10 +187,13 @@ int main(void) {
     put_word(entries[2], 8, 0);
 
     const char *query[] = {"hook_review_models"};
+    const char *texture_query[] = {"hook_review_textures"};
     assert(strcmp(hook_review_models_cb(NULL, 1, query), "game thread required") == 0);
+    assert(strcmp(hook_review_textures_cb(NULL, 1, texture_query), "game thread required") == 0);
     game_main_thread_known = 1; game_main_thread = pthread_self();
     /* No game code is mapped: the command must refuse this process's layout. */
     assert(strcmp(hook_review_models_cb(NULL, 1, query), "unsupported resource layout") == 0);
+    assert(strcmp(hook_review_textures_cb(NULL, 1, texture_query), "unsupported texture layout") == 0);
 
     /* Playback-entry capture must wait through any number of loading swaps
        until the gameplay HUD is drawn; failures still emit only once. */
@@ -173,6 +223,7 @@ int main(void) {
     update_review_model_diagnostic(1);
     assert(fflush(stderr) == 0 && automatic_length == first_length * 2);
     assert(strstr(automatic, "Automatic review model diagnostic: unsupported resource layout"));
+    assert(strstr(automatic, "Automatic review texture diagnostic: unsupported texture layout"));
     target = &game_targets[1];
     review_model_hud_seen = 1;
     update_review_model_diagnostic(1);
@@ -181,6 +232,7 @@ int main(void) {
     stderr = saved_stderr;
     free(automatic);
     assert(strcmp(hook_review_models_cb(NULL, 1, query), "client only") == 0);
+    assert(strcmp(hook_review_textures_cb(NULL, 1, texture_query), "client only") == 0);
     puts("review models: cached sources, filtering, read-only traversal and malformed-memory gates passed");
     return 0;
 }

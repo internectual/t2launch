@@ -96,6 +96,7 @@ static volatile int game_main_thread_known = 0;
 static int register_hook_commands(void);
 static void update_review_model_diagnostic(int active);
 static int review_model_hud_seen;
+static uint32_t review_model_hud_id;
 static int set_swap_interval(int interval);
 static volatile int vsync_requested = -1;   /* -1: never set by the game */
 static volatile int vsync_reapply = 0;
@@ -1788,8 +1789,10 @@ static void review_beacon_render(void *hud) {
     /* This call site belongs to the gameplay HUD, unlike swaps while loading.
        It runs even when target reassignment is off or there are no beacons. */
     if (!drawing && !target->dedicated && review_patches_applied &&
-        hook_option_bool("review.cheat_view") && review_demo_playing())
+        hook_option_bool("review.cheat_view") && review_demo_playing()) {
         review_model_hud_seen = 1;
+        review_model_hud_id = rv_word(hud, 0x20);
+    }
     if (drawing || target->dedicated || !review_patches_applied ||
         !hook_option_bool("review.cheat_view") || !hook_option_bool("review.autobeacon") ||
         !review_demo_playing()) {
@@ -4721,9 +4724,15 @@ static const char *hook_review_autobeacon_cb(void *obj, S32 argc, const char **a
    reads this cache rather than getFileCRC's independent file lookup. */
 #define RV_RESOURCE_MANAGER 0x08493de4u
 #define RV_MODEL_FIND_CALL 0x0810766bu
+#define RV_BITMAP_FIND_CALL 0x081085a3u
+#define RV_HUD_WAKE_CALL 0x082fb974u
+#define RV_TEXTURE_LIST 0x08494194u
 static const unsigned char rv_model_find_orig[] = {0xe8, 0x54, 0x10, 0x00, 0x00};
+static const unsigned char rv_bitmap_find_orig[] = {0xe8, 0x1c, 0x01, 0x00, 0x00};
+static const unsigned char rv_hud_wake_orig[] = {0xe8, 0x7f, 0x85, 0xe4, 0xff};
 typedef void *(*rv_resource_find_t)(void *, const char *, unsigned char);
 static rv_resource_find_t rv_native_resource_find = (rv_resource_find_t)0x081086c4;
+static unsigned char (*rv_native_hud_wake)(void *) = (unsigned char (*)(void *))0x08143ef8;
 static const struct {
     uintptr_t address;
     size_t length;
@@ -4779,16 +4788,97 @@ static void *review_model_find(void *manager, const char *name, unsigned char fo
     return preferred;
 }
 
+/* Bitmap instances bypass ResourceManager::load and are later uploaded to GL.
+   Log actual successful source lookups separately from decoded/cache evidence. */
+static void *review_bitmap_find(void *manager, const char *name, unsigned char force) {
+    void *resource = rv_native_resource_find(manager, name, force);
+    if (target->dedicated || !hook_option_bool("review.cheat_view") ||
+        !hook_option_bool("review.replace_models")) return resource;
+    resource = rv_prefer_loose_resource(resource);
+    if (!resource || !pthread_equal(pthread_self(), game_main_thread))
+        return resource;
+    const char *path = rv_pointer(resource, 0x18);
+    if (!path || strncmp(path, "textures", 8) != 0 || (path[8] && path[8] != '/')) return resource;
+    static struct { void *resource; const char *name, *backing_path, *backing_name; } seen[1024];
+    static size_t count;
+    const char *file = rv_pointer(resource, 0x1c);
+    const char *backing_path = rv_pointer(resource, 0x20);
+    const char *backing_name = rv_pointer(resource, 0x24);
+    for (size_t i = 0; i < count; i++)
+        if (seen[i].resource == resource && seen[i].name == file &&
+            seen[i].backing_path == backing_path && seen[i].backing_name == backing_name) return resource;
+    if (count == sizeof seen / sizeof seen[0]) {
+        static int reported_limit;
+        if (!reported_limit) fprintf(stderr, "[t2_hook] Review bitmap source log limit reached (1024 unique sources)\n");
+        reported_limit = 1;
+        return resource;
+    }
+    seen[count].resource = resource; seen[count].name = file;
+    seen[count].backing_path = backing_path; seen[count].backing_name = backing_name; count++;
+    if (file && backing_name)
+        fprintf(stderr, "[t2_hook] Review bitmap source: logical=\"%s/%s\" backing=\"%s%s%s\" "
+            "kind=%s resource=%p\n", path, file, backing_path ? backing_path : "",
+            backing_path && *backing_path ? "/" : "", backing_name,
+            rv_word(resource, 0x14) & 1 ? "volume" : rv_word(resource, 0x14) & 2 ? "loose" : "other", resource);
+    return resource;
+}
+
+/* Beacon settings from the supplied hm2 PlayGui.gui, applied before the native
+   GameTSCtrl acquires its texture handles. Their reference counting stays native. */
+static int rv_apply_review_hud(void *hud, int textures_available) {
+    if (!hud || !textures_available || target->dedicated || !hook_option_bool("review.cheat_view") ||
+        !hook_option_bool("review.replace_models")) return 0;
+    static const char *names[] = {"gui/happy_beaconbase", "gui/happy_beacontarget"};
+    static const float colors[6][4] = {
+        {0, 1, 1, .8f}, {0, 1, 1, .8f},
+        {1, 1, 0, .8f}, {1, 1, 0, .8f},
+        {1, 1, 1, 1}, {1, 1, 1, 1},
+    };
+    for (unsigned int i = 0; i < 2; i++) {
+        uint32_t pointer = (uint32_t)(uintptr_t)names[i];
+        memcpy((unsigned char *)hud + 0x1fc + i * 4, &pointer, 4);
+    }
+    uint32_t period = 4000, text_offset = 14000;
+    float line_width = 1;
+    memcpy((unsigned char *)hud + 0x204, &period, 4);
+    *((unsigned char *)hud + 0x208) = 1;
+    memcpy((unsigned char *)hud + 0x20c, colors, sizeof colors);
+    memcpy((unsigned char *)hud + 0x26c, &line_width, 4);
+    memcpy((unsigned char *)hud + 0x270, &text_offset, 4);
+    *((unsigned char *)hud + 0x274) = 0;
+    return 1;
+}
+
+static unsigned char review_hud_wake(void *hud) {
+    if (!target->dedicated && hook_option_bool("review.cheat_view") && hook_option_bool("review.replace_models")) {
+        char base_path[4096], target_path[4096];
+        int available = access(game_path(base_path, sizeof base_path, "base/textures/gui/happy_beaconbase.png"), R_OK) == 0 &&
+            access(game_path(target_path, sizeof target_path, "base/textures/gui/happy_beacontarget.png"), R_OK) == 0;
+        if (rv_apply_review_hud(hud, available))
+            fprintf(stderr, "[t2_hook] Review HUD: hm2 beacon presentation configured before native wake\n");
+        else if (!available)
+            fprintf(stderr, "[t2_hook] Review HUD: replacement images unavailable; keeping current presentation\n");
+    }
+    return rv_native_hud_wake(hud);
+}
+
 static void install_review_model_selection(void) {
     if (target->dedicated || !hook_option_bool("review.cheat_view") ||
         !hook_option_bool("review.replace_models")) return;
-    unsigned char replacement[5] = {0xe8};
-    int32_t relative = (int32_t)((uintptr_t)review_model_find - (RV_MODEL_FIND_CALL + sizeof replacement));
-    memcpy(replacement + 1, &relative, sizeof relative);
-    const struct code_patch patch = {RV_MODEL_FIND_CALL, rv_model_find_orig, sizeof rv_model_find_orig,
-        0, replacement, sizeof replacement};
-    if (apply_code_patches("Review asset lookup", &patch, 1))
-        fprintf(stderr, "[t2_hook] Review assets: prefer staged loose shapes/textures before native preload\n");
+    unsigned char model_call[5] = {0xe8}, bitmap_call[5] = {0xe8}, hud_call[5] = {0xe8};
+    int32_t relative = (int32_t)((uintptr_t)review_model_find - (RV_MODEL_FIND_CALL + sizeof model_call));
+    memcpy(model_call + 1, &relative, sizeof relative);
+    relative = (int32_t)((uintptr_t)review_bitmap_find - (RV_BITMAP_FIND_CALL + sizeof bitmap_call));
+    memcpy(bitmap_call + 1, &relative, sizeof relative);
+    relative = (int32_t)((uintptr_t)review_hud_wake - (RV_HUD_WAKE_CALL + sizeof hud_call));
+    memcpy(hud_call + 1, &relative, sizeof relative);
+    const struct code_patch patches[] = {
+        {RV_MODEL_FIND_CALL, rv_model_find_orig, sizeof rv_model_find_orig, 0, model_call, sizeof model_call},
+        {RV_BITMAP_FIND_CALL, rv_bitmap_find_orig, sizeof rv_bitmap_find_orig, 0, bitmap_call, sizeof bitmap_call},
+        {RV_HUD_WAKE_CALL, rv_hud_wake_orig, sizeof rv_hud_wake_orig, 0, hud_call, sizeof hud_call},
+    };
+    if (apply_code_patches("Review asset lookup", patches, sizeof patches / sizeof patches[0]))
+        fprintf(stderr, "[t2_hook] Review assets: prefer staged loose shapes and bitmap textures before native loading\n");
 }
 
 static const char *rv_dump_model_resources(const struct rv_memory *memory, void *manager,
@@ -4904,12 +4994,94 @@ static const char *hook_review_models_cb(void *obj, S32 argc, const char **argv)
     return result;
 }
 
+static const char *rv_dump_texture_cache(const struct rv_memory *memory, void *texture,
+                                       const char *filter, FILE *output, unsigned int *matches) {
+    *matches = 0;
+    for (unsigned int visited = 0; texture; visited++) {
+        if (visited >= 65536) return "texture traversal limit reached";
+        if (!rv_memory_range(memory, texture, 0x40, PROT_READ)) return "unreadable texture entry";
+        const char *key = rv_string(memory, rv_pointer(texture, 0x14), 1024);
+        if (!key && rv_pointer(texture, 0x14)) return "unreadable texture key";
+        int selected = key && (filter ? strcasestr(key, filter) != NULL :
+            strcasestr(key, "happy_") || strcasestr(key, "beacon") || strcasestr(key, "crosshair"));
+        if (selected) {
+            if (*matches >= 1024) return "texture output limit reached";
+            fprintf(output, "[t2_hook] Review texture: key=\"%s\" gl=0x%x small_gl=0x%x "
+                "width=%u height=%u type=%u refs=%u texture=%p\n", key,
+                rv_word(texture, 0xc), rv_word(texture, 0x10), rv_word(texture, 0x24),
+                rv_word(texture, 0x28), rv_word(texture, 0x34), rv_word(texture, 0x3c), texture);
+            ++*matches;
+        }
+        texture = rv_pointer(texture, 0);
+    }
+    return NULL;
+}
+
+static const char *rv_dump_hud_textures(const struct rv_memory *memory, void *dictionary,
+                                      uint32_t hud_id, FILE *output) {
+    if (!hud_id || !rv_memory_range(memory, dictionary, 4096 * 4, PROT_READ)) return "HUD unavailable";
+    void *hud = rv_find_object(memory, dictionary, hud_id);
+    if (!rv_memory_range(memory, hud, 0x204, PROT_READ)) return "HUD unavailable";
+    const char *roles[] = {"base", "target"};
+    for (unsigned int i = 0; i < 2; i++) {
+        const char *configured = rv_string(memory, rv_pointer(hud, 0x1fc + i * 4), 1024);
+        void *texture = rv_pointer(hud, 0x1f4 + i * 4);
+        const char *key = "<unloaded>";
+        uint32_t gl = 0;
+        if (!configured) return "unreadable HUD texture name";
+        if (texture) {
+            if (!rv_memory_range(memory, texture, 0x40, PROT_READ)) return "unreadable HUD texture handle";
+            key = rv_string(memory, rv_pointer(texture, 0x14), 1024);
+            if (!key) return "unreadable HUD texture key";
+            gl = rv_word(texture, 0xc);
+        }
+        fprintf(output, "[t2_hook] Review HUD texture: hud=%u role=%s configured=\"%s\" "
+            "loaded_key=\"%s\" gl=0x%x texture=%p\n", hud_id, roles[i], configured, key, gl, texture);
+    }
+    return NULL;
+}
+
+static const char *hook_review_textures_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    static char result[256];
+    static const struct { uintptr_t address; size_t length; unsigned char bytes[6]; } anchors[] = {
+        {0x08114eac, 5, {0xa1, 0x94, 0x41, 0x49, 0x08}},
+        {0x08114eb1, 3, {0x89, 0x73, 0x14}},
+        {0x08114f26, 3, {0x89, 0x53, 0x24}},
+        {0x08114f35, 3, {0x89, 0x43, 0x28}},
+        {0x082fb9c0, 6, {0x89, 0x87, 0xf8, 0x01, 0x00, 0x00}},
+        {0x082fba17, 6, {0x89, 0x87, 0xf4, 0x01, 0x00, 0x00}},
+        {0x082fcd32, 5, {0x68, 0xfc, 0x01, 0x00, 0x00}},
+        {0x082fcd4d, 5, {0x68, 0x00, 0x02, 0x00, 0x00}},
+    };
+    if (target->dedicated) return "client only";
+    if (!game_main_thread_known || !pthread_equal(pthread_self(), game_main_thread)) return "game thread required";
+    if (argc < 1 || argc > 2 || (argc == 2 && !argv[1])) return "expected an optional texture-key filter";
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory)) return "memory map unavailable";
+    for (size_t i = 0; i < sizeof anchors / sizeof anchors[0]; i++)
+        if (!rv_memory_range(&memory, (void *)anchors[i].address, anchors[i].length, PROT_READ | PROT_EXEC) ||
+            memcmp((void *)anchors[i].address, anchors[i].bytes, anchors[i].length) != 0)
+            return "unsupported texture layout";
+    if (!rv_memory_range(&memory, (void *)RV_TEXTURE_LIST, 4, PROT_READ)) return "texture list unavailable";
+    unsigned int matches;
+    const char *error = rv_dump_texture_cache(&memory, rv_pointer((void *)RV_TEXTURE_LIST, 0),
+        argc == 2 ? argv[1] : NULL, stderr, &matches);
+    const char *hud_error = "HUD unavailable";
+    if (rv_memory_range(&memory, (void *)RV_ID_DICTIONARY, 4, PROT_READ))
+        hud_error = rv_dump_hud_textures(&memory, rv_pointer((void *)RV_ID_DICTIONARY, 0), review_model_hud_id, stderr);
+    snprintf(result, sizeof result, "Review textures: %u cache entries%s%s; HUD=%s; details in launcher log",
+        matches, error ? "; incomplete: " : "", error ? error : "", hud_error ? hud_error : "captured");
+    fprintf(stderr, "[t2_hook] %s\n", result);
+    return result;
+}
+
 /* Loading also swaps with isPlayingDemo=true. Wait for the native gameplay HUD
    instead of a timeout; capture on the next swap after all borrowed state is restored. */
 static void update_review_model_diagnostic(int active) {
     static int reported;
     if (!active || target->dedicated || !hook_option_bool("review.cheat_view")) {
-        review_model_hud_seen = 0; reported = 0;
+        review_model_hud_seen = 0; review_model_hud_id = 0; reported = 0;
         return;
     }
     if (reported || !review_model_hud_seen) return;
@@ -4917,6 +5089,9 @@ static void update_review_model_diagnostic(int active) {
     const char *args[] = {"hook_review_models"};
     const char *status = hook_review_models_cb(NULL, 1, args);
     fprintf(stderr, "[t2_hook] Automatic review model diagnostic: %s\n", status);
+    const char *texture_args[] = {"hook_review_textures"};
+    status = hook_review_textures_cb(NULL, 1, texture_args);
+    fprintf(stderr, "[t2_hook] Automatic review texture diagnostic: %s\n", status);
 }
 
 /* ── Registration thread ─────────────────────────────────────────────── */
@@ -5073,6 +5248,8 @@ static int register_hook_commands(void) {
             "hook_review_autobeacon([0|1]) - query or change demo target reassignment for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_models", hook_review_models_cb,
             "hook_review_models([filename filter]) - log cached DTS backing files without loading or changing models", 1, 2);
+        Con__addMethodS(NULL, "hook_review_textures", hook_review_textures_cb,
+            "hook_review_textures([key filter]) - log face/HUD texture cache and actual beacon HUD handles", 1, 2);
     }
     Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
     Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);

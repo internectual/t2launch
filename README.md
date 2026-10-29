@@ -739,6 +739,13 @@ options bring the parts of it that fit the Linux client:
   the supplied pack verified all 15 compatible models loaded loose, with cached CRCs matching
   the pack payloads. The pack's scout-vehicle model is DTS v24; this client supports up to v23,
   so that model is deliberately skipped in favor of stock.
+  Replacement-asset launches also apply the supplied hm2 GUI's beacon presentation: its
+  happy base/target images, cyan enemy lines, yellow vehicle lines, white friendly lines,
+  and one-pixel line width. Its large label offset moves beacon-distance text offscreen.
+  These settings are applied before native HUD texture loading, only when both replacement
+  HUD images are available, and last for the review asset launch. Marker artwork and thin
+  colored lines have been confirmed in playback; runtime diagnostics also verify both loaded
+  happy beacon texture handles.
   Review playback automatically logs a model-cache snapshot once, after the first gameplay HUD
   draw, so console typing during playback is unnecessary. Loading-screen swaps do not trigger it.
   It logs each cached DTS resource's logical name and backing
@@ -750,6 +757,13 @@ options bring the parts of it that fit the Linux client:
   belong to a menu preview or an earlier scene, so it is not a list of only currently drawn objects.
   Additional `Review model use:` rows link ghost items, players, static shapes, and turrets to
   their actual datablock/resource pointers, distinguishing them from unused cached alternatives.
+  Bitmap textures use a separate native loading path; the same loose-file preference covers
+  that path while preserving the client's image-format search order. Review asset launches log
+  `Review bitmap source:` lookups, deduplicated and capped at 1024 unique sources per process.
+  The first gameplay snapshot also logs cached happy-face/beacon/crosshair texture keys and the
+  beacon HUD's configured names versus loaded handles. These are source/cache diagnostics,
+  not screenshots or verification of GPU pixel contents. `hook_review_textures([key filter])`
+  provides the same read-only cache report when console input is available.
 - **Demo review — autobeacon** (`review.autobeacon`, on with demo-review reconstruction).
   Reconstructs hm2's assignment of up to 32 recorded beacons to enemy players, selected structures,
   and waypoints. Targets are ranked by horizontal angle every 20 rendered frames and their current
@@ -998,9 +1012,9 @@ For the hook options and review regressions alone:
 python3 -m unittest tests.test_options tests.test_game_binaries -v
 ```
 
-`NativeReviewTests` builds and runs the review-patch, autobeacon, model-resource diagnostic,
-shortcut-parser, and native resource-lookup C fixtures with the host's 32-bit toolchain.
-The first three use synthetic objects and mappings and need no installed game. The parser and
+`NativeReviewTests` builds and runs the review-patch, autobeacon, model/texture diagnostic,
+HUD-presentation, shortcut-parser, and native resource-lookup C fixtures with the host's 32-bit toolchain.
+The first four use synthetic objects and mappings and need no installed game. The parser and
 resource-lookup fixtures require only the installed Loki client; the latter reproduces mixed
 volume/loose collision precedence using the client's actual lookup/registration code. Byte-anchor
 checks require both client and dedicated binaries. Native cases skip with a reason when Linux,
@@ -1046,6 +1060,7 @@ enablewinconsole(true);
 | `hook_review_no_cloak` | `[0|1]` | Query/change session no-cloak alpha override; report configured/applied state (client only) |
 | `hook_review_autobeacon` | `[0|1]` | Query/change session beacon target reassignment; report configured/playback-active state (client only) |
 | `hook_review_models` | `[filename filter]` | Log cached DTS resources and their backing loose file or volume without loading/changing models (client only) |
+| `hook_review_textures` | `[key filter]` | Log face/HUD texture cache and actual beacon HUD handles; empty filter lists all keys (client only) |
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
 | `hook_rand64` | none | Random unpadded 64-bit hex |

@@ -11,6 +11,7 @@ static size_t segment_count;
 static unsigned char entries[3][0x40];
 static uint32_t bucket, dictionary[3];
 static const char shape_path[] = "shapes", flag_name[] = "flag.dts";
+static const char *lookup_path = shape_path, *lookup_name = flag_name;
 static void put_word(void *object, size_t offset, uint32_t value) {
     memcpy((unsigned char *)object + offset, &value, 4);
 }
@@ -30,8 +31,10 @@ static void read_address(void *destination, uint32_t address, size_t length) {
 }
 typedef void *(*native_find_t)(void *, const char *, const char *, unsigned char);
 static void *native_manager_find(void *manager, const char *name, unsigned char force) {
-    assert(manager == dictionary && strcmp(name, "shapes/flag.dts") == 0);
-    return ((native_find_t)0x0810614c)(manager, shape_path, flag_name, force);
+    char expected[256];
+    snprintf(expected, sizeof expected, "%s/%s", lookup_path, lookup_name);
+    assert(manager == dictionary && strcmp(name, expected) == 0);
+    return ((native_find_t)0x0810614c)(manager, lookup_path, lookup_name, force);
 }
 
 int main(void) {
@@ -49,14 +52,18 @@ int main(void) {
     assert(fread(segments, sizeof segments[0], segment_count, binary) == segment_count);
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     assert(page == 4096);
-    uintptr_t pages[] = {0x08106000, 0x080e8000, 0x08107000};
+    uintptr_t pages[] = {0x08106000, 0x080e8000, 0x08107000, 0x08108000, 0x082fb000};
     for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++)
         assert(mmap((void *)pages[i], page, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)pages[i]);
     read_address((void *)0x0810612c, 0x0810612c, 0x1b6); /* hash/find/insert/remove */
     read_address((void *)RV_MODEL_FIND_CALL, RV_MODEL_FIND_CALL, sizeof rv_model_find_orig);
+    read_address((void *)RV_BITMAP_FIND_CALL, RV_BITMAP_FIND_CALL, sizeof rv_bitmap_find_orig);
+    read_address((void *)RV_HUD_WAKE_CALL, RV_HUD_WAKE_CALL, sizeof rv_hud_wake_orig);
     fclose(binary);
     assert(memcmp((void *)RV_MODEL_FIND_CALL, rv_model_find_orig, sizeof rv_model_find_orig) == 0);
+    assert(memcmp((void *)RV_BITMAP_FIND_CALL, rv_bitmap_find_orig, sizeof rv_bitmap_find_orig) == 0);
+    assert(memcmp((void *)RV_HUD_WAKE_CALL, rv_hud_wake_orig, sizeof rv_hud_wake_orig) == 0);
     memcpy((void *)0x080e8b48, "\xb0\x00\xc3", 3); /* ordinary native lookup mode */
     for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++)
         assert(mprotect((void *)pages[i], page, PROT_READ | PROT_EXEC) == 0);
@@ -84,6 +91,8 @@ int main(void) {
     assert(review_model_find(dictionary, "shapes/flag.dts", 0) == entries[2]);
     install_review_model_selection();
     assert(memcmp((void *)RV_MODEL_FIND_CALL, rv_model_find_orig, sizeof rv_model_find_orig) == 0);
+    assert(memcmp((void *)RV_BITMAP_FIND_CALL, rv_bitmap_find_orig, sizeof rv_bitmap_find_orig) == 0);
+    assert(memcmp((void *)RV_HUD_WAKE_CALL, rv_hud_wake_orig, sizeof rv_hud_wake_orig) == 0);
     store_hook_option("review.replace_models", "1"); store_hook_option("review.cheat_view", "0");
     assert(review_model_find(dictionary, "shapes/flag.dts", 0) == entries[2]);
     store_hook_option("review.cheat_view", "1"); target = &game_targets[1];
@@ -101,9 +110,42 @@ int main(void) {
     assert(review_model_find(dictionary, "shapes/flag.dts", 0) == entries[2]);
     assert(!rv_prefer_loose_resource(NULL));
 
+    /* The separate uncached-bitmap route must use the same collision correction
+       and preserve the native source/eligibility policy. */
+    lookup_path = "textures"; lookup_name = "blue_blink4.PNG";
+    for (int i = 1; i < 3; i++) {
+        put_pointer(entries[i], 0x18, lookup_path);
+        put_pointer(entries[i], 0x1c, lookup_name);
+    }
+    put_pointer(entries[1], 0x20, "base/textures");
+    put_pointer(entries[1], 0x24, lookup_name);
+    put_pointer(entries[2], 0x20, "base");
+    put_pointer(entries[2], 0x24, "textures.vl2");
+    put_pointer(entries[2], 8, entries[0]);
+    game_main_thread = pthread_self();
+    char *log = NULL; size_t log_length = 0;
+    FILE *saved_stderr = stderr;
+    stderr = open_memstream(&log, &log_length); assert(stderr);
+    assert(review_bitmap_find(dictionary, "textures/blue_blink4.PNG", 0) == entries[1]);
+    assert(fflush(stderr) == 0);
+    size_t first_length = log_length;
+    assert(strstr(log, "Review bitmap source: logical=\"textures/blue_blink4.PNG\" backing=\"base/textures/blue_blink4.PNG\" kind=loose"));
+    assert(review_bitmap_find(dictionary, "textures/blue_blink4.PNG", 0) == entries[1]);
+    assert(fflush(stderr) == 0 && log_length == first_length);
+    store_hook_option("review.replace_models", "0");
+    assert(review_bitmap_find(dictionary, "textures/blue_blink4.PNG", 0) == entries[2]);
+    store_hook_option("review.replace_models", "1");
+    put_word(entries[1], 0x14, 10);
+    assert(review_bitmap_find(dictionary, "textures/blue_blink4.PNG", 0) == entries[2]);
+    assert(fclose(stderr) == 0); stderr = saved_stderr; free(log);
+
     install_review_model_selection();
     int32_t relative; memcpy(&relative, (void *)(RV_MODEL_FIND_CALL + 1), 4);
     assert(RV_MODEL_FIND_CALL + 5 + relative == (uintptr_t)review_model_find);
+    memcpy(&relative, (void *)(RV_BITMAP_FIND_CALL + 1), 4);
+    assert(RV_BITMAP_FIND_CALL + 5 + relative == (uintptr_t)review_bitmap_find);
+    memcpy(&relative, (void *)(RV_HUD_WAKE_CALL + 1), 4);
+    assert(RV_HUD_WAKE_CALL + 5 + relative == (uintptr_t)review_hud_wake);
     for (size_t i = 0; i < sizeof pages / sizeof pages[0]; i++)
         assert(munmap((void *)pages[i], page) == 0);
     puts("review resource lookup: native collision precedence reproduced; loose preference and gates passed");

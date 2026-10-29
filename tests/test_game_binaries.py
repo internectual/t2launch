@@ -98,6 +98,9 @@ class NativeReviewTests(unittest.TestCase):
     def test_review_model_resource_diagnostic(self):
         self.run_fixture("review_models_test.c", "read-only traversal and malformed-memory gates passed")
 
+    def test_review_hud_presentation_before_native_wake(self):
+        self.run_fixture("review_hud_test.c", "reference fields precede native wake and fallback gates passed")
+
     def test_review_shortcut_descriptors_with_native_parser(self):
         client = Path(self.environment["HOME"]) / "t2-linux" / "tribes2.dynamic"
         if not client.is_file():
@@ -127,6 +130,20 @@ class GameBinaryTests(unittest.TestCase):
             (0x0825D18E, "89 b0 b8 00 00 00"),
             (0x0825D11F, "8b 41 44"),
             (0x0810766B, "e8 54 10 00 00"),
+            (0x081085A3, "e8 1c 01 00 00"),
+            (0x0811513B, "e8 48 34 ff ff"),
+            (0x08114EAC, "a1 94 41 49 08"),
+            (0x08114EB1, "89 73 14"),
+            (0x08114F26, "89 53 24"),
+            (0x08114F35, "89 43 28"),
+            (0x082FB9C0, "89 87 f8 01 00 00"),
+            (0x082FBA17, "89 87 f4 01 00 00"),
+            (0x082FCD32, "68 fc 01 00 00"),
+            (0x082FCD4D, "68 00 02 00 00"),
+            (0x082FB974, "e8 7f 85 e4 ff"),
+            (0x082FCE40, "68 6c 02 00 00"),
+            (0x082FCE5B, "68 70 02 00 00"),
+            (0x082FCE76, "68 74 02 00 00"),
         ):
             data = bytes.fromhex(expected)
             self.assertEqual(read(address, len(data)), data)
