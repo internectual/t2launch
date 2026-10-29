@@ -261,7 +261,7 @@ OPTIONS = (
                 "Status appears on the HUD. Existing bindings "
                 "are preserved, and the review bindings are removed when playback ends."),
     Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
-           env="T2LAUNCH_REVIEW_MODELS", requires=(("review.cheat_view", (True,)),),
+           env="T2LAUNCH_REVIEW_MODELS", hook=True, requires=(("review.cheat_view", (True,)),),
            help="Render demos with the hm2 asset pack (_hm2.vl2: bright/visible models, visible cloak, "
                 "hm2's HUD) so a demo looks the way the suspect saw it. The launcher installs the "
                 "replacement shapes/textures as loose files for the whole launch, "

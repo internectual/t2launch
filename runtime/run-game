@@ -486,10 +486,12 @@ launch_game() {
         # Demo review: show hm2's replacement models during playback by
         # extracting the WHOLE pack as LOOSE files under base/ (shapes/ and
         # textures/). Reverse-engineered on this build, confirmed by the project
-        # owner and CRC-probed:
+        # owner (getFileCRC alone does not prove the selected model):
         #   * A .vl2 mounted under base/ cannot override a model in a core volume
         #     like shapes.vl2 (core volumes load before the base/ scan).
-        #   * A LOOSE file at base/<path> DOES override the volume copy. It must
+        #   * A LOOSE file at base/<path> makes an override available. The review
+        #     hook prefers it before preload, even if native hash-chain ordering
+        #     puts a volume entry first. It must
         #     be a real file in a real directory -- a symlinked dir is not
         #     recursed and symlinked files are not registered.
         #   * Mounting the pack AND laying down loose shapes creates two

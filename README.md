@@ -722,8 +722,10 @@ options bring the parts of it that fit the Linux client:
   pack (`_hm2.vl2`: bright/visible models, visible cloak) so it looks the way the suspect saw it, which
   helps tell a shot lined up on an artificial target from a lucky one. On this build a mounted `.vl2`
   cannot override a model in a core volume like `shapes.vl2`, so the pack is instead extracted as
-  **loose files** under `base/` (`shapes/` and `textures/`) -- a loose file does override the volume
-  copy when the shape preloads. `run-game` extracts the pack to a launcher-managed cache
+  **loose files** under `base/` (`shapes/` and `textures/`). The review hook explicitly prefers
+  the staged loose resource before preload: the native lookup can otherwise select a volume
+  entry ahead of its loose counterpart in a mixed hash collision chain, leaving only some
+  replacements active. `run-game` extracts the pack to a launcher-managed cache
   (`~/.local/share/t2launch/review/`), copies each top-level dir into the game's `base/` as real files
   on a review launch, tracks what it added in an ownership sentinel, and removes it on non-review
   launches, so the stock install keeps no copy (models replace for the whole launch, so a review launch
@@ -733,6 +735,17 @@ options bring the parts of it that fit the Linux client:
   IFF indicators with autobeacon disabled, plus global-beacon visibility through a profile
   on/off comparison, have been confirmed in playback. Extended range and its Ctrl+Shift+F6 HUD
   control have also been confirmed by toggling IFF visibility while demo playback was paused.
+  Review playback automatically logs a model-cache snapshot once, after the first gameplay HUD
+  draw, so console typing during playback is unnecessary. Loading-screen swaps do not trigger it.
+  It logs each cached DTS resource's logical name and backing
+  loose file or volume to the launcher's output and `~/.local/state/t2launch/launch-diagnostics.log`
+  (under `$XDG_STATE_HOME` when set). Starting another demo after leaving playback captures another
+  snapshot. The optional console command `echo(hook_review_models("flag.dts"));` filters names
+  when console input is available.
+  This reads the resource cache without loading or replacing models; a cached resource can also
+  belong to a menu preview or an earlier scene, so it is not a list of only currently drawn objects.
+  Additional `Review model use:` rows link ghost items, players, static shapes, and turrets to
+  their actual datablock/resource pointers, distinguishing them from unused cached alternatives.
 - **Demo review — autobeacon** (`review.autobeacon`, on with demo-review reconstruction).
   Reconstructs hm2's assignment of up to 32 recorded beacons to enemy players, selected structures,
   and waypoints. Targets are ranked by horizontal angle every 20 rendered frames and their current
@@ -975,6 +988,22 @@ t2launch/
 
 Run the tests with `python3 -m unittest discover -s tests -v`.
 
+For the hook options and review regressions alone:
+
+```bash
+python3 -m unittest tests.test_options tests.test_game_binaries -v
+```
+
+`NativeReviewTests` builds and runs the review-patch, autobeacon, model-resource diagnostic,
+shortcut-parser, and native resource-lookup C fixtures with the host's 32-bit toolchain.
+The first three use synthetic objects and mappings and need no installed game. The parser and
+resource-lookup fixtures require only the installed Loki client; the latter reproduces mixed
+volume/loose collision precedence using the client's actual lookup/registration code. Byte-anchor
+checks require both client and dedicated binaries. Native cases skip with a reason when Linux,
+GCC's i386 development libraries/runtime, or the parser's client fixture are unavailable.
+Fixture builds use temporary directories; processes run with launcher/loader environment overrides
+removed and child core dumps disabled. No game is launched and no playback input or screenshots are needed.
+
 Adding a profile option means one `Option(...)` entry in `t2options.py`, plus a
 row in the hook's `hook_options[]` table when the hook applies it;
 `tests/test_options.py` checks the two lists agree. New emulator backends are
@@ -1012,6 +1041,7 @@ enablewinconsole(true);
 | `hook_review_ffi` | `[0|1]` | Query/change session IFF/FFI reconstruction; report configured/applied state (client only) |
 | `hook_review_no_cloak` | `[0|1]` | Query/change session no-cloak alpha override; report configured/applied state (client only) |
 | `hook_review_autobeacon` | `[0|1]` | Query/change session beacon target reassignment; report configured/playback-active state (client only) |
+| `hook_review_models` | `[filename filter]` | Log cached DTS resources and their backing loose file or volume without loading/changing models (client only) |
 | `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
 | `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
 | `hook_rand64` | none | Random unpadded 64-bit hex |

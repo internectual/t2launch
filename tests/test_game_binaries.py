@@ -1,12 +1,15 @@
-"""The hook's patch sites hold the expected bytes in the installed binaries.
+"""Installed-binary patch anchors and synthetic native review regressions.
 
-The addresses mirror game_targets[] and the server-only sites in t2_hook.c.
-Skipped when the Loki #25034 game is not installed in ~/t2-linux.
+Binary anchors require the Loki #25034 client/server in ~/t2-linux. Native
+review fixtures require Linux and a working i386 C toolchain/runtime. The
+native descriptor-parser and resource-lookup fixtures also need the client.
 """
 
+import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,28 +45,91 @@ def reader(path):
     return read
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "native fixtures use Linux memory mappings")
+class NativeReviewTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.compiler = shutil.which("gcc")
+        if not cls.compiler:
+            raise unittest.SkipTest("gcc is unavailable for native review fixtures")
+        directory = tempfile.TemporaryDirectory(prefix="t2-native-review-")
+        cls.addClassCleanup(directory.cleanup)
+        cls.directory = Path(directory.name)
+        # Fixtures must use their synthetic options, not an inherited launch
+        # profile or the game's preload/audit/compatibility libraries.
+        cls.environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("T2LAUNCH_") and
+                           key not in ("LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH")}
+        cls.environment.setdefault("HOME", str(Path.home()))
+        import resource
+        cls.limit_core_dumps = staticmethod(lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0)))
+        probe_path = cls.directory / "probe"
+        probe = subprocess.run([cls.compiler, "-m32", "-x", "c", "-", "-o", str(probe_path)],
+                               input="#include <stdio.h>\nint main(void) { return 0; }\n",
+                               env=cls.environment, text=True, capture_output=True, timeout=30)
+        if probe.returncode:
+            raise unittest.SkipTest("a working 32-bit C development toolchain is required")
+        try:
+            probe = subprocess.run([str(probe_path)], env=cls.environment, text=True,
+                                   capture_output=True, timeout=15, preexec_fn=cls.limit_core_dumps)
+        except OSError as error:
+            raise unittest.SkipTest("native i386 executables cannot run on this host") from error
+        if probe.returncode:
+            raise unittest.SkipTest("a working native i386 runtime is required")
+
+    def run_fixture(self, name, expected_output):
+        fixture = Path(__file__).resolve().with_name(name)
+        output = self.directory / fixture.stem
+        build = subprocess.run([self.compiler, "-m32", "-O2", "-std=c99", "-mstackrealign",
+                                "-fPIE", "-pie", str(fixture), "-o", str(output), "-pthread", "-ldl"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+        result = subprocess.run([str(output)], env=self.environment, text=True, capture_output=True,
+                                timeout=30, preexec_fn=self.limit_core_dumps)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(expected_output, result.stdout, result.stdout + result.stderr)
+
+    def test_review_patch_combinations_and_restoration(self):
+        self.run_fixture("review_patch_test.c", "32 independent feature combinations")
+
+    def test_autobeacon_assignment_and_restoration(self):
+        self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
+
+    def test_review_model_resource_diagnostic(self):
+        self.run_fixture("review_models_test.c", "read-only traversal and malformed-memory gates passed")
+
+    def test_review_shortcut_descriptors_with_native_parser(self):
+        client = Path(self.environment["HOME"]) / "t2-linux" / "tribes2.dynamic"
+        if not client.is_file():
+            self.skipTest("installed Loki client required for the real descriptor-parser fixture")
+        self.run_fixture("review_shortcut_test.c", "native parser rejects old descriptors")
+
+    def test_native_resource_collision_precedence(self):
+        client = Path(self.environment["HOME"]) / "t2-linux" / "tribes2.dynamic"
+        if not client.is_file():
+            self.skipTest("installed Loki client required for the native resource lookup fixture")
+        self.run_fixture("review_resource_lookup_test.c", "loose preference and gates passed")
+
+
 @unittest.skipUnless((GAME / "tribes2d.dynamic").is_file() and (GAME / "tribes2.dynamic").is_file(),
                      "the Loki #25034 game is not installed in ~/t2-linux")
 class GameBinaryTests(unittest.TestCase):
-    def test_review_shortcut_descriptors_with_native_parser(self):
-        compiler = shutil.which("gcc")
-        if not compiler:
-            self.skipTest("gcc is unavailable for the native shortcut fixture")
-        with tempfile.TemporaryDirectory(prefix="t2-shortcut-") as directory:
-            output = Path(directory) / "review_shortcut_test"
-            probe = subprocess.run([compiler, "-m32", "-x", "c", "-", "-o", str(output)],
-                                   input="#include <stdio.h>\nint main(void) { return 0; }\n",
-                                   text=True, capture_output=True, timeout=30)
-            if probe.returncode:
-                self.skipTest("a working 32-bit C development toolchain is required")
-            fixture = Path(__file__).with_name("review_shortcut_test.c")
-            build = subprocess.run([compiler, "-m32", "-O2", "-std=c99", "-mstackrealign",
-                                    "-fPIE", "-pie", str(fixture), "-o", str(output), "-pthread", "-ldl"],
-                                   text=True, capture_output=True, timeout=60)
-            self.assertEqual(build.returncode, 0, build.stderr)
-            result = subprocess.run([str(output)], text=True, capture_output=True, timeout=15)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            self.assertIn("native parser rejects old descriptors", result.stdout)
+    def test_client_model_resource_layout(self):
+        read = reader(GAME / "tribes2.dynamic")
+        # Resource manager global, dictionary base, chain link and backing filename.
+        for address, expected in (
+            (0x0825D15C, "a1 e4 3d 49 08"),
+            (0x08107A57, "81 c3 84 08 00 00"),
+            (0x081061A2, "8b 5b 08"),
+            (0x0810785E, "8b 47 20 8b 57 24"),
+            (0x0810616A, "f7 71 08 8b 01 31 f6 8b 1c 90"),
+            (0x081076E9, "89 43 34"),
+            (0x0825D18E, "89 b0 b8 00 00 00"),
+            (0x0825D11F, "8b 41 44"),
+            (0x0810766B, "e8 54 10 00 00"),
+        ):
+            data = bytes.fromhex(expected)
+            self.assertEqual(read(address, len(data)), data)
 
     def test_shared_sites_match_in_each_executable(self):
         for name, target in TARGETS.items():

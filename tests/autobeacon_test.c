@@ -64,8 +64,10 @@ static void render_and_check_restore(void) {
     struct fake_object before[3];
     memcpy(before, beacon, sizeof before);
     int previous = calls;
+    review_model_hud_seen = 0;
     review_beacon_render(beacon_set);
     assert(calls == previous + 1);
+    assert(review_model_hud_seen == (review_demo_playing() != 0));
     assert(memcmp(before, beacon, sizeof before) == 0);
 }
 

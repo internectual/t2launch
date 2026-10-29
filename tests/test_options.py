@@ -172,6 +172,11 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(lines["video.full_redraw"], "1")
         self.assertEqual(lines["runtime.monotonic_clock"], "1")
         self.assertNotIn("video.software_gl", lines)
+        models = {"review.cheat_view": True, "review.replace_models": True}
+        self.assertEqual(t2options.launch_env(models, HOOKED)["T2LAUNCH_REVIEW_MODELS"], "1")
+        self.assertIn("review.replace_models=1", t2options.hook_config(models, HOOKED).splitlines())
+        models["review.cheat_view"] = False
+        self.assertIn("review.replace_models=0", t2options.hook_config(models, HOOKED).splitlines())
         unhooked = t2options.hook_config({"won.mode": "off"}, {"launcher.load_hook": False})
         self.assertIn("runtime.monotonic_clock=0", unhooked)
 

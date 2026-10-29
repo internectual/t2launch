@@ -94,6 +94,8 @@ static pthread_t game_main_thread;
 static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
 static int register_hook_commands(void);
+static void update_review_model_diagnostic(int active);
+static int review_model_hud_seen;
 static int set_swap_interval(int interval);
 static volatile int vsync_requested = -1;   /* -1: never set by the game */
 static volatile int vsync_reapply = 0;
@@ -166,6 +168,7 @@ static struct hook_option hook_options[] = {
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
+    {"review.replace_models", "0", "T2LAUNCH_REVIEW_MODELS", 0, "", 0},
     {"review.ffi", "1", NULL, 0, "", 0},
     {"review.no_cloak", "1", NULL, 0, "", 0},
     {"review.autobeacon", "1", NULL, 0, "", 0},
@@ -1782,6 +1785,11 @@ static void rv_set_beacon(void *object, const float xyz[3], uint32_t type) {
 
 static void review_beacon_render(void *hud) {
     static int drawing;
+    /* This call site belongs to the gameplay HUD, unlike swaps while loading.
+       It runs even when target reassignment is off or there are no beacons. */
+    if (!drawing && !target->dedicated && review_patches_applied &&
+        hook_option_bool("review.cheat_view") && review_demo_playing())
+        review_model_hud_seen = 1;
     if (drawing || target->dedicated || !review_patches_applied ||
         !hook_option_bool("review.cheat_view") || !hook_option_bool("review.autobeacon") ||
         !review_demo_playing()) {
@@ -3767,6 +3775,7 @@ void SDL_GL_SwapBuffers(void) {
     if (shell_audio_setup_done && now != (time_t)-1)
         poll_discord_presence(now);
     update_review_patches();
+    update_review_model_diagnostic((review_applied_mask & review_group_mask(REVIEW_CORE)) != 0);
 }
 
 /* The dedicated server never swaps buffers. Platform::process (0x081CF400)
@@ -4706,6 +4715,210 @@ static const char *hook_review_autobeacon_cb(void *obj, S32 argc, const char **a
     return review_feature_cb(REVIEW_CORE, "review.autobeacon", argc, argv);
 }
 
+/* Review asset selection and cache diagnostics. Loki #25034:
+   ResourceManager+0x884 is the dictionary; ResourceObject+0x34 is the cached
+   instance. OpenStream builds its OS filename from +0x20/+0x24. The diagnostic
+   reads this cache rather than getFileCRC's independent file lookup. */
+#define RV_RESOURCE_MANAGER 0x08493de4u
+#define RV_MODEL_FIND_CALL 0x0810766bu
+static const unsigned char rv_model_find_orig[] = {0xe8, 0x54, 0x10, 0x00, 0x00};
+typedef void *(*rv_resource_find_t)(void *, const char *, unsigned char);
+static rv_resource_find_t rv_native_resource_find = (rv_resource_find_t)0x081086c4;
+static const struct {
+    uintptr_t address;
+    size_t length;
+    unsigned char bytes[6];
+} rv_resource_anchors[] = {
+    {0x0825d15c, 5, {0xa1, 0xe4, 0x3d, 0x49, 0x08}},
+    {0x08107a57, 6, {0x81, 0xc3, 0x84, 0x08, 0x00, 0x00}},
+    {0x081061a2, 3, {0x8b, 0x5b, 0x08}},
+    {0x0810785e, 6, {0x8b, 0x47, 0x20, 0x8b, 0x57, 0x24}},
+    {0x0825d18e, 6, {0x89, 0xb0, 0xb8, 0x00, 0x00, 0x00}},
+    {0x0825d11f, 3, {0x8b, 0x41, 0x44}},
+};
+
+/* Native lookup accepts the first matching resource in a collision chain.
+   Registration's ordering is not reliable when volume and loose entries mix.
+   Prefer the real loose counterpart for review assets BEFORE shape preload;
+   never replace an already-created TSShape or alter the resource dictionary. */
+static void *rv_prefer_loose_resource(void *original) {
+    if (!original) return NULL;
+    const char *path = rv_pointer(original, 0x18);
+    const char *name = rv_pointer(original, 0x1c);
+    uint32_t flags = rv_word(original, 0x14);
+    if (!path || !name || (flags & 2) ||
+        !((strncmp(path, "shapes", 6) == 0 && (!path[6] || path[6] == '/')) ||
+          (strncmp(path, "textures", 8) == 0 && (!path[8] || path[8] == '/')))) return original;
+    char backing[1024];
+    int length = snprintf(backing, sizeof backing, "base/%s", path);
+    if (length < 0 || (size_t)length >= sizeof backing) return original;
+    void *resource = rv_pointer(original, 8);
+    for (unsigned int visited = 0; resource && visited < 65536; visited++) {
+        uint32_t candidate_flags = rv_word(resource, 0x14);
+        if (rv_pointer(resource, 0x18) == path && rv_pointer(resource, 0x1c) == name &&
+            (candidate_flags & 3) == 2 && ((candidate_flags ^ flags) & 8) == 0) {
+            const char *disk_path = rv_pointer(resource, 0x20);
+            const char *disk_name = rv_pointer(resource, 0x24);
+            if (disk_path && disk_name && strcmp(disk_path, backing) == 0 &&
+                strcmp(disk_name, name) == 0) return resource;
+        }
+        resource = rv_pointer(resource, 8);
+    }
+    return original;
+}
+
+static void *review_model_find(void *manager, const char *name, unsigned char force) {
+    void *original = rv_native_resource_find(manager, name, force);
+    if (target->dedicated || !hook_option_bool("review.cheat_view") ||
+        !hook_option_bool("review.replace_models")) return original;
+    void *preferred = rv_prefer_loose_resource(original);
+    if (preferred != original && !rv_pointer(preferred, 0x34))
+        fprintf(stderr, "[t2_hook] Review asset selection: %s/%s -> %s/%s (loose before volume)\n",
+            (const char *)rv_pointer(preferred, 0x18), (const char *)rv_pointer(preferred, 0x1c),
+            (const char *)rv_pointer(preferred, 0x20), (const char *)rv_pointer(preferred, 0x24));
+    return preferred;
+}
+
+static void install_review_model_selection(void) {
+    if (target->dedicated || !hook_option_bool("review.cheat_view") ||
+        !hook_option_bool("review.replace_models")) return;
+    unsigned char replacement[5] = {0xe8};
+    int32_t relative = (int32_t)((uintptr_t)review_model_find - (RV_MODEL_FIND_CALL + sizeof replacement));
+    memcpy(replacement + 1, &relative, sizeof relative);
+    const struct code_patch patch = {RV_MODEL_FIND_CALL, rv_model_find_orig, sizeof rv_model_find_orig,
+        0, replacement, sizeof replacement};
+    if (apply_code_patches("Review asset lookup", &patch, 1))
+        fprintf(stderr, "[t2_hook] Review assets: prefer staged loose shapes/textures before native preload\n");
+}
+
+static const char *rv_dump_model_resources(const struct rv_memory *memory, void *manager,
+                                          const char *filter, FILE *output, unsigned int *matches) {
+    *matches = 0;
+    if (!rv_memory_range(memory, manager, 0x890, PROT_READ)) return "resource manager unavailable";
+    void *table = rv_pointer(manager, 0x884);
+    uint32_t buckets = rv_word(manager, 0x88c);
+    if (!buckets || buckets > 65536 ||
+        !rv_memory_range(memory, table, (size_t)buckets * 4, PROT_READ))
+        return "resource dictionary unavailable";
+    unsigned int visited = 0;
+    for (uint32_t bucket = 0; bucket < buckets; bucket++) {
+        void *resource = rv_pointer(table, (size_t)bucket * 4);
+        for (unsigned int chain = 0; resource; chain++) {
+            if (chain >= 4096 || visited++ >= 131072) return "resource traversal limit reached";
+            if (!rv_memory_range(memory, resource, 0x40, PROT_READ)) return "unreadable resource entry";
+            const char *name = rv_string(memory, rv_pointer(resource, 0x1c), 256);
+            size_t length = name ? strlen(name) : 0;
+            if (length > 4 && strcasecmp(name + length - 4, ".dts") == 0 &&
+                (!*filter || strcasestr(name, filter)) && rv_pointer(resource, 0x34)) {
+                const char *path = rv_string(memory, rv_pointer(resource, 0x18), 1024);
+                const char *backing_path = rv_string(memory, rv_pointer(resource, 0x20), 1024);
+                const char *backing_name = rv_string(memory, rv_pointer(resource, 0x24), 256);
+                /* A null directory means a root-level file, not an unreadable string. */
+                if (!path && !rv_pointer(resource, 0x18)) path = "";
+                if (!backing_path && !rv_pointer(resource, 0x20)) backing_path = "";
+                if (!path || !backing_path || !backing_name) return "unreadable resource filename";
+                if (*matches >= 1024) return "model output limit reached";
+                uint32_t flags = rv_word(resource, 0x14);
+                fprintf(output, "[t2_hook] Review model: logical=\"%s%s%s\" backing=\"%s%s%s\" "
+                    "kind=%s offset=%u flags=0x%x cached_crc=0x%08x resource=%p instance=%p\n",
+                    path, *path ? "/" : "", name,
+                    backing_path, *backing_path ? "/" : "", backing_name,
+                    flags & 1 ? "volume" : flags & 2 ? "loose" : "other",
+                    rv_word(resource, 0x28), flags, rv_word(resource, 0x3c),
+                    resource, rv_pointer(resource, 0x34));
+                ++*matches;
+            }
+            resource = rv_pointer(resource, 8);
+        }
+    }
+    return NULL;
+}
+
+/* Connect cached resources to actual ghost objects. These exact classes share
+   ShapeBase+0x2d0 -> ShapeBaseData, whose preloaded resource is at +0xb8. */
+static const char *rv_dump_model_users(const struct rv_memory *memory, void *dictionary,
+                                     const char *filter, FILE *output, unsigned int *matches) {
+    *matches = 0;
+    if (!rv_memory_range(memory, dictionary, 4096 * 4, PROT_READ)) return "object dictionary unavailable";
+    unsigned int visited = 0;
+    for (unsigned int bucket = 0; bucket < 4096; bucket++) {
+        void *object = rv_pointer(dictionary, bucket * 4);
+        for (unsigned int chain = 0; object; chain++) {
+            if (chain >= 4096 || visited++ >= 131072) return "object traversal limit reached";
+            if (!rv_memory_range(memory, object, 0x24, PROT_READ)) return "unreadable object entry";
+            const char *name = rv_class_name(memory, object);
+            if (name && (strcmp(name, "Item") == 0 || strcmp(name, "StaticShape") == 0 ||
+                         strcmp(name, "Player") == 0 || strcmp(name, "Turret") == 0) &&
+                rv_memory_range(memory, object, 0x2d4, PROT_READ) && (rv_word(object, 0x40) & 2)) {
+                void *data = rv_pointer(object, 0x2d0);
+                if (rv_memory_range(memory, data, 0xbc, PROT_READ)) {
+                    const char *shape = rv_string(memory, rv_pointer(data, 0x44), 256);
+                    void *resource = rv_pointer(data, 0xb8);
+                    if (shape && (!*filter || strcasestr(shape, filter)) &&
+                        rv_memory_range(memory, resource, 0x38, PROT_READ) && rv_pointer(resource, 0x34)) {
+                        if (*matches >= 1024) return "model user output limit reached";
+                        fprintf(output, "[t2_hook] Review model use: object=%u class=%s datablock=%u "
+                            "shape=\"%s\" resource=%p instance=%p\n",
+                            rv_word(object, 0x20), name, rv_word(data, 0x20), shape,
+                            resource, rv_pointer(resource, 0x34));
+                        ++*matches;
+                    }
+                }
+            }
+            object = rv_pointer(object, 0x10);
+        }
+    }
+    return NULL;
+}
+
+static const char *hook_review_models_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    static char result[192];
+    if (target->dedicated) return "client only";
+    if (!game_main_thread_known || !pthread_equal(pthread_self(), game_main_thread))
+        return "game thread required";
+    if (argc < 1 || argc > 2 || (argc == 2 && !argv[1])) return "expected an optional filename filter";
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory)) return "memory map unavailable";
+    for (size_t i = 0; i < sizeof rv_resource_anchors / sizeof rv_resource_anchors[0]; i++) {
+        const void *site = (void *)rv_resource_anchors[i].address;
+        size_t length = rv_resource_anchors[i].length;
+        if (!rv_memory_range(&memory, site, length, PROT_READ | PROT_EXEC) ||
+            memcmp(site, rv_resource_anchors[i].bytes, length) != 0)
+            return "unsupported resource layout";
+    }
+    if (!rv_memory_range(&memory, (void *)RV_RESOURCE_MANAGER, 4, PROT_READ))
+        return "resource manager unavailable";
+    unsigned int matches;
+    const char *error = rv_dump_model_resources(&memory, rv_pointer((void *)RV_RESOURCE_MANAGER, 0),
+        argc == 2 ? argv[1] : "", stderr, &matches);
+    unsigned int users = 0;
+    const char *user_error = "object dictionary unavailable";
+    if (rv_memory_range(&memory, (void *)RV_ID_DICTIONARY, 4, PROT_READ))
+        user_error = rv_dump_model_users(&memory, rv_pointer((void *)RV_ID_DICTIONARY, 0),
+            argc == 2 ? argv[1] : "", stderr, &users);
+    if (!error) error = user_error;
+    snprintf(result, sizeof result, "Review models: %u cached DTS resources, %u ghost model links%s%s; details in launcher log",
+        matches, users, error ? "; incomplete: " : "", error ? error : "");
+    fprintf(stderr, "[t2_hook] %s\n", result);
+    return result;
+}
+
+/* Loading also swaps with isPlayingDemo=true. Wait for the native gameplay HUD
+   instead of a timeout; capture on the next swap after all borrowed state is restored. */
+static void update_review_model_diagnostic(int active) {
+    static int reported;
+    if (!active || target->dedicated || !hook_option_bool("review.cheat_view")) {
+        review_model_hud_seen = 0; reported = 0;
+        return;
+    }
+    if (reported || !review_model_hud_seen) return;
+    reported = 1;  /* Errors must not produce a per-frame retry/log flood. */
+    const char *args[] = {"hook_review_models"};
+    const char *status = hook_review_models_cb(NULL, 1, args);
+    fprintf(stderr, "[t2_hook] Automatic review model diagnostic: %s\n", status);
+}
+
 /* ── Registration thread ─────────────────────────────────────────────── */
 
 /* ── VSync (video.vsync) ─────────────────────────────────────────────────
@@ -4858,6 +5071,8 @@ static int register_hook_commands(void) {
             "hook_review_no_cloak([0|1]) - query or change demo no-cloak reconstruction for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_autobeacon", hook_review_autobeacon_cb,
             "hook_review_autobeacon([0|1]) - query or change demo target reassignment for this session", 1, 2);
+        Con__addMethodS(NULL, "hook_review_models", hook_review_models_cb,
+            "hook_review_models([filename filter]) - log cached DTS backing files without loading or changing models", 1, 2);
     }
     Con__addMethodS(NULL, "hook_sha1", hook_sha1_cb, "hook_sha1 <string> - SHA1 hash", 2, 2);
     Con__addMethodS(NULL, "hook_rsa_mod_exp", hook_rsa_mod_exp_cb, "hook_rsa_mod_exp <base> <exp> <mod>", 4, 4);
@@ -4978,6 +5193,7 @@ static void __attribute__((constructor)) init(void) {
         return;
     }
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
+    install_review_model_selection();
     if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill") ||
         hook_option_bool("ui.bar_flip"))
         install_hud_bars(hook_option_bool("ui.hud_get_value"), hook_option_bool("ui.vertical_fill"),
