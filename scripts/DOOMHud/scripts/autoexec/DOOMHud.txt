@@ -1,0 +1,16 @@
+DOOMHud 1.0
+
+Install DOOMHud.vl2 into the Tribes 2 base/ directory. The package auto-loads
+the DOOM-style status bar and contains the DOOM graphics and GFT font sizes
+8 through 32. The hook's ui.hud_get_value option (on by default in t2launch)
+supplies the live health and energy values; no external executable, support.vl2,
+loadout.cs, or xHealth/xEnergy globals are required.
+
+The status bar is centered along the bottom edge and follows PlayGui resizing.
+Weapon slots and ammo are updated from the normal Tribes 2 HUD messages. The
+three keycard sockets are available to scripts through
+$DOOMHud::BlueKey/$DOOMHud::YellowKey/$DOOMHud::RedKey; unset values keep them
+hidden. The packaged DOOMHud.txt also serves as an example of selecting the
+bundled font with <font:doom:18>.
+
+Original DOOM graphics and font conversion credits are retained in README.md.

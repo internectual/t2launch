@@ -253,6 +253,7 @@ the bundled Loki-era libraries in `runtime/compat-libs/`.
 | `T2LAUNCH_EXECUTABLE` | `client` (default) or `dedicated`; see [Dedicated server](#dedicated-server) |
 | `T2LAUNCH_SERVER_RESTART=1` | Restart the dedicated server after a crash |
 | `T2LAUNCH_SOFTWARE_GL=1` | Use software GL instead of the hardware driver |
+| `T2LAUNCH_USE_PADSP=0` | Manually skip the legacy PulseAudio OSS shim (the game uses it for OpenAL audio) |
 | `T2LAUNCH_FULL_REDRAW=0` | Turn off the full-canvas redraw (see [Runtime compatibility](#runtime-compatibility)) |
 | `T2LAUNCH_OPENAL_VOLUME_FIX=0` | Turn off the volume-slider fix |
 | `T2LAUNCH_PULSE_SINK` | Send game audio to this sink (from `pactl list short sinks`) instead of the default output |
@@ -637,6 +638,19 @@ clocksource. No CPU affinity is needed.
   (16/20/240); the stock Options → Network **T1/LAN** preset already sets the
   maximum (32/32/450). Servers set the same `$pref::Net::` values in their
   ServerPrefs. No hook change is needed.
+- **Build identifier** (`net.build_identifier`, `25034` by default). The hook
+  replaces the native `getT2VersionNumber()` result for the selected client or
+  dedicated-server profile. It does not change the Torque packet protocol
+  (which remains 51). The client asks master servers not to pre-filter by build
+  ID, then its **Current Version** browser filter compares results locally
+  against the configured value. Use the same ID in client and server profiles
+  for custom-ID peers; the engine's peer-version check requires matching IDs.
+  A separate ID can be assigned to review or mod profiles, so the setting is
+  usable for other asset configurations too. Matching custom-ID listing and
+  joins, plus local filtering of nonmatching servers, have been user-verified.
+  The dedicated server's master-info serializer calls
+  `getT2VersionNumber()` at `0x082338e4` and writes the returned 32-bit value at
+  `0x08233904`.
 - **Crash dialogs and server restarts.** On Linux a crash does not wait on a
   dialog: Loki's signal handler prints `BUG! (Segmentation Fault)  Going down
   hard...` and exits. `$pref::Engine::ExitOnException` and
@@ -684,6 +698,21 @@ options bring the parts of it that fit the Linux client:
   the right. The flip across the fill inverts the bar, which then shows the
   empty part (0% full, 100% empty); `getValue()` still returns the real value.
   `tests/hudBarDemo.cs` shows every direction with tall bars.
+- **DOOMHud** (`scripts/DOOMHud/DOOMHud.vl2`) is a standalone classic status-bar
+  skin using bundled DOOM art and fonts. It reads health and energy from the
+  T2 hook's `HudDamage`/`HudEnergy` `.value` fields; it no longer needs the old
+  `t2health.exe` or `support.vl2`. The package README documents its layout and
+  rebuild command.
+- **HUD demo pack** (`scripts/HudDemo/HudDemo.vl2`). It includes the `hudBarDemo.cs`
+  test, both HUDbot/Tani horizontal and vertical health/energy samples, and the
+  Tribes 2 beta horizontal compass artwork. Compass mode is circular,
+  horizontal, or both; set it in-game with `hudBarDemoSetCompassMode("both")`.
+  The same script retains the T2 RadarHUD with terrain shading, camera-relative
+  rotation, teammates, assigned waypoint, and opponents only while in the
+  client's visible ShapeBase set; it works in player, observer, and demo views
+  while PlayGui/NavHud is active. Credits: PenguinOfDoom, Andrew (HUDbot 0.2b),
+  and NoFix. See
+  `scripts/HudDemo/README.md` for install and rebuild instructions.
 - **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
   while the control object is an observer camera; the hook skips that check
   (`0x081936BF`), as the Windows `l33thax` patch did.
@@ -717,6 +746,13 @@ options bring the parts of it that fit the Linux client:
   sync. Only your client changes: a listen server you host still sends real
   flash values to other players. This is the Linux equivalent of HappyMod 2's
   "no whiteout".
+- **Demo header tag** (`demo.protocol_tag`, `3342340` / `0x00330004` by default).
+  The client hook uses this profile-scoped value when writing a `.rec` header,
+  when checking a header for playback, and in `getDemoVersion()`. Set
+  `3145732` / `0x00300004` to pass the #24834-era header gate. This changes only
+  the recording header identity; it does not change the network build ID,
+  protocol 51, or the packet/block parser, and accepting the header does not
+  guarantee the rest of an old recording is compatible.
 - **Demo review — replacement assets** (`review.cheat_view` + `review.replace_models`, off). A launch
   for reviewing a suspected cheater's recorded demo: render the demo with an hm2-style replacement
   pack (`_hm2.vl2`: bright/visible models, visible cloak) so it looks the way the suspect saw it, which
@@ -962,7 +998,10 @@ options bring the parts of it that fit the Linux client:
   request. QoL servers read all of this at protocol 51 as well, and their
   protocol-52 game data would not parse in this client, so it keeps
   announcing 51. A stock server ignores the extra bits; one logged in to WON
-  accepts the connection without checking a WON certificate.
+  accepts the connection without checking a WON certificate. This is distinct
+  from the script-level T2CSRI exchange used by a T2Launch dedicated server
+  (`server.tribesnext_auth`); leave `net.native_auth` off when connecting to
+  that server.
 - **Discord presence** (`discord.presence`, off). Shows the menus, or the
   map, game type, server and player count while you're in a game, in the
   Discord desktop client on the same machine. The stock client keeps what the

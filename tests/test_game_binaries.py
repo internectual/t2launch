@@ -31,6 +31,34 @@ TARGETS = {
 }
 
 
+class HudBarDemoAssetTests(unittest.TestCase):
+    def test_hudbot_art_and_demo_paths_match(self):
+        tests = Path(__file__).parent
+        script = (tests / "hudBarDemo.cs").read_text()
+        samples = {
+            "hudbot_horizontal": {
+                "health_bar.png": (128, 16), "health_frame.png": (128, 16),
+                "energy_bar.png": (128, 8), "energy_frame.png": (128, 8),
+            },
+            "hudbot_vertical": {
+                "health_bar.png": (16, 128), "health_frame.png": (16, 128),
+                "energy_bar.png": (8, 128), "energy_frame.png": (8, 128),
+            },
+        }
+        for variant, files in samples.items():
+            for name, expected in files.items():
+                data = (tests / "hudBarDemo_assets" / variant / name).read_bytes()
+                self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(data[12:16], b"IHDR")
+                self.assertEqual(struct.unpack_from(">II", data, 16), expected)
+                self.assertIn(f"hudBarDemo_assets/{variant}/{name}", script)
+        self.assertIn('$T2Launch::HudDemo::Radar = 1;', script)
+        self.assertIn('$pref::skyRotationSpeed = 0.2;', script)
+        self.assertIn('$T2Launch::HudDemo::CompassMode = "both";', script)
+        self.assertIn("hook_hud_demo_heading()", script)
+        self.assertNotIn("getEyeVector()", script)
+
+
 def reader(path):
     data = path.read_bytes()
     phoff, = struct.unpack_from("<I", data, 28)
@@ -107,6 +135,9 @@ class NativeReviewTests(unittest.TestCase):
             self.skipTest("installed Loki client required for the real descriptor-parser fixture")
         self.run_fixture("review_shortcut_test.c", "native parser rejects old descriptors")
 
+    def test_build_identifier_patches_in_client_and_dedicated(self):
+        self.run_fixture("hook_won_patch_test.c", "RadarHUD LOS filtering, and Shazbot telemetry passed")
+
     def test_native_resource_collision_precedence(self):
         client = Path(self.environment["HOME"]) / "t2-linux" / "tribes2.dynamic"
         if not client.is_file():
@@ -117,6 +148,10 @@ class NativeReviewTests(unittest.TestCase):
 @unittest.skipUnless((GAME / "tribes2d.dynamic").is_file() and (GAME / "tribes2.dynamic").is_file(),
                      "the Loki #25034 game is not installed in ~/t2-linux")
 class GameBinaryTests(unittest.TestCase):
+    def test_sky_rotation_patch_anchor(self):
+        self.assertEqual(reader(GAME / "tribes2.dynamic")(0x08222390, 9),
+                         bytes.fromhex("55 89 e5 81 ec ac 00 00 00"))
+
     def test_client_model_resource_layout(self):
         read = reader(GAME / "tribes2.dynamic")
         # Resource manager global, dictionary base, chain link and backing filename.
@@ -196,6 +231,34 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(read(0x080CE9B4, 3), PROLOGUE)
         self.assertEqual(read(0x080CDD10, 3), PROLOGUE)
 
+    def test_build_identifier_sites(self):
+        for binary, address in (("tribes2.dynamic", 0x08309168),
+                                ("tribes2d.dynamic", 0x082FDE08)):
+            with self.subTest(binary=binary):
+                read = reader(GAME / binary)
+                self.assertEqual(read(address, 12), bytes.fromhex(
+                    "55 89 e5 b8 ca 61 00 00 89 ec 5d c3"))
+        # Clear only Torque's master-side version-match request bit; retain the
+        # client's separate local comparison against getT2VersionNumber().
+        read = reader(GAME / "tribes2.dynamic")
+        self.assertEqual(read(0x0823E9B3, 3), bytes.fromhex("80 ca 80"))
+        # Dedicated master-info serializer obtains the server build ID from
+        # getT2VersionNumber at 0x082338e4 and writes it as a U32 at 0x08233904.
+        read = reader(GAME / "tribes2d.dynamic")
+        self.assertEqual(read(0x082338E4, 8), bytes.fromhex(
+            "e8 1f a5 0c 00 eb 07 90"))
+        self.assertEqual(read(0x08233904, 9), bytes.fromhex(
+            "52 6a 04 56 8b 40 10 ff d0"))
+
+    def test_demo_protocol_tag_sites(self):
+        read = reader(GAME / "tribes2.dynamic")
+        self.assertEqual(read(0x081F9AF8, 7), bytes.fromhex(
+            "c7 45 d4 04 00 33 00"))
+        self.assertEqual(read(0x081F9EEC, 5), bytes.fromhex("3d 04 00 33 00"))
+        self.assertEqual(read(0x081FB974, 9), bytes.fromhex(
+            "55 89 e5 b8 04 00 33 00 89"))
+        self.assertEqual(read(0x081FB978, 4), bytes.fromhex("04 00 33 00"))
+
     def test_server_auth_sites(self):
         read = reader(GAME / "tribes2d.dynamic")
         self.assertEqual(read(0x0822B604, 10), bytes.fromhex("83 3d 34 60 6b 08 00 0f 95 c0"))
@@ -239,6 +302,143 @@ class GameBinaryTests(unittest.TestCase):
         self.assertEqual(read(0x080FBC77, 8), bytes.fromhex("8b 42 08 ff d0 8b 40 18"))
         self.assertEqual(read(0x080FD5AE, 8), bytes.fromhex("8b 41 20 25 ff 0f 00 00"))
         self.assertEqual(read(0x0831D365, 5), bytes.fromhex("68 88 08 00 00"))
+        # SceneObject::onAdd copies its world transform (+0x9c) to render transform (+0xdc).
+        self.assertEqual(read(0x08203130, 20), bytes.fromhex(
+            "8d bb dc 00 00 00 8d b3 9c 00 00 00 fc b9 10 00 00 00 f3 a5"))
+        # GameConnection::getControlObject returns the root's +0x825c Player pointer.
+        self.assertEqual(read(0x0827916C, 37), bytes.fromhex(
+            "55 89 e5 8b 45 08 31 d2 85 c0 74 06 8d 90 60 ff ff ff "
+            "8b 92 5c 82 00 00 31 c0 85 d2 74 03 8b 42 20 89 ec 5d c3"))
+
+    def test_shazbot_spatial_geometry_anchors(self):
+        read = reader(GAME / "tribes2.dynamic")
+        # getEyeTransform serializes the virtual MatrixF result into a Torque string;
+        # its wrapper calls the object's virtual slot +0x160 with MatrixF* output.
+        self.assertEqual(read(0x0826CD7C, 20), bytes.fromhex(
+            "55 89 e5 83 ec 74 53 8b 55 08 8d 5d c0 83 c4 f8 8b 02 53 52"))
+        # cGetCameraFov delegates to virtual slot +0x1d8 on server objects. The hook
+        # reads that getter directly for its validated local Player ghost.
+        self.assertEqual(read(0x0826D4C8, 29), bytes.fromhex(
+            "55 89 e5 83 ec 08 8b 55 08 f6 42 40 02 75 10 8b 02 83 c4 f4 "
+            "52 8b 80 d8 01 00 00 ff d0"))
+        # SensorData target-manager record: ID selects base + 0x1a58 + ID*0x44;
+        # the SensorData pointer is +0x40 and its datablock ID is +0x20.
+        self.assertEqual(read(0x082E205F, 41), bytes.fromhex(
+            "89 d0 c1 e0 04 01 d0 8d 04 85 58 1a 00 00 03 05 a0 7d 49 08 "
+            "8b 40 40 85 c0 75 07 b8 ff ff ff ff eb 03 8b 40 20 89 ec 5d c3"))
+        # SensorData::initPersistFields registers detectRadius at +0x4c.
+        self.assertEqual(read(0x082D768E, 18), bytes.fromhex(
+            "6a 00 6a 01 6a 4c 6a 05 68 a2 f7 46 08 e8 6c e8 e0 ff"))
+        # Mounted-image getters confirm the eight-slot array base and 0x74 stride;
+        # native muzzle-point/vector accessors are the wrappers used by telemetry.
+        self.assertEqual(read(0x082733AC, 22), bytes.fromhex(
+            "55 89 e5 6b 55 0c 74 8b 45 08 05 84 03 00 00 89 ec 5d 8b 04 02 c3"))
+        self.assertEqual(read(0x0826C96C, 25), bytes.fromhex(
+            "55 89 e5 83 ec 24 53 8b 45 10 8b 5d 08 83 c4 f4 8b 40 08 50 e8 07 2d f6 ff"))
+        self.assertEqual(read(0x0826C9A4, 19), bytes.fromhex(
+            "8b 13 83 c4 fc 8d 45 f4 50 51 53 8b 82 54 01 00 00 ff d0"))
+        self.assertEqual(read(0x0826CA04, 22), bytes.fromhex(
+            "55 89 e5 83 ec 24 53 8b 45 10 83 c4 f4 8b 40 08 50 e8 72 2c f6 ff"))
+        self.assertEqual(read(0x08273758, 17), bytes.fromhex(
+            "55 89 e5 83 ec 50 8b 4d 08 56 53 8b 75 0c 8b 5d 10"))
+        # Aim-target billboard point is a world-space solver result; its renderer
+        # passes that Point3F to dglDrawBillboard at this unique call site.
+        self.assertEqual(read(0x082FC32F, 5), bytes.fromhex("e8 0c 2f e1 ff"))
+        self.assertEqual(read(0x0810F240, 12), bytes.fromhex(
+            "55 89 e5 81 ec fc 00 00 00 57 56 53"))
+
+    def test_shazbot_observation_source_anchors(self):
+        read = reader(GAME / "tribes2.dynamic")
+        binary = (GAME / "tribes2.dynamic").read_bytes()
+        # ShapeBase getVelocity callback confirms the virtual +0xec aggregate-
+        # return ABI mirrored by the class-whitelisted direct getter call.
+        self.assertEqual(read(0x0826CB50, 0x5C), bytes.fromhex(
+            "55 89 e5 83 ec 20 56 53 8b 45 08 8d 5d f4 83 c4 f8 "
+            "8b 10 50 53 8b 82 ec 00 00 00 ff d0 6a 64 e8 ac 50 e8 ff "
+            "d9 43 08 83 c4 f4 83 ec 08 dd 1c 24 d9 43 04 83 ec 08 dd "
+            "1c 24 d9 45 f4 89 c6 83 ec 08 dd 1c 24 68 9e 9b 45 08 6a "
+            "64 56 e8 4f 27 f6 ff 89 f0 8d 65 d8 5b 5e 89 ec 5d c3"))
+        for class_name in (b"Item", b"Vehicle", b"WheeledVehicle", b"FlyingVehicle", b"HoverVehicle"):
+            self.assertIn(class_name + b"\0", binary)
+        self.assertEqual(read(0x08248D98, 10), bytes.fromhex("c7 82 58 09 00 00 00 00 00 00"))
+        self.assertEqual(read(0x08248DA2, 10), bytes.fromhex("c7 82 5c 09 00 00 00 00 00 00"))
+        self.assertEqual(read(0x08248DAC, 10), bytes.fromhex("c7 82 60 09 00 00 00 00 00 00"))
+        # getEnergyPercent confirms PlayerData inherit flag/maxEnergy and Player mEnergy fields.
+        self.assertEqual(read(0x0826CEA8, 51), bytes.fromhex(
+            "55 89 e5 8b 4d 08 8b 91 d0 02 00 00 80 ba 2b 03 00 00 00 75 23 "
+            "d9 ee d9 82 80 00 00 00 d8 d1 df e0 80 e4 45 fe cc 80 fc 40 "
+            "dd d9 72 5f d9 81 7c 07 00 00"))
+        # ShapeBase::getDamageValue confirms mDamage at Player+0x7f0 and
+        # maxDamage at PlayerData+0x84 for normalized health fraction.
+        self.assertEqual(read(0x0826D000, 28), bytes.fromhex(
+            "55 89 e5 8b 45 08 89 ec 8b 90 d0 02 00 00 5d d9 80 f0 07 00 00 "
+            "d8 b2 84 00 00 00 c3"))
+        # PlayerData::initPersistFields registers maxForwardSpeed at +0x380.
+        self.assertEqual(read(0x082465B6, 12), bytes.fromhex(
+            "68 80 03 00 00 6a 05 68 34 67 45 08"))
+        self.assertEqual(read(0x0826CEE0, 64), bytes.fromhex(
+            "8b 91 e4 07 00 00 85 d2 74 4c 8b 82 d0 02 00 00 d9 ee "
+            "d9 80 80 00 00 00 d8 d1 df e0 80 e4 45 fe cc 80 fc 40 "
+            "dd d9 72 2c 8b 82 d0 02 00 00 80 b8 2b 03 00 00 00 75 09 "
+            "d9 82 7c 07 00 00 eb bc 90"))
+        self.assertEqual(read(0x0826CF20, 28), bytes.fromhex(
+            "8b 82 e4 07 00 00 85 c0 74 06 89 c2 eb da 89 f6 d9 ee "
+            "eb a7 dd d8 d9 ee 89 ec 5d c3"))
+        # Player mJumpSurfaceNormal (+0x990) is initialized to (0,0,1).
+        self.assertEqual(read(0x08248DB6, 10), bytes.fromhex("c7 82 90 09 00 00 00 00 00 00"))
+        self.assertEqual(read(0x08248DC0, 10), bytes.fromhex("c7 82 94 09 00 00 00 00 00 00"))
+        self.assertEqual(read(0x08248DCA, 10), bytes.fromhex("c7 82 98 09 00 00 00 00 80 3f"))
+        # ContactInfo at +0xa3c: contacted/jump/run bytes, then contact normal at +0xa40.
+        self.assertEqual(read(0x08248A23, 45), bytes.fromhex(
+            "c7 86 40 0a 00 00 00 00 80 3f c6 86 3e 0a 00 00 00 "
+            "c6 86 3d 0a 00 00 00 c6 86 3c 0a 00 00 00 "
+            "c7 40 04 00 00 80 3f c7 40 08 00 00 80 3f"))
+        # updateMove copies a fresh findContact normal to +0x990 only if its current jump flag is set.
+        self.assertEqual(read(0x0824B27C, 36), bytes.fromhex(
+            "80 bd 37 ff ff ff 00 74 1b 8b 45 88 89 83 90 09 00 00 "
+            "8b 45 8c 89 83 94 09 00 00 8b 45 90 89 83 98 09 00 00"))
+        self.assertEqual(read(0x0824B258, 36), bytes.fromhex(
+            "83 bb e4 07 00 00 00 75 1b 8d 45 88 50 8d 85 37 ff ff ff "
+            "50 8d 85 36 ff ff ff 50 53 e8 97 52 00 00 83 c4 10"))
+        self.assertEqual(read(0x08250DC6, 6), bytes.fromhex("88 87 3c 0a 00 00"))
+        self.assertEqual(read(0x08250DF6, 11), bytes.fromhex(
+            "8b 55 10 8a 02 88 87 3d 0a 00 00"))
+        self.assertEqual(read(0x08250DC6, 6), bytes.fromhex("88 87 3c 0a 00 00"))
+        self.assertEqual(read(0x08250DF6, 11), bytes.fromhex(
+            "8b 55 10 8a 02 88 87 3d 0a 00 00"))
+        # ShapeBase::setSensorDataBlockVisibility adds/removes ghosted objects
+        # from the current-visible SimSet at this exact global.
+        self.assertEqual(read(0x0825C8F8, 46), bytes.fromhex(
+            "55 89 e5 83 ec 10 56 53 8b 5d 08 8b 75 0c f6 43 40 02 "
+            "74 29 85 f6 74 11 a1 ec 32 4e 08 83 c4 f8 8b 10 53 50 "
+            "8b 42 4c eb 0f a1 ec 32 4e 08"))
+        # ClientTargetList indexes 16-byte records at +0x10; its count is +0x210.
+        self.assertEqual(read(0x082E2850, 24), bytes.fromhex(
+            "55 89 e5 8b 55 08 8b 45 0c 3b 82 10 02 00 00 73 0f "
+            "c1 e0 04 8d 44 02 10"))
+        self.assertEqual(read(0x082E2878, 66), bytes.fromhex(
+            "55 89 e5 83 ec 0c 57 8b 7d 08 56 53 8b 75 0c 8b 5d 14 "
+            "83 c4 f4 57 e8 61 91 e1 ff c7 47 38 00 00 00 00 c7 07 "
+            "a0 d1 4a 08 8d 47 38 c7 40 04 00 00 00 00 c7 40 08 00 "
+            "00 00 00 8b 45 10 89 77 30 89 47 34"))
+        # TargetToEvent writes type 0/1 from its assigned/potential flag; the
+        # local cCreateWaypoint path uses type 2.
+        self.assertEqual(read(0x0827B066, 15), bytes.fromhex(
+            "80 7b 20 00 0f 94 c0 89 c2 83 e2 01 89 57 30"))
+        self.assertEqual(read(0x082E2A94, 7), bytes.fromhex(
+            "c7 43 30 02 00 00 00"))
+        # ClientTarget refresh follows its target ID into manager+0xa258, only
+        # when record+0x3c bit 0 and the current target object (+0x24) are set.
+        self.assertEqual(read(0x082DD8FE, 13), bytes.fromhex(
+            "f6 40 3c 01 74 49 8b 50 24 85 d2 74 42"))
+        # The #25034 initializer allocates a 0x2a0 ClientTargetList and stores it
+        # in global 0x08497da4.
+        self.assertEqual(read(0x082DC13A, 21), bytes.fromhex(
+            "68 a0 02 00 00 e8 ec 18 d7 ff 50 e8 ee 12 00 00 "
+            "a3 a4 7d 49 08"))
+        # The FFI visibility/HUD collection reads GameConnection sensor group +0x8434.
+        self.assertEqual(read(0x0819401A, 12), bytes.fromhex(
+            "8b 81 34 84 00 00 89 86 d8 00 00 00"))
 
 
 if __name__ == "__main__":

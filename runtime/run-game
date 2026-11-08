@@ -215,7 +215,7 @@ case "$EXECUTABLE" in
 esac
 
 # Defaults (can be overridden by the per-game config, e.g. tribes2.cfg)
-USE_PADSP=${USE_PADSP:-1}
+USE_PADSP="${T2LAUNCH_USE_PADSP:-${USE_PADSP:-1}}"
 SOFTWARE_GL=${SOFTWARE_GL:-1}
 MESA_YEAR=${MESA_YEAR:-}
 GAME_BINARY="./${GAME_NAME:-tribes2}.dynamic"

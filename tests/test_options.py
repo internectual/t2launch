@@ -1,3 +1,4 @@
+import ast
 import re
 import tempfile
 import unittest
@@ -11,6 +12,29 @@ HOOKED = {"launcher.load_hook": True}
 
 
 class OptionTests(unittest.TestCase):
+    def test_sentry_session_override_allowlist_matches_capture_client(self):
+        tree = ast.parse((ROOT / "t2launch_app.py").read_text())
+        assignment = next(
+            node for node in tree.body
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "SENTRY_SESSION_OVERRIDE_KEYS"
+                for target in node.targets
+            )
+        )
+        allowed = set(ast.literal_eval(assignment.value.args[0]))
+        self.assertEqual(allowed, {
+            "hook.console_commands",
+            "video.full_redraw",
+            "telemetry.shazbot",
+            "telemetry.shazbot_socket",
+            "telemetry.shazbot_packet_capture",
+            "telemetry.shazbot_notification_socket",
+            "telemetry.shazbot_actions",
+            "telemetry.shazbot_command_labels",
+            "telemetry.shazbot_auto_weapon_slot_test",
+            "telemetry.shazbot_weapon_slot_test_script",
+        })
+
     def test_hook_keys_match_the_c_option_table(self):
         source = (ROOT / "t2_hook.c").read_text()
         table = source[source.index("static struct hook_option hook_options[] = {"):]
@@ -74,6 +98,13 @@ class OptionTests(unittest.TestCase):
 
     def test_values_are_coerced_and_validated(self):
         self.assertTrue(t2options.chosen({"video.software_gl": "yes"})["video.software_gl"])
+        self.assertTrue(t2options.coerce(t2options.BY_KEY["security.safe_soundpacks"], ""))
+        self.assertTrue(t2options.coerce(t2options.BY_KEY["security.safe_soundpacks"], None))
+        self.assertFalse(t2options.coerce(t2options.BY_KEY["security.safe_soundpacks"], "0"))
+        self.assertEqual(t2options.coerce(t2options.BY_KEY["won.mode"], ""), "off")
+        self.assertEqual(t2options.coerce(t2options.BY_KEY["discord.app_id"], ""),
+                         t2options.BY_KEY["discord.app_id"].default)
+        self.assertEqual(t2options.coerce(t2options.BY_KEY["server.public_address"], ""), "")
         # A bad stored value falls back to the default instead of breaking launch.
         self.assertEqual(t2options.chosen({"won.mode": "bogus"})["won.mode"], "off")
         with self.assertRaisesRegex(ValueError, "choose one of"):
@@ -83,6 +114,119 @@ class OptionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "at most 65531"):
             t2options.validate({"won.base_port": 65535})
         t2options.validate({"unknown.key": "kept"})
+
+    def test_build_identifier_is_profile_scoped_and_written_to_hook_config(self):
+        option = t2options.BY_KEY["net.build_identifier"]
+        self.assertEqual(option.default, 25034)
+        self.assertEqual(t2options.coerce(option, "24834"), 24834)
+        self.assertEqual(t2options.coerce(option, ""), option.default)
+        self.assertEqual(t2options.coerce(option, "   "), option.default)
+        t2options.validate({"net.build_identifier": ""}, HOOKED)
+        blank_config = t2options.hook_config({"net.build_identifier": ""}, HOOKED)
+        self.assertIn("net.build_identifier=25034", blank_config.splitlines())
+        reset = t2options.reset_option({"net.build_identifier": 24834,
+                                        "demo.protocol_tag": 3145732}, "net.build_identifier")
+        self.assertEqual(reset["net.build_identifier"], option.default)
+        self.assertEqual(reset["demo.protocol_tag"], 3145732)
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            t2options.coerce(option, 0)
+        with self.assertRaisesRegex(ValueError, "at most 2147483647"):
+            t2options.coerce(option, 2147483648)
+        config = t2options.hook_config({"net.build_identifier": 987654}, HOOKED)
+        self.assertIn("net.build_identifier=987654", config.splitlines())
+        server = t2options.effective({"game.executable": "dedicated",
+                                      "net.build_identifier": 24834}, HOOKED)
+        self.assertEqual(server["net.build_identifier"], 24834)
+
+    def test_demo_protocol_tag_is_client_scoped_and_profile_configurable(self):
+        option = t2options.BY_KEY["demo.protocol_tag"]
+        self.assertEqual(option.default, 3342340)
+        self.assertEqual(t2options.coerce(option, "3145732"), 3145732)
+        self.assertEqual(t2options.coerce(option, ""), option.default)
+        self.assertEqual(t2options.coerce(option, "   "), option.default)
+        t2options.validate({"demo.protocol_tag": ""}, HOOKED)
+        blank_config = t2options.hook_config({"demo.protocol_tag": ""}, HOOKED)
+        self.assertIn("demo.protocol_tag=3342340", blank_config.splitlines())
+        reset = t2options.reset_option({"demo.protocol_tag": 3145732}, "demo.protocol_tag")
+        self.assertEqual(reset["demo.protocol_tag"], option.default)
+        with self.assertRaisesRegex(ValueError, "at least 1"):
+            t2options.coerce(option, 0)
+        with self.assertRaisesRegex(ValueError, "at most 2147483647"):
+            t2options.coerce(option, 2147483648)
+        config = t2options.hook_config({"demo.protocol_tag": 3145732}, HOOKED)
+        self.assertIn("demo.protocol_tag=3145732", config.splitlines())
+        dedicated = t2options.effective({"game.executable": "dedicated",
+                                         "demo.protocol_tag": 3145732}, HOOKED)
+        self.assertEqual(dedicated["demo.protocol_tag"], option.off_value)
+
+    def test_blank_soundpack_limit_restores_safe_cap_but_zero_is_explicit_off(self):
+        option = t2options.BY_KEY["security.max_soundpack_kbytes"]
+        self.assertEqual(option.default, 8192)
+        self.assertEqual(t2options.coerce(option, ""), 8192)
+        self.assertEqual(t2options.coerce(option, "   "), 8192)
+        self.assertEqual(t2options.coerce(option, "0"), 0)
+        with self.assertRaisesRegex(ValueError, "at most 2097151"):
+            t2options.coerce(option, 2097152)
+        blank_config = t2options.hook_config({"security.max_soundpack_kbytes": ""}, HOOKED)
+        self.assertIn("security.max_soundpack_kbytes=8192", blank_config.splitlines())
+
+    def test_shazbot_telemetry_is_opt_in_client_only_and_configurable(self):
+        enabled = t2options.BY_KEY["telemetry.shazbot"]
+        socket_path = t2options.BY_KEY["telemetry.shazbot_socket"]
+        notification_socket = t2options.BY_KEY["telemetry.shazbot_notification_socket"]
+        packet_capture = t2options.BY_KEY["telemetry.shazbot_packet_capture"]
+        actions = t2options.BY_KEY["telemetry.shazbot_actions"]
+        action_socket = t2options.BY_KEY["telemetry.shazbot_action_socket"]
+        command_labels = t2options.BY_KEY["telemetry.shazbot_command_labels"]
+        self.assertFalse(enabled.default)
+        self.assertEqual(socket_path.default, "/tmp/shazbot.sock")
+        self.assertEqual(notification_socket.default, "/tmp/shazbot-notify.sock")
+        self.assertFalse(packet_capture.default)
+        self.assertFalse(actions.default)
+        self.assertFalse(command_labels.default)
+        self.assertEqual(action_socket.default, "/tmp/shazbot-action.sock")
+        self.assertIn(enabled.key, t2options.CLIENT_ONLY)
+        self.assertIn(socket_path.key, t2options.CLIENT_ONLY)
+        self.assertIn(notification_socket.key, t2options.CLIENT_ONLY)
+        self.assertIn(packet_capture.key, t2options.CLIENT_ONLY)
+        self.assertIn(actions.key, t2options.CLIENT_ONLY)
+        self.assertIn(action_socket.key, t2options.CLIENT_ONLY)
+        self.assertIn(command_labels.key, t2options.CLIENT_ONLY)
+        self.assertFalse(t2options.effective({}, HOOKED)[enabled.key])
+        client = t2options.effective({enabled.key: True}, HOOKED)
+        self.assertTrue(client[enabled.key])
+        self.assertEqual(client[socket_path.key], "/tmp/shazbot.sock")
+        packet_config = t2options.hook_config({
+            packet_capture.key: True,
+            socket_path.key: "/tmp/custom-shazbot.sock",
+        }, HOOKED)
+        self.assertIn("telemetry.shazbot_packet_capture=1", packet_config.splitlines())
+        self.assertIn("telemetry.shazbot_socket=/tmp/custom-shazbot.sock", packet_config.splitlines())
+        configured = t2options.hook_config({enabled.key: True,
+                                             socket_path.key: "/tmp/custom-shazbot.sock"}, HOOKED)
+        self.assertIn("telemetry.shazbot=1", configured.splitlines())
+        self.assertIn("telemetry.shazbot_socket=/tmp/custom-shazbot.sock", configured.splitlines())
+        notification_config = t2options.hook_config({
+            enabled.key: True,
+            notification_socket.key: "/tmp/custom-notify.sock",
+        }, HOOKED)
+        self.assertIn("telemetry.shazbot_notification_socket=/tmp/custom-notify.sock",
+                      notification_config.splitlines())
+        action_config = t2options.hook_config({enabled.key: True, actions.key: True,
+                                                action_socket.key: "/tmp/custom-action.sock",
+                                                command_labels.key: True}, HOOKED)
+        self.assertIn("telemetry.shazbot_actions=1", action_config.splitlines())
+        self.assertIn("telemetry.shazbot_action_socket=/tmp/custom-action.sock", action_config.splitlines())
+        self.assertIn("telemetry.shazbot_command_labels=1", action_config.splitlines())
+        self.assertNotIn("T2LAUNCH_USE_PADSP", t2options.launch_env({enabled.key: True}, HOOKED))
+        self.assertNotIn("T2LAUNCH_USE_PADSP",
+                         t2options.launch_env({enabled.key: True, actions.key: True}, HOOKED))
+        dedicated = t2options.effective({"game.executable": "dedicated",
+                                          enabled.key: True,
+                                          socket_path.key: "/tmp/custom-shazbot.sock"}, HOOKED)
+        self.assertFalse(dedicated[enabled.key])
+        self.assertEqual(dedicated[socket_path.key], socket_path.default)
+        self.assertEqual(t2options.coerce(socket_path, ""), socket_path.default)
 
     def test_endpoints_fit_the_hooks_bootstrap_slots(self):
         option = t2options.BY_KEY["won.endpoints"]
@@ -104,6 +248,8 @@ class OptionTests(unittest.TestCase):
 
     def test_backends_are_ordered_and_validated(self):
         option = t2options.BY_KEY["won.backends"]
+        self.assertEqual(t2options.coerce(option, ""), option.default)
+        t2options.validate({"won.backends": ""}, HOOKED)
         backends = t2options.coerce(option, [
             {"kind": "native", "auth": True, "master": True, "irc": False},
             {"kind": "tribesnext", "auth": False, "master": True, "irc": False},
@@ -226,6 +372,14 @@ class OptionTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             self.assertIn("hook.tribesnext=0", path.read_text())
+            session_path = t2options.write_hook_config(
+                "LAN / test", {"won.mode": "off"}, HOOKED, session_id="sentry_abc123"
+            )
+            self.assertEqual(session_path.name, "LAN_test-sentry_abc123.conf")
+            with self.assertRaisesRegex(ValueError, "session_id"):
+                t2options.write_hook_config(
+                    "LAN / test", {"won.mode": "off"}, HOOKED, session_id="../unsafe"
+                )
 
 
 if __name__ == "__main__":

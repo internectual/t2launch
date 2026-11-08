@@ -3418,15 +3418,18 @@ class Emulator:
         if mission_type.casefold() == "any":
             mission_type = "Any"
         # 255 bots is the default once the hook lifts the client's 16-bot limit.
+        # Torque's 0x80 query flag requests exact build-version matching. The
+        # TribesNext HTTP list has no version parameter; let the client perform
+        # its configured local match after receiving this merged candidate set.
+        info_flags = query["info_flags"] & ~0x80
         unfiltered = (game_type == "Any" and mission_type == "Any" and
                       query["min_players"] == 0 and query["max_players"] in (0, 100, 255) and
                       query["max_bots"] in (0, 16, 255) and query["regions"] in (0, 0xffffffff) and
-                      query["version"] == 0 and query["min_cpu"] == 0 and
-                      query["info_flags"] == 0 and not query["buddies"])
+                      query["min_cpu"] == 0 and info_flags == 0 and not query["buddies"])
         if unfiltered:
             path = "/list"
         else:
-            flags = str(query["info_flags"])
+            flags = str(info_flags)
             if query["buddies"]:
                 flags += " " + " ".join(str(value) for value in query["buddies"])
             values = (game_type, mission_type, query["min_players"], query["max_players"],
@@ -3501,11 +3504,14 @@ class Emulator:
 
     def torque_master_servers(self, query, address):
         session, key = secrets.randbelow(0xffff), secrets.randbelow(0xffff)
+        # Do not let an upstream Torque master discard other build IDs before
+        # the client can apply its own configured version match.
+        info_flags = query["info_flags"] & ~0x80
         request = (struct.pack("<BBHHB", 6, 0, session, key, 0xff) +
                    torque_string(query["game_type"] or "any") +
                    torque_string(query["mission_type"] or "any") +
                    struct.pack("<BBIIBBH", query["min_players"], query["max_players"], query["regions"],
-                               query["version"], query["info_flags"], query["max_bots"],
+                               0, info_flags, query["max_bots"],
                                min(query["min_cpu"], 0xffff)) +
                    struct.pack("<B", min(len(query["buddies"]), 255)) +
                    b"".join(struct.pack("<I", buddy) for buddy in query["buddies"][:255]))
@@ -3550,9 +3556,8 @@ class Emulator:
                 continue
             if query["regions"] and not (info["regions"] & query["regions"]):
                 continue
-            if query["info_flags"] and (info["info_flags"] & query["info_flags"]) != query["info_flags"]:
-                continue
-            if query["info_flags"] & 0x80 and info["version"] != query["version"]:
+            info_flags = query["info_flags"] & ~0x80
+            if info_flags and (info["info_flags"] & info_flags) != info_flags:
                 continue
             if query["min_cpu"] and info["cpu_speed"] < query["min_cpu"]:
                 continue
@@ -3637,7 +3642,8 @@ class Emulator:
                     if kind == "tribesnext":
                         self.publish_tribesnext_heartbeat(peer, address)
                 self.log.event("master_game_info", peer=list(peer), game_type=game_type,
-                               mission_type=mission_type, players=info["player_count"])
+                               mission_type=mission_type, players=info["player_count"],
+                               version=info["version"])
             elif packet_type == 6:  # Server-list request
                 query = parse_torque_list_request(data)
                 servers = self.master_list(query)

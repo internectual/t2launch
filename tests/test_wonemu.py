@@ -2580,13 +2580,18 @@ class NetworkTests(unittest.TestCase):
 
                 info_response = (struct.pack("<BBHH", 12, 0, session, key) +
                                  wonemu.torque_string("Tribes 2") + wonemu.torque_string("Arena") +
-                                 struct.pack("<BIIBBIB", 32, 0x2, 25034, 0x03, 0, 2200, 0))
+                                 struct.pack("<BIIBBIB", 32, 0x2, 24834, 0x03, 0, 2200, 0))
                 client.sendto(info_response, (wonemu.HOST, emulator.ports["master"]))
                 for _ in range(30):
-                    if emulator.master_servers:
+                    if any(info.get("version") == 24834 for info in emulator.master_servers.values()):
                         break
                     time.sleep(0.01)
                 self.assertEqual(len(emulator.master_servers), 1)
+                server_record = next(iter(emulator.master_servers.values()))
+                self.assertEqual(server_record["version"], 24834)
+                traffic = [json.loads(line) for line in emulator.log.path.read_text().splitlines()]
+                game_info = next(event for event in traffic if event["event"] == "master_game_info")
+                self.assertEqual(game_info["version"], 24834)
 
                 query = (struct.pack("<BBHHB", 6, 0, 0x1234, 0x5678, 0xff) +
                          wonemu.torque_string("Tribes 2") + wonemu.torque_string("Arena") +
@@ -2596,6 +2601,18 @@ class NetworkTests(unittest.TestCase):
                 self.assertEqual(struct.unpack_from("<BBHHBBH", reply), (8, 0, 0x1234, 0x5678, 0, 1, 1))
                 self.assertEqual(reply[10:14], socket.inet_aton(wonemu.HOST))
                 self.assertEqual(struct.unpack_from("<H", reply, 14)[0], client.getsockname()[1])
+
+                # The launcher master must return cross-build candidates; the
+                # client performs any configured exact-version match locally.
+                cross_version_query = (
+                    struct.pack("<BBHHB", 6, 0x80, 0x1234, 0x5678, 0xff) +
+                    wonemu.torque_string("Tribes 2") + wonemu.torque_string("Arena") +
+                    struct.pack("<BBIIBBHB", 0, 100, 0, 25034, 0x80, 0, 0, 0))
+                client.sendto(cross_version_query, (wonemu.HOST, emulator.ports["master"]))
+                cross_version_reply, _ = client.recvfrom(4096)
+                self.assertEqual(struct.unpack_from("<BBHHBBH", cross_version_reply),
+                                 (8, 0, 0x1234, 0x5678, 0, 1, 1))
+                self.assertEqual(cross_version_reply[10:14], socket.inet_aton(wonemu.HOST))
 
                 unmatched = query.replace(wonemu.torque_string("Tribes 2"),
                                           wonemu.torque_string("No Such Game"), 1)
@@ -2634,6 +2651,9 @@ class NetworkTests(unittest.TestCase):
             all_servers = dict(default_query, game_type="any", mission_type="any", max_bots=255)
             with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
                 emulator.tribesnext_servers(all_servers)
+            fetch.assert_called_once_with("/list", None)
+            with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
+                emulator.tribesnext_servers(dict(all_servers, version=25034, info_flags=0x80))
             fetch.assert_called_once_with("/list", None)
             # A filtered query sends TribesNext's capitalized "Any".
             with patch.object(emulator, "fetch_tribesnext", return_value="") as fetch:
@@ -2706,14 +2726,14 @@ class NetworkTests(unittest.TestCase):
             try:
                 upstream.master_servers[("192.0.2.30", 28000)] = {
                     "endpoint": (socket.inet_aton("192.0.2.30"), 28000), "game_type": "Classic",
-                    "mission_type": "CTF", "max_players": 32, "regions": 0, "version": 0,
+                    "mission_type": "CTF", "max_players": 32, "regions": 0, "version": 24834,
                     "info_flags": 0, "num_bots": 0, "cpu_speed": 0, "player_count": 3,
                     "players": [], "last_heartbeat": time.monotonic()}
                 address = f"{wonemu.HOST}:{upstream.ports['master']}"
                 downstream = wonemu.Emulator({service: 0 for service in wonemu.PORTS}, Path(second_dir),
                                              master_sources=[("torque", address), ("lan", "")])
                 query = {"game_type": "", "mission_type": "", "min_players": 0, "max_players": 0,
-                         "max_bots": 0, "regions": 0, "version": 0, "info_flags": 0, "min_cpu": 0,
+                         "max_bots": 0, "regions": 0, "version": 25034, "info_flags": 0x80, "min_cpu": 0,
                          "buddies": []}
                 self.assertEqual(downstream.master_list(query), [(socket.inet_aton("192.0.2.30"), 28000)])
                 self.assertEqual(downstream.master_game_types(), (["Classic"], ["CTF"]))

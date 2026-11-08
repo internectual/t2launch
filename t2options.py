@@ -253,14 +253,20 @@ OPTIONS = (
            hook=True, requires=(("review.cheat_view", (True,)),),
            help="Show recorded beacons across sensor groups during demo review. Compare with "
                 "stock visibility using hook_review_global_beacons(0) and hook_review_global_beacons(1)."),
-    Option("review.shortcuts", "Demo review", "Playback review shortcuts", "bool", True,
-           hook=True, requires=(("review.cheat_view", (True,)), ("hook.console_commands", (True,))),
-           help="During review playback, Ctrl+Shift+F6 toggles extended range and Ctrl+Shift+F7 "
-                "toggles global beacons; Ctrl+Shift+F8 toggles IFF, F9 toggles no-cloak, and F10 toggles "
-                "autobeacon (all with Ctrl+Shift). "
-                "Status appears on the HUD. Existing bindings "
-                "are preserved, and the review bindings are removed when playback ends."),
-    Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
+     Option("review.shortcuts", "Demo review", "Playback review shortcuts", "bool", True,
+            hook=True, requires=(("review.cheat_view", (True,)), ("hook.console_commands", (True,))),
+            help="During review playback, Ctrl+Shift+F6 toggles extended range and Ctrl+Shift+F7 "
+                 "toggles global beacons; Ctrl+Shift+F8 toggles IFF, F9 toggles no-cloak, and F10 toggles "
+                 "autobeacon (all with Ctrl+Shift). "
+                 "Status appears on the HUD. Existing bindings "
+                 "are preserved, and the review bindings are removed when playback ends."),
+     Option("demo.protocol_tag", "Demo review", "Demo header tag", "int", 3342340,
+            hook=True, advanced=True, minimum=1, maximum=2147483647,
+            help="Set the 32-bit tag written to new demo headers and required when playing them. "
+                 "3342340 (0x00330004) is the #25034 default; 3145732 (0x00300004) matches "
+                 "#24834-era headers. This changes only the .rec header identity, not the packet "
+                 "parser or network protocol; matching the tag does not guarantee payload compatibility."),
+     Option("review.replace_models", "Demo review", "Use the hm2 replacement asset pack", "bool", False,
            env="T2LAUNCH_REVIEW_MODELS", hook=True, requires=(("review.cheat_view", (True,)),),
            help="Render demos with the hm2 asset pack (_hm2.vl2: bright/visible models, visible cloak, "
                 "hm2's HUD) so a demo looks the way the suspect saw it. The launcher installs the "
@@ -282,7 +288,7 @@ OPTIONS = (
                 "which the audio loader mis-parses and crashes the client. This blocks any ~w sound "
                 "that is not a valid WAV; real soundpacks still play."),
     Option("security.max_soundpack_kbytes", "Security", "Largest ~w sound to load (KiB, 0 = no cap)",
-           "int", 8192, hook=True, minimum=0,
+           "int", 8192, hook=True, minimum=0, maximum=2097151,
            requires=(("launcher.load_hook", (True,)), ("security.safe_soundpacks", (True,))),
            help="Also refuse a ~w sound whose file is larger than this many KiB before it is loaded, "
                 "so a valid but enormous WAV can't be used to stall or exhaust memory. The game's own "
@@ -294,7 +300,59 @@ OPTIONS = (
                 "servers for more and gets a matching \"TribesNext QoL\" network preset; the "
                 "dedicated server sends up to 64/s and 1000 bytes to clients that ask. Stock "
                 "peers still hold their end to 32/s and 450 bytes."),
-    Option("net.depot_downloads", "Network", "Download missing map files from the TribesNext depot",
+    Option("net.build_identifier", "Network", "Reported build identifier", "int", 25034,
+           hook=True, minimum=1, maximum=2147483647,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Change the numeric Tribes 2 build identifier used for master-list matching and "
+                "peer version checks without changing the wire protocol. Use the same value in "
+                "client and server profiles for a custom server; 25034 is the retail default. "
+                "Profiles with different asset sets (including review profiles) can use a "
+                "different identifier and still connect to matching servers. The browser's "
+                "Current Version filter matches this value; turning that filter off shows all IDs."),
+    # Optional Project Shazbot bridge. It emits read-only Player/target observations,
+    # view, muzzle-vector, native aim-marker geometry, and received game packets.
+    Option("telemetry.shazbot", "Telemetry", "Send player spatial telemetry to Shazbot", "bool", False,
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+            help="Send opt-in, client-only Player/target observations, view-cone, muzzle-vector and native aim-marker telemetry to a local Shazbot receiver "
+                "over a non-blocking Unix datagram socket. No game state or input is changed. "
+                "The receiver defaults to /tmp/shazbot.sock."),
+      Option("telemetry.shazbot_socket", "Telemetry", "Shazbot socket path", "text", "/tmp/shazbot.sock",
+              hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+              help="Unix datagram socket for the optional Shazbot telemetry producer."),
+      Option("telemetry.shazbot_packet_capture", "Telemetry", "Forward received game packets to Shazbot", "bool", False,
+             hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+             help="Mirror received Tribes 2 ConnectionProtocol data packets to the configured Shazbot Unix socket for offline capture. Non-blocking and read-only; requires shazbotd --hook-packet-capture."),
+      Option("telemetry.shazbot_notification_socket", "Telemetry", "Shazbot capture notification socket", "text", "/tmp/shazbot-notify.sock",
+             hook=True, advanced=True, requires=(("telemetry.shazbot", (True,)),),
+             help="Unix datagram socket for local Shazbot capture lifecycle notices."),
+     Option("telemetry.shazbot_actions", "Telemetry", "Allow policy actions to control this client", "bool", False,
+            hook=True, advanced=True, requires=(
+                ("launcher.load_hook", (True,)), ("telemetry.shazbot", (True,)),
+            ),
+            help="When enabled, accept explicit policy Action frames from the local Shazbot runtime and apply them to this client's Move inputs. Off by default."),
+      Option("telemetry.shazbot_action_socket", "Telemetry", "Shazbot action socket path", "text", "/tmp/shazbot-action.sock",
+             hook=True, advanced=True, requires=(
+                 ("launcher.load_hook", (True,)), ("telemetry.shazbot_actions", (True,)),
+             ),
+             help="Unix datagram socket bound by the game hook for opt-in same-client policy actions."),
+       Option("telemetry.shazbot_command_labels", "Telemetry", "Record weapon/pack command labels", "bool", False,
+              hook=True, advanced=True, requires=(
+                  ("launcher.load_hook", (True,)), ("hook.console_commands", (True,)),
+                  ("telemetry.shazbot", (True,)),
+              ),
+               help="Allow the opt-in Shazbot collector to capture timestamped weapon/pack command labels from hook-managed input bindings. Off by default."),
+       Option("telemetry.shazbot_auto_weapon_slot_test", "Telemetry", "Run scripted weapon-slot test", "bool", False,
+              hook=True, advanced=True, requires=(
+                  ("launcher.load_hook", (True,)), ("telemetry.shazbot", (True,)),
+                  ("telemetry.shazbot_command_labels", (True,)),
+              ),
+              help="Allow Sentry's per-session TorqueScript to call hook-exposed weapon-slot commands without changing key bindings."),
+       Option("telemetry.shazbot_weapon_slot_test_script", "Telemetry", "Sentry weapon-slot script path", "text", "",
+              hook=True, advanced=True, requires=(
+                  ("launcher.load_hook", (True,)), ("telemetry.shazbot_auto_weapon_slot_test", (True,)),
+              ),
+              help="Per-session prefs/ script that calls the hook's bounded weapon-slot test command."),
+     Option("net.depot_downloads", "Network", "Download missing map files from the TribesNext depot",
            "bool", False, hook=True,
            requires=(("launcher.load_hook", (True,)), ("hook.console_commands", (True,))),
            help="When a server's map needs an interior, shape or terrain you don't have, fetch it "
@@ -401,7 +459,12 @@ CLIENT_ONLY = frozenset((
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
     "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.autobeacon", "review.replace_models",
     "review.extended_range", "review.global_beacons", "review.shortcuts",
-    "review.ffi", "review.no_cloak",
+      "review.ffi", "review.no_cloak", "demo.protocol_tag",
+       "telemetry.shazbot", "telemetry.shazbot_socket", "telemetry.shazbot_packet_capture",
+       "telemetry.shazbot_notification_socket",
+       "telemetry.shazbot_actions",
+       "telemetry.shazbot_action_socket", "telemetry.shazbot_command_labels",
+       "telemetry.shazbot_auto_weapon_slot_test", "telemetry.shazbot_weapon_slot_test_script",
     "security.safe_soundpacks", "security.max_soundpack_kbytes",
     *(option.key for option in OPTIONS if option.section == "Gamescope"),
 ))
@@ -425,19 +488,32 @@ def migrate(profile):
 def coerce(option, value):
     """Convert a stored or typed value to the option's kind, or raise ValueError."""
     if option.kind == "bool":
+        if value is None:
+            return option.default
         if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "yes", "on")
+            value = value.strip().lower()
+            if not value:
+                return option.default
+            return value in ("1", "true", "yes", "on")
         return bool(value)
     if option.kind == "endpoints":
         return _coerce_endpoints(option, value)
     if option.kind == "backends":
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return option.default
         return _coerce_backends(option, value)
     if option.kind == "int":
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return option.default
         value = int(value)
     elif option.kind == "float":
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return option.default
         value = float(value)
     else:
-        value = str(value).strip()
+        value = "" if value is None else str(value).strip()
+        if not value and option.default not in ("", None):
+            return option.default
     if option.kind == "choice" and value not in option.choices:
         raise ValueError(f"{option.label}: choose one of {', '.join(option.choices)}")
     if option.kind in ("int", "float"):
@@ -519,6 +595,15 @@ def chosen(options):
     return values
 
 
+def reset_option(options, key):
+    """Return a profile's option values with one registered option at default."""
+    if key not in BY_KEY:
+        raise KeyError(key)
+    values = dict(options or {})
+    values[key] = BY_KEY[key].default
+    return values
+
+
 def unmet(option, values, context):
     """The requirements of an option that its profile does not meet."""
     merged = {**values, **(context or {})}
@@ -581,12 +666,17 @@ def hook_config(options, context=None):
     return "\n".join(lines) + "\n"
 
 
-def write_hook_config(profile_name, options, context=None):
+def write_hook_config(profile_name, options, context=None, session_id=None):
     """Write the hook config for a profile (mode 0600) and return its path."""
     HOOK_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     HOOK_CONFIG_DIR.chmod(0o700)
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", profile_name).strip("._") or "profile"
     path = HOOK_CONFIG_DIR / f"{slug}.conf"
+    if session_id is not None:
+        session_id = str(session_id)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            raise ValueError("session_id must contain only letters, digits, '_' or '-' (max 64)")
+        path = HOOK_CONFIG_DIR / f"{slug}-{session_id}.conf"
     fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(hook_config(options, context))

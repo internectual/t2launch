@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 try:
     from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Signal  # noqa: I001 (grid-wrapped names)
     from PySide6.QtGui import QAction
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
         QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
         QFileDialog, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -31,6 +34,45 @@ ROOT = Path(__file__).resolve().parent
 RUNTIME = ROOT / "runtime"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "t2launch"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
+SENTRY_SESSION_OVERRIDE_KEYS = frozenset({
+    "hook.console_commands",
+    "video.full_redraw",
+    "telemetry.shazbot",
+    "telemetry.shazbot_socket",
+    "telemetry.shazbot_packet_capture",
+    "telemetry.shazbot_notification_socket",
+    "telemetry.shazbot_actions",
+    "telemetry.shazbot_command_labels",
+    "telemetry.shazbot_auto_weapon_slot_test",
+    "telemetry.shazbot_weapon_slot_test_script",
+})
+SENTRY_DEMO_RECORDING_RE = re.compile(r"recordings/[A-Za-z0-9][A-Za-z0-9_.-]*\.rec")
+SENTRY_CONTROL_API_FEATURES = ["session_demo_recording"]
+
+
+def normalize_sentry_demo_recording(value):
+    """Accept only a simple demo filename under Torque's recordings directory."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not SENTRY_DEMO_RECORDING_RE.fullmatch(value):
+        raise ValueError("demo_recording must be recordings/<filename>.rec")
+    return value
+
+
+def configure_sentry_demo_environment(environment, demo_recording):
+    """Remove inherited autoplay state, then apply this capture's explicit demo."""
+    environment.remove("T2LAUNCH_AUTOPLAY_DEMO")
+    if demo_recording:
+        environment.insert("T2LAUNCH_AUTOPLAY_DEMO", demo_recording)
+    return environment
+
+
+def sentry_control_socket_path() -> Path:
+    """Per-user local control endpoint for Sentry; never carries credentials."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    directory = Path(runtime) if runtime and Path(runtime).is_dir() else Path(tempfile.gettempdir())
+    uid = os.getuid() if hasattr(os, "getuid") else os.environ.get("USER", "user")
+    return directory / f"t2launch-sentry-{uid}.sock"
 
 # Tribes 2 command-line options, as console_start.cs parses them. Each argument
 # that takes values has an enable checkbox and one field per value, hinted with
@@ -120,6 +162,7 @@ def launch_diagnostics_path():
 
 
 def append_launch_diagnostic(message):
+    message = redact_launch_secrets(str(message), ())
     path = launch_diagnostics_path()
     if path.exists() and path.stat().st_size > 2 * 1024 * 1024:
         previous = path.with_name(path.name + ".1")
@@ -136,6 +179,23 @@ def redact_launch_secrets(text, secrets_to_redact):
     for secret in secrets_to_redact:
         if secret:
             text = text.replace(secret, "[redacted]")
+    argument = r'(?:"[^"]*"|\'[^\']*\'|[^\s,;]+)'
+    text = re.sub(
+        rf'(?i)(?<!\S)(--?login)(\s+)({argument})(\s+)({argument})',
+        r'\1\2[redacted]\4[redacted]', text,
+    )
+    text = re.sub(
+        rf'(?i)(?<!\S)(--?password)(\s+)({argument})',
+        r'\1\2[redacted]', text,
+    )
+    text = re.sub(
+        rf'(?i)(?<!\S)(-telnetParams)(\s+)({argument})(\s+)({argument})(\s+)({argument})',
+        r'\1\2\3\4[redacted]\6[redacted]', text,
+    )
+    text = re.sub(
+        r'(?i)(\b(?:username|user|login|password|passwd)\b\s*[:=]\s*)(?:"[^"]*"|\'[^\']*\'|[^,\r\n]+)',
+        r'\1[redacted]', text,
+    )
     return text
 
 
@@ -192,15 +252,21 @@ def terminal_command(command, environment):
 
 def sensitive_profile_arguments(args):
     sensitive = []
-    option_counts = {"-login": 2, "-password": 1}
+    option_positions = {
+        "-login": (0, 1), "--login": (0, 1),
+        "-password": (0,), "--password": (0,),
+        "-telnetParams": (1, 2),
+    }
     index = 0
     while index < len(args):
-        count = option_counts.get(args[index])
-        if count is None:
+        positions = option_positions.get(args[index])
+        if positions is None:
             index += 1
             continue
-        sensitive.extend(args[index + 1:index + 1 + count])
-        index += count + 1
+        arity = max(positions) + 1
+        values = args[index + 1:index + 1 + arity]
+        sensitive.extend(values[position] for position in positions if position < len(values))
+        index += arity + 1
     return tuple(value for value in sensitive if value)
 
 
@@ -370,6 +436,7 @@ class ProfileEditor(QWidget):
         saved_options = t2options.chosen(t2options.migrate(profile))
         self.option_widgets = {}
         self.option_rows = {}
+        self.option_default_buttons = {}
         self.section_headings = []  # (heading, keys of its options)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -479,18 +546,24 @@ class ProfileEditor(QWidget):
         row_layout.setContentsMargins(12, 0, 0, 4)
         widget = self._option_widget(option, value)
         widget.setToolTip(option.help)
+        line = QHBoxLayout()
         if option.kind == "bool":
-            row_layout.addWidget(widget)
+            line.addWidget(widget, 1)
         else:
-            line = QHBoxLayout()
             line.addWidget(QLabel(option.label))
             line.addWidget(widget, 1)
-            row_layout.addLayout(line)
+        reset = QPushButton("Default")
+        reset.setFixedWidth(70)
+        reset.setToolTip(f"Reset {option.label} to its declared default")
+        reset.clicked.connect(lambda _checked=False, key=option.key: self.reset_option(key))
+        line.addWidget(reset)
+        row_layout.addLayout(line)
         note = QLabel()
         note.setStyleSheet("color: gray")
         note.setWordWrap(True)
         row_layout.addWidget(note)
         self.option_widgets[option.key] = widget
+        self.option_default_buttons[option.key] = reset
         self.option_rows[option.key] = (row, note)
         return row
 
@@ -523,6 +596,26 @@ class ProfileEditor(QWidget):
             widget = QLineEdit(str(value))
         return widget
 
+    def reset_option(self, key):
+        """Restore one profile option to its registry default."""
+        option = t2options.BY_KEY[key]
+        widget = self.option_widgets[key]
+        value = t2options.reset_option(self.option_values(), key)[key]
+        if option.kind == "bool":
+            widget.setChecked(bool(value))
+        elif option.kind == "choice":
+            widget.setCurrentText(str(value))
+        elif option.kind in ("int", "float"):
+            widget.setValue(value)
+        elif option.kind == "endpoints":
+            widget.setText(", ".join(value or ()))
+        elif option.kind == "backends":
+            widget.backends = [dict(backend) for backend in value]
+            widget.render()
+            widget.changed.emit()
+        else:
+            widget.setText(str(value))
+
     def option_values(self):
         values = {}
         for key, widget in self.option_widgets.items():
@@ -539,7 +632,8 @@ class ProfileEditor(QWidget):
 
     def refresh_options(self, *_args):
         """Enable each option only while its requirements hold."""
-        values = t2options.chosen(self.option_values())
+        raw_values = self.option_values()
+        values = t2options.chosen(raw_values)
         context = self.hook_context()
         effective = t2options.effective(values, context)
         show_advanced = self.show_advanced.isChecked()
@@ -552,6 +646,12 @@ class ProfileEditor(QWidget):
             other_executable = any(key == "game.executable" for key, _allowed in missing)
             row.setVisible((show_advanced or not option.advanced) and not other_executable)
             self.option_widgets[option.key].setEnabled(not missing)
+            try:
+                is_default = t2options.coerce(option, raw_values[option.key]) == option.default
+            except (TypeError, ValueError):
+                is_default = False
+            self.option_default_buttons[option.key].setVisible(not is_default)
+            self.option_default_buttons[option.key].setEnabled(not missing)
             note.setText("Requires: " + ", ".join(requirement_text(key, allowed)
                                                   for key, allowed in missing) if missing else "")
             note.setVisible(bool(missing))
@@ -786,7 +886,11 @@ class Launcher(QApplication):
         if not self.settings.get("monitor") and QApplication.primaryScreen():
             self.settings["monitor"] = QApplication.primaryScreen().name()
         self.processes = {}
+        self.process_metadata = {}
         self.launch_output_states = {}
+        self._sentry_buffers = {}
+        self.sentry_control_server = None
+        self.sentry_control_path = None
         self.build_process = None
         self.build_dialog = None
         self.settings_dialog = None
@@ -797,6 +901,7 @@ class Launcher(QApplication):
         self.tray.setContextMenu(self.menu)
         self.tray.activated.connect(self.tray_activated)
         self.tray.show()
+        self._start_sentry_control_server()
         self.refresh_menu()
         self.poll = QTimer(self)
         self.poll.timeout.connect(self.update_tooltip)
@@ -809,6 +914,165 @@ class Launcher(QApplication):
             self.tray.showMessage("T2Launch", f"Launching {profile_name} in {delay} seconds. Open Settings to cancel.", QSystemTrayIcon.Information, min(delay, 10) * 1000)
             self.autolaunch_timer.timeout.connect(lambda: self.launch_profile(profile_name))
             self.autolaunch_timer.start(delay * 1000)
+
+    def _start_sentry_control_server(self):
+        path = sentry_control_socket_path()
+        server = QLocalServer(self)
+        server.setSocketOptions(QLocalServer.UserAccessOption)
+        if not server.listen(str(path)):
+            probe = QLocalSocket(self)
+            probe.connectToServer(str(path))
+            if probe.waitForConnected(100):
+                probe.disconnectFromServer()
+                server.deleteLater()
+                return  # a running T2Launch instance already owns the endpoint
+            probe.deleteLater()
+            QLocalServer.removeServer(str(path))  # remove only an unresponsive stale socket
+            if not server.listen(str(path)):
+                server.deleteLater()
+                append_launch_diagnostic(f"Sentry control API unavailable: {server.errorString()}")
+                return
+        self.sentry_control_server = server
+        self.sentry_control_path = str(path)
+        server.newConnection.connect(self._accept_sentry_control)
+        append_launch_diagnostic(f"Sentry control API ready at {path}")
+
+    def _restart_sentry_control_server(self):
+        old_path = self.sentry_control_path or str(sentry_control_socket_path())
+        old_server = self.sentry_control_server
+        if old_server is not None:
+            old_server.close()
+            old_server.deleteLater()
+        QLocalServer.removeServer(old_path)
+        self.sentry_control_server = None
+        self.sentry_control_path = None
+        self._start_sentry_control_server()
+        return self.sentry_control_server is not None
+
+    def _accept_sentry_control(self):
+        server = self.sentry_control_server
+        if not server:
+            return
+        while server.hasPendingConnections():
+            client = server.nextPendingConnection()
+            if not client:
+                continue
+            self._sentry_buffers[id(client)] = bytearray()
+            client.readyRead.connect(lambda c=client: self._read_sentry_control(c))
+            client.disconnected.connect(lambda c=client: self._sentry_buffers.pop(id(c), None))
+
+    def _read_sentry_control(self, client):
+        buffer = self._sentry_buffers.get(id(client))
+        if buffer is None:
+            return
+        request = None
+        buffer.extend(bytes(client.readAll()))
+        if len(buffer) > 65536:
+            response = {"ok": False, "error": "request exceeds 64 KiB"}
+        elif b"\n" not in buffer:
+            return
+        else:
+            line, _rest = bytes(buffer).split(b"\n", 1)
+            try:
+                request = json.loads(line.decode("utf-8"))
+                response = self._handle_sentry_request(request)
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError, OSError) as error:
+                response = {"ok": False, "error": str(error)}
+        if isinstance(response, dict) and isinstance(request, dict):
+            response.setdefault("request_id", request.get("request_id"))
+        client.write((json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8"))
+        client.flush()
+        client.waitForBytesWritten(100)
+        client.disconnectFromServer()
+
+    def _sentry_profile_summaries(self):
+        summaries = []
+        for profile in self.settings.get("profiles", []):
+            if not isinstance(profile, dict):
+                continue
+            hooked = bool(profile.get("load_hook", True))
+            effective = t2options.effective(t2options.migrate(profile),
+                                            {"launcher.load_hook": hooked})
+            summaries.append({
+                "name": str(profile.get("name", "Profile")),
+                "client": effective.get("game.executable") == "client",
+                "hook": hooked,
+                "console_commands": bool(effective.get("hook.console_commands", False)),
+                "telemetry": bool(effective.get("telemetry.shazbot", False)),
+                "packet_capture": bool(effective.get("telemetry.shazbot_packet_capture", False)),
+                "command_labels": bool(effective.get("telemetry.shazbot_command_labels", False)),
+                "actions": bool(effective.get("telemetry.shazbot_actions", False)),
+            })
+        return summaries
+
+    def _sentry_session_summaries(self):
+        summaries = []
+        for process_key, (name, process) in list(self.processes.items()):
+            metadata = self.process_metadata.get(process_key, {})
+            state = process.state()
+            state_name = ("starting" if state == QProcess.Starting else
+                          "running" if state == QProcess.Running else "stopped")
+            summaries.append({
+                "profile": name,
+                "session_id": metadata.get("session_id"),
+                "state": state_name,
+                "pid": int(process.processId()),
+                "hook": bool(metadata.get("hook", False)),
+                "telemetry": bool(metadata.get("telemetry", False)),
+                "packet_capture": bool(metadata.get("packet_capture", False)),
+                "demo_recording": metadata.get("demo_recording"),
+            })
+        return summaries
+
+    def _handle_sentry_request(self, request):
+        if not isinstance(request, dict):
+            raise ValueError("request must be a JSON object")
+        operation = request.get("op")
+        if operation == "ping":
+            return {"ok": True, "api": 2, "features": SENTRY_CONTROL_API_FEATURES}
+        if operation == "profiles":
+            return {"ok": True, "profiles": self._sentry_profile_summaries()}
+        if operation == "status":
+            return {"ok": True, "sessions": self._sentry_session_summaries()}
+        if operation == "restart_control_api":
+            restarted = self._restart_sentry_control_server()
+            if not restarted:
+                raise ValueError("T2Launch could not restart its Sentry control API")
+            return {"ok": True, "api": 2, "features": SENTRY_CONTROL_API_FEATURES,
+                    "state": "restarted"}
+        if operation == "launch_profile":
+            name = request.get("profile")
+            session_id = request.get("session_id")
+            if not isinstance(name, str) or not name:
+                raise ValueError("profile name is required")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("session_id is required for a Sentry launch")
+            demo_recording = normalize_sentry_demo_recording(
+                request.get("demo_recording")
+            )
+            overrides = request.get("overrides", {})
+            if not isinstance(overrides, dict):
+                raise ValueError("overrides must be a JSON object")
+            unknown = set(overrides) - SENTRY_SESSION_OVERRIDE_KEYS
+            if unknown:
+                raise ValueError(f"unsupported session override(s): {', '.join(sorted(unknown))}")
+            # This channel is specifically for passive data collection. It never
+            # permits the Sentry command to enable policy control of the client.
+            overrides = dict(overrides)
+            overrides["telemetry.shazbot"] = True
+            overrides["telemetry.shazbot_actions"] = False
+            overrides["hook.console_commands"] = True
+            process = self.launch_profile(
+                name, session_overrides=overrides, session_id=session_id,
+                load_hook_override=True, show_errors=False,
+                demo_recording=demo_recording,
+            )
+            if process is None:
+                raise ValueError("profile launch was rejected; inspect the T2Launch profile and game path")
+            return {"ok": True, "session_id": session_id, "profile": name,
+                    "pid": int(process.processId()), "state": "starting",
+                    "demo_recording": demo_recording}
+        raise ValueError("unknown Sentry control operation")
 
     def refresh_menu(self):
         self.menu.clear()
@@ -845,34 +1109,60 @@ class Launcher(QApplication):
         self.settings_dialog = SettingsDialog(self)
         self.settings_dialog.show()
 
-    def launch_profile(self, name):
+    def launch_profile(self, name, *, session_overrides=None, session_id=None,
+                       load_hook_override=None, show_errors=True, demo_recording=None):
         self.autolaunch_timer.stop()
         profile = next((p for p in self.settings["profiles"] if p.get("name") == name), None)
         if not profile:
-            return
+            return None
         game_path = Path(self.settings["game_directory"]).expanduser()
         if not game_path.is_dir():
-            self.tray.showMessage("Game folder needed", "Choose the Tribes 2 folder in Settings.", QSystemTrayIcon.Warning)
-            self.open_settings()
-            return
-        hooked = bool(profile.get("load_hook", True))
+            if show_errors:
+                self.tray.showMessage("Game folder needed", "Choose the Tribes 2 folder in Settings.", QSystemTrayIcon.Warning)
+                self.open_settings()
+            return None
+        hooked = (bool(profile.get("load_hook", True)) if load_hook_override is None
+                  else bool(load_hook_override))
         try:
+            demo_recording = normalize_sentry_demo_recording(demo_recording)
+            if demo_recording and session_id is None:
+                raise ValueError("demo playback autoplay is only available for Sentry capture sessions")
             args = profile_arguments(profile)
             options = t2options.migrate(profile)
+            overrides = session_overrides or {}
+            if not isinstance(overrides, dict):
+                raise ValueError("session overrides must be a mapping")
+            unknown = set(overrides) - SENTRY_SESSION_OVERRIDE_KEYS
+            if unknown:
+                raise ValueError(f"unsupported session override(s): {', '.join(sorted(unknown))}")
+            options.update(overrides)
             t2options.validate(options, {"launcher.load_hook": hooked})
             if options["won.mode"] != "off" and not hooked:
                 raise ValueError("Local WON emulation requires the hook.")
+            if session_id is not None and not hooked:
+                raise ValueError("Sentry telemetry capture requires the hook.")
+            if session_id is not None and t2options.effective(
+                    options, {"launcher.load_hook": hooked}).get("game.executable") != "client":
+                raise ValueError("Sentry telemetry capture requires the client executable.")
+            if session_id is not None and not options.get("hook.console_commands", True):
+                raise ValueError("Sentry command capture requires hook.console_commands.")
         except ValueError as exc:
-            self.tray.showMessage("Invalid profile", str(exc), QSystemTrayIcon.Warning)
-            self.open_settings()
-            return
+            if show_errors:
+                self.tray.showMessage("Invalid profile", str(exc), QSystemTrayIcon.Warning)
+                self.open_settings()
+            return None
         process = QProcess(self)
-        env = QProcessEnvironment.systemEnvironment()
+        env = configure_sentry_demo_environment(
+            QProcessEnvironment.systemEnvironment(), demo_recording
+        )
         context = {"launcher.load_hook": hooked}
         launch = {"T2LAUNCH_LOAD_HOOK": "1" if hooked else "0",
                   **t2options.launch_env(options, context)}
+        hook_config_path = None
         if hooked:
-            launch["T2LAUNCH_HOOK_CONFIG"] = str(t2options.write_hook_config(name, options, context))
+            hook_config_path = t2options.write_hook_config(
+                name, options, context, session_id=session_id)
+            launch["T2LAUNCH_HOOK_CONFIG"] = str(hook_config_path)
         effective = t2options.effective(options, context)
         dedicated = effective["game.executable"] == "dedicated"
         if not dedicated:
@@ -896,15 +1186,31 @@ class Launcher(QApplication):
         process.setProcessChannelMode(QProcess.MergedChannels)
         self.launch_output_states[id(process)] = {
             "buffer": "", "secrets": sensitive_profile_arguments(args)}
+        effective = t2options.effective(options, context)
+        self.process_metadata[id(process)] = {
+            "profile": name,
+            "session_id": session_id,
+            "hook": hooked,
+            "telemetry": bool(effective.get("telemetry.shazbot", False)),
+            "packet_capture": bool(effective.get("telemetry.shazbot_packet_capture", False)),
+            "command_labels": bool(effective.get("telemetry.shazbot_command_labels", False)),
+            "actions": bool(effective.get("telemetry.shazbot_actions", False)),
+            "executable": effective.get("game.executable", "client"),
+            "started_at": time.time(),
+            "hook_config_path": str(hook_config_path) if hook_config_path else None,
+            "demo_recording": demo_recording,
+        }
         append_launch_diagnostic(
             f"launch requested; executable={effective['game.executable']} won={options['won.mode']} "
-            f"hook={int(hooked)} terminal={int(terminal is not None)}")
+            f"hook={int(hooked)} terminal={int(terminal is not None)} "
+            f"session={session_id or '-'} demo={demo_recording or '-'}")
         process.readyReadStandardOutput.connect(lambda p=process, n=name: self.read_launch_output(p, n))
         process.finished.connect(lambda code, status, n=name, p=process: self.launch_finished(n, p, code))
         process.errorOccurred.connect(lambda error, p=process: self.launch_error(p, error))
         process.start()
         self.processes[id(process)] = (name, process)
         self.update_tooltip()
+        return process
 
     def read_launch_output(self, process, name):
         if not is_qobject_valid(process):
@@ -937,6 +1243,12 @@ class Launcher(QApplication):
             self._record_launch_output_line(state["buffer"].rstrip("\r"), state)
         append_launch_diagnostic(f"game exited code={code}")
         self.processes.pop(id(process), None)
+        metadata = self.process_metadata.pop(id(process), None)
+        if metadata and metadata.get("session_id") and metadata.get("hook_config_path"):
+            try:
+                Path(metadata["hook_config_path"]).unlink(missing_ok=True)
+            except OSError as error:
+                append_launch_diagnostic(f"Sentry session config cleanup failed: {error}")
         if code:
             self.tray.showMessage("Tribes 2 exited", f"Profile {name} exited with status {code}.", QSystemTrayIcon.Warning)
         self.update_tooltip()

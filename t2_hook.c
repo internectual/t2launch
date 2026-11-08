@@ -3,12 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
+#include <limits.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -72,15 +76,21 @@ struct game_target {
     uintptr_t net_rate_variable;     /* $pref::Net::PacketRateToClient */
     uintptr_t net_size_variable;     /* $pref::Net::PacketSize */
     uintptr_t net_rate_compare[3];   /* see install_net_packet_limits() */
+    uintptr_t build_version_helper;  /* getT2VersionNumber() return stub */
+    uintptr_t master_list_version_flag; /* client list request's OR 0x80 */
+    uintptr_t demo_tag_writer;       /* recorder's 32-bit .rec header tag */
+    uintptr_t demo_tag_compare;      /* playback's strict .rec tag compare */
+    uintptr_t demo_tag_helper;       /* getDemoVersion() result */
 };
 
 static const struct game_target game_targets[] = {
     {"tribes2.dynamic", "client", 0, 0x080E85C0, 0x080E88F4, 0x08493DEC, 0x081CFA44,
      {0x084846B1, 0x084846CD, 0x084846E9}, 0x0849A860, 0x08495CEC, 0x08495CF0,
-     {0x081F8EAE, 0x081FB382, 0x081FB683}},
+     {0x081F8EAE, 0x081FB382, 0x081FB683}, 0x08309168, 0x0823E9B3,
+     0x081F9AF8, 0x081F9EEC, 0x081FB978},
     {"tribes2d.dynamic", "dedicated server", 1, 0x080E74B0, 0x080E77E4, 0x0848902C, 0x081CD014,
      {0x08479751, 0x0847976D, 0x08479789}, 0x0848F520, 0x0848ADCC, 0x0848ADD0,
-     {0x081EDB4E, 0x081F0022, 0x081F0323}},
+     {0x081EDB4E, 0x081F0022, 0x081F0323}, 0x082FDE08, 0, 0, 0, 0},
 };
 #define GAME_TARGET_COUNT (sizeof(game_targets) / sizeof(game_targets[0]))
 static const struct game_target *target = &game_targets[0];
@@ -148,6 +158,17 @@ static struct hook_option hook_options[] = {
     {"browser.many_bots", "1", NULL, 0, "", 0},
     {"browser.web_links", "1", NULL, 0, "", 0},
     {"net.packet_limits", "1", NULL, 0, "", 0},
+    {"net.build_identifier", "25034", NULL, 0, "", 0},
+    {"demo.protocol_tag", "3342340", NULL, 0, "", 0},
+    {"telemetry.shazbot", "0", NULL, 0, "", 0},
+    {"telemetry.shazbot_socket", "/tmp/shazbot.sock", NULL, 0, "", 0},
+    {"telemetry.shazbot_packet_capture", "0", NULL, 0, "", 0},
+    {"telemetry.shazbot_notification_socket", "/tmp/shazbot-notify.sock", NULL, 0, "", 0},
+    {"telemetry.shazbot_actions", "0", NULL, 0, "", 0},
+    {"telemetry.shazbot_action_socket", "/tmp/shazbot-action.sock", NULL, 0, "", 0},
+    {"telemetry.shazbot_command_labels", "0", NULL, 0, "", 0},
+    {"telemetry.shazbot_auto_weapon_slot_test", "0", NULL, 0, "", 0},
+    {"telemetry.shazbot_weapon_slot_test_script", "", NULL, 0, "", 0},
     {"video.fps_limit", "0", NULL, 0, "", 0},
     {"video.borderless", "0", NULL, 0, "", 0},
     {"video.vsync", "1", NULL, 0, "", 0},
@@ -265,6 +286,18 @@ static const char *hook_option_str(const char *key) {
 
 static int hook_option_bool(const char *key) {
     const char *value = hook_option_str(key);
+    while (value && (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n')) value++;
+    if (value && !*value) {
+        /* A blank bool entry means "use this option's declared default";
+           explicit off is represented by 0/false/no/off. */
+        for (size_t i = 0; i < HOOK_OPTION_COUNT; i++) {
+            if (strcmp(hook_options[i].key, key) == 0) {
+                value = hook_options[i].fallback;
+                break;
+            }
+        }
+    }
+    while (value && (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n')) value++;
     return value && (strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
                      strcasecmp(value, "on") == 0 || strcasecmp(value, "yes") == 0);
 }
@@ -373,6 +406,12 @@ static const char core_runtime_script[] =
     " if (isObject(LaunchGui)) return \"1\";\n"
     " return \"0\";\n"
     "}\n"
+    "function t2launch_hudDemoRadarEnabled() {"
+    " if (!$T2Launch::HudDemo::Radar || !isObject(PlayGui) || !PlayGui.isAwake()) return \"0\";"
+    " if (!isObject(navHud) || !navHud.isAwake() || !navHud.visible) return \"0\";"
+    " return \"1\";"
+    "}\n"
+    "function t2launch_skyRotationSpeed() { return $pref::skyRotationSpeed; }\n"
     "function t2launch_audioState() {\n"
     " return $Audio::initialized @ \"|\" @ $pref::Audio::activeDriver @ \"|\" @ $pref::Audio::drivers;\n"
     "}\n"
@@ -389,6 +428,44 @@ static const char core_runtime_script[] =
     "}\n"
     "t2launch_refreshServerBrowser();\n"
     "t2launch_audioMenuPoll();\n";
+
+/* Mirror the stock HUD's weapon inventory/selection events. Torque does not
+   replicate Player dynamic inventory fields to client ghosts; the HUD messages
+   are the client-visible record of weaponSlot changes. */
+static const char shazbot_hud_telemetry_script[] =
+    "package T2LaunchShazbotHudTelemetry {\n"
+    " function clientCmdSetWeaponsHudClearAll() {\n"
+    "  shazbot_hud_weapon_clear();\n"
+    "  Parent::clientCmdSetWeaponsHudClearAll();\n"
+    " }\n"
+     " function clientCmdSetWeaponsHudItem(%slot, %ammoAmount, %addItem) {\n"
+     "  %item = \"\";\n"
+     "  if (%slot >= 0 && %slot < $WeaponsHudCount) {\n"
+     "   %item = $WeaponNames[%slot];\n"
+     "   if (%item $= \"\") %item = $WeaponsHudData[%slot, itemDataName];\n"
+     "  }\n"
+     "  shazbot_hud_weapon_item(%slot, %item, %addItem);\n"
+    "  Parent::clientCmdSetWeaponsHudItem(%slot, %ammoAmount, %addItem);\n"
+    " }\n"
+    " function clientCmdSetWeaponsHudActive(%slot, %ret, %vis) {\n"
+    "  %item = \"\";\n"
+    "  if (%slot >= 0 && %slot < $WeaponsHudCount)\n"
+    "   %item = $WeaponsHudData[%slot, itemDataName];\n"
+    "  shazbot_hud_weapon_active(%item);\n"
+    "  Parent::clientCmdSetWeaponsHudActive(%slot, %ret, %vis);\n"
+    " }\n"
+     "};\n"
+     "activatePackage(T2LaunchShazbotHudTelemetry);\n";
+
+static const char autoplay_demo_exit_package[] =
+    "package T2LaunchAutoplayDemoExit {\n"
+    " function demoPlaybackComplete() {\n"
+    "  Parent::demoPlaybackComplete();\n"
+    "  echo(\"t2launch: autoplay demo complete; exiting\");\n"
+    "  schedule(1, 0, \"quit\");\n"
+    " }\n"
+    "};\n"
+    "activatePackage(T2LaunchAutoplayDemoExit);\n";
 
 /* TribesNext account unlock and T2CSRI client handlers (hook.tribesnext). */
 static const char tribesnext_runtime_script[] =
@@ -1246,6 +1323,127 @@ static int apply_code_patches(const char *name, const struct code_patch *patches
     return 1;
 }
 
+/* getT2VersionNumber feeds browser matching and peer version checks; both
+   executables expose the same helper. Override that build identifier without
+   touching the engine's packet/protocol version (51). The client's master-list
+   request normally sets flag 0x80, which asks a master to pre-filter by
+   version; clear only that reserved bit so the client can perform its local
+   match against the configured identifier after receiving all rows. */
+static const unsigned char build_version_helper_original[] = {
+    0x55, 0x89, 0xe5, 0xb8, 0xca, 0x61, 0x00, 0x00, 0x89, 0xec, 0x5d, 0xc3
+};
+static const unsigned char master_list_version_flag_original[] = {0x80, 0xca, 0x80};
+static const unsigned char master_list_version_flag_any[] = {0x80, 0xe2, 0x7f};
+
+/* Numeric hook settings may be blank in an older or hand-edited profile. Treat
+   empty/whitespace as the declared safe default; reject malformed nonblank text
+   rather than allowing strtoul's zero result to become a patch value. */
+static int hook_u31_or_default(const char *key, uint32_t fallback, uint32_t *value) {
+    const char *text = hook_option_str(key);
+    const char *number = text;
+    if (!number) {
+        *value = fallback;
+        return 1;
+    }
+    while (*number == ' ' || *number == '\t' || *number == '\r' || *number == '\n') number++;
+    if (!*number) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(number, &end, 10);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end++;
+    if (errno || end == number || !end || *end || parsed == 0 || parsed > 0x7ffffffful) {
+        fprintf(stderr, "[t2_hook] Invalid %s '%s'; expected decimal 1..2147483647\n",
+                key, text);
+        return 0;
+    }
+    *value = (uint32_t)parsed;
+    return 1;
+}
+
+/* security.max_soundpack_kbytes explicitly allows zero (no cap). Empty or
+   malformed text must use the safe default, not silently disable that limit. */
+static long hook_long_or_default(const char *key, long fallback, long minimum, long maximum) {
+    const char *text = hook_option_str(key);
+    const char *number = text;
+    if (!number) return fallback;
+    while (*number == ' ' || *number == '\t' || *number == '\r' || *number == '\n') number++;
+    if (!*number) return fallback;
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(number, &end, 10);
+    while (end && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end++;
+    if (errno || end == number || !end || *end || parsed < minimum || parsed > maximum) {
+        fprintf(stderr, "[t2_hook] Invalid %s '%s'; using default %ld\n", key, text, fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
+static int install_build_identifier(void) {
+    uint32_t identifier;
+    if (!hook_u31_or_default("net.build_identifier", 25034, &identifier)) return 0;
+    const struct code_patch helper = {
+        target->build_version_helper, build_version_helper_original,
+        sizeof(build_version_helper_original), 4, (const unsigned char *)&identifier,
+        sizeof(identifier)
+    };
+    if (target->dedicated) {
+        if (!apply_code_patches("Build identifier", &helper, 1)) return 0;
+    } else {
+        const struct code_patch patches[] = {
+            helper,
+            {target->master_list_version_flag, master_list_version_flag_original,
+             sizeof(master_list_version_flag_original), 0, master_list_version_flag_any,
+             sizeof(master_list_version_flag_any)},
+        };
+        if (!apply_code_patches("Build identifier and cross-version master list", patches,
+                                sizeof(patches) / sizeof(patches[0]))) return 0;
+    }
+    fprintf(stderr, "[t2_hook] Build identifier set to %u; network protocol unchanged%s\n",
+            identifier, target->dedicated ? "" : "; version filtering is local to this client");
+    return 1;
+}
+
+/* .rec headers carry a recording-format tag, independent from the master
+   build identifier and network protocol. Patch writer, strict reader gate,
+   and getDemoVersion()'s reported tag together; packet/block parsing remains
+   the engine's native implementation and is not changed by this option. */
+static const unsigned char demo_tag_writer_original[] = {
+    0xc7, 0x45, 0xd4, 0x04, 0x00, 0x33, 0x00
+};
+static const unsigned char demo_tag_compare_original[] = {
+    0x3d, 0x04, 0x00, 0x33, 0x00
+};
+static const unsigned char demo_tag_helper_original[] = {
+    0x04, 0x00, 0x33, 0x00
+};
+
+static int install_demo_protocol_tag(void) {
+    if (target->dedicated || !target->demo_tag_writer || !target->demo_tag_compare ||
+        !target->demo_tag_helper) return 1;
+
+    uint32_t tag;
+    if (!hook_u31_or_default("demo.protocol_tag", 3342340, &tag)) return 0;
+    const unsigned char *value = (const unsigned char *)&tag;
+    const struct code_patch patches[] = {
+        {target->demo_tag_writer, demo_tag_writer_original,
+         sizeof(demo_tag_writer_original), 3, value, sizeof(tag)},
+        {target->demo_tag_compare, demo_tag_compare_original,
+         sizeof(demo_tag_compare_original), 1, value, sizeof(tag)},
+        {target->demo_tag_helper, demo_tag_helper_original,
+         sizeof(demo_tag_helper_original), 0, value, sizeof(tag)},
+    };
+    if (!apply_code_patches("Demo recording header tag", patches,
+                            sizeof(patches) / sizeof(patches[0]))) return 0;
+    fprintf(stderr,
+            "[t2_hook] Demo header tag set to 0x%08x; network protocol and payload parser unchanged\n",
+            tag);
+    return 1;
+}
+
 /* ---- Demo-review reconstruction (review.cheat_view) -----------------------
    Loki #25034 CLIENT ONLY. RESEARCH.md records executable hashes, Windows
    counterparts, disassembly evidence and rejected earlier candidates. These
@@ -1609,8 +1807,12 @@ static const char *rv_string(const struct rv_memory *memory, const void *pointer
     return memchr(pointer, 0, available) ? pointer : NULL;
 }
 
-/* Equivalent to SimObject::getClassName: virtual getClassRep, then +0x18. */
-static const char *rv_class_name(const struct rv_memory *memory, void *object) {
+#define SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET 0x2C
+#define SHAZBOT_SIM_FIELD_BUCKET_COUNT 19
+#define SHAZBOT_SIM_FIELD_ENTRY_STRIDE 12
+
+/* SimObject's virtual getClassRep plus its class-rep name at +0x18. */
+static void *rv_class_rep(const struct rv_memory *memory, void *object) {
     if (!rv_memory_range(memory, object, 0x30, PROT_READ)) return NULL;
     void *vtable = rv_pointer(object, 0);
     if (!rv_memory_range(memory, vtable, 12, PROT_READ)) return NULL;
@@ -1618,7 +1820,88 @@ static const char *rv_class_name(const struct rv_memory *memory, void *object) {
     if (!rv_memory_range(memory, getter, 1, PROT_EXEC)) return NULL;
     void *class_rep = ((void *(*)(void *))getter)(object);
     if (!rv_memory_range(memory, class_rep, 0x1c, PROT_READ)) return NULL;
+    return class_rep;
+}
+
+static const char *rv_class_name(const struct rv_memory *memory, void *object) {
+    void *class_rep = rv_class_rep(memory, object);
+    if (!class_rep) return NULL;
     return rv_string(memory, rv_pointer(class_rep, 0x18), 64);
+}
+
+/* Locate the registered Field array without assuming this client's concrete
+   AbstractClassRep/Vector layout. Torque Field entries are six 32-bit words;
+   require an exact registered field-name match before trusting its offset. */
+static int rv_persist_field_offset(const struct rv_memory *memory, void *object,
+                                   const char *field_name, uint32_t *field_offset) {
+    if (!memory || !object || !field_name || !field_offset) return 0;
+    void *class_rep = rv_class_rep(memory, object);
+    if (!class_rep || !rv_memory_range(memory, class_rep, 0x40, PROT_READ)) return 0;
+    for (size_t array_slot = 4; array_slot < 0x40; array_slot += sizeof(uint32_t)) {
+        void *fields = rv_pointer(class_rep, array_slot);
+        if (!rv_memory_range(memory, fields, 24, PROT_READ)) continue;
+        for (size_t count_slot = 4; count_slot < 0x40; count_slot += sizeof(uint32_t)) {
+            if (count_slot == array_slot) continue;
+            uint32_t field_count = rv_word(class_rep, count_slot);
+            if (field_count == 0 || field_count > 512 ||
+                !rv_memory_range(memory, fields, (size_t)field_count * 24, PROT_READ))
+                continue;
+            for (uint32_t index = 0; index < field_count; ++index) {
+                void *field = (unsigned char *)fields + (size_t)index * 24;
+                const char *name = rv_string(memory, rv_pointer(field, 0), 128);
+                if (name && strcmp(name, field_name) == 0) {
+                    uint32_t offset = rv_word(field, 8);
+                    if (offset > 0x10000) return 0;
+                    *field_offset = offset;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* SimObject dynamic fields live in a 19-bucket SimFieldDictionary; each Entry
+   is {StringTableEntry name, char *value, Entry *next}. */
+static const char *rv_dynamic_field(const struct rv_memory *memory, void *object,
+                                    const char *field_name) {
+    if (!memory || !object || !field_name ||
+        !rv_memory_range(memory, (unsigned char *)object + SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET,
+                         sizeof(uint32_t), PROT_READ)) return NULL;
+    void *dictionary = rv_pointer(object, SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET);
+    if (!rv_memory_range(memory, dictionary,
+                         SHAZBOT_SIM_FIELD_BUCKET_COUNT * sizeof(uint32_t), PROT_READ)) return NULL;
+    for (size_t bucket = 0; bucket < SHAZBOT_SIM_FIELD_BUCKET_COUNT; bucket++) {
+        void *entry = rv_pointer(dictionary, bucket * sizeof(uint32_t));
+        void *visited[128];
+        size_t visited_count = 0;
+        while (entry && visited_count < sizeof visited / sizeof visited[0]) {
+            if (!rv_memory_range(memory, entry, SHAZBOT_SIM_FIELD_ENTRY_STRIDE, PROT_READ))
+                return NULL;
+            for (size_t index = 0; index < visited_count; index++)
+                if (visited[index] == entry) return NULL;
+            visited[visited_count++] = entry;
+            const char *name = rv_string(memory, rv_pointer(entry, 0), 128);
+            if (!name) return NULL;
+            if (strcmp(name, field_name) == 0)
+                return rv_string(memory, rv_pointer(entry, 4), 128);
+            entry = rv_pointer(entry, 8);
+        }
+        if (entry) return NULL; /* Refuse cyclic or excessively long chains. */
+    }
+    return NULL;
+}
+
+static int rv_dynamic_float(const struct rv_memory *memory, void *object,
+                            const char *field_name, float *value) {
+    if (!value) return 0;
+    const char *text = rv_dynamic_field(memory, object, field_name);
+    if (!text) return 0;
+    char *end = NULL;
+    float parsed = strtof(text, &end);
+    if (end == text || *end || !isfinite(parsed)) return 0;
+    *value = parsed;
+    return 1;
 }
 
 static void *rv_find_object(const struct rv_memory *memory, void *dictionary, uint32_t id) {
@@ -1640,6 +1923,2532 @@ static int rv_position(const struct rv_memory *memory, void *object, enum rv_kin
         if (!isfinite(xyz[i])) return 0;
     }
     return 1;
+}
+
+/* ---- Project Shazbot IPC v1 client telemetry and packet mirroring (opt-in) --
+   The exact #25034 client identity and spatial fields are documented in
+   RESEARCH.md. This emits Player position, the versioned 32-float Observation,
+   actual-radius view cones, and mounted-image muzzle-vector rays plus the
+   existing native projectile aim marker's source/point when drawn. Separately,
+   the opt-in packet capture mirrors received ConnectionProtocol data datagrams.
+   No action/input state is read or applied. The receiver is a separate process;
+   sends are non-blocking and samples are dropped on any socket error. */
+#define SHAZBOT_CONNECTION 0x08495CDC
+#define SHAZBOT_ID_DICTIONARY 0x084E3320
+#define SHAZBOT_TARGET_MANAGER 0x08497DA0
+#define SHAZBOT_LOCAL_CONTROL_OFFSET 0x825C
+#define SHAZBOT_POSITION_X_OFFSET 0xA8
+#define SHAZBOT_POSITION_Y_OFFSET 0xB8
+#define SHAZBOT_POSITION_Z_OFFSET 0xC8
+#define SHAZBOT_TARGET_ID_OFFSET 0x270
+#define SHAZBOT_TARGET_INFO_OFFSET 0x26C
+#define SHAZBOT_TARGET_ARRAY_OFFSET 0x1A58
+#define SHAZBOT_TARGET_STRIDE 0x44
+#define SHAZBOT_TARGET_INFO_STRIDE 0x44
+#define SHAZBOT_CLIENT_TARGET_ARRAY_OFFSET 0xA258
+#define SHAZBOT_TARGET_SENSOR_DATA_OFFSET 0x40
+#define SHAZBOT_LOCAL_SENSOR_GROUP_OFFSET 0x8434
+#define SHAZBOT_PLAYER_VELOCITY_X_OFFSET 0x958
+#define SHAZBOT_PLAYER_VELOCITY_Y_OFFSET 0x95C
+#define SHAZBOT_PLAYER_VELOCITY_Z_OFFSET 0x960
+#define SHAZBOT_PLAYER_DATABLOCK_OFFSET 0x2D0
+#define SHAZBOT_PLAYER_MAX_FORWARD_SPEED_OFFSET 0x380
+#define SHAZBOT_PLAYER_ENERGY_OFFSET 0x77C
+#define SHAZBOT_PLAYER_DAMAGE_OFFSET 0x7F0
+#define SHAZBOT_DATABLOCK_MAX_ENERGY_OFFSET 0x80
+#define SHAZBOT_DATABLOCK_MAX_DAMAGE_OFFSET 0x84
+#define SHAZBOT_DATABLOCK_INHERIT_ENERGY_OFFSET 0x32B
+#define SHAZBOT_ENERGY_PERCENT_CALLBACK 0x0826CEA8
+#define SHAZBOT_TARGET_INFO_COUNT 512
+#define SHAZBOT_VISIBLE_SHAPEBASE_SET 0x084E32EC
+#define SHAZBOT_CLIENT_TARGET_LIST 0x08497DA4
+#define SHAZBOT_CLIENT_TARGET_LIST_ENTRIES_OFFSET 0x10
+#define SHAZBOT_CLIENT_TARGET_LIST_COUNT_OFFSET 0x210
+#define SHAZBOT_CLIENT_TARGET_ENTRY_STRIDE 0x10
+#define SHAZBOT_CLIENT_TARGET_LIST_CAPACITY 32
+#define SHAZBOT_CLIENT_TARGET_TYPE_OFFSET 0x30
+#define SHAZBOT_CLIENT_TARGET_POSITION_OFFSET 0x38
+#define SHAZBOT_SENSOR_DETECT_RADIUS_OFFSET 0x4C
+#define SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET 0x160
+#define SHAZBOT_CAMERA_FOV_VTABLE_OFFSET 0x1D8
+#define SHAZBOT_EYE_CALLBACK 0x0826CD7C
+#define SHAZBOT_FOV_CALLBACK 0x0826D4C8
+#define SHAZBOT_MUZZLE_VECTOR_CALLBACK 0x0826C96C
+#define SHAZBOT_MUZZLE_POINT_CALLBACK 0x0826CA04
+#define SHAZBOT_MOUNTED_IMAGE_GETTER 0x082733AC
+#define SHAZBOT_TARGET_SENSOR_CALLBACK 0x082E2040
+#define SHAZBOT_SENSOR_RADIUS_REGISTRATION 0x082D768E
+#define SHAZBOT_AIM_BILLBOARD_CALL 0x082FC32F
+#define SHAZBOT_NATIVE_BILLBOARD 0x0810F240
+#define SHAZBOT_IMAGE_PROJECTILE_OFFSET 0xCD8
+#define SHAZBOT_MOUNTED_IMAGES_OFFSET 0x384
+#define SHAZBOT_MOUNTED_IMAGE_STRIDE 0x74
+#define SHAZBOT_MOUNTED_IMAGE_COUNT 8
+#define SHAZBOT_HEADER_SIZE 28
+#define SHAZBOT_PAYLOAD_SIZE 16
+#define SHAZBOT_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_PAYLOAD_SIZE)
+#define SHAZBOT_VIEW_PAYLOAD_SIZE 36
+#define SHAZBOT_VIEW_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_VIEW_PAYLOAD_SIZE)
+#define SHAZBOT_MUZZLE_AIM_PAYLOAD_SIZE 40
+#define SHAZBOT_MUZZLE_AIM_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_MUZZLE_AIM_PAYLOAD_SIZE)
+#define SHAZBOT_HOOK_SERVER_PACKET_KIND 21
+#define SHAZBOT_MAX_GAME_PACKET_SIZE 1500
+#define SHAZBOT_HOOK_SERVER_PACKET_FRAME_SIZE \
+    (SHAZBOT_HEADER_SIZE + 2 + SHAZBOT_MAX_GAME_PACKET_SIZE)
+#define SHAZBOT_OBSERVATION_DIMENSIONS 32
+#define SHAZBOT_OBSERVATION_PAYLOAD_SIZE (SHAZBOT_OBSERVATION_DIMENSIONS * 4)
+#define SHAZBOT_OBSERVATION_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_OBSERVATION_PAYLOAD_SIZE)
+#define SHAZBOT_COMMAND_OBSERVATION_V5_KIND 7
+#define SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS 95
+#define SHAZBOT_COMMAND_OBSERVATION_V5_PAYLOAD_SIZE (SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS * 4)
+#define SHAZBOT_COMMAND_OBSERVATION_V5_PACKET_SIZE \
+    (SHAZBOT_HEADER_SIZE + SHAZBOT_COMMAND_OBSERVATION_V5_PAYLOAD_SIZE)
+#define SHAZBOT_COMMAND_OBSERVATION_V6_KIND 10
+#define SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS 95
+#define SHAZBOT_COMMAND_OBSERVATION_V6_PAYLOAD_SIZE (SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS * 4)
+#define SHAZBOT_COMMAND_OBSERVATION_V6_PACKET_SIZE \
+    (SHAZBOT_HEADER_SIZE + SHAZBOT_COMMAND_OBSERVATION_V6_PAYLOAD_SIZE)
+#define SHAZBOT_COMMAND_OBSERVATION_V7_KIND 11
+#define SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS 95
+#define SHAZBOT_COMMAND_OBSERVATION_V7_PAYLOAD_SIZE (SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS * 4)
+#define SHAZBOT_COMMAND_OBSERVATION_V7_PACKET_SIZE \
+    (SHAZBOT_HEADER_SIZE + SHAZBOT_COMMAND_OBSERVATION_V7_PAYLOAD_SIZE)
+#define SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_BASE 61
+#define SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_PER_SLOT 5
+#define SHAZBOT_V7_WEAPON_SLOT_COUNT 6
+#define SHAZBOT_NOTIFICATION_KIND 8
+#define SHAZBOT_NOTIFICATION_PAYLOAD_SIZE 4
+#define SHAZBOT_NOTIFICATION_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_NOTIFICATION_PAYLOAD_SIZE)
+#define SHAZBOT_NOTIFICATION_CAPTURE_SAVED 1
+#define SHAZBOT_NOTIFICATION_CAPTURE_START 2
+#define SHAZBOT_NOTIFICATION_SOCKET "/tmp/shazbot-notify.sock"
+#define SHAZBOT_V5_MOUNTED_WEAPON_ID_BITS_BASE 61
+#define SHAZBOT_V5_MOUNTED_WEAPON_ID_VALID 77
+#define SHAZBOT_V5_MOUNTED_PACK_ID_BITS_BASE 78
+#define SHAZBOT_V5_MOUNTED_PACK_ID_VALID 94
+#define SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_BITS_BASE 61
+#define SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_BITS_COUNT 16
+#define SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_VALID 77
+#define SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_BITS_BASE 78
+#define SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_BITS_COUNT 16
+#define SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_VALID 94
+#define SHAZBOT_MOVE_ACTION_DIMENSIONS 13
+#define SHAZBOT_COMMAND_ACTION_BASE SHAZBOT_MOVE_ACTION_DIMENSIONS
+#define SHAZBOT_COMMAND_ACTIONS 26
+#define SHAZBOT_ACTION_DIMENSIONS (SHAZBOT_MOVE_ACTION_DIMENSIONS + SHAZBOT_COMMAND_ACTIONS)
+#define SHAZBOT_ACTION_PAYLOAD_SIZE (SHAZBOT_ACTION_DIMENSIONS * 4)
+#define SHAZBOT_ACTION_PACKET_SIZE (SHAZBOT_HEADER_SIZE + SHAZBOT_ACTION_PAYLOAD_SIZE)
+#define SHAZBOT_COMMAND_USE_BACKPACK 8
+#define SHAZBOT_SAMPLE_PERIOD_NS 50000000ULL  /* 20 Hz maximum */
+
+typedef ssize_t (*shazbot_sendto_fn)(int, const void *, size_t, int,
+                                     const struct sockaddr *, socklen_t);
+static int shazbot_socket_fd = -1;
+static char shazbot_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static struct sockaddr_un shazbot_address;
+static socklen_t shazbot_address_length;
+static uint64_t shazbot_sequence;
+static uint64_t shazbot_last_attempt_ns;
+static int shazbot_socket_error_reported;
+static int shazbot_spatial_anchor_reported;
+static int shazbot_observation_anchor_reported;
+static int shazbot_target_reported;
+static int shazbot_poll_gate_reported;
+static int shazbot_memory_reported;
+static int shazbot_globals_reported;
+static int shazbot_socket_open_reported;
+static int shazbot_telemetry_sent_reported;
+static int shazbot_observation_collect_reported;
+static int shazbot_observation_sent_reported;
+static int shazbot_command_context_reported;
+static int shazbot_semantic_command_context_reported;
+static int shazbot_weapon_slot_context_reported;
+static unsigned shazbot_semantic_name_diagnostic_reported;
+static int shazbot_hud_weapon_context_valid;
+static char shazbot_hud_weapon_order[16][64];
+static size_t shazbot_hud_weapon_count;
+static char shazbot_hud_active_weapon[64];
+static int shazbot_hud_runtime_script_loaded;
+static int shazbot_hud_weapon_clear_reported;
+static int shazbot_hud_weapon_item_reported;
+static int shazbot_hud_weapon_active_reported;
+static unsigned shazbot_hud_weapon_item_events_logged;
+static int shazbot_notification_socket_fd = -1;
+static int shazbot_notification_socket_error_reported;
+static int shazbot_notification_sequence_valid;
+static uint64_t shazbot_notification_last_sequence;
+static int shazbot_auto_command_capture_active;
+static int shazbot_auto_command_capture_reported;
+static int shazbot_command_label_capture_active;
+static int shazbot_autoplay_demo_active;
+static int shazbot_action_socket_fd = -1;
+static char shazbot_action_socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static int shazbot_action_socket_error_reported;
+static int shazbot_action_connected_reported;
+static int shazbot_action_sequence_valid;
+static int shazbot_action_trigger_known;
+static uint64_t shazbot_action_last_sequence;
+static uint64_t shazbot_action_last_receive_ns;
+static int shazbot_action_trigger_state[7];
+static int shazbot_action_command_known;
+static int shazbot_action_command_state = -1;
+static int shazbot_local_player_valid;
+static char shazbot_player_failure_state[160];
+static uint64_t shazbot_player_status_time_ns;
+static int shazbot_demo_state_initialized;
+static int shazbot_demo_state;
+static int shazbot_aim_hook_attempted;
+static int shazbot_aim_hook_installed;
+static int shazbot_spatial_context_valid;
+static struct rv_memory shazbot_spatial_memory;
+static void *shazbot_spatial_player;
+static uint32_t shazbot_spatial_player_id;
+static float shazbot_spatial_detection_radius;
+static uint64_t shazbot_spatial_epoch;
+struct shazbot_aim_key { uint32_t target_id, image_slot; uint64_t epoch; };
+static struct shazbot_aim_key shazbot_aim_keys[64];
+
+static void shazbot_report_once(int *reported, const char *message) {
+    if (!*reported) {
+        fprintf(stderr, "[t2_hook] Shazbot: %s\n", message);
+        *reported = 1;
+    }
+}
+
+static uint16_t shazbot_get_u16le(const unsigned char *data) {
+    return (uint16_t)data[0] | (uint16_t)((uint16_t)data[1] << 8);
+}
+
+static uint32_t shazbot_get_u32le(const unsigned char *data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) |
+           ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+}
+
+static uint64_t shazbot_get_u64le(const unsigned char *data) {
+    uint64_t value = 0;
+    for (unsigned int i = 0; i < 8; i++) value |= (uint64_t)data[i] << (i * 8);
+    return value;
+}
+
+static float shazbot_get_f32le(const unsigned char *data) {
+    uint32_t bits = shazbot_get_u32le(data);
+    float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+
+static int shazbot_decode_action_frame(const unsigned char *frame, size_t length,
+                                       uint64_t *sequence,
+                                       float action[SHAZBOT_ACTION_DIMENSIONS]) {
+    if (!frame || !sequence || !action || length != SHAZBOT_ACTION_PACKET_SIZE ||
+        memcmp(frame, "SHZB", 4) != 0 || shazbot_get_u16le(frame + 4) != 1 ||
+        shazbot_get_u16le(frame + 6) != 2 ||
+        shazbot_get_u32le(frame + 8) != SHAZBOT_ACTION_PAYLOAD_SIZE) return 0;
+    *sequence = shazbot_get_u64le(frame + 12);
+    for (size_t index = 0; index < SHAZBOT_ACTION_DIMENSIONS; index++) {
+        action[index] = shazbot_get_f32le(frame + SHAZBOT_HEADER_SIZE + index * 4);
+        if (!isfinite(action[index])) return 0;
+        if (index < 3 && (action[index] < -1.0f || action[index] > 1.0f)) return 0;
+        if (index >= 3 && index < 6 && fabsf(action[index]) > 6.2831855f) return 0;
+        if (index >= 6 && action[index] != 0.0f && action[index] != 1.0f) return 0;
+    }
+    return 1;
+}
+
+static int shazbot_format_action_script(const float action[SHAZBOT_ACTION_DIMENSIONS],
+                                        const int previous[7], int previous_known,
+                                        char *script, size_t script_size,
+                                        int next_triggers[7]) {
+    if (!action || !script || !script_size || !next_triggers) return 0;
+    static const char *const trigger_functions[6] = {
+        "mouseFire", "altTrigger", "jump", "mouseJet", NULL, NULL
+    };
+    next_triggers[0] = action[6] >= 0.5f; /* free-look */
+    for (size_t index = 0; index < 6; index++)
+        next_triggers[index + 1] = action[7 + index] >= 0.5f;
+    int used = snprintf(script, script_size,
+                        "$mvPitch += %.8g; $mvYaw += %.8g; $mvRoll += %.8g; "
+                        "moveleft(%.8g); moveright(%.8g); movebackward(%.8g); "
+                        "moveforward(%.8g); movedown(%.8g); moveup(%.8g);",
+                        (double)action[3], (double)action[4], (double)action[5],
+                         (double)(action[0] < 0.0f ? -action[0] : 0.0f),
+                         (double)(action[0] > 0.0f ? action[0] : 0.0f),
+                         (double)(action[1] < 0.0f ? -action[1] : 0.0f),
+                         (double)(action[1] > 0.0f ? action[1] : 0.0f),
+                         (double)(action[2] < 0.0f ? -action[2] : 0.0f),
+                         (double)(action[2] > 0.0f ? action[2] : 0.0f));
+    if (used < 0 || (size_t)used >= script_size) return 0;
+    if (!previous_known || next_triggers[0] != previous[0]) {
+        int amount = snprintf(script + used, script_size - (size_t)used,
+                              " toggleFreeLook(%d);", next_triggers[0]);
+        if (amount < 0 || (size_t)amount >= script_size - (size_t)used) return 0;
+        used += amount;
+    }
+    for (size_t index = 0; index < 6; index++) {
+        if (previous_known && next_triggers[index + 1] == previous[index + 1]) continue;
+        if (trigger_functions[index]) {
+            int amount = snprintf(script + used, script_size - (size_t)used,
+                                  " %s(%d);", trigger_functions[index], next_triggers[index + 1]);
+            if (amount < 0 || (size_t)amount >= script_size - (size_t)used) return 0;
+            used += amount;
+        } else {
+            const size_t trigger_number = index;
+            int amount = snprintf(script + used, script_size - (size_t)used,
+                                  " $mvTriggerCount%zu += (($mvTriggerCount%zu & 1) == %d) ? 2 : 1;",
+                                  trigger_number, trigger_number, next_triggers[index + 1]);
+            if (amount < 0 || (size_t)amount >= script_size - (size_t)used) return 0;
+            used += amount;
+        }
+    }
+    return used > 0;
+}
+
+static const char *const shazbot_command_scripts[SHAZBOT_COMMAND_ACTIONS] = {
+    "useFirstWeaponSlot(1);", "useSecondWeaponSlot(1);", "useThirdWeaponSlot(1);",
+    "useFourthWeaponSlot(1);", "useFifthWeaponSlot(1);", "useSixthWeaponSlot(1);",
+    "nextWeapon(1);", "prevWeapon(1);", NULL,
+    "useRepairKit(1);", "useTargetingLaser(1);",
+    "quickPackEnergyPack(1);", "quickPackRepairPack(1);", "quickPackShieldPack(1);",
+    "quickPackCloakPack(1);", "quickPackJammerPack(1);", "quickPackAmmoPack(1);",
+    "quickPackSatchelCharge(1);", "quickPackDeployableStation(1);",
+    "quickPackIndoorTurret(1);", "quickPackOutdoorTurret(1);",
+    "quickPackMotionSensor(1);", "quickPackPulse(1);",
+    "throwWeapon(1);", "throwPack(1);", "throwFlag(1);",
+};
+static const char *const shazbot_command_names[SHAZBOT_COMMAND_ACTIONS] = {
+    "weapon_slot_1", "weapon_slot_2", "weapon_slot_3", "weapon_slot_4",
+    "weapon_slot_5", "weapon_slot_6", "weapon_next", "weapon_previous",
+    "backpack_use", "repair_kit", "targeting_laser", "pack_energy",
+    "pack_repair", "pack_shield", "pack_cloak", "pack_jammer", "pack_ammo",
+    "pack_satchel", "pack_station", "pack_indoor_turret", "pack_outdoor_turret",
+    "pack_motion_sensor", "pack_pulse", "drop_weapon", "drop_pack", "drop_flag",
+};
+
+static void shazbot_release_command_action(void) {
+    if (shazbot_action_command_known &&
+        shazbot_action_command_state == SHAZBOT_COMMAND_USE_BACKPACK && Con__evaluate)
+        (void)Con__evaluate("useBackPack(0);", 0, "t2launch/shazbot_command.cs", 0);
+    shazbot_action_command_state = -1;
+    shazbot_action_command_known = 0;
+}
+
+static void shazbot_apply_command_action(const float action[SHAZBOT_ACTION_DIMENSIONS]) {
+    if (!action) return;
+    int selected = -1;
+    for (size_t index = 0; index < SHAZBOT_COMMAND_ACTIONS; index++) {
+        if (action[SHAZBOT_COMMAND_ACTION_BASE + index] >= 0.5f) {
+            selected = (int)index;
+            break;
+        }
+    }
+    if (shazbot_action_command_known && selected == shazbot_action_command_state) return;
+    if (shazbot_action_command_known &&
+        shazbot_action_command_state == SHAZBOT_COMMAND_USE_BACKPACK && Con__evaluate)
+        (void)Con__evaluate("useBackPack(0);", 0, "t2launch/shazbot_command.cs", 0);
+    shazbot_action_command_state = selected;
+    shazbot_action_command_known = 1;
+    if (selected < 0 || !Con__evaluate) return;
+    if (selected == SHAZBOT_COMMAND_USE_BACKPACK) {
+        (void)Con__evaluate("useBackPack(1);", 0, "t2launch/shazbot_command.cs", 0);
+        fprintf(stderr, "[t2_hook] Shazbot command action: %s\n",
+                shazbot_command_names[selected]);
+        return;
+    }
+    (void)Con__evaluate(shazbot_command_scripts[selected], 0,
+                        "t2launch/shazbot_command.cs", 0);
+    fprintf(stderr, "[t2_hook] Shazbot command action: %s\n",
+            shazbot_command_names[selected]);
+}
+
+static int shazbot_open_action_socket(void) {
+    const char *configured = hook_option_str("telemetry.shazbot_action_socket");
+    if (!configured || !configured[0]) configured = "/tmp/shazbot-action.sock";
+    size_t length = strnlen(configured, sizeof shazbot_address.sun_path);
+    if (!length || length >= sizeof shazbot_address.sun_path) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    if (shazbot_action_socket_fd >= 0 && strcmp(configured, shazbot_action_socket_path) == 0)
+        return 1;
+    if (shazbot_action_socket_fd >= 0) close(shazbot_action_socket_fd);
+    shazbot_action_socket_fd = -1;
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, configured, length + 1);
+    socklen_t address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1);
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    if (bind(fd, (const struct sockaddr *)&address, address_length) != 0) {
+        int bind_error = errno;
+        if (bind_error == EADDRINUSE) {
+            struct stat info;
+            if (lstat(configured, &info) == 0 && S_ISSOCK(info.st_mode) && info.st_uid == geteuid()) {
+                int probe = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+                int active = probe >= 0 &&
+                    connect(probe, (const struct sockaddr *)&address, address_length) == 0;
+                if (probe >= 0) close(probe);
+                if (!active && unlink(configured) == 0 &&
+                    bind(fd, (const struct sockaddr *)&address, address_length) == 0) {
+                    bind_error = 0;
+                } else {
+                    errno = bind_error;
+                }
+            }
+        }
+        if (bind_error != 0) {
+            close(fd);
+            errno = bind_error;
+            return 0;
+        }
+    }
+    (void)chmod(configured, S_IRUSR | S_IWUSR);
+    shazbot_action_socket_fd = fd;
+    memcpy(shazbot_action_socket_path, configured, length + 1);
+    return 1;
+}
+
+static void shazbot_apply_client_action(const float action[SHAZBOT_ACTION_DIMENSIONS],
+                                        uint64_t sequence, uint64_t now_ns) {
+    char script[512];
+    int next_triggers[7];
+    if (!shazbot_format_action_script(action, shazbot_action_trigger_state,
+                                      shazbot_action_trigger_known,
+                                      script, sizeof script, next_triggers)) return;
+    if (Con__evaluate)
+        (void)Con__evaluate(script, 0, "t2launch/shazbot_action.cs", 0);
+    memcpy(shazbot_action_trigger_state, next_triggers, sizeof next_triggers);
+    shazbot_action_trigger_known = 1;
+    shazbot_apply_command_action(action);
+    shazbot_action_last_sequence = sequence;
+    shazbot_action_sequence_valid = 1;
+    shazbot_action_last_receive_ns = now_ns;
+    shazbot_report_once(&shazbot_action_connected_reported,
+                        "same-client action input is active");
+}
+
+static void shazbot_release_client_triggers(void) {
+    if (shazbot_action_trigger_known && Con__evaluate) {
+        (void)Con__evaluate(
+            "moveleft(0); moveright(0); movebackward(0); moveforward(0); movedown(0); moveup(0); "
+            "toggleFreeLook(0); mouseFire(0); altTrigger(0); jump(0); mouseJet(0); "
+            "$mvTriggerCount4 += (($mvTriggerCount4 & 1) == 0) ? 2 : 1; "
+            "$mvTriggerCount5 += (($mvTriggerCount5 & 1) == 0) ? 2 : 1;",
+            0, "t2launch/shazbot_action.cs", 0);
+        memset(shazbot_action_trigger_state, 0, sizeof shazbot_action_trigger_state);
+    }
+    shazbot_action_trigger_known = 0;
+    shazbot_release_command_action();
+}
+
+static void shazbot_poll_actions(void) {
+    if (!hook_option_bool("telemetry.shazbot_actions")) {
+        shazbot_release_client_triggers();
+        return;
+    }
+    if (target != &game_targets[0] || target->dedicated ||
+        !hook_option_bool("telemetry.shazbot")) {
+        shazbot_release_client_triggers();
+        return;
+    }
+    if (!shazbot_local_player_valid || shazbot_demo_state) {
+        unsigned char discard[256];
+        if (shazbot_action_socket_fd >= 0)
+            while (recv(shazbot_action_socket_fd, discard, sizeof discard, 0) >= 0) {}
+        shazbot_release_client_triggers();
+        return;
+    }
+
+    /* Delay binding the action input socket until a live local Player exists.
+       This keeps opt-in command polling out of menus and online join setup. */
+    if (!shazbot_open_action_socket()) {
+        if (!shazbot_action_socket_error_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot action socket unavailable: %s\n", strerror(errno));
+            shazbot_action_socket_error_reported = 1;
+        }
+        return;
+    }
+
+    unsigned char frame[256];
+    for (;;) {
+        ssize_t received = recv(shazbot_action_socket_fd, frame, sizeof frame, 0);
+        if (received < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR &&
+                !shazbot_action_socket_error_reported) {
+                fprintf(stderr, "[t2_hook] Shazbot action receive failed: %s\n", strerror(errno));
+                shazbot_action_socket_error_reported = 1;
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+        uint64_t sequence = 0;
+        float action[SHAZBOT_ACTION_DIMENSIONS];
+        if (!shazbot_decode_action_frame(frame, (size_t)received, &sequence, action)) {
+            shazbot_report_once(&shazbot_action_socket_error_reported,
+                                "discarded malformed or out-of-range action frame");
+            continue;
+        }
+        if (shazbot_action_sequence_valid && sequence <= shazbot_action_last_sequence) continue;
+        struct timespec now;
+        uint64_t now_ns = 0;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0)
+            now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        shazbot_apply_client_action(action, sequence, now_ns);
+    }
+
+    if (shazbot_action_sequence_valid && shazbot_action_last_receive_ns) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0) {
+            uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+            if (now_ns >= shazbot_action_last_receive_ns &&
+                now_ns - shazbot_action_last_receive_ns > 300000000ULL) {
+                shazbot_release_client_triggers();
+                shazbot_action_sequence_valid = 0;
+            }
+        }
+    }
+}
+
+static size_t shazbot_aim_key_cursor;
+static unsigned char shazbot_aim_billboard_call_patch[5] = {0xe8};
+static void shazbot_aim_billboard_wrapper(const float *hit, float width, float rotation);
+static void (*shazbot_native_billboard)(const float *, float, float) =
+    (void (*)(const float *, float, float))SHAZBOT_NATIVE_BILLBOARD;
+
+static void shazbot_put_u16le(unsigned char *out, uint16_t value) {
+    out[0] = (unsigned char)value;
+    out[1] = (unsigned char)(value >> 8);
+}
+
+static void shazbot_put_u32le(unsigned char *out, uint32_t value) {
+    for (unsigned int i = 0; i < 4; i++) out[i] = (unsigned char)(value >> (i * 8));
+}
+
+static void shazbot_put_u64le(unsigned char *out, uint64_t value) {
+    for (unsigned int i = 0; i < 8; i++) out[i] = (unsigned char)(value >> (i * 8));
+}
+
+static void shazbot_put_f32le(unsigned char *out, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    shazbot_put_u32le(out, bits);
+}
+
+/* IPC v1 telemetry_point: SHZB, version 1, kind 3, 16-byte payload, seq/timestamp,
+   then little-endian x/y/z/intensity IEEE-754 FP32. */
+static size_t shazbot_encode_telemetry(unsigned char out[SHAZBOT_PACKET_SIZE],
+                                       uint64_t sequence, uint64_t monotonic_time_ns,
+                                       const float xyz[3], float intensity) {
+    if (!out || !xyz || !isfinite(xyz[0]) || !isfinite(xyz[1]) ||
+        !isfinite(xyz[2]) || !isfinite(intensity)) return 0;
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, 3);
+    shazbot_put_u32le(out + 8, SHAZBOT_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    shazbot_put_f32le(out + 28, xyz[0]);
+    shazbot_put_f32le(out + 32, xyz[1]);
+    shazbot_put_f32le(out + 36, xyz[2]);
+    shazbot_put_f32le(out + 40, intensity);
+    return SHAZBOT_PACKET_SIZE;
+}
+
+static size_t shazbot_encode_view_cone(unsigned char out[SHAZBOT_VIEW_PACKET_SIZE],
+                                       uint64_t sequence, uint64_t monotonic_time_ns,
+                                       uint32_t object_id, const float origin[3],
+                                       const float forward[3], float fov_degrees,
+                                       float detection_radius) {
+    if (!out || !origin || !forward || !object_id ||
+        !isfinite(fov_degrees) || fov_degrees <= 0.0f || fov_degrees >= 180.0f ||
+        !isfinite(detection_radius) || detection_radius <= 0.0f) return 0;
+    float direction_length = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        if (!isfinite(origin[i]) || !isfinite(forward[i])) return 0;
+        direction_length += forward[i] * forward[i];
+    }
+    if (!isfinite(direction_length) || direction_length < 1.0e-8f) return 0;
+
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, 4); /* view_cone */
+    shazbot_put_u32le(out + 8, SHAZBOT_VIEW_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    shazbot_put_u32le(out + 28, object_id);
+    for (int i = 0; i < 3; i++) shazbot_put_f32le(out + 32 + i * 4, origin[i]);
+    for (int i = 0; i < 3; i++) shazbot_put_f32le(out + 44 + i * 4, forward[i]);
+    shazbot_put_f32le(out + 56, fov_degrees);
+    shazbot_put_f32le(out + 60, detection_radius);
+    return SHAZBOT_VIEW_PACKET_SIZE;
+}
+
+static size_t shazbot_encode_muzzle_aim(unsigned char out[SHAZBOT_MUZZLE_AIM_PACKET_SIZE],
+                                        uint64_t sequence, uint64_t monotonic_time_ns,
+                                        uint32_t object_id, uint32_t image_slot,
+                                        uint32_t target_id,
+                                        const float muzzle[3], const float aim[3],
+                                        float detection_radius) {
+    if (!out || !muzzle || !aim || !object_id || image_slot >= SHAZBOT_MOUNTED_IMAGE_COUNT ||
+        !isfinite(detection_radius) || detection_radius <= 0.0f) return 0;
+    for (int i = 0; i < 3; i++)
+        if (!isfinite(muzzle[i]) || !isfinite(aim[i])) return 0;
+
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, 5); /* muzzle_aim */
+    shazbot_put_u32le(out + 8, SHAZBOT_MUZZLE_AIM_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    shazbot_put_u32le(out + 28, object_id);
+    shazbot_put_u32le(out + 32, image_slot);
+    shazbot_put_u32le(out + 36, target_id);
+    for (int i = 0; i < 3; i++) shazbot_put_f32le(out + 40 + i * 4, muzzle[i]);
+    for (int i = 0; i < 3; i++) shazbot_put_f32le(out + 52 + i * 4, aim[i]);
+    shazbot_put_f32le(out + 64, detection_radius);
+    return SHAZBOT_MUZZLE_AIM_PACKET_SIZE;
+}
+
+/* The sender parameter is injectable so tests can deterministically model an
+   absent receiver (ENOENT) and a full socket (EAGAIN). */
+static int shazbot_send_datagram(int enabled, int fd,
+                                 const struct sockaddr_un *address,
+                                 socklen_t address_length,
+                                 const unsigned char *packet, size_t length,
+                                 shazbot_sendto_fn sender) {
+    if (!enabled || fd < 0 || !address || !packet || !length || !sender) return 0;
+    ssize_t sent = sender(fd, packet, length, MSG_DONTWAIT | MSG_NOSIGNAL,
+                          (const struct sockaddr *)address, address_length);
+    return sent == (ssize_t)length;
+}
+
+/* Validate the active client connection's readable control-object slot, then
+   require an exact local Player class, object-dictionary identity and the
+   researched world-transform reads before touching player fields. A spectator
+   camera or stale ghost emits nothing. */
+static int shazbot_local_player_position_detail(const struct rv_memory *memory,
+                                                void *connection, void *dictionary,
+                                                float xyz[3], uint32_t *player_id,
+                                                void **player_out,
+                                                const char **failure_reason) {
+#define SHAZBOT_PLAYER_FAIL(reason) do { \
+    if (failure_reason) *failure_reason = reason; \
+    return 0; \
+} while (0)
+    if (!memory || !xyz || !player_id)
+        SHAZBOT_PLAYER_FAIL("invalid local Player validation arguments");
+    if (!connection)
+        SHAZBOT_PLAYER_FAIL("waiting for an active server connection");
+    if (!rv_memory_range(memory, connection,
+            SHAZBOT_LOCAL_CONTROL_OFFSET + sizeof(uint32_t), PROT_READ))
+        SHAZBOT_PLAYER_FAIL("active connection pointer does not reference readable memory");
+    void *player = rv_pointer(connection, SHAZBOT_LOCAL_CONTROL_OFFSET);
+    if (!rv_memory_range(memory, player, 0x30, PROT_READ))
+        SHAZBOT_PLAYER_FAIL("GameConnection has no readable control object");
+    const char *class_name = rv_class_name(memory, player);
+    if (!class_name || strcmp(class_name, "Player") != 0)
+        SHAZBOT_PLAYER_FAIL("control object is not a Player");
+    uint32_t id = rv_word(player, 0x20);
+    if (!id || !rv_memory_range(memory, dictionary, 4096 * sizeof(uint32_t), PROT_READ) ||
+        rv_find_object(memory, dictionary, id) != player)
+        SHAZBOT_PLAYER_FAIL("Player is not present in the client object dictionary");
+    if (!rv_memory_range(memory, (unsigned char *)player + SHAZBOT_POSITION_X_OFFSET,
+                         SHAZBOT_POSITION_Z_OFFSET - SHAZBOT_POSITION_X_OFFSET + sizeof(float),
+                         PROT_READ))
+        SHAZBOT_PLAYER_FAIL("Player world position is unreadable");
+    xyz[0] = rv_float(player, SHAZBOT_POSITION_X_OFFSET);
+    xyz[1] = rv_float(player, SHAZBOT_POSITION_Y_OFFSET);
+    xyz[2] = rv_float(player, SHAZBOT_POSITION_Z_OFFSET);
+    if (!isfinite(xyz[0]) || !isfinite(xyz[1]) || !isfinite(xyz[2]))
+        SHAZBOT_PLAYER_FAIL("Player world position is non-finite");
+    *player_id = id;
+    if (player_out) *player_out = player;
+    if (failure_reason) *failure_reason = NULL;
+#undef SHAZBOT_PLAYER_FAIL
+    return 1;
+}
+
+static int shazbot_local_player_position(const struct rv_memory *memory,
+                                          void *connection, void *dictionary,
+                                          float xyz[3], uint32_t *player_id,
+                                          void **player_out) {
+    return shazbot_local_player_position_detail(memory, connection, dictionary,
+                                                 xyz, player_id, player_out, NULL);
+}
+
+static const unsigned char shazbot_eye_callback_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x74,0x53,0x8b,0x55,0x08,0x8d,0x5d,0xc0,
+    0x83,0xc4,0xf8,0x8b,0x02,0x53,0x52
+};
+static const unsigned char shazbot_fov_callback_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x08,0x8b,0x55,0x08,0xf6,0x42,0x40,0x02,
+    0x75,0x10,0x8b,0x02,0x83,0xc4,0xf4,0x52,0x8b,0x80,0xd8,0x01,0x00,0x00
+};
+static const unsigned char shazbot_muzzle_vector_callback_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x24,0x53,0x8b,0x45,0x10,0x8b,0x5d,0x08,
+    0x83,0xc4,0xf4,0x8b,0x40,0x08,0x50,0xe8,0x07,0x2d,0xf6,0xff
+};
+static const unsigned char shazbot_muzzle_point_callback_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x24,0x53,0x8b,0x45,0x10,0x83,0xc4,0xf4,
+    0x8b,0x40,0x08,0x50,0xe8,0x72,0x2c,0xf6,0xff
+};
+static const unsigned char shazbot_muzzle_vector_slot_bytes[] = {
+    0x8b,0x13,0x83,0xc4,0xfc,0x8d,0x45,0xf4,0x50,0x51,0x53,
+    0x8b,0x82,0x54,0x01,0x00,0x00,0xff,0xd0
+};
+static const unsigned char shazbot_muzzle_point_helper_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x50,0x8b,0x4d,0x08,0x56,0x53,0x8b,0x75,0x0c,
+    0x8b,0x5d,0x10
+};
+static const unsigned char shazbot_mounted_image_getter_bytes[] = {
+    0x55,0x89,0xe5,0x6b,0x55,0x0c,0x74,0x8b,0x45,0x08,0x05,0x84,0x03,
+    0x00,0x00,0x89,0xec,0x5d,0x8b,0x04,0x02,0xc3
+};
+static const unsigned char shazbot_target_sensor_bytes[] = {
+    0x89,0xd0,0xc1,0xe0,0x04,0x01,0xd0,0x8d,0x04,0x85,0x58,0x1a,0x00,0x00,
+    0x03,0x05,0xa0,0x7d,0x49,0x08,0x8b,0x40,0x40,0x85,0xc0,0x75,0x07,
+    0xb8,0xff,0xff,0xff,0xff,0xeb,0x03,0x8b,0x40,0x20,0x89,0xec,0x5d,0xc3
+};
+static const unsigned char shazbot_sensor_radius_field_bytes[] = {
+    0x6a,0x00,0x6a,0x01,0x6a,0x4c,0x6a,0x05,0x68,0xa2,0xf7,0x46,0x08,
+    0xe8,0x6c,0xe8,0xe0,0xff
+};
+static const unsigned char shazbot_velocity_getter_callback_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x20,0x56,0x53,0x8b,0x45,0x08,0x8d,0x5d,0xf4,
+    0x83,0xc4,0xf8,0x8b,0x10,0x50,0x53,0x8b,0x82,0xec,0x00,0x00,0x00,0xff,
+    0xd0,0x6a,0x64,0xe8,0xac,0x50,0xe8,0xff,0xd9,0x43,0x08,0x83,0xc4,0xf4,
+    0x83,0xec,0x08,0xdd,0x1c,0x24,0xd9,0x43,0x04,0x83,0xec,0x08,0xdd,0x1c,
+    0x24,0xd9,0x45,0xf4,0x89,0xc6,0x83,0xec,0x08,0xdd,0x1c,0x24,0x68,0x9e,
+    0x9b,0x45,0x08,0x6a,0x64,0x56,0xe8,0x4f,0x27,0xf6,0xff,0x89,0xf0,0x8d,
+    0x65,0xd8,0x5b,0x5e,0x89,0xec,0x5d,0xc3
+};
+static const unsigned char shazbot_velocity_x_init_bytes[] = {
+    0xc7,0x82,0x58,0x09,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const unsigned char shazbot_velocity_y_init_bytes[] = {
+    0xc7,0x82,0x5c,0x09,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const unsigned char shazbot_velocity_z_init_bytes[] = {
+    0xc7,0x82,0x60,0x09,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const unsigned char shazbot_energy_percent_callback_bytes[] = {
+    0x55,0x89,0xe5,0x8b,0x4d,0x08,0x8b,0x91,0xd0,0x02,0x00,0x00,
+    0x80,0xba,0x2b,0x03,0x00,0x00,0x00,0x75,0x23,0xd9,0xee,0xd9,0x82,
+    0x80,0x00,0x00,0x00,0xd8,0xd1,0xdf,0xe0,0x80,0xe4,0x45,0xfe,
+    0xcc,0x80,0xfc,0x40,0xdd,0xd9,0x72,0x5f,0xd9,0x81,0x7c,0x07,
+    0x00,0x00
+};
+static const unsigned char shazbot_damage_value_method_bytes[] = {
+    0x55,0x89,0xe5,0x8b,0x45,0x08,0x89,0xec,0x8b,0x90,0xd0,0x02,0x00,0x00,0x5d,
+    0xd9,0x80,0xf0,0x07,0x00,0x00,0xd8,0xb2,0x84,0x00,0x00,0x00,0xc3
+};
+static const unsigned char shazbot_max_forward_speed_field_bytes[] = {
+    0x68,0x80,0x03,0x00,0x00,0x6a,0x05,0x68,0x34,0x67,0x45,0x08
+};
+static const unsigned char shazbot_energy_mount_path_bytes[] = {
+    0x8b,0x91,0xe4,0x07,0x00,0x00,0x85,0xd2,0x74,0x4c,
+    0x8b,0x82,0xd0,0x02,0x00,0x00,0xd9,0xee,0xd9,0x80,0x80,0x00,0x00,0x00,
+    0xd8,0xd1,0xdf,0xe0,0x80,0xe4,0x45,0xfe,0xcc,0x80,0xfc,0x40,0xdd,0xd9,
+    0x72,0x2c,0x8b,0x82,0xd0,0x02,0x00,0x00,0x80,0xb8,0x2b,0x03,0x00,0x00,
+    0x00,0x75,0x09,0xd9,0x82,0x7c,0x07,0x00,0x00,0xeb,0xbc,0x90
+};
+static const unsigned char shazbot_energy_mount_loop_bytes[] = {
+    0x8b,0x82,0xe4,0x07,0x00,0x00,0x85,0xc0,0x74,0x06,0x89,0xc2,0xeb,0xda,
+    0x89,0xf6,0xd9,0xee,0xeb,0xa7,0xdd,0xd8,0xd9,0xee,0x89,0xec,0x5d,0xc3
+};
+static const unsigned char shazbot_jump_normal_x_init_bytes[] = {
+    0xc7,0x82,0x90,0x09,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const unsigned char shazbot_jump_normal_y_init_bytes[] = {
+    0xc7,0x82,0x94,0x09,0x00,0x00,0x00,0x00,0x00,0x00
+};
+static const unsigned char shazbot_jump_normal_z_init_bytes[] = {
+    0xc7,0x82,0x98,0x09,0x00,0x00,0x00,0x00,0x80,0x3f
+};
+static const unsigned char shazbot_contact_info_init_bytes[] = {
+    0xc7,0x86,0x40,0x0a,0x00,0x00,0x00,0x00,0x80,0x3f,
+    0xc6,0x86,0x3e,0x0a,0x00,0x00,0x00,
+    0xc6,0x86,0x3d,0x0a,0x00,0x00,0x00,
+    0xc6,0x86,0x3c,0x0a,0x00,0x00,0x00,
+    0xc7,0x40,0x04,0x00,0x00,0x80,0x3f,
+    0xc7,0x40,0x08,0x00,0x00,0x80,0x3f
+};
+static const unsigned char shazbot_jump_normal_store_bytes[] = {
+    0x80,0xbd,0x37,0xff,0xff,0xff,0x00,0x74,0x1b,
+    0x8b,0x45,0x88,0x89,0x83,0x90,0x09,0x00,0x00,
+    0x8b,0x45,0x8c,0x89,0x83,0x94,0x09,0x00,0x00,
+    0x8b,0x45,0x90,0x89,0x83,0x98,0x09,0x00,0x00
+};
+static const unsigned char shazbot_find_contact_gate_bytes[] = {
+    0x83,0xbb,0xe4,0x07,0x00,0x00,0x00,0x75,0x1b,0x8d,0x45,0x88,0x50,
+    0x8d,0x85,0x37,0xff,0xff,0xff,0x50,0x8d,0x85,0x36,0xff,0xff,0xff,
+    0x50,0x53,0xe8,0x97,0x52,0x00,0x00,0x83,0xc4,0x10
+};
+static const unsigned char shazbot_contact_info_contact_flag_bytes[] = {
+    0x88,0x87,0x3c,0x0a,0x00,0x00
+};
+static const unsigned char shazbot_contact_info_jump_flag_bytes[] = {
+    0x8b,0x55,0x10,0x8a,0x02,0x88,0x87,0x3d,0x0a,0x00,0x00
+};
+static const unsigned char shazbot_visibility_membership_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x10,0x56,0x53,0x8b,0x5d,0x08,0x8b,0x75,0x0c,
+    0xf6,0x43,0x40,0x02,0x74,0x29,0x85,0xf6,0x74,0x11,0xa1,0xec,0x32,0x4e,
+    0x08,0x83,0xc4,0xf8,0x8b,0x10,0x53,0x50,0x8b,0x42,0x4c,0xeb,0x0f,0xa1,
+    0xec,0x32,0x4e,0x08
+};
+static const unsigned char shazbot_client_target_index_bytes[] = {
+    0x55,0x89,0xe5,0x8b,0x55,0x08,0x8b,0x45,0x0c,0x3b,0x82,0x10,0x02,0x00,
+    0x00,0x73,0x0f,0xc1,0xe0,0x04,0x8d,0x44,0x02,0x10
+};
+static const unsigned char shazbot_client_target_ctor_bytes[] = {
+    0x55,0x89,0xe5,0x83,0xec,0x0c,0x57,0x8b,0x7d,0x08,0x56,0x53,0x8b,0x75,
+    0x0c,0x8b,0x5d,0x14,0x83,0xc4,0xf4,0x57,0xe8
+};
+static const unsigned char shazbot_assigned_task_type_bytes[] = {
+    0x80,0x7b,0x20,0x00,0x0f,0x94,0xc0,0x89,0xc2,0x83,0xe2,0x01,0x89,0x57,0x30
+};
+static const unsigned char shazbot_waypoint_type_bytes[] = {
+    0xc7,0x43,0x30,0x02,0x00,0x00,0x00
+};
+static const unsigned char shazbot_client_target_list_init_bytes[] = {
+    0x68,0xa0,0x02,0x00,0x00,0xe8,0xec,0x18,0xd7,0xff,0x50,0xe8,0xee,0x12,
+    0x00,0x00,0xa3,0xa4,0x7d,0x49,0x08
+};
+static const unsigned char shazbot_client_target_live_object_bytes[] = {
+    0xf6,0x40,0x3c,0x01,0x74,0x49,0x8b,0x50,0x24,0x85,0xd2,0x74,0x42
+};
+static const unsigned char shazbot_sensor_group_read_bytes[] = {
+    0x8b,0x81,0x34,0x84,0x00,0x00,0x89,0x86,0xd8,0x00,0x00,0x00
+};
+static const unsigned char shazbot_aim_billboard_call_original[] = {
+    0xe8,0x0c,0x2f,0xe1,0xff
+};
+static int shazbot_spatial_anchors_valid(const struct rv_memory *memory) {
+    return rv_memory_range(memory, (void *)SHAZBOT_EYE_CALLBACK,
+                           sizeof shazbot_eye_callback_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_EYE_CALLBACK, shazbot_eye_callback_bytes,
+                  sizeof shazbot_eye_callback_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_FOV_CALLBACK,
+                           sizeof shazbot_fov_callback_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_FOV_CALLBACK, shazbot_fov_callback_bytes,
+                  sizeof shazbot_fov_callback_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_MUZZLE_VECTOR_CALLBACK,
+                           sizeof shazbot_muzzle_vector_callback_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_MUZZLE_VECTOR_CALLBACK, shazbot_muzzle_vector_callback_bytes,
+                  sizeof shazbot_muzzle_vector_callback_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_MUZZLE_POINT_CALLBACK,
+                           sizeof shazbot_muzzle_point_callback_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_MUZZLE_POINT_CALLBACK, shazbot_muzzle_point_callback_bytes,
+                  sizeof shazbot_muzzle_point_callback_bytes) == 0 &&
+           rv_memory_range(memory, (void *)0x0826C9A4,
+                           sizeof shazbot_muzzle_vector_slot_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)0x0826C9A4, shazbot_muzzle_vector_slot_bytes,
+                  sizeof shazbot_muzzle_vector_slot_bytes) == 0 &&
+           rv_memory_range(memory, (void *)0x08273758,
+                           sizeof shazbot_muzzle_point_helper_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)0x08273758, shazbot_muzzle_point_helper_bytes,
+                  sizeof shazbot_muzzle_point_helper_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_MOUNTED_IMAGE_GETTER,
+                           sizeof shazbot_mounted_image_getter_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_MOUNTED_IMAGE_GETTER, shazbot_mounted_image_getter_bytes,
+                  sizeof shazbot_mounted_image_getter_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_TARGET_SENSOR_CALLBACK + 0x1f,
+                           sizeof shazbot_target_sensor_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)(SHAZBOT_TARGET_SENSOR_CALLBACK + 0x1f),
+                  shazbot_target_sensor_bytes, sizeof shazbot_target_sensor_bytes) == 0 &&
+           rv_memory_range(memory, (void *)SHAZBOT_SENSOR_RADIUS_REGISTRATION,
+                           sizeof shazbot_sensor_radius_field_bytes, PROT_READ | PROT_EXEC) &&
+           memcmp((void *)SHAZBOT_SENSOR_RADIUS_REGISTRATION,
+                   shazbot_sensor_radius_field_bytes,
+                   sizeof shazbot_sensor_radius_field_bytes) == 0;
+}
+
+/* Anchors for the separate 32-float Observation producer, including the
+   current ContactInfo/jump-surface guard for the non-terrain-specific normal. */
+static const char *shazbot_observation_anchor_failure(const struct rv_memory *memory) {
+#define SHAZBOT_CHECK_ANCHOR(address, bytes, label) do { \
+    if (!rv_memory_range(memory, (void *)(address), sizeof bytes, PROT_READ | PROT_EXEC)) \
+        return "unreadable anchor: " label; \
+    if (memcmp((void *)(address), bytes, sizeof bytes) != 0) \
+        return "mismatched anchor: " label; \
+} while (0)
+    SHAZBOT_CHECK_ANCHOR(SHAZBOT_ENERGY_PERCENT_CALLBACK, shazbot_energy_percent_callback_bytes,
+                         "energy-percent callback 0x0826cea8");
+    SHAZBOT_CHECK_ANCHOR(0x0826D000, shazbot_damage_value_method_bytes,
+                         "damage fraction method 0x0826d000");
+    SHAZBOT_CHECK_ANCHOR(0x082465B6, shazbot_max_forward_speed_field_bytes,
+                         "maxForwardSpeed field 0x082465b6");
+    SHAZBOT_CHECK_ANCHOR(0x0826CEE0, shazbot_energy_mount_path_bytes,
+                         "energy mount path 0x0826cee0");
+    SHAZBOT_CHECK_ANCHOR(0x0826CF20, shazbot_energy_mount_loop_bytes,
+                         "energy mount loop 0x0826cf20");
+    SHAZBOT_CHECK_ANCHOR(0x0826CB50, shazbot_velocity_getter_callback_bytes,
+                         "velocity getter 0x0826cb50");
+    SHAZBOT_CHECK_ANCHOR(0x08248D98, shazbot_velocity_x_init_bytes, "velocity X init 0x08248d98");
+    SHAZBOT_CHECK_ANCHOR(0x08248DA2, shazbot_velocity_y_init_bytes, "velocity Y init 0x08248da2");
+    SHAZBOT_CHECK_ANCHOR(0x08248DAC, shazbot_velocity_z_init_bytes, "velocity Z init 0x08248dac");
+    SHAZBOT_CHECK_ANCHOR(0x08248DB6, shazbot_jump_normal_x_init_bytes, "jump normal X init 0x08248db6");
+    SHAZBOT_CHECK_ANCHOR(0x08248DC0, shazbot_jump_normal_y_init_bytes, "jump normal Y init 0x08248dc0");
+    SHAZBOT_CHECK_ANCHOR(0x08248DCA, shazbot_jump_normal_z_init_bytes, "jump normal Z init 0x08248dca");
+    SHAZBOT_CHECK_ANCHOR(0x08248A23, shazbot_contact_info_init_bytes, "ContactInfo init 0x08248a23");
+    SHAZBOT_CHECK_ANCHOR(0x0824B27C, shazbot_jump_normal_store_bytes, "jump normal store 0x0824b27c");
+    SHAZBOT_CHECK_ANCHOR(0x0824B258, shazbot_find_contact_gate_bytes, "contact gate 0x0824b258");
+    SHAZBOT_CHECK_ANCHOR(0x08250DC6, shazbot_contact_info_contact_flag_bytes, "contact flag 0x08250dc6");
+    SHAZBOT_CHECK_ANCHOR(0x08250DF6, shazbot_contact_info_jump_flag_bytes, "jump flag 0x08250df6");
+    SHAZBOT_CHECK_ANCHOR(0x0825C8F8, shazbot_visibility_membership_bytes, "visibility membership 0x0825c8f8");
+    SHAZBOT_CHECK_ANCHOR(0x082E2850, shazbot_client_target_index_bytes, "client target index 0x082e2850");
+    SHAZBOT_CHECK_ANCHOR(0x082E2878, shazbot_client_target_ctor_bytes, "client target constructor 0x082e2878");
+    SHAZBOT_CHECK_ANCHOR(0x0827B066, shazbot_assigned_task_type_bytes, "assigned task type 0x0827b066");
+    SHAZBOT_CHECK_ANCHOR(0x082E2A94, shazbot_waypoint_type_bytes, "waypoint type 0x082e2a94");
+    SHAZBOT_CHECK_ANCHOR(0x082DC13A, shazbot_client_target_list_init_bytes,
+                         "client target list init 0x082dc13a");
+    SHAZBOT_CHECK_ANCHOR(0x082DD8FE, shazbot_client_target_live_object_bytes,
+                         "client target live object 0x082dd8fe");
+    SHAZBOT_CHECK_ANCHOR(0x0819401A, shazbot_sensor_group_read_bytes,
+                         "sensor group read 0x0819401a");
+#undef SHAZBOT_CHECK_ANCHOR
+    return NULL;
+}
+
+/* Read eye origin/forward via the researched Player virtual and camera FOV via
+   ShapeBase::getCameraFov's virtual slot. SensorData comes from this target's
+   TargetManager server-target record; no guessed fallback radius is emitted. */
+static int shazbot_local_view_cone(const struct rv_memory *memory, void *player,
+                                   uint32_t object_id, void *target_manager,
+                                   float origin[3], float forward[3], float *fov_degrees,
+                                   float *detection_radius) {
+    if (!memory || !player || !object_id || !target_manager ||
+        !origin || !forward || !fov_degrees || !detection_radius ||
+        !rv_memory_range(memory, player, SHAZBOT_TARGET_INFO_OFFSET + 4, PROT_READ)) return 0;
+    const char *player_class = rv_class_name(memory, player);
+    if (!player_class || strcmp(player_class, "Player") != 0 || rv_word(player, 0x20) != object_id)
+        return 0;
+
+    uint32_t target_id = rv_word(player, SHAZBOT_TARGET_ID_OFFSET);
+    if (target_id >= 512) return 0;
+    unsigned char *target_info = (unsigned char *)target_manager + SHAZBOT_TARGET_ARRAY_OFFSET +
+                                 (size_t)target_id * SHAZBOT_TARGET_STRIDE;
+    size_t manager_bytes = SHAZBOT_TARGET_ARRAY_OFFSET +
+                           ((size_t)target_id + 1) * SHAZBOT_TARGET_STRIDE;
+    if (!rv_memory_range(memory, target_manager, manager_bytes, PROT_READ) ||
+        rv_pointer(player, SHAZBOT_TARGET_INFO_OFFSET) != target_info) return 0;
+    void *sensor_data = rv_pointer(target_info, SHAZBOT_TARGET_SENSOR_DATA_OFFSET);
+    if (!rv_memory_range(memory, sensor_data, SHAZBOT_SENSOR_DETECT_RADIUS_OFFSET + 4, PROT_READ)) return 0;
+    const char *sensor_class = rv_class_name(memory, sensor_data);
+    if (!sensor_class || strcmp(sensor_class, "SensorData") != 0) return 0;
+    float radius = rv_float(sensor_data, SHAZBOT_SENSOR_DETECT_RADIUS_OFFSET);
+    if (!isfinite(radius) || radius <= 0.0f) return 0;
+
+    void *vtable = rv_pointer(player, 0);
+    if (!rv_memory_range(memory, vtable, SHAZBOT_CAMERA_FOV_VTABLE_OFFSET + 4, PROT_READ)) return 0;
+    void *eye_method = rv_pointer(vtable, SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET);
+    void *fov_method = rv_pointer(vtable, SHAZBOT_CAMERA_FOV_VTABLE_OFFSET);
+    if (!rv_memory_range(memory, eye_method, 1, PROT_EXEC) ||
+        !rv_memory_range(memory, fov_method, 1, PROT_EXEC)) return 0;
+
+    float matrix[16];
+    memset(matrix, 0, sizeof matrix);
+    ((void (*)(void *, float *))eye_method)(player, matrix);
+    float fov = ((float (*)(void *))fov_method)(player);
+    origin[0] = matrix[3]; origin[1] = matrix[7]; origin[2] = matrix[11];
+    /* Torque eye transforms use local +Y as forward: MatrixF::mulV(0,1,0). */
+    forward[0] = matrix[1]; forward[1] = matrix[5]; forward[2] = matrix[9];
+    float norm2 = forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2];
+    if (!isfinite(fov) || fov <= 0.0f || fov >= 180.0f || !isfinite(norm2) || norm2 < 1.0e-8f)
+        return 0;
+    /* MatrixF's eye basis is orthonormal; the viewer normalizes defensively. */
+    if (!isfinite(origin[0]) || !isfinite(origin[1]) || !isfinite(origin[2])) return 0;
+    *fov_degrees = fov;
+    *detection_radius = radius;
+    return 1;
+}
+
+static int shazbot_player_velocity(const struct rv_memory *memory, void *player,
+                                   float velocity[3]) {
+    if (!memory || !player || !velocity ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_PLAYER_VELOCITY_X_OFFSET,
+                         SHAZBOT_PLAYER_VELOCITY_Z_OFFSET - SHAZBOT_PLAYER_VELOCITY_X_OFFSET + 4,
+                         PROT_READ)) return 0;
+    velocity[0] = rv_float(player, SHAZBOT_PLAYER_VELOCITY_X_OFFSET);
+    velocity[1] = rv_float(player, SHAZBOT_PLAYER_VELOCITY_Y_OFFSET);
+    velocity[2] = rv_float(player, SHAZBOT_PLAYER_VELOCITY_Z_OFFSET);
+    return isfinite(velocity[0]) && isfinite(velocity[1]) && isfinite(velocity[2]);
+}
+
+static int shazbot_shape_velocity(const struct rv_memory *memory, void *target,
+                                  const char *class_name, float velocity[3]) {
+    if (!memory || !target || !class_name || !velocity) return 0;
+    if (strcmp(class_name, "Player") == 0)
+        return shazbot_player_velocity(memory, target, velocity);
+
+    /* These concrete ShapeBase classes have source-verified getVelocity
+       implementations: Item owns mVelocity; Vehicle and its three registered
+       subclasses inherit Vehicle::getVelocity. Other ShapeBases inherit the
+       zero-valued GameBase implementation and are not treated as moving. */
+    if (strcmp(class_name, "Item") != 0 && strcmp(class_name, "Vehicle") != 0 &&
+        strcmp(class_name, "WheeledVehicle") != 0 &&
+        strcmp(class_name, "FlyingVehicle") != 0 &&
+        strcmp(class_name, "HoverVehicle") != 0) return 0;
+
+#ifndef T2_HOOK_TEST
+    if (!rv_memory_range(memory, (void *)0x0826CB50,
+                         sizeof shazbot_velocity_getter_callback_bytes, PROT_READ | PROT_EXEC) ||
+        memcmp((void *)0x0826CB50, shazbot_velocity_getter_callback_bytes,
+               sizeof shazbot_velocity_getter_callback_bytes) != 0) return 0;
+#endif
+    void *vtable = rv_pointer(target, 0);
+    if (!rv_memory_range(memory, vtable, 0xF0, PROT_READ)) return 0;
+    void *getter = rv_pointer(vtable, 0xEC);
+    if (!rv_memory_range(memory, getter, 1, PROT_EXEC)) return 0;
+    /* The anchored ShapeBase console callback passes (&VectorF, this) to the
+       +0xec slot; mirror that verified aggregate-return ABI directly. */
+    ((void (*)(float *, void *))getter)(velocity, target);
+    return isfinite(velocity[0]) && isfinite(velocity[1]) && isfinite(velocity[2]);
+}
+
+/* Match #25034 getEnergyPercent: local energy when inheritance is off; otherwise
+   follow the mounted ShapeBase chain to its first non-inheriting energy source. */
+static int shazbot_player_energy_fraction(const struct rv_memory *memory, void *dictionary,
+                                           void *player, float *fraction) {
+    if (!memory || !dictionary || !player || !fraction) return 0;
+    void *current = player;
+    void *visited[32];
+    size_t visited_count = 0;
+    float denominator = 0.0f;
+    int inherited = 0;
+
+    for (size_t depth = 0; depth < sizeof visited / sizeof visited[0]; depth++) {
+        if (!rv_memory_range(memory, current, 0x7e8, PROT_READ)) return 0;
+        for (size_t i = 0; i < visited_count; i++)
+            if (visited[i] == current) return 0;
+        visited[visited_count++] = current;
+        uint32_t object_id = rv_word(current, 0x20);
+        if (!object_id || object_id == UINT32_MAX ||
+            rv_find_object(memory, dictionary, object_id) != current) return 0;
+
+        void *data = rv_pointer(current, SHAZBOT_PLAYER_DATABLOCK_OFFSET);
+        if (!rv_memory_range(memory, data, SHAZBOT_DATABLOCK_INHERIT_ENERGY_OFFSET + 1,
+                             PROT_READ)) return 0;
+        const char *data_class = rv_class_name(memory, data);
+        if (!data_class || (!inherited && strcmp(data_class, "PlayerData") != 0)) return 0;
+        const float maximum = rv_float(data, SHAZBOT_DATABLOCK_MAX_ENERGY_OFFSET);
+        if (inherited && denominator == 0.0f) {
+            if (!isfinite(maximum) || maximum <= 0.0f) return 0;
+            denominator = maximum;
+        }
+        const int data_inherits =
+            *((const unsigned char *)data + SHAZBOT_DATABLOCK_INHERIT_ENERGY_OFFSET) != 0;
+        if (!inherited && !data_inherits) {
+            denominator = maximum;
+        } else if (inherited && data_inherits) {
+            current = rv_pointer(current, 0x7e4);
+            if (!current) return 0;
+            continue;
+        } else if (!inherited && data_inherits) {
+            current = rv_pointer(current, 0x7e4);
+            if (!current) return 0;
+            inherited = 1;
+            continue;
+        }
+
+        float energy = rv_float(current, SHAZBOT_PLAYER_ENERGY_OFFSET);
+        if (!isfinite(denominator) || denominator <= 0.0f || !isfinite(energy) ||
+            energy < 0.0f || energy > denominator) return 0;
+        *fraction = energy / denominator;
+        return isfinite(*fraction) && *fraction >= 0.0f && *fraction <= 1.0f;
+    }
+    return 0; /* Refuse a malformed or cyclic mount chain. */
+}
+
+static int shazbot_player_health_fraction(const struct rv_memory *memory, void *dictionary,
+                                          void *player, float *fraction) {
+    if (!memory || !dictionary || !player || !fraction ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_PLAYER_DAMAGE_OFFSET,
+                         sizeof(float), PROT_READ) ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_PLAYER_DATABLOCK_OFFSET,
+                         sizeof(uint32_t), PROT_READ)) return 0;
+    uint32_t object_id = rv_word(player, 0x20);
+    if (!object_id || rv_find_object(memory, dictionary, object_id) != player) return 0;
+    void *data = rv_pointer(player, SHAZBOT_PLAYER_DATABLOCK_OFFSET);
+    if (!rv_memory_range(memory, (unsigned char *)data + SHAZBOT_DATABLOCK_MAX_DAMAGE_OFFSET,
+                         sizeof(float), PROT_READ)) return 0;
+    const char *data_class = rv_class_name(memory, data);
+    if (!data_class || strcmp(data_class, "PlayerData") != 0) return 0;
+    const float damage = rv_float(player, SHAZBOT_PLAYER_DAMAGE_OFFSET);
+    const float maximum = rv_float(data, SHAZBOT_DATABLOCK_MAX_DAMAGE_OFFSET);
+    if (!isfinite(damage) || !isfinite(maximum) || maximum <= 0.0f ||
+        damage < 0.0f || damage > maximum) return 0;
+    *fraction = 1.0f - damage / maximum;
+    return isfinite(*fraction) && *fraction >= 0.0f && *fraction <= 1.0f;
+}
+
+static int shazbot_player_speed_reference(const struct rv_memory *memory, void *player,
+                                          float *speed_reference) {
+    if (!memory || !player || !speed_reference ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_PLAYER_DATABLOCK_OFFSET,
+                         sizeof(uint32_t), PROT_READ)) return 0;
+    void *data = rv_pointer(player, SHAZBOT_PLAYER_DATABLOCK_OFFSET);
+    if (!rv_memory_range(memory, data, SHAZBOT_PLAYER_MAX_FORWARD_SPEED_OFFSET + sizeof(float),
+                         PROT_READ)) return 0;
+    const char *data_class = rv_class_name(memory, data);
+    if (!data_class || strcmp(data_class, "PlayerData") != 0) return 0;
+    const float value = rv_float(data, SHAZBOT_PLAYER_MAX_FORWARD_SPEED_OFFSET);
+    if (!isfinite(value) || value <= 0.0f) return 0;
+    *speed_reference = value;
+    return 1;
+}
+
+static int shazbot_player_target_info(const struct rv_memory *memory, void *player,
+                                      void *dictionary, void *target_manager,
+                                      uint32_t self_id, int local_sensor_group,
+                                      float position[3], float velocity[3], uint32_t *id_out) {
+    if (!memory || !player || !dictionary || !target_manager || !position || !velocity ||
+        !rv_memory_range(memory, player, SHAZBOT_TARGET_ID_OFFSET + sizeof(uint32_t), PROT_READ) ||
+        !rv_memory_range(memory, target_manager, SHAZBOT_TARGET_ARRAY_OFFSET, PROT_READ)) return 0;
+    const char *class_name = rv_class_name(memory, player);
+    if (!class_name || strcmp(class_name, "Player") != 0 ||
+        !(rv_word(player, 0x40) & 2)) return 0;
+    uint32_t id = rv_word(player, 0x20);
+    uint32_t target_id = rv_word(player, SHAZBOT_TARGET_ID_OFFSET);
+    if (!id || id == self_id || target_id >= SHAZBOT_TARGET_INFO_COUNT ||
+        rv_find_object(memory, dictionary, id) != player) return 0;
+
+    unsigned char *server_info = (unsigned char *)target_manager + SHAZBOT_TARGET_ARRAY_OFFSET +
+                                 (size_t)target_id * SHAZBOT_TARGET_INFO_STRIDE;
+    unsigned char *client_info = (unsigned char *)target_manager + SHAZBOT_CLIENT_TARGET_ARRAY_OFFSET +
+                                 (size_t)target_id * SHAZBOT_TARGET_INFO_STRIDE;
+    void *object_info = rv_pointer(player, SHAZBOT_TARGET_INFO_OFFSET);
+    size_t manager_bytes = SHAZBOT_CLIENT_TARGET_ARRAY_OFFSET +
+                           ((size_t)target_id + 1) * SHAZBOT_TARGET_INFO_STRIDE;
+    if (!rv_memory_range(memory, target_manager, manager_bytes, PROT_READ) ||
+        (object_info != server_info && object_info != client_info) ||
+        !rv_memory_range(memory, object_info, SHAZBOT_TARGET_INFO_STRIDE, PROT_READ)) return 0;
+    int target_group = (int32_t)rv_word(object_info, 0x18);
+    if (target_group <= 0 || local_sensor_group <= 0 || target_group == local_sensor_group ||
+        !rv_position(memory, player, RV_PLAYER, position) ||
+        !shazbot_player_velocity(memory, player, velocity)) return 0;
+    if (id_out) *id_out = id;
+    return 1;
+}
+
+static int shazbot_nearest_visible_enemy(const struct rv_memory *memory, void *visible_set,
+                                         void *dictionary, void *target_manager,
+                                         uint32_t self_id, int local_sensor_group,
+                                         const float self_position[3], const float self_velocity[3],
+                                         float position_delta[3],
+                                         float velocity_delta[3]) {
+    if (!memory || !visible_set || !dictionary || !target_manager || !self_id ||
+        !self_position || !self_velocity || !position_delta || !velocity_delta ||
+        !rv_memory_range(memory, visible_set, 0x3c, PROT_READ)) return 0;
+    uint32_t count = rv_word(visible_set, 0x30);
+    void *objects = rv_pointer(visible_set, 0x38);
+    if (count > 4096 || (count && !rv_memory_range(memory, objects, (size_t)count * 4, PROT_READ)))
+        return 0;
+
+    int found = 0;
+    double best_distance2 = 0.0;
+    uint32_t best_id = 0;
+    float best_position[3], best_velocity[3];
+    for (uint32_t i = 0; i < count; i++) {
+        void *candidate = rv_pointer(objects, (size_t)i * 4);
+        float position[3], velocity[3];
+        uint32_t id;
+        if (!shazbot_player_target_info(memory, candidate, dictionary, target_manager,
+                                        self_id, local_sensor_group, position, velocity, &id))
+            continue;
+        double dx = (double)position[0] - self_position[0];
+        double dy = (double)position[1] - self_position[1];
+        double dz = (double)position[2] - self_position[2];
+        double distance2 = dx * dx + dy * dy + dz * dz;
+        if (!isfinite(distance2)) continue;
+        if (!found || distance2 < best_distance2 ||
+            (distance2 == best_distance2 && id < best_id)) {
+            found = 1;
+            best_distance2 = distance2;
+            best_id = id;
+            memcpy(best_position, position, sizeof best_position);
+            memcpy(best_velocity, velocity, sizeof best_velocity);
+        }
+    }
+    if (!found) return 0;
+    for (int axis = 0; axis < 3; axis++) {
+        position_delta[axis] = best_position[axis] - self_position[axis];
+        velocity_delta[axis] = best_velocity[axis] - self_velocity[axis];
+        if (!isfinite(position_delta[axis]) || !isfinite(velocity_delta[axis])) return 0;
+    }
+    return 1;
+}
+
+static int shazbot_assigned_task_delta(const struct rv_memory *memory, void *client_target_list,
+                                       void *dictionary, void *target_manager,
+                                       const float self_position[3], const float self_velocity[3],
+                                       float delta[3], float velocity_delta[3],
+                                       int *velocity_valid) {
+    if (velocity_valid) *velocity_valid = 0;
+    if (!memory || !client_target_list || !self_position || !self_velocity || !delta ||
+        !velocity_delta ||
+        !rv_memory_range(memory, client_target_list,
+                         SHAZBOT_CLIENT_TARGET_LIST_COUNT_OFFSET + sizeof(uint32_t), PROT_READ))
+        return 0;
+    uint32_t count = rv_word(client_target_list, SHAZBOT_CLIENT_TARGET_LIST_COUNT_OFFSET);
+    if (count > SHAZBOT_CLIENT_TARGET_LIST_CAPACITY ||
+        !rv_memory_range(memory, client_target_list,
+                         SHAZBOT_CLIENT_TARGET_LIST_ENTRIES_OFFSET +
+                         (size_t)count * SHAZBOT_CLIENT_TARGET_ENTRY_STRIDE, PROT_READ)) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t entry_offset = SHAZBOT_CLIENT_TARGET_LIST_ENTRIES_OFFSET +
+                              (size_t)i * SHAZBOT_CLIENT_TARGET_ENTRY_STRIDE;
+        void *task = rv_pointer(client_target_list, entry_offset);
+        if (!rv_memory_range(memory, task, 0x48, PROT_READ)) continue;
+        const char *class_name = rv_class_name(memory, task);
+        if (!class_name || strcmp(class_name, "ClientTarget") != 0 ||
+            rv_word(task, SHAZBOT_CLIENT_TARGET_TYPE_OFFSET) != 0) continue;
+        float task_position[3] = {0.0f, 0.0f, 0.0f};
+        int position_valid = 1;
+        for (int axis = 0; axis < 3; axis++) {
+            task_position[axis] = rv_float(task, SHAZBOT_CLIENT_TARGET_POSITION_OFFSET +
+                                           (size_t)axis * sizeof(float));
+            if (!isfinite(task_position[axis])) position_valid = 0;
+        }
+        if (!position_valid) continue;
+        int delta_valid = 1;
+        for (int axis = 0; axis < 3; axis++) {
+            delta[axis] = task_position[axis] - self_position[axis];
+            if (!isfinite(delta[axis])) delta_valid = 0;
+        }
+        if (!delta_valid) continue;
+
+        /* A task may be a position-only assignment (target ID -1/stale) or
+           point to a live ghost. Use velocity only for the latter when the
+           client TargetInfo still owns that exact object and its concrete
+           ShapeBase class has a verified nonzero velocity implementation. */
+        uint32_t target_id = rv_word(task, 0x34);
+        if (dictionary && target_manager && target_id < SHAZBOT_TARGET_INFO_COUNT) {
+            unsigned char *client_info = (unsigned char *)target_manager +
+                SHAZBOT_CLIENT_TARGET_ARRAY_OFFSET +
+                (size_t)target_id * SHAZBOT_TARGET_INFO_STRIDE;
+            unsigned char *server_info = (unsigned char *)target_manager +
+                SHAZBOT_TARGET_ARRAY_OFFSET +
+                (size_t)target_id * SHAZBOT_TARGET_INFO_STRIDE;
+            size_t client_manager_bytes = SHAZBOT_CLIENT_TARGET_ARRAY_OFFSET +
+                ((size_t)target_id + 1) * SHAZBOT_TARGET_INFO_STRIDE;
+            size_t server_manager_bytes = SHAZBOT_TARGET_ARRAY_OFFSET +
+                ((size_t)target_id + 1) * SHAZBOT_TARGET_INFO_STRIDE;
+            if (rv_memory_range(memory, target_manager, client_manager_bytes, PROT_READ) &&
+                rv_memory_range(memory, target_manager, server_manager_bytes, PROT_READ) &&
+                (rv_word(client_info, 0x3c) & 1)) {
+                void *target = rv_pointer(client_info, 0x24);
+                if (rv_memory_range(memory, target, 0x274, PROT_READ)) {
+                    float target_velocity[3];
+                    uint32_t target_object_id = rv_word(target, 0x20);
+                    if (target_object_id && (rv_word(target, 0x40) & 2) &&
+                        rv_word(target, 0x270) == target_id &&
+                        rv_find_object(memory, dictionary, target_object_id) == target &&
+                        rv_pointer(target, SHAZBOT_TARGET_INFO_OFFSET) == server_info) {
+                        const char *target_class = rv_class_name(memory, target);
+                        if (target_class &&
+                            shazbot_shape_velocity(memory, target, target_class, target_velocity)) {
+                            int finite_delta = 1;
+                            for (int axis = 0; axis < 3; axis++) {
+                                velocity_delta[axis] = target_velocity[axis] - self_velocity[axis];
+                                if (!isfinite(velocity_delta[axis])) finite_delta = 0;
+                            }
+                            if (finite_delta && velocity_valid) *velocity_valid = 1;
+                        }
+                    }
+                }
+            }
+        }
+        return 1; /* type 0 is AssignedTask; type 1/2 tasks are not substituted. */
+    }
+    return 0;
+}
+
+static void shazbot_observation_put_vector(float values[SHAZBOT_OBSERVATION_DIMENSIONS],
+                                           size_t offset, const float vector[3]) {
+    for (int axis = 0; axis < 3; axis++) values[offset + (size_t)axis] = vector[axis];
+}
+
+static float shazbot_sqrtf(float value) {
+    float result;
+    __asm__ __volatile__("flds %1; fsqrt; fstps %0" : "=m"(result) : "m"(value));
+    return result;
+}
+
+/* +0x990 is mJumpSurfaceNormal, which persists between contacts. The paired
+   +0xa3c/+0xa3d ContactInfo flags are updated by findContact; require both a
+   current contact and a current jump-surface classification before exposing it. */
+static int shazbot_player_contact_normal(const struct rv_memory *memory, void *player,
+                                         float normal[3]) {
+    if (!memory || !player || !normal ||
+        !rv_memory_range(memory, player, 0xA4C, PROT_READ)) return 0;
+    const unsigned char *bytes = player;
+    if (rv_pointer(player, 0x7E4) || !bytes[0xA3C] || !bytes[0xA3D]) return 0;
+    float candidate[3] = {rv_float(player, 0x990), rv_float(player, 0x994),
+                          rv_float(player, 0x998)};
+    if (!isfinite(candidate[0]) || !isfinite(candidate[1]) || !isfinite(candidate[2])) return 0;
+    float length2 = candidate[0] * candidate[0] + candidate[1] * candidate[1] +
+                    candidate[2] * candidate[2];
+    if (!isfinite(length2) || length2 < 1.0e-8f) return 0;
+    float inverse_length = 1.0f / shazbot_sqrtf(length2);
+    for (int axis = 0; axis < 3; axis++) normal[axis] = candidate[axis] * inverse_length;
+    return 1;
+}
+
+static int shazbot_collect_observation(const struct rv_memory *memory, void *connection,
+                                       void *dictionary, void *target_manager,
+                                       void *visible_set, void *client_target_list,
+                                       int view_valid, const float view_forward[3],
+                                       float fov_degrees, float sensor_radius,
+                                       float values[SHAZBOT_OBSERVATION_DIMENSIONS]) {
+    if (!memory || !values) return 0;
+    memset(values, 0, SHAZBOT_OBSERVATION_DIMENSIONS * sizeof values[0]);
+    float player_position[3], player_velocity[3];
+    uint32_t player_id;
+    void *player = NULL;
+    if (!shazbot_local_player_position(memory, connection, dictionary, player_position,
+                                       &player_id, &player) ||
+        !shazbot_player_velocity(memory, player, player_velocity)) return 0;
+    shazbot_observation_put_vector(values, 0, player_position);
+    shazbot_observation_put_vector(values, 3, player_velocity);
+    float energy_fraction = 0.0f;
+    if (shazbot_player_energy_fraction(memory, dictionary, player, &energy_fraction)) {
+        values[30] = energy_fraction;
+        values[31] = 1.0f;
+    }
+    float speed_reference = 0.0f;
+    if (shazbot_player_speed_reference(memory, player, &speed_reference))
+        values[29] = speed_reference;
+
+    float contact_normal[3];
+    if (shazbot_player_contact_normal(memory, player, contact_normal)) {
+        shazbot_observation_put_vector(values, 6, contact_normal);
+        values[9] = 1.0f;
+    }
+    int local_sensor_group = 0;
+    if (rv_memory_range(memory, (unsigned char *)connection + SHAZBOT_LOCAL_SENSOR_GROUP_OFFSET,
+                        sizeof(uint32_t), PROT_READ))
+        local_sensor_group = (int32_t)rv_word(connection, SHAZBOT_LOCAL_SENSOR_GROUP_OFFSET);
+    float opponent_position_delta[3], opponent_velocity_delta[3];
+    if (shazbot_nearest_visible_enemy(memory, visible_set, dictionary, target_manager,
+                                      player_id, local_sensor_group, player_position,
+                                      player_velocity,
+                                      opponent_position_delta, opponent_velocity_delta)) {
+        shazbot_observation_put_vector(values, 10, opponent_position_delta);
+        shazbot_observation_put_vector(values, 13, opponent_velocity_delta);
+        values[16] = 1.0f;
+        values[17] = 1.0f;
+    }
+    float objective_delta[3], objective_velocity_delta[3];
+    int objective_velocity_valid = 0;
+    if (shazbot_assigned_task_delta(memory, client_target_list, dictionary, target_manager,
+                                    player_position, player_velocity, objective_delta,
+                                    objective_velocity_delta, &objective_velocity_valid)) {
+        shazbot_observation_put_vector(values, 18, objective_delta);
+        values[24] = 1.0f;
+        if (objective_velocity_valid) {
+            shazbot_observation_put_vector(values, 21, objective_velocity_delta);
+            values[25] = 1.0f;
+        }
+    }
+    if (view_valid && view_forward && isfinite(fov_degrees) && fov_degrees > 0.0f &&
+        fov_degrees < 180.0f && isfinite(sensor_radius) && sensor_radius > 0.0f) {
+        float length2 = view_forward[0] * view_forward[0] +
+                        view_forward[1] * view_forward[1] +
+                        view_forward[2] * view_forward[2];
+        if (isfinite(length2) && length2 > 1.0e-8f) {
+            float inverse_length = 1.0f / shazbot_sqrtf(length2);
+            float normalized_forward[3] = {view_forward[0] * inverse_length,
+                                           view_forward[1] * inverse_length,
+                                           view_forward[2] * inverse_length};
+            shazbot_observation_put_vector(values, 26, normalized_forward);
+        }
+    }
+    return 1;
+}
+
+static size_t shazbot_encode_observation(unsigned char out[SHAZBOT_OBSERVATION_PACKET_SIZE],
+                                         uint64_t sequence, uint64_t monotonic_time_ns,
+                                         const float values[SHAZBOT_OBSERVATION_DIMENSIONS]) {
+    if (!out || !values) return 0;
+    for (size_t i = 0; i < SHAZBOT_OBSERVATION_DIMENSIONS; i++)
+        if (!isfinite(values[i])) return 0;
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, 1); /* observation */
+    shazbot_put_u32le(out + 8, SHAZBOT_OBSERVATION_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    for (size_t i = 0; i < SHAZBOT_OBSERVATION_DIMENSIONS; i++)
+        shazbot_put_f32le(out + SHAZBOT_HEADER_SIZE + i * sizeof(float), values[i]);
+    return SHAZBOT_OBSERVATION_PACKET_SIZE;
+}
+
+static void shazbot_store_mounted_datablock_id(
+    const struct rv_memory *memory, void *player,
+    size_t image_slot, size_t feature_base, size_t valid_slot,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    unsigned char *state = (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                           image_slot * SHAZBOT_MOUNTED_IMAGE_STRIDE;
+    if (!rv_memory_range(memory, state, sizeof(uint32_t), PROT_READ)) return;
+    void *image_data = rv_pointer(state, 0);
+    if (!rv_memory_range(memory, image_data, 0x24, PROT_READ)) return;
+    const char *class_name = rv_class_name(memory, image_data);
+    if (!class_name || (strcmp(class_name, "ShapeBaseImageData") != 0 &&
+                        strcmp(class_name, "TurretImageData") != 0)) return;
+    uint32_t image_id = rv_word(image_data, 0x20);
+    if (image_id == 0 || image_id > 65535) return;
+    for (size_t bit = 0; bit < 16; bit++)
+        values[feature_base + bit] = (image_id & (1U << bit)) ? 1.0f : 0.0f;
+    values[valid_slot] = 1.0f;
+}
+
+static void shazbot_player_mounted_datablock_ids(
+    const struct rv_memory *memory, void *player,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    if (!memory || !player || !values ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                         2 * SHAZBOT_MOUNTED_IMAGE_STRIDE, SHAZBOT_MOUNTED_IMAGE_STRIDE,
+                         PROT_READ)) return;
+    shazbot_store_mounted_datablock_id(memory, player, 0,
+        SHAZBOT_V5_MOUNTED_WEAPON_ID_BITS_BASE, SHAZBOT_V5_MOUNTED_WEAPON_ID_VALID, values);
+    shazbot_store_mounted_datablock_id(memory, player, 2,
+        SHAZBOT_V5_MOUNTED_PACK_ID_BITS_BASE, SHAZBOT_V5_MOUNTED_PACK_ID_VALID, values);
+}
+
+static uint16_t shazbot_stable_name_hash(const char *name) {
+    uint32_t hash = 2166136261U;
+    if (!name) return 0;
+    for (const unsigned char *cursor = (const unsigned char *)name; *cursor; ++cursor) {
+        hash ^= *cursor;
+        hash *= 16777619U;
+    }
+    return (uint16_t)((hash ^ (hash >> 16)) & 0xffffU);
+}
+
+static void shazbot_report_semantic_name_diagnostic(
+    size_t image_slot, const char *stage, void *image_data,
+    const char *class_name, uint32_t shape_file_offset, void *shape_pointer,
+    const char *shape_name) {
+    if (image_slot >= sizeof(unsigned) * 8) return;
+    unsigned bit = 1U << image_slot;
+    if (shazbot_semantic_name_diagnostic_reported & bit) return;
+    fprintf(stderr,
+            "[t2_hook] Shazbot v6 shape diagnostic slot=%zu stage=%s image=%p class=%s shapeFile_offset=0x%x shapeFile_ptr=%p shapeFile=%s\n",
+            image_slot, stage, image_data,
+            class_name ? class_name : "<unreadable>", shape_file_offset, shape_pointer,
+            shape_name ? shape_name : "<unreadable>");
+    shazbot_semantic_name_diagnostic_reported |= bit;
+}
+
+static void shazbot_store_mounted_name_hash(
+    const struct rv_memory *memory, void *player, size_t image_slot,
+    size_t feature_base, size_t feature_count, size_t valid_slot,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS]) {
+    unsigned char *state = (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                           image_slot * SHAZBOT_MOUNTED_IMAGE_STRIDE;
+    if (!rv_memory_range(memory, state, sizeof(uint32_t), PROT_READ)) {
+        shazbot_report_semantic_name_diagnostic(image_slot, "slot-unreadable",
+                                                NULL, NULL, 0, NULL, NULL);
+        return;
+    }
+    void *image_data = rv_pointer(state, 0);
+    if (!image_data) return;
+    if (!rv_memory_range(memory, image_data, 0x24, PROT_READ)) {
+        shazbot_report_semantic_name_diagnostic(image_slot, "image-unreadable",
+                                                image_data, NULL, 0, NULL, NULL);
+        return;
+    }
+    const char *class_name = rv_class_name(memory, image_data);
+    if (!class_name || (strcmp(class_name, "ShapeBaseImageData") != 0 &&
+                        strcmp(class_name, "TurretImageData") != 0)) {
+        shazbot_report_semantic_name_diagnostic(image_slot, "unexpected-class",
+                                                image_data, class_name, 0, NULL, NULL);
+        return;
+    }
+    /* Client-created SimDataBlocks receive only their numeric ID from the
+       network event, so SimObject::objectName is intentionally unset. The
+       datablock's shapeFile is transmitted by ShapeBaseImageData::packData and
+       is available through the registered persist-field offset. */
+    uint32_t shape_file_offset = 0;
+    if (!rv_persist_field_offset(memory, image_data, "shapeFile", &shape_file_offset) ||
+        !rv_memory_range(memory, (unsigned char *)image_data + shape_file_offset,
+                         sizeof(uint32_t), PROT_READ)) {
+        shazbot_report_semantic_name_diagnostic(image_slot, "shapeFile-field-not-found",
+                                                image_data, class_name, shape_file_offset,
+                                                NULL, NULL);
+        return;
+    }
+    void *shape_pointer = rv_pointer(image_data, shape_file_offset);
+    const char *shape_name = rv_string(memory, shape_pointer, 128);
+    if (!shape_name || !shape_name[0]) {
+        shazbot_report_semantic_name_diagnostic(image_slot, "shapeFile-unreadable-or-empty",
+                                                image_data, class_name, shape_file_offset,
+                                                shape_pointer, NULL);
+        return;
+    }
+    shazbot_report_semantic_name_diagnostic(image_slot, "ok", image_data,
+                                            class_name, shape_file_offset,
+                                            shape_pointer, shape_name);
+    const uint16_t stable_hash = shazbot_stable_name_hash(shape_name);
+    for (size_t bit = 0; bit < feature_count; ++bit)
+        values[feature_base + bit] = (stable_hash & (1U << bit)) ? 1.0f : 0.0f;
+    values[valid_slot] = 1.0f;
+}
+
+static void shazbot_player_mounted_name_hashes(
+    const struct rv_memory *memory, void *player,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS]) {
+    if (!memory || !player || !values ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                         2 * SHAZBOT_MOUNTED_IMAGE_STRIDE, SHAZBOT_MOUNTED_IMAGE_STRIDE,
+                          PROT_READ)) return;
+    shazbot_store_mounted_name_hash(memory, player, 0,
+        SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_BITS_BASE,
+        SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_BITS_COUNT,
+        SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_VALID, values);
+    shazbot_store_mounted_name_hash(memory, player, 2,
+        SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_BITS_BASE,
+        SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_BITS_COUNT,
+        SHAZBOT_V6_MOUNTED_PACK_NAME_HASH_VALID, values);
+}
+
+#define SHAZBOT_HUD_WEAPON_ORDER_CAPACITY 16
+#define SHAZBOT_HUD_WEAPON_NAME_CAPACITY 64
+
+static void shazbot_hud_weapon_clear_state(void) {
+    memset(shazbot_hud_weapon_order, 0, sizeof shazbot_hud_weapon_order);
+    shazbot_hud_weapon_count = 0;
+    shazbot_hud_active_weapon[0] = 0;
+    shazbot_hud_weapon_context_valid = 1;
+    shazbot_report_once(&shazbot_hud_weapon_clear_reported,
+                        "client weapon-HUD inventory reset was observed");
+}
+
+static const char *shazbot_stock_hud_weapon_name(int hud_slot) {
+    static const char *const names[] = {
+        "Blaster", "Plasma", "Chaingun", "Disc", "GrenadeLauncher",
+        "SniperRifle", "ELFGun", "Mortar", "MissileLauncher",
+        "TargetingLaser", "ShockLance", "TR2Disc", "TR2GrenadeLauncher",
+        "TR2Chaingun", "TR2GoldTargetingLaser", "TR2SilverTargetingLaser",
+        "TR2ShockLance", "TR2Mortar",
+    };
+    if (hud_slot < 0 || (size_t)hud_slot >= sizeof names / sizeof names[0]) return NULL;
+    return names[hud_slot];
+}
+
+static void shazbot_hud_weapon_update_state(int hud_slot, const char *name, int add_item) {
+    const char *resolved_name = name;
+    if (!resolved_name || !resolved_name[0])
+        resolved_name = shazbot_stock_hud_weapon_name(hud_slot);
+    if (shazbot_hud_weapon_item_events_logged < 64) {
+        fprintf(stderr,
+                "[t2_hook] Shazbot: weapon-HUD item event slot=%d name=%s resolved=%s add=%d\n",
+                hud_slot, name ? name : "", resolved_name ? resolved_name : "", add_item);
+        shazbot_hud_weapon_item_events_logged++;
+    }
+    if (!resolved_name || !resolved_name[0] ||
+        strlen(resolved_name) >= SHAZBOT_HUD_WEAPON_NAME_CAPACITY) return;
+    shazbot_hud_weapon_context_valid = 1;
+    shazbot_report_once(&shazbot_hud_weapon_item_reported,
+                        "client weapon-HUD item updates were observed");
+    size_t found = shazbot_hud_weapon_count;
+    for (size_t index = 0; index < shazbot_hud_weapon_count; ++index) {
+        if (strcmp(shazbot_hud_weapon_order[index], resolved_name) == 0) {
+            found = index;
+            break;
+        }
+    }
+    if (add_item) {
+        if (found != shazbot_hud_weapon_count) return;
+        if (shazbot_hud_weapon_count >= SHAZBOT_HUD_WEAPON_ORDER_CAPACITY) {
+            shazbot_hud_weapon_context_valid = 0;
+            return;
+        }
+        snprintf(shazbot_hud_weapon_order[shazbot_hud_weapon_count],
+                  sizeof shazbot_hud_weapon_order[0], "%s", resolved_name);
+        shazbot_hud_weapon_count++;
+        return;
+    }
+    if (found == shazbot_hud_weapon_count) {
+        shazbot_hud_weapon_context_valid = 0;
+        return;
+    }
+    for (size_t index = found; index + 1 < shazbot_hud_weapon_count; ++index)
+        memcpy(shazbot_hud_weapon_order[index], shazbot_hud_weapon_order[index + 1],
+               sizeof shazbot_hud_weapon_order[index]);
+    memset(shazbot_hud_weapon_order[--shazbot_hud_weapon_count], 0,
+           sizeof shazbot_hud_weapon_order[0]);
+    if (strcmp(shazbot_hud_active_weapon, resolved_name) == 0)
+        shazbot_hud_active_weapon[0] = 0;
+}
+
+static void shazbot_hud_weapon_active_state(const char *name) {
+    if (!name || strlen(name) >= sizeof shazbot_hud_active_weapon) {
+        shazbot_hud_active_weapon[0] = 0;
+        return;
+    }
+    snprintf(shazbot_hud_active_weapon, sizeof shazbot_hud_active_weapon, "%s", name);
+    shazbot_report_once(&shazbot_hud_weapon_active_reported,
+                        "client weapon-HUD selection updates were observed");
+}
+
+static uint32_t shazbot_weapon_item_code(const char *name) {
+    static const struct { const char *name; uint32_t code; } codes[] = {
+        {"Blaster", 1}, {"Plasma", 2}, {"Chaingun", 3}, {"Disc", 4},
+        {"GrenadeLauncher", 5}, {"SniperRifle", 6}, {"ELFGun", 7},
+        {"Mortar", 8}, {"MissileLauncher", 9}, {"TargetingLaser", 10},
+        {"ShockLance", 11}, {"TR2Disc", 4}, {"TR2GrenadeLauncher", 5},
+        {"TR2Chaingun", 3}, {"TR2GoldTargetingLaser", 10},
+        {"TR2SilverTargetingLaser", 10}, {"TR2ShockLance", 11},
+        {"TR2Mortar", 8},
+    };
+    if (!name) return 0;
+    for (size_t i = 0; i < sizeof codes / sizeof codes[0]; ++i)
+        if (strcmp(name, codes[i].name) == 0) return codes[i].code;
+    return 0;
+}
+
+static void shazbot_store_hud_weapon_slot_codes(
+    float values[SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS]) {
+    if (!values || !shazbot_hud_weapon_context_valid) return;
+    for (size_t slot = 0; slot < SHAZBOT_V7_WEAPON_SLOT_COUNT; ++slot) {
+        if (slot >= shazbot_hud_weapon_count) continue;
+        const uint32_t code = shazbot_weapon_item_code(shazbot_hud_weapon_order[slot]);
+        for (size_t bit = 0; bit < SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_PER_SLOT; ++bit)
+            values[SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_BASE +
+                   slot * SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_PER_SLOT + bit] =
+                (code & (1U << bit)) ? 1.0f : 0.0f;
+    }
+}
+
+static void shazbot_apply_hud_weapon_context(
+    float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    if (!values || !shazbot_hud_weapon_context_valid) return;
+    memset(values + 34, 0, (47 - 34) * sizeof values[0]);
+    const size_t slot_count = shazbot_hud_weapon_count < 6 ? shazbot_hud_weapon_count : 6;
+    for (size_t slot = 0; slot < slot_count; ++slot)
+        values[41 + slot] = 1.0f;
+    values[47] = 1.0f;
+    if (!shazbot_hud_active_weapon[0]) return;
+    for (size_t slot = 0; slot < slot_count; ++slot) {
+        if (strcmp(shazbot_hud_weapon_order[slot], shazbot_hud_active_weapon) == 0) {
+            values[34 + slot] = 1.0f;
+            values[40] = 1.0f;
+            return;
+        }
+    }
+}
+
+static int shazbot_pack_command_index(const char *shape_file) {
+    static const char *const shape_files[12] = {
+        "pack_upgrade_energy.dts", "pack_upgrade_repair.dts",
+        "pack_upgrade_shield.dts", "pack_upgrade_cloaking.dts",
+        "pack_upgrade_sensorjammer.dts", "pack_upgrade_ammo.dts",
+        "pack_upgrade_satchel.dts", "pack_deploy_inventory.dts",
+        "pack_deploy_turreti.dts", "pack_deploy_turreto.dts",
+        "pack_deploy_sensor_motion.dts", "pack_deploy_sensor_pulse.dts",
+    };
+    if (!shape_file) return -1;
+    for (int index = 0; index < 12; ++index)
+        if (strcmp(shape_file, shape_files[index]) == 0) return index;
+    return -1;
+}
+
+static void shazbot_apply_mounted_pack_availability(
+    const struct rv_memory *memory, void *player,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    unsigned char *state = (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                           2 * SHAZBOT_MOUNTED_IMAGE_STRIDE;
+    if (!rv_memory_range(memory, state, sizeof(uint32_t), PROT_READ)) return;
+    void *image_data = rv_pointer(state, 0);
+    const char *class_name = rv_class_name(memory, image_data);
+    if (!class_name || (strcmp(class_name, "ShapeBaseImageData") != 0 &&
+                        strcmp(class_name, "TurretImageData") != 0)) return;
+    uint32_t shape_file_offset = 0;
+    if (!rv_persist_field_offset(memory, image_data, "shapeFile", &shape_file_offset) ||
+        !rv_memory_range(memory, (unsigned char *)image_data + shape_file_offset,
+                         sizeof(uint32_t), PROT_READ)) return;
+    const char *shape_file = rv_string(memory,
+        rv_pointer(image_data, shape_file_offset), 128);
+    if (!shape_file || !shape_file[0]) return;
+    const int index = shazbot_pack_command_index(shape_file);
+    if (index < 0) return;
+    memset(values + 48, 0, 12 * sizeof values[0]);
+    values[48 + index] = 1.0f;
+    values[60] = 1.0f;
+}
+
+static int shazbot_player_command_context(
+    const struct rv_memory *memory, void *dictionary, void *player,
+    float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    static const char *const pack_items[12] = {
+        "EnergyPack", "RepairPack", "ShieldPack", "CloakingPack",
+        "SensorJammerPack", "AmmoPack", "SatchelCharge", "InventoryDeployable",
+        "TurretIndoorDeployable", "TurretOutdoorDeployable",
+        "MotionSensorDeployable", "PulseSensorDeployable",
+    };
+    if (!memory || !dictionary || !player || !values) return 0;
+
+    float health_fraction = 0.0f;
+    if (shazbot_player_health_fraction(memory, dictionary, player, &health_fraction)) {
+        values[32] = health_fraction;
+        values[33] = 1.0f;
+    }
+    shazbot_player_mounted_datablock_ids(memory, player, values);
+
+    float weapon_count_value = 0.0f;
+    if (!rv_dynamic_float(memory, player, "weaponSlotCount", &weapon_count_value) ||
+        weapon_count_value < 0.0f || weapon_count_value > 32.0f ||
+        (float)(int)weapon_count_value != weapon_count_value) return 1;
+    const size_t weapon_count = (size_t)weapon_count_value;
+    int inventory_valid = 1;
+    const unsigned char *weapon_image = (const unsigned char *)player +
+        SHAZBOT_MOUNTED_IMAGES_OFFSET; /* $WeaponSlot is 0 in the shipped scripts. */
+    if (!rv_memory_range(memory, weapon_image, SHAZBOT_MOUNTED_IMAGE_STRIDE, PROT_READ))
+        inventory_valid = 0;
+    const char *current_weapon = NULL;
+    if (inventory_valid) {
+        void *image_data = rv_pointer(weapon_image, 0);
+        const char *image_class = rv_class_name(memory, image_data);
+        if (image_class && strcmp(image_class, "ShapeBaseImageData") == 0)
+            current_weapon = rv_dynamic_field(memory, image_data, "item");
+    }
+
+    for (size_t slot = 0; slot < 6; slot++) {
+        char field_name[24];
+        snprintf(field_name, sizeof field_name, "weaponSlot[%zu]", slot);
+        const char *weapon_name = rv_dynamic_field(memory, player, field_name);
+        if (slot < weapon_count && !weapon_name) inventory_valid = 0;
+        if (slot < weapon_count && weapon_name && weapon_name[0]) {
+            char inventory_field[96];
+            int used = snprintf(inventory_field, sizeof inventory_field, "inv[%s]", weapon_name);
+            float count = 0.0f;
+            if (used < 0 || (size_t)used >= sizeof inventory_field) inventory_valid = 0;
+            else if (rv_dynamic_float(memory, player, inventory_field, &count) && count > 0.0f)
+                values[41 + slot] = 1.0f;
+            if (current_weapon && strcmp(current_weapon, weapon_name) == 0) {
+                values[34 + slot] = 1.0f;
+                values[40] = 1.0f;
+            }
+        }
+    }
+
+    if (!inventory_valid) {
+        memset(values + 34, 0, (47 - 34) * sizeof values[0]);
+        return 1;
+    }
+    values[47] = 1.0f;
+    for (size_t index = 0; index < 12; index++) {
+        char inventory_field[48];
+        snprintf(inventory_field, sizeof inventory_field, "inv[%s]", pack_items[index]);
+        float count = 0.0f;
+        if (rv_dynamic_float(memory, player, inventory_field, &count) && count > 0.0f)
+            values[48 + index] = 1.0f;
+    }
+    values[60] = 1.0f;
+    return 1;
+}
+
+static size_t shazbot_encode_command_observation_v5(
+    unsigned char out[SHAZBOT_COMMAND_OBSERVATION_V5_PACKET_SIZE], uint64_t sequence,
+    uint64_t monotonic_time_ns,
+    const float values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS]) {
+    if (!out || !values) return 0;
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS; index++)
+        if (!isfinite(values[index])) return 0;
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, SHAZBOT_COMMAND_OBSERVATION_V5_KIND);
+    shazbot_put_u32le(out + 8, SHAZBOT_COMMAND_OBSERVATION_V5_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS; index++)
+        shazbot_put_f32le(out + SHAZBOT_HEADER_SIZE + index * sizeof(float), values[index]);
+    return SHAZBOT_COMMAND_OBSERVATION_V5_PACKET_SIZE;
+}
+
+static size_t shazbot_encode_command_observation_v6(
+    unsigned char out[SHAZBOT_COMMAND_OBSERVATION_V6_PACKET_SIZE], uint64_t sequence,
+    uint64_t monotonic_time_ns,
+    const float values[SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS]) {
+    if (!out || !values) return 0;
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS; index++)
+        if (!isfinite(values[index])) return 0;
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, SHAZBOT_COMMAND_OBSERVATION_V6_KIND);
+    shazbot_put_u32le(out + 8, SHAZBOT_COMMAND_OBSERVATION_V6_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS; index++)
+        shazbot_put_f32le(out + SHAZBOT_HEADER_SIZE + index * sizeof(float), values[index]);
+    return SHAZBOT_COMMAND_OBSERVATION_V6_PACKET_SIZE;
+}
+
+static size_t shazbot_encode_command_observation_v7(
+    unsigned char out[SHAZBOT_COMMAND_OBSERVATION_V7_PACKET_SIZE], uint64_t sequence,
+    uint64_t monotonic_time_ns,
+    const float values[SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS]) {
+    if (!out || !values) return 0;
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS; index++)
+        if (!isfinite(values[index])) return 0;
+    memcpy(out, "SHZB", 4);
+    shazbot_put_u16le(out + 4, 1);
+    shazbot_put_u16le(out + 6, SHAZBOT_COMMAND_OBSERVATION_V7_KIND);
+    shazbot_put_u32le(out + 8, SHAZBOT_COMMAND_OBSERVATION_V7_PAYLOAD_SIZE);
+    shazbot_put_u64le(out + 12, sequence);
+    shazbot_put_u64le(out + 20, monotonic_time_ns);
+    for (size_t index = 0; index < SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS; index++)
+        shazbot_put_f32le(out + SHAZBOT_HEADER_SIZE + index * sizeof(float), values[index]);
+    return SHAZBOT_COMMAND_OBSERVATION_V7_PACKET_SIZE;
+}
+
+static const char *shazbot_notification_socket_path(void) {
+    const char *configured = hook_option_str("telemetry.shazbot_notification_socket");
+    return configured && configured[0] ? configured : SHAZBOT_NOTIFICATION_SOCKET;
+}
+
+static int shazbot_open_notification_socket(void) {
+    if (shazbot_notification_socket_fd >= 0) return 1;
+    const char *path = shazbot_notification_socket_path();
+    const size_t path_length = path ? strlen(path) : 0;
+    if (path_length == 0 || path_length >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        return 0;
+    }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof address);
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, path, path_length + 1);
+    socklen_t address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) +
+                                           path_length + 1);
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) return 0;
+    if (bind(fd, (const struct sockaddr *)&address, address_length) != 0) {
+        int bind_error = errno;
+        if (bind_error == EADDRINUSE) {
+            struct stat info;
+            if (lstat(path, &info) == 0 &&
+                S_ISSOCK(info.st_mode) && info.st_uid == geteuid()) {
+                int probe = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+                int active = probe >= 0 &&
+                    connect(probe, (const struct sockaddr *)&address, address_length) == 0;
+                if (probe >= 0) close(probe);
+                if (!active && unlink(path) == 0 &&
+                    bind(fd, (const struct sockaddr *)&address, address_length) == 0) {
+                    bind_error = 0;
+                } else {
+                    errno = bind_error;
+                }
+            }
+        }
+        if (bind_error != 0) {
+            close(fd);
+            errno = bind_error;
+            return 0;
+        }
+    }
+    (void)chmod(path, S_IRUSR | S_IWUSR);
+    shazbot_notification_socket_fd = fd;
+    return 1;
+}
+
+static int shazbot_decode_notification(const unsigned char *frame, size_t length,
+                                       uint64_t *sequence, uint32_t *notification) {
+    if (!frame || !sequence || !notification || length != SHAZBOT_NOTIFICATION_PACKET_SIZE ||
+        memcmp(frame, "SHZB", 4) != 0 || shazbot_get_u16le(frame + 4) != 1 ||
+        shazbot_get_u16le(frame + 6) != SHAZBOT_NOTIFICATION_KIND ||
+        shazbot_get_u32le(frame + 8) != SHAZBOT_NOTIFICATION_PAYLOAD_SIZE) return 0;
+    *sequence = shazbot_get_u64le(frame + 12);
+    *notification = shazbot_get_u32le(frame + SHAZBOT_HEADER_SIZE);
+    return *notification == SHAZBOT_NOTIFICATION_CAPTURE_SAVED ||
+           *notification == SHAZBOT_NOTIFICATION_CAPTURE_START;
+}
+
+static void shazbot_start_auto_command_capture(void) {
+    if (shazbot_auto_command_capture_active) return;
+    if (!hook_option_bool("telemetry.shazbot_command_labels")) {
+        shazbot_report_once(&shazbot_auto_command_capture_reported,
+                            "automatic command capture requested, but command labels are disabled");
+        return;
+    }
+    if (!shazbot_local_player_valid || !Con__evaluate) {
+        shazbot_report_once(&shazbot_auto_command_capture_reported,
+                            "automatic command capture requested without a valid Player/console");
+        return;
+    }
+    shazbot_auto_command_capture_active = 1;
+    shazbot_command_label_capture_active = 1;
+    shazbot_auto_command_capture_reported = 0;
+    (void)Con__evaluate(
+        "shazbot_command_capture_start(); "
+        "clientCmdCenterPrint(\"Shazbot command capture started\", 6, 1);",
+        0, "t2launch/shazbot_auto_capture.cs", 0);
+    if (hook_option_bool("telemetry.shazbot_auto_weapon_slot_test")) {
+        const char *relative_script = hook_option_str("telemetry.shazbot_weapon_slot_test_script");
+        if (!relative_script || strncmp(relative_script, "prefs/", 6) != 0 ||
+            strchr(relative_script, '"') || strstr(relative_script, "..")) {
+            shazbot_report_once(&shazbot_auto_command_capture_reported,
+                                "weapon-slot test script path is invalid");
+        } else {
+            char eval_script[512];
+            int length = snprintf(eval_script, sizeof eval_script, "exec(\"%s\");", relative_script);
+            if (length < 0 || (size_t)length >= sizeof eval_script) {
+                shazbot_report_once(&shazbot_auto_command_capture_reported,
+                                    "weapon-slot test script path is too long");
+            } else {
+                const char *script_status = Con__evaluate(
+                    eval_script, 0, "t2launch/shazbot_weapon_slot_test.cs", 0);
+                fprintf(stderr, "[t2_hook] Shazbot weapon-slot test script loaded: %s%s%s\n",
+                        relative_script, script_status ? " (" : "",
+                        script_status ? script_status : "");
+            }
+        }
+    }
+    fprintf(stderr, "[t2_hook] Shazbot automatic command capture started\n");
+}
+
+static void shazbot_stop_auto_command_capture(void) {
+    if (!shazbot_auto_command_capture_active) return;
+    shazbot_auto_command_capture_active = 0;
+    shazbot_command_label_capture_active = 0;
+    (void)Con__evaluate(
+        "shazbot_command_capture_stop(); "
+        "clientCmdCenterPrint(\"Shazbot command labels saved\", 6, 1);",
+        0, "t2launch/shazbot_auto_capture.cs", 0);
+    fprintf(stderr, "[t2_hook] Shazbot automatic command capture stopped\n");
+}
+
+static void shazbot_handle_notification(uint32_t notification) {
+    if (notification == SHAZBOT_NOTIFICATION_CAPTURE_START) {
+        shazbot_start_auto_command_capture();
+    } else if (notification == SHAZBOT_NOTIFICATION_CAPTURE_SAVED) {
+        int command_capture_was_active = shazbot_auto_command_capture_active;
+        if (command_capture_was_active)
+            shazbot_stop_auto_command_capture();
+        if (shazbot_autoplay_demo_active && Con__evaluate) {
+            shazbot_autoplay_demo_active = 0;
+            fprintf(stderr, "[t2_hook] Shazbot capture saved; exiting autoplay demo client\n");
+            (void)Con__evaluate("schedule(1, 0, \"quit\");", 0,
+                                "t2launch/autoplay_demo_exit.cs", 0);
+        } else if (!command_capture_was_active && Con__evaluate) {
+            (void)Con__evaluate(
+                "clientCmdCenterPrint(\"Shazbot v5 trace saved\", 6, 1);",
+                0, "t2launch/shazbot_notification.cs", 0);
+        }
+    }
+}
+
+static void shazbot_poll_notifications(void) {
+    if (!hook_option_bool("telemetry.shazbot")) return;
+    if (!shazbot_open_notification_socket()) {
+        shazbot_report_once(&shazbot_notification_socket_error_reported,
+                            "could not open the local centerprint notification socket");
+        return;
+    }
+    unsigned char frame[SHAZBOT_NOTIFICATION_PACKET_SIZE];
+    for (;;) {
+        ssize_t received = recv(shazbot_notification_socket_fd, frame, sizeof frame, 0);
+        if (received < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR &&
+                !shazbot_notification_socket_error_reported) {
+                fprintf(stderr, "[t2_hook] Shazbot notification receive failed: %s\n", strerror(errno));
+                shazbot_notification_socket_error_reported = 1;
+            }
+            if (errno == EINTR) continue;
+            break;
+        }
+        uint64_t sequence = 0;
+        uint32_t notification = 0;
+        if (!shazbot_decode_notification(frame, (size_t)received, &sequence, &notification)) continue;
+        if (shazbot_notification_sequence_valid &&
+            sequence <= shazbot_notification_last_sequence) continue;
+        shazbot_notification_sequence_valid = 1;
+        shazbot_notification_last_sequence = sequence;
+        shazbot_handle_notification(notification);
+    }
+}
+
+static int shazbot_open_socket(void) {
+    const char *configured = hook_option_str("telemetry.shazbot_socket");
+    if (!configured || !configured[0]) configured = "/tmp/shazbot.sock";
+    size_t length = configured ? strnlen(configured, sizeof shazbot_address.sun_path) : 0;
+    if (!length || length >= sizeof shazbot_address.sun_path) return 0;
+    if (shazbot_socket_fd >= 0 && strcmp(configured, shazbot_socket_path) == 0) return 1;
+    if (shazbot_socket_fd >= 0) close(shazbot_socket_fd);
+    shazbot_socket_fd = -1;
+    memset(&shazbot_address, 0, sizeof shazbot_address);
+    shazbot_address.sun_family = AF_UNIX;
+    memcpy(shazbot_address.sun_path, configured, length + 1);
+    shazbot_address_length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + length + 1);
+    shazbot_socket_fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (shazbot_socket_fd < 0) return 0;
+    memcpy(shazbot_socket_path, configured, length + 1);
+    return 1;
+}
+
+static uint64_t shazbot_packet_sequence;
+static ssize_t shazbot_real_sendto(int fd, const void *packet, size_t length, int flags,
+                                   const struct sockaddr *address, socklen_t address_length);
+
+static void shazbot_forward_server_packet(const void *packet, size_t length,
+                                          const struct sockaddr *peer,
+                                          socklen_t peer_length) {
+    if (!hook_option_bool("telemetry.shazbot_packet_capture") || !packet ||
+        length < 3 || length > SHAZBOT_MAX_GAME_PACKET_SIZE || !peer ||
+        (peer->sa_family != AF_INET && peer->sa_family != AF_INET6) ||
+        !(((const unsigned char *)packet)[0] & 1U) ||
+        ((((const unsigned char *)packet)[2] >> 4) & 3U) != 0U)
+        return;
+    if (!shazbot_open_socket()) return;
+
+    unsigned char frame[SHAZBOT_HOOK_SERVER_PACKET_FRAME_SIZE];
+    memcpy(frame, "SHZB", 4);
+    shazbot_put_u16le(frame + 4, 1);
+    shazbot_put_u16le(frame + 6, SHAZBOT_HOOK_SERVER_PACKET_KIND);
+    shazbot_put_u32le(frame + 8, (uint32_t)(2 + length));
+    const uint64_t sequence = __atomic_add_fetch(&shazbot_packet_sequence, 1, __ATOMIC_RELAXED);
+    shazbot_put_u64le(frame + 12, sequence);
+    struct timespec now;
+    uint64_t timestamp = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0)
+        timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    shazbot_put_u64le(frame + 20, timestamp);
+    shazbot_put_u16le(frame + SHAZBOT_HEADER_SIZE, (uint16_t)length);
+    memcpy(frame + SHAZBOT_HEADER_SIZE + 2, packet, length);
+    (void)peer_length;
+    (void)shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                shazbot_address_length, frame,
+                                SHAZBOT_HEADER_SIZE + 2 + length,
+                                shazbot_real_sendto);
+}
+
+typedef ssize_t (*shazbot_recvfrom_fn)(int, void *, size_t, int,
+                                       struct sockaddr *, socklen_t *);
+typedef ssize_t (*shazbot_recv_fn)(int, void *, size_t, int);
+
+ssize_t recvfrom(int fd, void *buffer, size_t length, int flags,
+                 struct sockaddr *address, socklen_t *address_length) {
+    static shazbot_recvfrom_fn real_recvfrom;
+    if (!real_recvfrom) real_recvfrom = (shazbot_recvfrom_fn)next_symbol("recvfrom");
+    if (!real_recvfrom) { errno = ENOSYS; return -1; }
+    struct sockaddr_storage peer;
+    socklen_t peer_length = sizeof peer;
+    struct sockaddr *destination = address ? address : (struct sockaddr *)&peer;
+    socklen_t *destination_length = address_length ? address_length : &peer_length;
+    ssize_t received = real_recvfrom(fd, buffer, length, flags, destination,
+                                     destination_length);
+    if (received > 0) {
+        const struct sockaddr *source = address ? address : (struct sockaddr *)&peer;
+        const socklen_t source_length = address_length ? *address_length : peer_length;
+        shazbot_forward_server_packet(buffer, (size_t)received, source, source_length);
+    }
+    return received;
+}
+
+ssize_t recv(int fd, void *buffer, size_t length, int flags) {
+    static shazbot_recv_fn real_recv;
+    if (!real_recv) real_recv = (shazbot_recv_fn)next_symbol("recv");
+    if (!real_recv) { errno = ENOSYS; return -1; }
+    ssize_t received = real_recv(fd, buffer, length, flags);
+    if (received > 0) {
+        struct sockaddr_storage peer;
+        socklen_t peer_length = sizeof peer;
+        if (getpeername(fd, (struct sockaddr *)&peer, &peer_length) == 0)
+            shazbot_forward_server_packet(buffer, (size_t)received,
+                                          (const struct sockaddr *)&peer, peer_length);
+    }
+    return received;
+}
+
+static ssize_t shazbot_real_sendto(int fd, const void *packet, size_t length, int flags,
+                                   const struct sockaddr *address, socklen_t address_length) {
+    return sendto(fd, packet, length, flags, address, address_length);
+}
+
+static int shazbot_parse_vector_text(const struct rv_memory *memory, const char *text,
+                                     float vector[3]) {
+    if (!rv_string(memory, text, 96)) return 0;
+    char extra;
+    if (sscanf(text, "%f %f %f %c", &vector[0], &vector[1], &vector[2], &extra) != 3)
+        return 0;
+    return isfinite(vector[0]) && isfinite(vector[1]) && isfinite(vector[2]);
+}
+
+/* Emit engine ShapeBase muzzle-point/vector rays for mounted image slots.
+   getMuzzleVector returns the native corrected aim direction when available;
+   this is a ray cue, not a calculated projectile impact/ballistic trajectory. */
+static void shazbot_emit_muzzle_rays(const struct rv_memory *memory, void *player,
+                                     uint32_t player_id, float detection_radius,
+                                     uint64_t timestamp) {
+    if (!memory || !player || !isfinite(detection_radius) || detection_radius <= 0.0f ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET,
+                         SHAZBOT_MOUNTED_IMAGE_COUNT * SHAZBOT_MOUNTED_IMAGE_STRIDE, PROT_READ))
+        return;
+    void *vtable = rv_pointer(player, 0);
+    if (!rv_memory_range(memory, vtable, 0x170, PROT_READ) ||
+        !rv_memory_range(memory, rv_pointer(vtable, 0x154), 1, PROT_EXEC) ||
+        !rv_memory_range(memory, rv_pointer(vtable, 0x16c), 1, PROT_EXEC)) return;
+
+    for (uint32_t slot = 0; slot < SHAZBOT_MOUNTED_IMAGE_COUNT; slot++) {
+        unsigned char *image_state = (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                                     (size_t)slot * SHAZBOT_MOUNTED_IMAGE_STRIDE;
+        if (!rv_memory_range(memory, image_state, 0x30, PROT_READ) ||
+            !rv_memory_range(memory, rv_pointer(image_state, 0x2c), 0x10, PROT_READ)) continue;
+        void *image_data = rv_pointer(image_state, 0);
+        if (!rv_memory_range(memory, image_data, 0x30, PROT_READ)) continue;
+        const char *image_class = rv_class_name(memory, image_data);
+        if (!image_class || strcmp(image_class, "ShapeBaseImageData") != 0) continue;
+
+        char slot_text[16];
+        snprintf(slot_text, sizeof slot_text, "%u", slot);
+        const char *argv[3] = {"getMuzzle", "", slot_text};
+        const char *point_text = ((const char *(*)(void *, int, const char **))
+                                  SHAZBOT_MUZZLE_POINT_CALLBACK)(player, 3, argv);
+        float muzzle[3], direction[3];
+        if (!shazbot_parse_vector_text(memory, point_text, muzzle)) continue;
+        const char *vector_text = ((const char *(*)(void *, int, const char **))
+                                   SHAZBOT_MUZZLE_VECTOR_CALLBACK)(player, 3, argv);
+        if (!shazbot_parse_vector_text(memory, vector_text, direction)) continue;
+        float length2 = direction[0] * direction[0] + direction[1] * direction[1] +
+                        direction[2] * direction[2];
+        if (!isfinite(length2) || length2 < 1.0e-8f) continue;
+        float aim[3] = {
+            muzzle[0] + direction[0] * detection_radius,
+            muzzle[1] + direction[1] * detection_radius,
+            muzzle[2] + direction[2] * detection_radius,
+        };
+        unsigned char packet[SHAZBOT_MUZZLE_AIM_PACKET_SIZE];
+        uint64_t sequence = shazbot_sequence + 1;
+        size_t length = shazbot_encode_muzzle_aim(packet, sequence, timestamp,
+                                                   player_id, slot, 0, muzzle, aim,
+                                                   detection_radius);
+        if (!length) continue;
+        if (shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                  shazbot_address_length, packet, length,
+                                  shazbot_real_sendto)) {
+            shazbot_sequence = sequence;
+            shazbot_socket_error_reported = 0;
+        } else if (!shazbot_socket_error_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot muzzle ray dropped: %s\n", strerror(errno));
+            shazbot_socket_error_reported = 1;
+        }
+    }
+}
+
+struct shazbot_native_aim_sample {
+    uint32_t player_id, image_slot, target_id;
+    float muzzle[3], aim[3], detection_radius;
+};
+
+/* Find which mounted image supplied this renderBeacon projectile pointer. */
+static int shazbot_image_slot_for_projectile(const struct rv_memory *memory, void *player,
+                                             void *projectile_data, uint32_t *slot_out) {
+    if (!memory || !player || !projectile_data || !slot_out ||
+        !rv_memory_range(memory, (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET,
+                         SHAZBOT_MOUNTED_IMAGE_COUNT * SHAZBOT_MOUNTED_IMAGE_STRIDE, PROT_READ))
+        return 0;
+    for (uint32_t slot = 0; slot < SHAZBOT_MOUNTED_IMAGE_COUNT; slot++) {
+        unsigned char *state = (unsigned char *)player + SHAZBOT_MOUNTED_IMAGES_OFFSET +
+                               (size_t)slot * SHAZBOT_MOUNTED_IMAGE_STRIDE;
+        if (!rv_memory_range(memory, state, 0x30, PROT_READ) ||
+            !rv_memory_range(memory, rv_pointer(state, 0x2c), 0x10, PROT_READ)) continue;
+        void *image_data = rv_pointer(state, 0);
+        if (!rv_memory_range(memory, image_data, SHAZBOT_IMAGE_PROJECTILE_OFFSET + 4, PROT_READ)) continue;
+        const char *class_name = rv_class_name(memory, image_data);
+        if (!class_name || strcmp(class_name, "ShapeBaseImageData") != 0) continue;
+        if (rv_pointer(image_data, SHAZBOT_IMAGE_PROJECTILE_OFFSET) == projectile_data) {
+            *slot_out = slot;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* This parent-frame reader is pinned to GameTSCtrl::renderBeacon's #25034 ABI:
+   beacon object at EBP+0x0c, native source/muzzle Point3F* at +0x14, and
+   ProjectileData* at +0x1c. The aim point comes from its existing native
+   dglDrawBillboard call after ProjectileData::calculateAim succeeds. */
+static int shazbot_capture_native_aim(const struct rv_memory *memory, void *dictionary,
+                                      void *parent_frame,
+                                      const float *aim_point,
+                                      struct shazbot_native_aim_sample *sample) {
+    if (!memory || !parent_frame || !aim_point || !sample ||
+        !shazbot_spatial_context_valid || !shazbot_spatial_player ||
+        !rv_memory_range(memory, parent_frame, 0x20, PROT_READ) ||
+        !rv_memory_range(memory, aim_point, 3 * sizeof(float), PROT_READ)) return 0;
+    if (!rv_memory_range(memory, dictionary, 4096 * sizeof(uint32_t), PROT_READ) ||
+        rv_find_object(memory, dictionary, shazbot_spatial_player_id) != shazbot_spatial_player)
+        return 0;
+
+    void *beacon = rv_pointer(parent_frame, 0x0c);
+    void *source_position = rv_pointer(parent_frame, 0x14);
+    void *projectile_data = rv_pointer(parent_frame, 0x1c);
+    if (!rv_memory_range(memory, source_position, 3 * sizeof(float), PROT_READ) ||
+        !rv_memory_range(memory, projectile_data, 0x20, PROT_READ))
+        return 0;
+    const char *beacon_class = rv_class_name(memory, beacon);
+    if (!beacon_class || strcmp(beacon_class, "BeaconObject") != 0) return 0;
+    uint32_t target_id = rv_word(beacon, 0x20);
+    if (!target_id || rv_find_object(memory, dictionary, target_id) != beacon) return 0;
+
+    uint32_t image_slot;
+    if (!shazbot_image_slot_for_projectile(memory, shazbot_spatial_player,
+                                           projectile_data, &image_slot)) return 0;
+    sample->player_id = shazbot_spatial_player_id;
+    sample->image_slot = image_slot;
+    sample->target_id = target_id;
+    for (int i = 0; i < 3; i++) {
+        sample->muzzle[i] = rv_float(source_position, i * 4);
+        sample->aim[i] = aim_point[i];
+        if (!isfinite(sample->muzzle[i]) || !isfinite(sample->aim[i])) return 0;
+    }
+    sample->detection_radius = shazbot_spatial_detection_radius;
+    return isfinite(sample->detection_radius) && sample->detection_radius > 0.0f;
+}
+
+static int shazbot_aim_sample_due(uint32_t player_id, uint32_t image_slot,
+                                  uint32_t target_id, uint64_t epoch) {
+    static uint32_t player_ids[64], image_slots[64], target_ids[64];
+    static uint64_t epochs[64];
+    for (size_t i = 0; i < sizeof target_ids / sizeof target_ids[0]; i++) {
+        if (player_ids[i] == player_id && image_slots[i] == image_slot && target_ids[i] == target_id) {
+            if (epochs[i] == epoch) return 0;
+            epochs[i] = epoch;
+            return 1;
+        }
+    }
+    size_t slot = shazbot_aim_key_cursor++ % (sizeof target_ids / sizeof target_ids[0]);
+    player_ids[slot] = player_id;
+    image_slots[slot] = image_slot;
+    target_ids[slot] = target_id;
+    epochs[slot] = epoch;
+    return 1;
+}
+
+static void shazbot_emit_native_aim(const struct rv_memory *memory, void *parent_frame,
+                                    const float *aim_point) {
+    struct shazbot_native_aim_sample sample;
+    void *dictionary = rv_memory_range(memory, (void *)SHAZBOT_ID_DICTIONARY,
+                                       sizeof(uint32_t), PROT_READ)
+        ? rv_pointer((void *)SHAZBOT_ID_DICTIONARY, 0) : NULL;
+    if (!shazbot_capture_native_aim(memory, dictionary, parent_frame, aim_point, &sample) ||
+        !shazbot_aim_sample_due(sample.player_id, sample.image_slot, sample.target_id,
+                                shazbot_spatial_epoch)) return;
+    unsigned char packet[SHAZBOT_MUZZLE_AIM_PACKET_SIZE];
+    uint64_t sequence = shazbot_sequence + 1;
+    size_t length = shazbot_encode_muzzle_aim(packet, sequence, shazbot_spatial_epoch,
+        sample.player_id, sample.image_slot, sample.target_id,
+        sample.muzzle, sample.aim, sample.detection_radius);
+    if (!length) return;
+    if (shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                              shazbot_address_length, packet, length, shazbot_real_sendto)) {
+        shazbot_sequence = sequence;
+        shazbot_socket_error_reported = 0;
+    } else if (!shazbot_socket_error_reported) {
+        fprintf(stderr, "[t2_hook] Shazbot native aim point dropped: %s\n", strerror(errno));
+        shazbot_socket_error_reported = 1;
+    }
+}
+
+static const unsigned char shazbot_native_billboard_prologue[] = {
+    0x55,0x89,0xe5,0x81,0xec,0xfc,0x00,0x00,0x00,0x57,0x56,0x53
+};
+
+static int shazbot_install_aim_billboard_hook(void) {
+    if (shazbot_aim_hook_attempted) return shazbot_aim_hook_installed;
+    shazbot_aim_hook_attempted = 1;
+    if (target != &game_targets[0] || target->dedicated ||
+        !hook_option_bool("telemetry.shazbot")) return 0;
+    int protection;
+    if (!readable_range(SHAZBOT_AIM_BILLBOARD_CALL, sizeof shazbot_aim_billboard_call_original,
+                        &protection) || !(protection & PROT_EXEC) ||
+        memcmp((void *)SHAZBOT_AIM_BILLBOARD_CALL, shazbot_aim_billboard_call_original,
+               sizeof shazbot_aim_billboard_call_original) != 0 ||
+        !readable_range(SHAZBOT_NATIVE_BILLBOARD, sizeof shazbot_native_billboard_prologue,
+                        &protection) || !(protection & PROT_EXEC) ||
+        memcmp((void *)SHAZBOT_NATIVE_BILLBOARD, shazbot_native_billboard_prologue,
+               sizeof shazbot_native_billboard_prologue) != 0) {
+        fprintf(stderr, "[t2_hook] Shazbot native aim hook refused: target bytes differ\n");
+        return 0;
+    }
+    int32_t relative = (int32_t)((uintptr_t)shazbot_aim_billboard_wrapper -
+                                  (SHAZBOT_AIM_BILLBOARD_CALL + sizeof shazbot_aim_billboard_call_original));
+    memcpy(shazbot_aim_billboard_call_patch + 1, &relative, sizeof relative);
+    const struct code_patch patch = {
+        SHAZBOT_AIM_BILLBOARD_CALL, shazbot_aim_billboard_call_original,
+        sizeof shazbot_aim_billboard_call_original, 0,
+        shazbot_aim_billboard_call_patch, sizeof shazbot_aim_billboard_call_patch
+    };
+    shazbot_aim_hook_installed = apply_code_patches("Shazbot native aim telemetry", &patch, 1);
+    if (shazbot_aim_hook_installed)
+        fprintf(stderr, "[t2_hook] Shazbot native aim-point capture enabled (memory only)\n");
+    return shazbot_aim_hook_installed;
+}
+
+__attribute__((noinline))
+static void shazbot_aim_billboard_wrapper(const float *hit, float width, float rotation) {
+    if (hook_option_bool("telemetry.shazbot") && shazbot_spatial_context_valid) {
+        void *frame = __builtin_frame_address(0);
+        void *parent_frame = rv_memory_range(&shazbot_spatial_memory, frame,
+                                             sizeof(uint32_t), PROT_READ)
+            ? rv_pointer(frame, 0) : NULL;
+        shazbot_emit_native_aim(&shazbot_spatial_memory, parent_frame, hit);
+    }
+    shazbot_native_billboard(hit, width, rotation);
+}
+
+static void poll_shazbot_telemetry(void) {
+    /* Client target only: never apply any of these offsets to the dedicated build. */
+    if (!hook_option_bool("telemetry.shazbot")) {
+        shazbot_spatial_context_valid = 0;
+        shazbot_local_player_valid = 0;
+        return;
+    }
+    if (target != &game_targets[0] || target->dedicated) {
+        shazbot_report_once(&shazbot_target_reported,
+                            "telemetry is enabled, but this is not the supported client target");
+        shazbot_spatial_context_valid = 0;
+        shazbot_local_player_valid = 0;
+        return;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return;
+    uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    if (shazbot_last_attempt_ns && timestamp >= shazbot_last_attempt_ns &&
+        timestamp - shazbot_last_attempt_ns < SHAZBOT_SAMPLE_PERIOD_NS) return;
+    shazbot_last_attempt_ns = timestamp;
+    const int demo_playing = review_demo_playing();
+    if (demo_playing && (!shazbot_demo_state_initialized || !shazbot_demo_state)) {
+        fprintf(stderr, "[t2_hook] Shazbot: demo playback start monotonic_ns=%llu\n",
+                (unsigned long long)timestamp);
+    }
+    shazbot_demo_state = demo_playing;
+    shazbot_demo_state_initialized = 1;
+    shazbot_spatial_context_valid = 0;
+
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory)) {
+        shazbot_report_once(&shazbot_memory_reported,
+                            "waiting for a readable client memory snapshot");
+        shazbot_local_player_valid = 0;
+        return;
+    }
+    if (!rv_memory_range(&memory, (void *)SHAZBOT_CONNECTION, sizeof(uint32_t), PROT_READ) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_ID_DICTIONARY, sizeof(uint32_t), PROT_READ) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_TARGET_MANAGER, sizeof(uint32_t), PROT_READ)) {
+        shazbot_report_once(&shazbot_globals_reported,
+                            "client connection/object globals are not readable at the expected build anchors");
+        shazbot_local_player_valid = 0;
+        return;
+    }
+    void *connection = rv_pointer((void *)SHAZBOT_CONNECTION, 0);
+    void *dictionary = rv_pointer((void *)SHAZBOT_ID_DICTIONARY, 0);
+    void *target_manager = rv_pointer((void *)SHAZBOT_TARGET_MANAGER, 0);
+    void *visible_set = rv_memory_range(&memory, (void *)SHAZBOT_VISIBLE_SHAPEBASE_SET,
+                                        sizeof(uint32_t), PROT_READ)
+        ? rv_pointer((void *)SHAZBOT_VISIBLE_SHAPEBASE_SET, 0) : NULL;
+    void *client_target_list = rv_memory_range(&memory, (void *)SHAZBOT_CLIENT_TARGET_LIST,
+                                               sizeof(uint32_t), PROT_READ)
+        ? rv_pointer((void *)SHAZBOT_CLIENT_TARGET_LIST, 0) : NULL;
+    float xyz[3];
+    uint32_t player_id;
+    void *player = NULL;
+    const char *player_failure = NULL;
+    if (!shazbot_local_player_position_detail(&memory, connection, dictionary, xyz,
+                                               &player_id, &player, &player_failure)) {
+        shazbot_local_player_valid = 0;
+        const char *reason = player_failure ? player_failure : "unknown reason";
+        if (strcmp(shazbot_player_failure_state, reason) != 0 ||
+            timestamp < shazbot_player_status_time_ns ||
+            timestamp - shazbot_player_status_time_ns >= 15000000000ULL) {
+            fprintf(stderr, "[t2_hook] Shazbot: local Player validation waiting: %s\n", reason);
+            snprintf(shazbot_player_failure_state, sizeof shazbot_player_failure_state,
+                     "%s", reason);
+            shazbot_player_status_time_ns = timestamp;
+        }
+        return;
+    }
+    shazbot_local_player_valid = 1;
+    if (shazbot_player_failure_state[0]) {
+        fprintf(stderr, "[t2_hook] Shazbot: local Player validation recovered\n");
+        shazbot_player_failure_state[0] = '\0';
+        shazbot_player_status_time_ns = 0;
+    }
+    if (!shazbot_open_socket()) {
+        if (!shazbot_socket_open_reported) {
+            const char *path = hook_option_str("telemetry.shazbot_socket");
+            char message[256];
+            snprintf(message, sizeof message, "could not open telemetry socket %s: %s",
+                     path && path[0] ? path : "/tmp/shazbot.sock", strerror(errno));
+            shazbot_report_once(&shazbot_socket_open_reported, message);
+        }
+        return;
+    }
+
+    unsigned char packet[SHAZBOT_PACKET_SIZE];
+    uint64_t sequence = shazbot_sequence + 1;
+    size_t length = shazbot_encode_telemetry(packet, sequence, timestamp, xyz, 1.0f);
+    if (!length) return;
+    if (shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                              shazbot_address_length, packet, length, shazbot_real_sendto)) {
+        shazbot_sequence = sequence;
+        shazbot_socket_error_reported = 0;
+        shazbot_report_once(&shazbot_telemetry_sent_reported,
+                            "position telemetry is being sent to the configured socket");
+    } else if (!shazbot_socket_error_reported) {
+        fprintf(stderr, "[t2_hook] Shazbot telemetry sample dropped: %s\n", strerror(errno));
+        shazbot_socket_error_reported = 1;
+    }
+
+    /* Optional view data requires all of its #25034 camera/SensorData anchors;
+       its absence masks only the view slots, not the observation frame. */
+    int spatial_anchors_valid = shazbot_spatial_anchors_valid(&memory);
+    if (!spatial_anchors_valid) {
+        if (!shazbot_spatial_anchor_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot view cone disabled: target spatial anchors differ\n");
+            shazbot_spatial_anchor_reported = 1;
+        }
+    }
+    int view_valid = 0;
+    float origin[3], forward[3], fov_degrees = 0.0f, detection_radius = 0.0f;
+    if (spatial_anchors_valid) {
+        if (!shazbot_aim_hook_attempted) (void)shazbot_install_aim_billboard_hook();
+        view_valid = shazbot_local_view_cone(&memory, player, player_id, target_manager,
+                                              origin, forward, &fov_degrees, &detection_radius);
+        if (view_valid) {
+            shazbot_spatial_memory = memory;
+            shazbot_spatial_player = player;
+            shazbot_spatial_player_id = player_id;
+            shazbot_spatial_detection_radius = detection_radius;
+            shazbot_spatial_epoch = timestamp;
+            shazbot_spatial_context_valid = 1;
+            unsigned char view_packet[SHAZBOT_VIEW_PACKET_SIZE];
+            uint64_t view_sequence = shazbot_sequence + 1;
+            size_t view_length = shazbot_encode_view_cone(view_packet, view_sequence, timestamp,
+                                                           player_id, origin, forward,
+                                                           fov_degrees, detection_radius);
+            if (view_length && shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                                      shazbot_address_length, view_packet, view_length,
+                                                      shazbot_real_sendto)) {
+                shazbot_sequence = view_sequence;
+                shazbot_socket_error_reported = 0;
+            } else if (!shazbot_socket_error_reported) {
+                fprintf(stderr, "[t2_hook] Shazbot view-cone sample dropped: %s\n", strerror(errno));
+                shazbot_socket_error_reported = 1;
+            }
+            shazbot_emit_muzzle_rays(&memory, player, player_id, detection_radius, timestamp);
+        }
+    }
+
+    const char *anchor_failure = shazbot_observation_anchor_failure(&memory);
+    if (anchor_failure) {
+        if (!shazbot_observation_anchor_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot Observation disabled: %s\n", anchor_failure);
+            shazbot_observation_anchor_reported = 1;
+        }
+        return;
+    }
+    float values[SHAZBOT_OBSERVATION_DIMENSIONS];
+    if (!shazbot_collect_observation(&memory, connection, dictionary, target_manager,
+                                     visible_set, client_target_list, view_valid,
+                                     view_valid ? forward : NULL, fov_degrees,
+                                     detection_radius, values)) {
+        shazbot_report_once(&shazbot_observation_collect_reported,
+                            "local Player is valid, but observation fields could not be collected");
+        return;
+    }
+    unsigned char observation_packet[SHAZBOT_OBSERVATION_PACKET_SIZE];
+    uint64_t observation_sequence = shazbot_sequence + 1;
+    size_t observation_length = shazbot_encode_observation(observation_packet,
+                                                           observation_sequence,
+                                                           timestamp, values);
+    if (observation_length &&
+        shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                              shazbot_address_length, observation_packet,
+                              observation_length, shazbot_real_sendto)) {
+        shazbot_sequence = observation_sequence;
+        shazbot_socket_error_reported = 0;
+        shazbot_report_once(&shazbot_observation_sent_reported,
+                            "policy observations are being sent to the configured socket");
+    } else if (!shazbot_socket_error_reported) {
+        fprintf(stderr, "[t2_hook] Shazbot Observation sample dropped: %s\n", strerror(errno));
+        shazbot_socket_error_reported = 1;
+    }
+
+    float command_values[SHAZBOT_COMMAND_OBSERVATION_V5_DIMENSIONS] = {0};
+    memcpy(command_values, values, sizeof values);
+    if (shazbot_player_command_context(&memory, dictionary, player, command_values)) {
+        shazbot_apply_hud_weapon_context(command_values);
+        shazbot_apply_mounted_pack_availability(&memory, player, command_values);
+        unsigned char command_packet[SHAZBOT_COMMAND_OBSERVATION_V5_PACKET_SIZE];
+        uint64_t command_sequence = shazbot_sequence + 1;
+        size_t command_length = shazbot_encode_command_observation_v5(
+            command_packet, command_sequence, timestamp, command_values);
+        if (command_length &&
+            shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                  shazbot_address_length, command_packet, command_length,
+                                  shazbot_real_sendto)) {
+            shazbot_sequence = command_sequence;
+            shazbot_socket_error_reported = 0;
+            shazbot_report_once(&shazbot_command_context_reported,
+                                "v5 health, weapon-slot, and pack inventory context is being sent");
+        } else if (!shazbot_socket_error_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot v5 command context dropped: %s\n", strerror(errno));
+            shazbot_socket_error_reported = 1;
+        }
+
+        /* V6 retains the v4/health/inventory prefix and adds mounted image
+           asset-path hashes. */
+        float semantic_values[SHAZBOT_COMMAND_OBSERVATION_V6_DIMENSIONS] = {0};
+        memcpy(semantic_values, command_values,
+               SHAZBOT_V6_MOUNTED_WEAPON_NAME_HASH_BITS_BASE * sizeof(float));
+        shazbot_player_mounted_name_hashes(&memory, player, semantic_values);
+        unsigned char semantic_packet[SHAZBOT_COMMAND_OBSERVATION_V6_PACKET_SIZE];
+        uint64_t semantic_sequence = shazbot_sequence + 1;
+        size_t semantic_length = shazbot_encode_command_observation_v6(
+            semantic_packet, semantic_sequence, timestamp, semantic_values);
+        if (semantic_length &&
+            shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                  shazbot_address_length, semantic_packet, semantic_length,
+                                  shazbot_real_sendto)) {
+            shazbot_sequence = semantic_sequence;
+            shazbot_socket_error_reported = 0;
+            shazbot_report_once(&shazbot_semantic_command_context_reported,
+                                "v6 stable mounted weapon/pack shapeFile path hashes are being sent");
+        } else if (!shazbot_socket_error_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot v6 semantic command context dropped: %s\n",
+                    strerror(errno));
+            shazbot_socket_error_reported = 1;
+        }
+
+        /* V7 replaces mounted-only IDs/hashes with the stable script identity
+           of each ordered weapon slot, matching the numeric selection actions. */
+        float weapon_slot_values[SHAZBOT_COMMAND_OBSERVATION_V7_DIMENSIONS] = {0};
+        memcpy(weapon_slot_values, command_values,
+               SHAZBOT_V7_WEAPON_SLOT_ITEM_CODE_BITS_BASE * sizeof(float));
+        shazbot_store_hud_weapon_slot_codes(weapon_slot_values);
+        unsigned char weapon_slot_packet[SHAZBOT_COMMAND_OBSERVATION_V7_PACKET_SIZE];
+        uint64_t weapon_slot_sequence = shazbot_sequence + 1;
+        size_t weapon_slot_length = shazbot_encode_command_observation_v7(
+            weapon_slot_packet, weapon_slot_sequence, timestamp, weapon_slot_values);
+        if (weapon_slot_length &&
+            shazbot_send_datagram(1, shazbot_socket_fd, &shazbot_address,
+                                  shazbot_address_length, weapon_slot_packet,
+                                  weapon_slot_length, shazbot_real_sendto)) {
+            shazbot_sequence = weapon_slot_sequence;
+            shazbot_socket_error_reported = 0;
+            shazbot_report_once(&shazbot_weapon_slot_context_reported,
+                                "v7 ordered weapon-slot item identities are being sent");
+        } else if (!shazbot_socket_error_reported) {
+            fprintf(stderr, "[t2_hook] Shazbot v7 weapon-slot context dropped: %s\n",
+                    strerror(errno));
+            shazbot_socket_error_reported = 1;
+        }
+
+    }
 }
 
 static int rv_team(const struct rv_memory *memory, void *object) {
@@ -2060,7 +4869,7 @@ static int install_safe_soundpacks(void) {
     }
     real_alx_get_wave_len = (alx_int_cb_t)ALX_GET_WAVE_LEN_CB;
     real_alx_create_source = (alx_int_cb_t)ALX_CREATE_SOURCE_CB;
-    long kbytes = strtol(hook_option_str("security.max_soundpack_kbytes"), NULL, 10);
+    long kbytes = hook_long_or_default("security.max_soundpack_kbytes", 8192, 0, LONG_MAX / 1024L);
     soundpack_max_bytes = kbytes > 0 ? (off_t)kbytes * 1024 : 0;
     /* Re-register the global functions so script calls reach the wrappers; the
      * arg counts match the engine's so normal calls still validate. The engine
@@ -3618,6 +6427,638 @@ static void install_datablock_overrides(void) {
     fprintf(stderr, "[t2_hook] datablock overrides watcher installed\n");
 }
 
+/* Small T2-native RadarHUD. It deliberately uses the client's *visible*
+   ShapeBase set for opposing players; teammates and the assigned ClientTarget
+   may be shown independently. The T1 memory offsets/map palette are not used. */
+#define RADAR_MARKER_LIMIT 96
+#define RADAR_WORLD_RANGE 600.0f
+#define RADAR_TERRAIN_SIDE 64
+#define RADAR_TERRAIN_STRIDE 4
+#define RADAR_VIEWPORT 0x0ba2
+#define RADAR_PROJECTION 0x1701
+#define RADAR_MODELVIEW 0x1700
+#define RADAR_MATRIX_MODE 0x0ba0
+#define RADAR_ALL_ATTRIB_BITS 0x000fffff
+#define RADAR_LINES 0x0001
+#define RADAR_LINE_LOOP 0x0002
+#define RADAR_TRIANGLE_FAN 0x0006
+#define RADAR_QUADS 0x0007
+#define RADAR_BLEND 0x0be2
+#define RADAR_DEPTH_TEST 0x0b71
+#define RADAR_TEXTURE_2D 0x0de1
+#define RADAR_CULL_FACE 0x0b44
+#define RADAR_SCISSOR_TEST 0x0c11
+#define RADAR_ALPHA_TEST 0x0bc0
+#define RADAR_SRC_ALPHA 0x0302
+#define RADAR_ONE_MINUS_SRC_ALPHA 0x0303
+
+struct radar_marker { float dx, dy; unsigned char kind; };
+struct radar_terrain {
+    uint16_t height[RADAR_TERRAIN_SIDE * RADAR_TERRAIN_SIDE];
+    uint8_t material[RADAR_TERRAIN_SIDE * RADAR_TERRAIN_SIDE];
+    float origin_x, origin_y, square_size;
+    uint16_t minimum, maximum;
+    int valid;
+};
+static struct radar_marker radar_markers[RADAR_MARKER_LIMIT];
+static size_t radar_marker_count;
+static uint64_t radar_last_refresh_ns;
+static int radar_data_valid;
+static struct radar_terrain radar_terrain_map;
+static float radar_origin[3];
+static float radar_forward_x, radar_forward_y;
+static int sky_rotation_hook_attempted;
+static int sky_rotation_hook_installed;
+static void *sky_rotation_trampoline;
+static float sky_rotation_angle;
+static uint64_t sky_rotation_last_ns;
+
+typedef struct {
+    void (*GetIntegerv)(unsigned, int *);
+    void (*PushAttrib)(unsigned);
+    void (*PopAttrib)(void);
+    void (*MatrixMode)(unsigned);
+    void (*PushMatrix)(void);
+    void (*PopMatrix)(void);
+    void (*LoadIdentity)(void);
+    void (*Ortho)(double, double, double, double, double, double);
+    void (*Disable)(unsigned);
+    void (*Enable)(unsigned);
+    void (*BlendFunc)(unsigned, unsigned);
+    void (*Color4f)(float, float, float, float);
+    void (*Begin)(unsigned);
+    void (*End)(void);
+    void (*Vertex2f)(float, float);
+    void (*LineWidth)(float);
+} radar_gl_api;
+static radar_gl_api radar_gl;
+static int radar_gl_state;
+
+static int radar_resolve_gl(void) {
+    if (radar_gl_state) return radar_gl_state > 0;
+    radar_gl_state = -1;
+    void *lib = dlopen("libGL.so.1", RTLD_NOW | RTLD_NOLOAD);
+    void *scope = lib ? lib : RTLD_DEFAULT;
+#define RADAR_GL(field, name) do { \
+    *(void **)(&radar_gl.field) = dlsym(scope, name); \
+    if (!radar_gl.field) return 0; \
+} while (0)
+    RADAR_GL(GetIntegerv, "glGetIntegerv");
+    RADAR_GL(PushAttrib, "glPushAttrib"); RADAR_GL(PopAttrib, "glPopAttrib");
+    RADAR_GL(MatrixMode, "glMatrixMode"); RADAR_GL(PushMatrix, "glPushMatrix");
+    RADAR_GL(PopMatrix, "glPopMatrix"); RADAR_GL(LoadIdentity, "glLoadIdentity");
+    RADAR_GL(Ortho, "glOrtho"); RADAR_GL(Disable, "glDisable");
+    RADAR_GL(Enable, "glEnable"); RADAR_GL(BlendFunc, "glBlendFunc");
+    RADAR_GL(Color4f, "glColor4f"); RADAR_GL(Begin, "glBegin");
+    RADAR_GL(End, "glEnd"); RADAR_GL(Vertex2f, "glVertex2f");
+    RADAR_GL(LineWidth, "glLineWidth");
+#undef RADAR_GL
+    radar_gl_state = 1;
+    return 1;
+}
+
+static int radar_console_enabled(void) {
+    if (!Con__evaluate || !core_runtime_installed) return 0;
+    const char *value = Con__evaluate("t2launch_hudDemoRadarEnabled();", 0, NULL, 0);
+    return value && value[0] == '1' && value[1] == '\0';
+}
+
+static void radar_add_world_marker(float x, float y, unsigned char kind) {
+    if (!isfinite(x) || !isfinite(y) || radar_marker_count >= RADAR_MARKER_LIMIT) return;
+    radar_markers[radar_marker_count++] = (struct radar_marker){x, y, kind};
+}
+
+static size_t radar_collect_visible_enemies(const struct rv_memory *memory, void *visible,
+                                            void *dictionary, uint32_t self_id,
+                                            int local_team, const float origin[3],
+                                            struct radar_marker *out, size_t capacity) {
+    if (!memory || !visible || !dictionary || !self_id || !origin || !out || !capacity ||
+        !rv_memory_range(memory, visible, 0x3c, PROT_READ)) return 0;
+    uint32_t count = rv_word(visible, 0x30);
+    void *objects = rv_pointer(visible, 0x38);
+    if (count > 4096 || (count && !rv_memory_range(memory, objects,
+                                      (size_t)count * sizeof(uint32_t), PROT_READ))) return 0;
+    size_t used = 0;
+    for (uint32_t i = 0; i < count && used < capacity; i++) {
+        void *object = rv_pointer(objects, (size_t)i * sizeof(uint32_t));
+        const char *name = rv_class_name(memory, object);
+        if (!name || strcmp(name, "Player") != 0 ||
+            !rv_memory_range(memory, object, 0x2d4, PROT_READ)) continue;
+        uint32_t id = rv_word(object, 0x20);
+        if (!id || id == self_id || !(rv_word(object, 0x40) & 2) ||
+            rv_team(memory, object) == local_team ||
+            rv_find_object(memory, dictionary, id) != object) continue;
+        float position[3];
+        if (!rv_position(memory, object, RV_PLAYER, position)) continue;
+        out[used++] = (struct radar_marker){
+            position[0] - origin[0], position[1] - origin[1], 1
+        };
+    }
+    return used;
+}
+
+struct radar_point { float x, y; };
+static float radar_inverse_sqrt(float value) {
+    union { float f; uint32_t u; } estimate = {value};
+    estimate.u = 0x5f375a86u - (estimate.u >> 1);
+    float y = estimate.f;
+    return y * (1.5f - 0.5f * value * y * y);
+}
+
+/* Use the current control object's eye transform for both Player and Camera.
+   Camera is the observer/demo-playback control object; no Player is required. */
+static int radar_control_view(const struct rv_memory *memory, void *connection,
+                              void *dictionary, float origin[3], float forward[2],
+                              uint32_t *object_id, int *team_out) {
+    if (!memory || !connection || !dictionary || !origin || !forward || !object_id || !team_out ||
+        !rv_memory_range(memory, connection, SHAZBOT_LOCAL_CONTROL_OFFSET + sizeof(uint32_t),
+                         PROT_READ)) return 0;
+    void *object = rv_pointer(connection, SHAZBOT_LOCAL_CONTROL_OFFSET);
+    if (!rv_memory_range(memory, object, 0x164, PROT_READ)) return 0;
+    const char *class_name = rv_class_name(memory, object);
+    if (!class_name || (strcmp(class_name, "Player") != 0 && strcmp(class_name, "Camera") != 0 &&
+        strcmp(class_name, "Vehicle") != 0 && strcmp(class_name, "WheeledVehicle") != 0 &&
+        strcmp(class_name, "FlyingVehicle") != 0 && strcmp(class_name, "HoverVehicle") != 0 &&
+        strcmp(class_name, "Turret") != 0 && strcmp(class_name, "StaticShape") != 0 &&
+        strcmp(class_name, "Item") != 0)) return 0;
+    uint32_t id = rv_word(object, 0x20);
+    if (!id || rv_find_object(memory, dictionary, id) != object) return 0;
+
+    void *vtable = rv_pointer(object, 0);
+    if (!rv_memory_range(memory, vtable, SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET + 4, PROT_READ)) return 0;
+    void *eye_method = rv_pointer(vtable, SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET);
+    if (!rv_memory_range(memory, eye_method, 1, PROT_EXEC)) return 0;
+    float matrix[16];
+    memset(matrix, 0, sizeof matrix);
+    ((void (*)(void *, float *))eye_method)(object, matrix);
+    origin[0] = matrix[3]; origin[1] = matrix[7]; origin[2] = matrix[11];
+    if (!isfinite(origin[0]) || !isfinite(origin[1]) || !isfinite(origin[2])) return 0;
+    float fx = matrix[1], fy = matrix[5];
+    float length2 = fx * fx + fy * fy;
+    if (!isfinite(fx) || !isfinite(fy) || !isfinite(length2) || length2 < 1.0e-8f) return 0;
+    float inverse = radar_inverse_sqrt(length2);
+    forward[0] = fx * inverse;
+    forward[1] = fy * inverse;
+    if (!isfinite(forward[0]) || !isfinite(forward[1])) return 0;
+
+    int team = RV_OTHER_TEAM;
+    if (rv_memory_range(memory, connection, SHAZBOT_LOCAL_SENSOR_GROUP_OFFSET + 4, PROT_READ))
+        team = (int32_t)rv_word(connection, SHAZBOT_LOCAL_SENSOR_GROUP_OFFSET);
+    if (team <= 0 && strcmp(class_name, "Camera") != 0)
+        team = rv_team(memory, object);
+    if (team <= 0) team = RV_OTHER_TEAM;
+    *object_id = id;
+    *team_out = team;
+    return 1;
+}
+
+/* Torque's Player/Camera console bindings do not consistently expose
+   getEyeVector() across the shipped client builds. Read the same native eye
+   transform used by RadarHUD and return a heading for the optional demo HUD. */
+static const char *hook_hud_demo_heading_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    static char heading_text[32];
+    heading_text[0] = 0;
+    if (target->dedicated) return heading_text;
+
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_CONNECTION, sizeof(uint32_t), PROT_READ) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_ID_DICTIONARY, sizeof(uint32_t), PROT_READ))
+        return heading_text;
+    void *connection = rv_pointer((void *)SHAZBOT_CONNECTION, 0);
+    void *dictionary = rv_pointer((void *)SHAZBOT_ID_DICTIONARY, 0);
+    float origin[3], forward[2];
+    uint32_t object_id;
+    int team;
+    if (!radar_control_view(&memory, connection, dictionary, origin, forward,
+                            &object_id, &team)) return heading_text;
+    float y = -forward[0], x = forward[1];
+    float ay = y < 0.0f ? -y : y, ax = x < 0.0f ? -x : x;
+    float ratio = ax >= ay ? ay / ax : ax / ay;
+    /* atan(r) ~= r * (45 - 14.32 * (1 - r)); accurate enough for a HUD tick
+       and avoids adding a libm dependency to the hook's native test fixtures. */
+    float angle = ratio * (45.0f - 14.32f * (1.0f - ratio));
+    if (ay > ax) angle = 90.0f - angle;
+    if (x < 0.0f) angle = 180.0f - angle;
+    if (y < 0.0f) angle = -angle;
+    float heading = angle;
+    if (heading < 0.0f) heading += 360.0f;
+    if (heading >= 360.0f) heading -= 360.0f;
+    snprintf(heading_text, sizeof(heading_text), "%.3f", heading);
+    return heading_text;
+}
+
+static int radar_capture_terrain(const struct rv_memory *memory, void *dictionary) {
+    radar_terrain_map.valid = 0;
+    if (!memory || !dictionary) return 0;
+    void *terrain = NULL;
+    unsigned int visited = 0;
+    for (size_t bucket = 0; bucket < 4096 && visited < 131072 && !terrain; bucket++) {
+        void *object = rv_pointer(dictionary, bucket * sizeof(uint32_t));
+        for (unsigned int chain = 0; object && chain < 4096 && visited++ < 131072; chain++) {
+            if (!rv_memory_range(memory, object, 0x24, PROT_READ)) break;
+            void *next = rv_pointer(object, 0x10);
+            const char *name = rv_class_name(memory, object);
+            if (name && strcmp(name, "TerrainBlock") == 0) terrain = object;
+            object = next;
+        }
+    }
+    if (!terrain) return 0;
+
+    uint32_t terrain_file_offset, square_size_offset;
+    if (!rv_persist_field_offset(memory, terrain, "terrainFile", &terrain_file_offset) ||
+        !rv_persist_field_offset(memory, terrain, "squareSize", &square_size_offset) ||
+        terrain_file_offset < 4 * sizeof(uint32_t)) return 0;
+    const size_t height_offset = terrain_file_offset - 4 * sizeof(uint32_t);
+    const uint32_t square_size = rv_word(terrain, square_size_offset);
+    if (square_size == 0 || square_size > 128) return 0;
+
+    const uint16_t *height_map = (const uint16_t *)rv_pointer(terrain, height_offset);
+    const uint8_t *material_map = (const uint8_t *)rv_pointer(terrain, height_offset - 4);
+    if (!rv_memory_range(memory, height_map, 256u * 256u * sizeof(uint16_t), PROT_READ) ||
+        !rv_memory_range(memory, material_map, 256u * 256u * 2u, PROT_READ)) return 0;
+
+    float terrain_position[3];
+    if (!rv_position(memory, terrain, RV_SHAPE, terrain_position)) return 0;
+    uint16_t minimum = UINT16_MAX, maximum = 0;
+    for (size_t i = 0; i < 256u * 256u; i++) {
+        uint16_t height;
+        memcpy(&height, height_map + i, sizeof height);
+        if (height < minimum) minimum = height;
+        if (height > maximum) maximum = height;
+    }
+    for (size_t y = 0; y < RADAR_TERRAIN_SIDE; y++) {
+        for (size_t x = 0; x < RADAR_TERRAIN_SIDE; x++) {
+            size_t terrain_index = (y * RADAR_TERRAIN_STRIDE + 2) * 256 +
+                                   (x * RADAR_TERRAIN_STRIDE + 2);
+            size_t sample_index = y * RADAR_TERRAIN_SIDE + x;
+            memcpy(&radar_terrain_map.height[sample_index], height_map + terrain_index,
+                   sizeof(uint16_t));
+            radar_terrain_map.material[sample_index] = material_map[terrain_index * 2 + 1];
+        }
+    }
+    radar_terrain_map.origin_x = terrain_position[0] + square_size * 2.0f;
+    radar_terrain_map.origin_y = terrain_position[1] + square_size * 2.0f;
+    radar_terrain_map.square_size = (float)square_size * RADAR_TERRAIN_STRIDE;
+    radar_terrain_map.minimum = minimum;
+    radar_terrain_map.maximum = maximum;
+    radar_terrain_map.valid = 1;
+    return 1;
+}
+
+static int radar_project(float dx, float dy, float forward_x, float forward_y,
+                         float range, float cx, float cy, float radius,
+                         struct radar_point *point) {
+    if (!point || !isfinite(dx) || !isfinite(dy) || !isfinite(forward_x) ||
+        !isfinite(forward_y) || !isfinite(range) || range <= 0.0f ||
+        !isfinite(cx) || !isfinite(cy) || !isfinite(radius) || radius <= 0.0f) return 0;
+    /* A forward-facing radar rotates its terrain and contacts with the view. */
+    float nx = (dx * forward_y - dy * forward_x) / range;
+    float ny = (dx * forward_x + dy * forward_y) / range;
+    if (nx * nx + ny * ny > 1.0f) return 0;
+    point->x = cx + nx * radius;
+    point->y = cy - ny * radius;
+    return isfinite(point->x) && isfinite(point->y);
+}
+
+static void radar_refresh_data(uint64_t now_ns) {
+    if (radar_last_refresh_ns && now_ns >= radar_last_refresh_ns &&
+        now_ns - radar_last_refresh_ns < 100000000ULL) return;
+    radar_last_refresh_ns = now_ns;
+    radar_marker_count = 0;
+    radar_data_valid = 0;
+
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_CONNECTION, 4, PROT_READ) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_ID_DICTIONARY, 4, PROT_READ)) return;
+    void *connection = rv_pointer((void *)SHAZBOT_CONNECTION, 0);
+    void *dictionary = rv_pointer((void *)SHAZBOT_ID_DICTIONARY, 0);
+    float origin[3], forward[2];
+    uint32_t self_id;
+    int local_team;
+    if (!radar_control_view(&memory, connection, dictionary, origin, forward,
+                            &self_id, &local_team)) return;
+    memcpy(radar_origin, origin, sizeof radar_origin);
+    radar_forward_x = forward[0];
+    radar_forward_y = forward[1];
+    (void)radar_capture_terrain(&memory, dictionary);
+
+    /* Teammates are useful even when off-camera. In observer mode the control
+       object has no team, so use all players in the visible set as contacts. */
+    uint32_t visited = 0;
+    for (size_t bucket = 0; local_team != RV_OTHER_TEAM && bucket < 4096 &&
+         visited < 131072; bucket++) {
+        void *object = rv_pointer(dictionary, bucket * 4);
+        for (unsigned int chain = 0; object && chain < 4096 && visited++ < 131072; chain++) {
+            if (!rv_memory_range(&memory, object, 0x24, PROT_READ)) break;
+            void *next = rv_pointer(object, 0x10);
+            const char *name = rv_class_name(&memory, object);
+            uint32_t id = rv_word(object, 0x20);
+            if (name && strcmp(name, "Player") == 0 && id && id != self_id &&
+                rv_memory_range(&memory, object, 0x2d4, PROT_READ) &&
+                (rv_word(object, 0x40) & 2) && rv_team(&memory, object) == local_team) {
+                float position[3];
+                if (rv_position(&memory, object, RV_PLAYER, position))
+                    radar_add_world_marker(position[0] - origin[0],
+                                          position[1] - origin[1], 0);
+            }
+            object = next;
+        }
+    }
+
+    if (rv_memory_range(&memory, (void *)SHAZBOT_VISIBLE_SHAPEBASE_SET, 4, PROT_READ)) {
+        void *visible = rv_pointer((void *)SHAZBOT_VISIBLE_SHAPEBASE_SET, 0);
+        struct radar_marker enemies[RADAR_MARKER_LIMIT];
+        size_t enemy_count = radar_collect_visible_enemies(&memory, visible, dictionary,
+                                      self_id, local_team, origin, enemies,
+                                      RADAR_MARKER_LIMIT - radar_marker_count);
+        for (size_t i = 0; i < enemy_count; i++)
+            radar_add_world_marker(enemies[i].dx, enemies[i].dy, enemies[i].kind);
+    }
+
+    /* The first assigned ClientTarget is the T2 client waypoint. */
+    if (rv_memory_range(&memory, (void *)SHAZBOT_CLIENT_TARGET_LIST, 4, PROT_READ)) {
+        void *targets = rv_pointer((void *)SHAZBOT_CLIENT_TARGET_LIST, 0);
+        float zero[3] = {0, 0, 0}, delta[3], velocity[3];
+        if (shazbot_assigned_task_delta(&memory, targets, dictionary, NULL,
+                                         origin, zero, delta, velocity, NULL))
+            radar_add_world_marker(delta[0], delta[1], 2);
+    }
+    radar_data_valid = 1;
+}
+
+static void radar_vertex(float x, float y) { radar_gl.Vertex2f(x, y); }
+
+static void radar_draw_dot(float x, float y, float radius,
+                           float r, float g, float b) {
+    radar_gl.Color4f(r, g, b, 1.0f);
+    radar_gl.Begin(RADAR_QUADS);
+    radar_vertex(x - radius, y - radius); radar_vertex(x + radius, y - radius);
+    radar_vertex(x + radius, y + radius); radar_vertex(x - radius, y + radius);
+    radar_gl.End();
+}
+
+static void radar_draw_terrain(float cx, float cy, float radius) {
+    if (!radar_terrain_map.valid || radar_terrain_map.square_size <= 0.0f) return;
+    static const float material_colors[8][3] = {
+        {0.13f, 0.31f, 0.16f}, {0.27f, 0.34f, 0.18f},
+        {0.38f, 0.29f, 0.16f}, {0.36f, 0.35f, 0.24f},
+        {0.22f, 0.30f, 0.28f}, {0.33f, 0.32f, 0.22f},
+        {0.18f, 0.28f, 0.34f}, {0.38f, 0.38f, 0.35f},
+    };
+    float height_range = (float)radar_terrain_map.maximum - radar_terrain_map.minimum;
+    if (height_range < 1.0f) height_range = 1.0f;
+    float tile = radar_terrain_map.square_size * radius / RADAR_WORLD_RANGE;
+    if (tile < 1.0f) tile = 1.0f;
+    if (tile > 9.0f) tile = 9.0f;
+    float edge = radius - tile * 0.75f;
+    float edge2 = edge * edge;
+
+    radar_gl.Begin(RADAR_QUADS);
+    for (size_t y = 0; y < RADAR_TERRAIN_SIDE; y++) {
+        for (size_t x = 0; x < RADAR_TERRAIN_SIDE; x++) {
+            size_t index = y * RADAR_TERRAIN_SIDE + x;
+            float world_x = radar_terrain_map.origin_x + x * radar_terrain_map.square_size;
+            float world_y = radar_terrain_map.origin_y + y * radar_terrain_map.square_size;
+            struct radar_point p;
+            if (!radar_project(world_x - radar_origin[0], world_y - radar_origin[1],
+                               radar_forward_x, radar_forward_y, RADAR_WORLD_RANGE,
+                               cx, cy, radius, &p)) continue;
+            float px = p.x - cx, py = p.y - cy;
+            if (px * px + py * py > edge2) continue;
+
+            float elevation = ((float)radar_terrain_map.height[index] -
+                               radar_terrain_map.minimum) / height_range;
+            if (elevation < 0.0f) elevation = 0.0f;
+            if (elevation > 1.0f) elevation = 1.0f;
+            float shade = 0.48f + elevation * 0.52f;
+            const float *base = material_colors[radar_terrain_map.material[index] & 7];
+            radar_gl.Color4f(base[0] * shade, base[1] * shade, base[2] * shade, 0.9f);
+            radar_vertex(p.x - tile * 0.5f, p.y - tile * 0.5f);
+            radar_vertex(p.x + tile * 0.5f, p.y - tile * 0.5f);
+            radar_vertex(p.x + tile * 0.5f, p.y + tile * 0.5f);
+            radar_vertex(p.x - tile * 0.5f, p.y + tile * 0.5f);
+        }
+    }
+    radar_gl.End();
+}
+
+static void radar_draw_overlay(void) {
+    if (!radar_console_enabled() || !radar_resolve_gl()) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return;
+    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    radar_refresh_data(now_ns);
+    if (!radar_data_valid) return;
+
+    int viewport[4], matrix_mode = RADAR_MODELVIEW;
+    radar_gl.GetIntegerv(RADAR_VIEWPORT, viewport);
+    if (viewport[2] <= 0 || viewport[3] <= 0) return;
+    radar_gl.GetIntegerv(RADAR_MATRIX_MODE, &matrix_mode);
+    radar_gl.PushAttrib(RADAR_ALL_ATTRIB_BITS);
+    radar_gl.MatrixMode(RADAR_PROJECTION); radar_gl.PushMatrix(); radar_gl.LoadIdentity();
+    radar_gl.Ortho(0, viewport[2], viewport[3], 0, -1, 1);
+    radar_gl.MatrixMode(RADAR_MODELVIEW); radar_gl.PushMatrix(); radar_gl.LoadIdentity();
+    radar_gl.Disable(RADAR_TEXTURE_2D); radar_gl.Disable(RADAR_DEPTH_TEST);
+    radar_gl.Disable(RADAR_CULL_FACE); radar_gl.Disable(RADAR_SCISSOR_TEST);
+    radar_gl.Disable(RADAR_ALPHA_TEST); radar_gl.Enable(RADAR_BLEND);
+    radar_gl.BlendFunc(RADAR_SRC_ALPHA, RADAR_ONE_MINUS_SRC_ALPHA);
+
+    const float radius = 74.0f, cx = 104.0f, cy = (float)viewport[3] - 104.0f;
+    static const float turn_cos = 0.9914448614f, turn_sin = 0.1305261922f;
+    float circle_x = radius, circle_y = 0.0f;
+    radar_gl.Color4f(0.015f, 0.05f, 0.035f, 0.78f);
+    radar_gl.Begin(RADAR_TRIANGLE_FAN); radar_vertex(cx, cy);
+    for (int i = 0; i <= 48; i++) {
+        radar_vertex(cx + circle_x, cy + circle_y);
+        float next_x = circle_x * turn_cos - circle_y * turn_sin;
+        circle_y = circle_x * turn_sin + circle_y * turn_cos;
+        circle_x = next_x;
+    }
+    radar_gl.End();
+    radar_draw_terrain(cx, cy, radius);
+    radar_gl.LineWidth(1.0f); radar_gl.Color4f(0.1f, 0.85f, 0.45f, 0.8f);
+    for (int ring = 1; ring <= 2; ring++) {
+        float rr = radius * ring / 2.0f;
+        circle_x = rr; circle_y = 0.0f;
+        radar_gl.Begin(RADAR_LINE_LOOP);
+        for (int i = 0; i < 48; i++) {
+            radar_vertex(cx + circle_x, cy + circle_y);
+            float next_x = circle_x * turn_cos - circle_y * turn_sin;
+            circle_y = circle_x * turn_sin + circle_y * turn_cos;
+            circle_x = next_x;
+        }
+        radar_gl.End();
+    }
+    radar_gl.Begin(RADAR_LINES);
+    radar_vertex(cx - radius, cy); radar_vertex(cx + radius, cy);
+    radar_vertex(cx, cy - radius); radar_vertex(cx, cy + radius);
+    radar_gl.End();
+    radar_draw_dot(cx, cy, 3.0f, 1.0f, 1.0f, 1.0f);
+
+    for (size_t i = 0; i < radar_marker_count; i++) {
+        struct radar_marker *m = &radar_markers[i];
+        struct radar_point point;
+        if (!radar_project(m->dx, m->dy, radar_forward_x, radar_forward_y,
+                           RADAR_WORLD_RANGE, cx, cy, radius, &point)) continue;
+        if (m->kind == 0) radar_draw_dot(point.x, point.y, 2.5f, 0.25f, 0.65f, 1.0f);
+        else if (m->kind == 1) radar_draw_dot(point.x, point.y, 3.0f, 1.0f, 0.25f, 0.15f);
+        else radar_draw_dot(point.x, point.y, 3.5f, 1.0f, 0.9f, 0.1f);
+    }
+
+    radar_gl.MatrixMode(RADAR_MODELVIEW); radar_gl.PopMatrix();
+    radar_gl.MatrixMode(RADAR_PROJECTION); radar_gl.PopMatrix();
+    radar_gl.MatrixMode((unsigned)matrix_mode); radar_gl.PopAttrib();
+}
+
+/* The #25034 Sky::renderSkyBox entry at 0x08222390 reads the ten Sky::mPoints
+   vertices beginning at this+0xd18, then submits the cube faces. Rotate those
+   vertices only around that native call and restore the object immediately;
+   cloud geometry, scene state, networked fields, and other Sky instances are
+   otherwise untouched. Angle units match the T1 reference (radians/second). */
+#define SKY_RENDER_SLICES_ADDRESS 0x08222390
+#define SKY_POINTS_OFFSET 0x0d18
+#define SKY_POINTS_BYTES (10 * 3 * sizeof(float))
+static const unsigned char sky_render_slices_original[] = {
+    0x55, 0x89, 0xe5, 0x81, 0xec, 0xac, 0x00, 0x00, 0x00
+};
+static const float sky_pi = 3.14159265358979323846f;
+static const float sky_tau = 6.28318530717958647692f;
+
+static void sky_sincos(float angle, float *sine, float *cosine) {
+    while (angle > sky_pi) angle -= sky_tau;
+    while (angle < -sky_pi) angle += sky_tau;
+    float cosine_sign = 1.0f;
+    if (angle > sky_pi * 0.5f) {
+        angle = sky_pi - angle;
+        cosine_sign = -1.0f;
+    } else if (angle < -sky_pi * 0.5f) {
+        angle = -sky_pi - angle;
+        cosine_sign = -1.0f;
+    }
+    float x2 = angle * angle;
+    *sine = angle * (1.0f + x2 * (-0.1666666716f + x2 *
+            (0.0083333477f + x2 * (-0.0001984090f))));
+    *cosine = cosine_sign *
+        (1.0f + x2 * (-0.5f + x2 * (0.0416666418f + x2 * -0.0013888378f)));
+}
+
+static void sky_rotate_points(unsigned char *sky, float angle) {
+    float sine, cosine;
+    sky_sincos(angle, &sine, &cosine);
+    float *points = (float *)(sky + SKY_POINTS_OFFSET);
+    for (size_t i = 0; i < 10; i++) {
+        float x = points[i * 3], y = points[i * 3 + 1];
+        points[i * 3] = x * cosine - y * sine;
+        points[i * 3 + 1] = x * sine + y * cosine;
+    }
+}
+
+static float sky_rotation_speed(void) {
+    if (!Con__evaluate || !core_runtime_installed) return 0.0f;
+    const char *text = Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0);
+    if (!text || !text[0]) return 0.0f;
+    char *end = NULL;
+    float speed = strtof(text, &end);
+    return end != text && !*end && isfinite(speed) && speed >= -20.0f && speed <= 20.0f
+        ? speed : 0.0f;
+}
+
+static void sky_rotation_update(uint64_t now_ns, float speed) {
+    if (!sky_rotation_last_ns || now_ns < sky_rotation_last_ns) {
+        sky_rotation_last_ns = now_ns;
+        return;
+    }
+    uint64_t elapsed_ns = now_ns - sky_rotation_last_ns;
+    sky_rotation_last_ns = now_ns;
+    if (elapsed_ns > 250000000ULL) elapsed_ns = 250000000ULL;
+    sky_rotation_angle += speed * ((float)elapsed_ns / 1000000000.0f);
+    while (sky_rotation_angle > sky_pi) sky_rotation_angle -= sky_tau;
+    while (sky_rotation_angle < -sky_pi) sky_rotation_angle += sky_tau;
+}
+
+typedef void (*sky_render_slices_t)(void *sky, float lower_band_height, float upper_alpha);
+static sky_render_slices_t sky_render_slices_original_fn;
+
+static void sky_render_slices_wrapper(void *sky_object, float lower_band_height,
+                                      float upper_alpha) {
+    float speed = sky_rotation_speed();
+    if (speed == 0.0f) {
+        sky_rotation_last_ns = 0;
+        sky_render_slices_original_fn(sky_object, lower_band_height, upper_alpha);
+        return;
+    }
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) {
+        sky_render_slices_original_fn(sky_object, lower_band_height, upper_alpha);
+        return;
+    }
+    sky_rotation_update((uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec, speed);
+    struct rv_memory memory;
+    unsigned char saved[SKY_POINTS_BYTES];
+    if (!sky_object || !rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (unsigned char *)sky_object + SKY_POINTS_OFFSET,
+                         SKY_POINTS_BYTES, PROT_READ | PROT_WRITE)) {
+        sky_render_slices_original_fn(sky_object, lower_band_height, upper_alpha);
+        return;
+    }
+    memcpy(saved, (unsigned char *)sky_object + SKY_POINTS_OFFSET, sizeof saved);
+    sky_rotate_points((unsigned char *)sky_object, sky_rotation_angle);
+    sky_render_slices_original_fn(sky_object, lower_band_height, upper_alpha);
+    memcpy((unsigned char *)sky_object + SKY_POINTS_OFFSET, saved, sizeof saved);
+}
+
+static int install_sky_rotation_hook(void) {
+    if (sky_rotation_hook_attempted) return sky_rotation_hook_installed;
+    sky_rotation_hook_attempted = 1;
+    int protection;
+    if (target != &game_targets[0] || target->dedicated ||
+        !readable_range(SKY_RENDER_SLICES_ADDRESS, sizeof sky_render_slices_original,
+                        &protection) || !(protection & PROT_EXEC) ||
+        memcmp((void *)SKY_RENDER_SLICES_ADDRESS, sky_render_slices_original,
+               sizeof sky_render_slices_original) != 0) {
+        fprintf(stderr, "[t2_hook] Sky rotation refused: unsupported T2 Sky renderer\n");
+        return 0;
+    }
+    unsigned char *trampoline = mmap(NULL, 32, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (trampoline == MAP_FAILED) return 0;
+    memcpy(trampoline, sky_render_slices_original, sizeof sky_render_slices_original);
+    trampoline[sizeof sky_render_slices_original] = 0xe9;
+    int32_t back = (int32_t)((SKY_RENDER_SLICES_ADDRESS + sizeof sky_render_slices_original) -
+                            ((uintptr_t)trampoline + sizeof sky_render_slices_original + 5));
+    memcpy(trampoline + sizeof sky_render_slices_original + 1, &back, sizeof back);
+    __builtin___clear_cache((char *)trampoline,
+                            (char *)trampoline + sizeof sky_render_slices_original + 5);
+    if (mprotect(trampoline, 32, PROT_READ | PROT_EXEC) != 0) {
+        munmap(trampoline, 32);
+        return 0;
+    }
+    sky_rotation_trampoline = trampoline;
+    sky_render_slices_original_fn = (sky_render_slices_t)trampoline;
+
+    unsigned char replacement[sizeof sky_render_slices_original];
+    replacement[0] = 0xe9;
+    int32_t to_wrapper = (int32_t)((uintptr_t)sky_render_slices_wrapper -
+                                   (SKY_RENDER_SLICES_ADDRESS + 5));
+    memcpy(replacement + 1, &to_wrapper, sizeof to_wrapper);
+    memset(replacement + 5, 0x90, sizeof replacement - 5);
+    const struct code_patch patch = {SKY_RENDER_SLICES_ADDRESS,
+        sky_render_slices_original, sizeof sky_render_slices_original, 0,
+        replacement, sizeof replacement};
+    if (!apply_code_patches("Sky rotation", &patch, 1)) {
+        munmap(trampoline, 32);
+        sky_rotation_trampoline = NULL;
+        sky_render_slices_original_fn = NULL;
+        return 0;
+    }
+    sky_rotation_hook_installed = 1;
+    fprintf(stderr, "[t2_hook] T2 sky rotation hook installed; set pref::skyRotationSpeed (radians/sec)\n");
+    return 1;
+}
+
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
@@ -3628,6 +7069,7 @@ void SDL_GL_SwapBuffers(void) {
     int on_game_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
     if (on_game_thread && rt.active) rt_present();
     else if (on_game_thread) apply_gamma_pass();
+    if (on_game_thread) radar_draw_overlay();
     real_sdl_gl_swap_buffers();
     if (on_game_thread && rt.active) gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt_draw_fbo());
     cap_frame_rate();
@@ -3641,8 +7083,22 @@ void SDL_GL_SwapBuffers(void) {
         register_hook_commands();
     if (!registered || !Con__evaluate ||
         !game_main_thread_known ||
-        !pthread_equal(pthread_self(), game_main_thread))
+        !pthread_equal(pthread_self(), game_main_thread)) {
+        if (hook_option_bool("telemetry.shazbot") && !shazbot_poll_gate_reported) {
+            char message[192];
+            snprintf(message, sizeof message,
+                     "telemetry poll blocked before client polling (registered=%d, evaluator=%d, main_thread=%d, current_thread=%d)",
+                     !!registered, Con__evaluate != NULL, !!game_main_thread_known,
+                     game_main_thread_known && pthread_equal(pthread_self(), game_main_thread));
+            shazbot_report_once(&shazbot_poll_gate_reported, message);
+        }
         return;
+    }
+
+    if (hook_option_bool("telemetry.shazbot_actions") || shazbot_action_trigger_known)
+        shazbot_poll_actions();
+    poll_shazbot_telemetry();
+    shazbot_poll_notifications();
 
     if (vsync_reapply) {
         vsync_reapply = 0;
@@ -3676,6 +7132,12 @@ void SDL_GL_SwapBuffers(void) {
     if (!core_runtime_installed) {
         Con__evaluate(core_runtime_script, 0, "t2launch/core.cs", 0);
         core_runtime_installed = 1;
+    }
+    if (!target->dedicated && hook_option_bool("telemetry.shazbot") &&
+        hook_option_bool("hook.console_commands") && !shazbot_hud_runtime_script_loaded) {
+        Con__evaluate(shazbot_hud_telemetry_script, 0, "t2launch/shazbot_hud.cs", 0);
+        shazbot_hud_runtime_script_loaded = 1;
+        fprintf(stderr, "[t2_hook] Shazbot HUD weapon availability/selection tracking enabled\n");
     }
     /* The TribesNext handlers call the hook's console commands. */
     if (!tribesnext_runtime_installed) {
@@ -3757,6 +7219,9 @@ void SDL_GL_SwapBuffers(void) {
             const char *autoplay = getenv("T2LAUNCH_AUTOPLAY_DEMO");
             if (autoplay && *autoplay && !strchr(autoplay, '"')) {
                 char script[768];
+                Con__evaluate(autoplay_demo_exit_package, 0,
+                              "t2launch/autoplay_demo_exit.cs", 0);
+                shazbot_autoplay_demo_active = 1;
                 snprintf(script, sizeof script,
                     "$T2Launch::AutoplayDemo = \"%s\";"
                     "function t2launch_autoplayDemo() {"
@@ -4046,6 +7511,120 @@ static void sha1(const uint8_t *data, int len, char out[41]) {
 static const char* hook_test_cb(void *obj, S32 argc, const char **argv) {
     (void)obj; (void)argc; (void)argv;
     return "ok_from_c";
+}
+
+static const char* shazbot_command_label_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (!hook_option_bool("telemetry.shazbot_command_labels") ||
+        !shazbot_command_label_capture_active) return "disabled";
+    if (argc != 3) return "usage: shazbot_command_label <id> <pressed>";
+    char *end = NULL;
+    long command = strtol(argv[1], &end, 10);
+    if (!end || *end || command < 0 || command >= SHAZBOT_COMMAND_ACTIONS)
+        return "invalid command id";
+    end = NULL;
+    long pressed = strtol(argv[2], &end, 10);
+    if (!end || *end || (pressed != 0 && pressed != 1)) return "pressed must be 0 or 1";
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return "clock unavailable";
+    uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    fprintf(stderr, "[t2_hook] Shazbot: command label monotonic_ns=%llu id=%ld pressed=%ld\n",
+            (unsigned long long)timestamp, command, pressed);
+    return "ok";
+}
+
+static const char* shazbot_test_weapon_slot_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (!hook_option_bool("telemetry.shazbot_auto_weapon_slot_test") ||
+        !hook_option_bool("telemetry.shazbot_command_labels") ||
+        !shazbot_command_label_capture_active) return "disabled";
+    if (argc != 2) return "usage: shazbot_test_weapon_slot <slot-id-0-to-5>";
+    char *end = NULL;
+    long slot = strtol(argv[1], &end, 10);
+    if (!end || *end || slot < 0 || slot >= 6) return "slot must be in 0..5";
+    if (!Con__evaluate || !shazbot_command_scripts[slot]) return "console unavailable";
+    char slot_text[8];
+    (void)snprintf(slot_text, sizeof slot_text, "%ld", slot);
+    const char *label_arguments[] = {"shazbot_command_label", slot_text, "1"};
+    const char *label_result = shazbot_command_label_cb(NULL, 3, label_arguments);
+    if (!label_result || strcmp(label_result, "ok") != 0) return "command label unavailable";
+    (void)Con__evaluate(shazbot_command_scripts[slot], 0,
+                        "t2launch/shazbot_weapon_slot_test.cs", 0);
+    fprintf(stderr, "[t2_hook] Shazbot scripted weapon-slot command id=%ld name=%s\n",
+            slot, shazbot_command_names[slot]);
+    return "ok";
+}
+
+static const char *shazbot_hud_weapon_clear_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argv;
+    if (argc != 1) return "usage: shazbot_hud_weapon_clear()";
+    shazbot_hud_weapon_clear_state();
+    return "ok";
+}
+
+static const char *shazbot_hud_weapon_item_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc != 4) return "usage: shazbot_hud_weapon_item(hudSlot, name, addItem)";
+    char *end = NULL;
+    long hud_slot = strtol(argv[1], &end, 10);
+    if (!end || *end || hud_slot < -1 || hud_slot > 255) return "invalid HUD slot";
+    end = NULL;
+    long add_item = strtol(argv[3], &end, 10);
+    if (!end || *end || (add_item != 0 && add_item != 1)) return "addItem must be 0 or 1";
+    shazbot_hud_weapon_update_state((int)hud_slot, argv[2], (int)add_item);
+    return "ok";
+}
+
+static const char *shazbot_hud_weapon_active_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc != 2) return "usage: shazbot_hud_weapon_active(name)";
+    shazbot_hud_weapon_active_state(argv[1]);
+    return "ok";
+}
+
+static const char* shazbot_demo_record_start_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!hook_option_bool("telemetry.shazbot_command_labels")) return "disabled";
+    shazbot_command_label_capture_active = 1;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return "clock unavailable";
+    uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    fprintf(stderr, "[t2_hook] Shazbot: demo recording start monotonic_ns=%llu\n",
+            (unsigned long long)timestamp);
+    return "ok";
+}
+
+static const char* shazbot_demo_record_stop_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!hook_option_bool("telemetry.shazbot_command_labels")) return "disabled";
+    shazbot_command_label_capture_active = 0;
+    return "ok";
+}
+
+static const char* shazbot_command_capture_start_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!hook_option_bool("telemetry.shazbot_command_labels")) return "disabled";
+    shazbot_command_label_capture_active = 1;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0)
+        return "clock unavailable";
+    uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    fprintf(stderr, "[t2_hook] Shazbot: command capture start monotonic_ns=%llu\n",
+            (unsigned long long)timestamp);
+    return "ok";
+}
+
+static const char* shazbot_command_capture_stop_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!hook_option_bool("telemetry.shazbot_command_labels")) return "disabled";
+    shazbot_command_label_capture_active = 0;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 && now.tv_sec >= 0) {
+        uint64_t timestamp = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        fprintf(stderr, "[t2_hook] Shazbot: command capture stop monotonic_ns=%llu\n",
+                (unsigned long long)timestamp);
+    }
+    return "ok";
 }
 
 static const char* hook_profile_browser_wake_cb(void *obj, S32 argc, const char **argv) {
@@ -5221,6 +8800,9 @@ static int register_hook_commands(void) {
     if (!target->dedicated && hook_option_bool("video.vsync"))
         Con__addMethodS(NULL, "setVerticalSync", set_vertical_sync_cb,
             "setVerticalSync( <bool> )", 2, 2);
+    if (!target->dedicated)
+        Con__addMethodS(NULL, "hook_hud_demo_heading", hook_hud_demo_heading_cb,
+            "hook_hud_demo_heading() - native heading for the HUD demo compass", 1, 1);
     if (hud_bar_store_value)
         Con__addMethodS("HudBarBaseCtrl", "getValue", hud_bar_get_value_cb,
             "bar.getValue() - the bar's current fill, 0 to 1", 2, 2);
@@ -5235,6 +8817,28 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
+    if (!target->dedicated && hook_option_bool("telemetry.shazbot_command_labels")) {
+        Con__addMethodS(NULL, "shazbot_command_label", shazbot_command_label_cb,
+            "shazbot_command_label <id> <pressed> - record an opted-in command label", 3, 3);
+        Con__addMethodS(NULL, "shazbot_test_weapon_slot", shazbot_test_weapon_slot_cb,
+            "shazbot_test_weapon_slot <slot-id-0-to-5> - label and send one real weapon-slot command", 2, 2);
+        Con__addMethodS(NULL, "shazbot_demo_record_start", shazbot_demo_record_start_cb,
+            "shazbot_demo_record_start - mark a demo recording for Shazbot labels", 1, 1);
+        Con__addMethodS(NULL, "shazbot_demo_record_stop", shazbot_demo_record_stop_cb,
+            "shazbot_demo_record_stop - stop Shazbot command labels for this recording", 1, 1);
+        Con__addMethodS(NULL, "shazbot_command_capture_start", shazbot_command_capture_start_cb,
+            "shazbot_command_capture_start - mark a direct command-label capture", 1, 1);
+        Con__addMethodS(NULL, "shazbot_command_capture_stop", shazbot_command_capture_stop_cb,
+            "shazbot_command_capture_stop - finish a direct command-label capture", 1, 1);
+    }
+    if (!target->dedicated && hook_option_bool("telemetry.shazbot")) {
+        Con__addMethodS(NULL, "shazbot_hud_weapon_clear", shazbot_hud_weapon_clear_cb,
+            "shazbot_hud_weapon_clear() - reset HUD-mirrored weapon inventory", 1, 1);
+        Con__addMethodS(NULL, "shazbot_hud_weapon_item", shazbot_hud_weapon_item_cb,
+            "shazbot_hud_weapon_item(hudSlot, name, addItem) - mirror a HUD weapon inventory update", 4, 4);
+        Con__addMethodS(NULL, "shazbot_hud_weapon_active", shazbot_hud_weapon_active_cb,
+            "shazbot_hud_weapon_active(name) - mirror the selected HUD weapon", 2, 2);
+    }
     if (!target->dedicated) {
         Con__addMethodS(NULL, "hook_review_range", hook_review_range_cb,
             "hook_review_range([0|1]) - query or change demo-review range for this session", 1, 2);
@@ -5357,6 +8961,8 @@ static void __attribute__((constructor)) init(void) {
     /* Before main() calibrates or reads the timer, so game time never jumps. */
     if (hook_option_bool("runtime.monotonic_clock")) install_monotonic_clock();
     if (hook_option_bool("net.packet_limits")) install_net_packet_limits();
+    install_build_identifier();
+    install_demo_protocol_tag();
     if (target->dedicated) {
         game_main_thread_known = 1;  /* constructors run on the main thread */
         /* A headless server's stdout is a pipe or file, which the game would
@@ -5369,6 +8975,7 @@ static void __attribute__((constructor)) init(void) {
         fprintf(stderr, "[t2_hook] Console command registration deferred to the server's main loop\n");
         return;
     }
+    install_sky_rotation_hook();
     if (hook_option_bool("browser.many_bots")) install_browser_bot_limit();
     install_review_model_selection();
     if (hook_option_bool("ui.hud_get_value") || hook_option_bool("ui.vertical_fill") ||

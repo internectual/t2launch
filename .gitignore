@@ -3,3 +3,10 @@ rsa_helper
 __pycache__/
 /games/
 /RESEARCH.md
+*.log
+*.log.*
+*.strace
+/HANDOFF.md
+/PLAN.md
+# Unused: the compass markers are the stock textures/gui/hud_* now.
+/scripts/HudDemo/assets/textures/schemes/
