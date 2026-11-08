@@ -1090,32 +1090,52 @@ enablewinconsole(true);
 
 ### Hook console commands
 
-| Command | Args | Description |
-|---------|------|-------------|
-| `hook_test` | none | Returns "ok_from_c" |
-| `hook_option` | `<key>` | Current hook option value, including session overrides |
-| `hook_review_range` | `[0|1]` | Query/change session review range; report configured/applied state and stock far distance (client only) |
-| `hook_review_global_beacons` | `[0|1]` | Query/change session beacon visibility; report configured/applied state (client only) |
-| `hook_review_ffi` | `[0|1]` | Query/change session IFF/FFI reconstruction; report configured/applied state (client only) |
-| `hook_review_no_cloak` | `[0|1]` | Query/change session no-cloak alpha override; report configured/applied state (client only) |
-| `hook_review_autobeacon` | `[0|1]` | Query/change session beacon target reassignment; report configured/playback-active state (client only) |
-| `hook_review_models` | `[filename filter]` | Log cached DTS resources and their backing loose file or volume without loading/changing models (client only) |
-| `hook_review_textures` | `[key filter]` | Log face/HUD texture cache and actual beacon HUD handles; empty filter lists all keys (client only) |
-| `hook_sha1` | `<string>` | SHA1 hash → 40-char hex |
-| `hook_rsa_mod_exp` | `<base_hex> <exp_hex> <mod_hex>` | RSA modular exponentiation |
-| `hook_rand64` | none | Random unpadded 64-bit hex |
-| `hook_profile_browser_wake` | none | Confirm runtime browser integration |
-| `hook_tn_unlock` | `<username> <password>` | Unlock the installed key in memory; no password logging |
-| `hook_tn_certificate_length` | none | Installed certificate length |
-| `hook_tn_certificate_chunk` | `<offset>` | One certificate chunk |
-| `hook_tn_decrypt` | `<hex>` | Decrypt a server challenge with the unlocked key |
-| `hook_tn_clear` | none | Clear in-memory account material |
-| `hook_tn_trace` | `<known_stage> [safe_state...]` | Safe diagnostic marker for auth stages |
-| `hook_tn_join_trace` | `<address> <ready>` | Log the selected server and key-ready state |
-| `hook_tn_ip_trace` | `<ip> <hex>` | Log the parsed IPv4 used in the client challenge |
-| `hook_tn_ipv4_hex` | `<dotted_ipv4>` | Encode the T2CSRI IPv4 challenge suffix |
-| `hook_tn_hex_ipv4` | `<hex>` | Decode a T2CSRI IPv4 suffix to dotted form |
-| `hook_tn_verify_cert` | `<certificate>` | 1 if the TribesNext root key signed the account certificate |
+Unless noted otherwise, global commands in this table require `hook.console_commands`.
+Arguments are shown after the command name.
+
+| Command | Arguments | Description | Availability |
+|---------|-----------|-------------|--------------|
+| `hook_test` | — | Returns `ok_from_c`. | Global |
+| `hook_option` | `<key>` | Returns the effective hook option value (config, environment override, or default). | Global |
+| `hook_hud_demo_heading` | — | Returns the controlled object's heading in degrees, or an empty string when unavailable. | Client; registered independently of `hook.console_commands` |
+| `hook_review_range` | `[0|1]` | Query or set extended review range; reports configured/applied state and stock/review far distances. | Client |
+| `hook_review_global_beacons` | `[0|1]` | Query or set review beacon visibility; reports configured/applied state. | Client |
+| `hook_review_ffi` | `[0|1]` | Query or set review IFF/FFI reconstruction; reports configured/applied state. | Client |
+| `hook_review_no_cloak` | `[0|1]` | Query or set the review no-cloak alpha override; reports configured/applied state. | Client |
+| `hook_review_autobeacon` | `[0|1]` | Query or set review target reassignment; reports whether it is active during demo playback. | Client |
+| `hook_review_models` | `[filename-filter]` | Log cached DTS resources and backing loose files/volumes; does not load or replace models. | Client |
+| `hook_review_textures` | `[key-filter]` | Log texture-cache entries and beacon HUD handles; no filter lists all keys. | Client |
+| `hook_sha1` | `<string>` | Return the SHA-1 digest as 40 hexadecimal characters. | Global |
+| `hook_rsa_mod_exp` | `<base-hex> <exponent-hex> <modulus-hex>` | Return the RSA modular exponentiation result in hexadecimal. | Global; needs the bundled RSA helper |
+| `hook_rand64` | — | Return a random, unpadded 64-bit hexadecimal value. | Global |
+| `hook_profile_browser_wake` | — | Log once that the runtime Community Browser hooks are active. | Global |
+| `hook_tn_unlock` | `<username> <password>` | Unlock the installed TribesNext account key in memory; does not log the password. | Global |
+| `hook_tn_certificate_length` | — | Return the unlocked account certificate length. | Global |
+| `hook_tn_certificate_chunk` | `<offset>` | Return a safe chunk of the unlocked account certificate. | Global |
+| `hook_tn_decrypt` | `<hex>` | Decrypt a server challenge using the unlocked account key. | Global |
+| `hook_tn_clear` | — | Clear unlocked account material from memory. | Global |
+| `hook_tn_trace` | `<stage> [safe-state ...]` | Emit a diagnostic for a recognized TribesNext authentication stage. | Global |
+| `hook_tn_join_trace` | `<address> <ready>` | Log the selected server address and whether the account key is ready. | Global |
+| `hook_tn_ip_trace` | `<ip> <hex>` | Log the parsed challenge IPv4 address and its encoded form. | Global |
+| `hook_tn_ipv4_hex` | `<dotted-ipv4>` | Encode an IPv4 address in T2CSRI challenge order. | Global |
+| `hook_tn_hex_ipv4` | `<hex>` | Decode an eight-digit T2CSRI IPv4 suffix to dotted form. | Global |
+| `hook_tn_verify_cert` | `<certificate>` | Return `1` if the TribesNext root key signed the certificate, otherwise `0`. | Global |
+| `hook_depot_fetch` | `<file>` | Start fetching a missing map asset from the TribesNext depot; returns `1` when started, otherwise `0`. | Client; `net.depot_downloads` enabled |
+| `hook_depot_status` | — | Return `running`, `ok <path>`, or `error <reason>` for the active depot download. | Client; `net.depot_downloads` enabled |
+| `setVerticalSync` | `<bool>` | Set GLX vertical sync; returns `1` on success or `0` when unsupported. | Client; `video.vsync` enabled |
+| `shazbot_command_label` | `<id> <pressed>` | Record one weapon/pack command label (`pressed` is `0` or `1`). | Client; command-label capture enabled and active |
+| `shazbot_test_weapon_slot` | `<slot-id>` | Label and issue a scripted weapon-slot command (`0`–`5`). | Client; auto weapon-slot test and command-label capture enabled |
+| `shazbot_demo_record_start` | — | Start command-label capture for a demo recording. | Client; command-label capture enabled |
+| `shazbot_demo_record_stop` | — | Stop command-label capture for a demo recording. | Client; command-label capture enabled |
+| `shazbot_command_capture_start` | — | Start direct command-label capture. | Client; command-label capture enabled |
+| `shazbot_command_capture_stop` | — | Stop direct command-label capture. | Client; command-label capture enabled |
+| `shazbot_hud_weapon_clear` | — | Clear the HUD-mirrored weapon inventory. | Client; Shazbot telemetry enabled |
+| `shazbot_hud_weapon_item` | `<hud-slot> <name> <add-item>` | Update one HUD-mirrored weapon item (`add-item` is `0` or `1`). | Client; Shazbot telemetry enabled |
+| `shazbot_hud_weapon_active` | `<name>` | Set the active weapon in the HUD-mirrored inventory. | Client; Shazbot telemetry enabled |
+
+`HudBarBaseCtrl.getValue()` is a control method, not a global command; it is
+registered when `ui.hud_get_value` is enabled. `setVerticalSync` is also
+registered before the `hook.console_commands` gate.
 
 ### Binary addresses (Tribes 2 Linux #25034)
 
