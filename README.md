@@ -1011,8 +1011,9 @@ options bring the parts of it that fit the Linux client:
   `discord_presence.py`, which it starts beside the game. The helper sends it
   over Discord's IPC socket (`$XDG_RUNTIME_DIR/discord-ipc-N`, including the
   Flatpak, Snap and Vesktop locations), connects whenever Discord is running,
-  and exits when the game does. `discord.app_id` (advanced) picks the Discord
-  application; its art asset should be named `tribes2`.
+  and exits when the game does. The default `discord.app_id` matches the
+  TribesNEXT QoL patch; the advanced setting can override it. The application
+  art asset should be named `tribes2`.
 
 ## Development
 

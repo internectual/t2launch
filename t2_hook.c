@@ -180,7 +180,7 @@ static struct hook_option hook_options[] = {
     {"net.depot_downloads", "0", NULL, 0, "", 0},
     {"net.native_auth", "0", NULL, 0, "", 0},
     {"discord.presence", "0", NULL, 0, "", 0},
-    {"discord.app_id", "1563045749846056970", NULL, 0, "", 0},
+    {"discord.app_id", "488764170460725249", NULL, 0, "", 0},
     {"ui.hud_get_value", "1", NULL, 0, "", 0},
     {"ui.vertical_fill", "1", NULL, 0, "", 0},
     {"ui.bar_flip", "1", NULL, 0, "", 0},

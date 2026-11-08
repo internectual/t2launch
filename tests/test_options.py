@@ -104,6 +104,7 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(t2options.coerce(t2options.BY_KEY["won.mode"], ""), "off")
         self.assertEqual(t2options.coerce(t2options.BY_KEY["discord.app_id"], ""),
                          t2options.BY_KEY["discord.app_id"].default)
+        self.assertEqual(t2options.BY_KEY["discord.app_id"].default, "488764170460725249")
         self.assertEqual(t2options.coerce(t2options.BY_KEY["server.public_address"], ""), "")
         # A bad stored value falls back to the default instead of breaking launch.
         self.assertEqual(t2options.chosen({"won.mode": "bogus"})["won.mode"], "off")

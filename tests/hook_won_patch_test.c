@@ -2750,7 +2750,7 @@ int main(void) {
     assert(waitpid(discord_child, NULL, 0) == discord_child);
     char discord_expected[256], discord_result[256] = "";
     snprintf(discord_expected, sizeof(discord_expected),
-             "4|--app-id|1563045749846056970|--pid|%d|unset\nmenu\ngame\tServer\tKatabatic\tCTF\t12\n",
+             "4|--app-id|488764170460725249|--pid|%d|unset\nmenu\ngame\tServer\tKatabatic\tCTF\t12\n",
              (int)getpid());
     FILE *discord_file = fopen(discord_seen, "r");
     assert(discord_file);

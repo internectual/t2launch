@@ -368,7 +368,7 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Rich presence: the menus, or the map, game type, server and player count while "
                 "you're in a game. Needs the Discord desktop client running on this machine."),
-    Option("discord.app_id", "Discord", "Discord application ID", "text", "1563045749846056970",
+    Option("discord.app_id", "Discord", "Discord application ID", "text", "488764170460725249",
            hook=True, advanced=True, requires=(("discord.presence", (True,)),),
            help="The Discord application whose name and art the presence shows. Its art asset "
                 "should be named \"tribes2\"."),
