@@ -32,7 +32,8 @@ SERVER_PROGRAM = r'''import sys
 from PySide6.QtCore import QTimer
 import t2launch_app
 t2launch_app_settings = {
-    "profiles": [{"name": "Sentry API Test", "options": {"game.executable": "client"}}],
+    "profiles": [{"name": "Sentry API Test", "options": {"game.executable": "client"}},
+                 {"name": "Dedicated API Test", "options": {"game.executable": "dedicated"}}],
     "monitor": "", "autolaunch_profile": "", "autolaunch_delay": 0
 }
 t2launch_app.read_settings = lambda: t2launch_app_settings
@@ -42,6 +43,10 @@ saved_profile = repr(app.settings["profiles"])
 class FakeProcess:
     def processId(self): return 4421
 def verify_launch(name, **kwargs):
+    if name == "Dedicated API Test":
+        assert kwargs == {"show_errors": False}, kwargs
+        print("dedicated-launch-verified", flush=True)
+        return FakeProcess()
     assert name == "Sentry API Test"
     assert kwargs["session_id"] == "test-session-001"
     assert kwargs["load_hook_override"] is True
@@ -160,6 +165,11 @@ class SentryControlApiTests(unittest.TestCase):
                             "video.full_redraw": False,
                         },
                     }, timeout_ms=2000)
+                    dedicated = control_client.request(
+                        {"op": "launch_dedicated", "profile": "Dedicated API Test"}, timeout_ms=2000)
+                    client_as_dedicated = control_client.request(
+                        {"op": "launch_dedicated", "profile": "Sentry API Test"}, timeout_ms=2000)
+                    stopped = control_client.request({"op": "stop_dedicated"}, timeout_ms=2000)
                     restarted = control_client.request({"op": "restart_control_api"}, timeout_ms=2000)
                     status = control_client.request({"op": "status"}, timeout_ms=2000)
                 self.assertTrue(ping["ok"])
@@ -171,6 +181,14 @@ class SentryControlApiTests(unittest.TestCase):
                 self.assertEqual(launched["pid"], 4421)
                 self.assertEqual(launched["session_id"], "test-session-001")
                 self.assertEqual(server.stdout.readline().strip(), "launch-overrides-verified")
+                self.assertIn("dedicated_server", ping["features"])
+                self.assertEqual(profiles["profiles"][1]["executable"], "dedicated")
+                self.assertTrue(dedicated["ok"])
+                self.assertEqual(dedicated["pid"], 4421)
+                self.assertEqual(server.stdout.readline().strip(), "dedicated-launch-verified")
+                self.assertFalse(client_as_dedicated["ok"])
+                self.assertIn("dedicated executable", client_as_dedicated["error"])
+                self.assertEqual(stopped, {"ok": True, "stopped": [], "request_id": None})
                 self.assertTrue(restarted["ok"])
                 self.assertEqual(restarted["api"], 2)
                 self.assertEqual(restarted["state"], "restarted")

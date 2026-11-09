@@ -47,7 +47,7 @@ SENTRY_SESSION_OVERRIDE_KEYS = frozenset({
     "telemetry.shazbot_weapon_slot_test_script",
 })
 SENTRY_DEMO_RECORDING_RE = re.compile(r"recordings/[A-Za-z0-9][A-Za-z0-9_.-]*\.rec")
-SENTRY_CONTROL_API_FEATURES = ["session_demo_recording"]
+SENTRY_CONTROL_API_FEATURES = ["session_demo_recording", "dedicated_server"]
 
 
 def normalize_sentry_demo_recording(value):
@@ -1002,6 +1002,7 @@ class Launcher(QApplication):
                 "packet_capture": bool(effective.get("telemetry.shazbot_packet_capture", False)),
                 "command_labels": bool(effective.get("telemetry.shazbot_command_labels", False)),
                 "actions": bool(effective.get("telemetry.shazbot_actions", False)),
+                "executable": str(effective.get("game.executable", "client")),
             })
         return summaries
 
@@ -1021,8 +1022,62 @@ class Launcher(QApplication):
                 "telemetry": bool(metadata.get("telemetry", False)),
                 "packet_capture": bool(metadata.get("packet_capture", False)),
                 "demo_recording": metadata.get("demo_recording"),
+                "executable": metadata.get("executable", "client"),
             })
         return summaries
+
+    def _profile_by_name(self, name):
+        """The named profile as saved in settings.json, so edits made outside the
+        settings dialog (for example by an agent) apply without a restart."""
+        saved = next((p for p in read_settings()["profiles"]
+                      if isinstance(p, dict) and p.get("name") == name), None)
+        profiles = self.settings["profiles"]
+        index = next((i for i, p in enumerate(profiles) if p.get("name") == name), None)
+        if saved is not None:
+            if index is None:
+                profiles.append(saved)
+            else:
+                profiles[index] = saved
+            return saved
+        return profiles[index] if index is not None else None
+
+    def _running_dedicated_servers(self):
+        return [(key, name, process) for key, (name, process) in list(self.processes.items())
+                if self.process_metadata.get(key, {}).get("executable") == "dedicated"
+                and is_qobject_valid(process) and process.state() != QProcess.NotRunning]
+
+    def _launch_dedicated_request(self, request):
+        """Start a dedicated-server profile as saved: no session overrides or telemetry."""
+        name = request.get("profile")
+        if not isinstance(name, str) or not name:
+            raise ValueError("profile name is required")
+        profile = self._profile_by_name(name)
+        if profile is None:
+            raise ValueError(f"unknown profile: {name}")
+        hooked = bool(profile.get("load_hook", True))
+        effective = t2options.effective(t2options.migrate(profile), {"launcher.load_hook": hooked})
+        if effective.get("game.executable") != "dedicated":
+            raise ValueError(f"profile {name!r} does not use the dedicated executable")
+        running = self._running_dedicated_servers()
+        if running:
+            raise ValueError("a dedicated server is already running: " +
+                             ", ".join(f"{n} (PID {int(p.processId())})" for _, n, p in running))
+        process = self.launch_profile(name, show_errors=False)
+        if process is None:
+            raise ValueError("dedicated profile launch was rejected; inspect the profile and game path")
+        return {"ok": True, "profile": name, "pid": int(process.processId()), "state": "starting"}
+
+    def _stop_dedicated_request(self, request):
+        name = request.get("profile")
+        if name is not None and not isinstance(name, str):
+            raise ValueError("profile must be a string")
+        stopped = []
+        for _key, process_name, process in self._running_dedicated_servers():
+            if name and process_name != name:
+                continue
+            stopped.append({"profile": process_name, "pid": int(process.processId())})
+            process.terminate()
+        return {"ok": True, "stopped": stopped}
 
     def _handle_sentry_request(self, request):
         if not isinstance(request, dict):
@@ -1040,6 +1095,10 @@ class Launcher(QApplication):
                 raise ValueError("T2Launch could not restart its Sentry control API")
             return {"ok": True, "api": 2, "features": SENTRY_CONTROL_API_FEATURES,
                     "state": "restarted"}
+        if operation == "launch_dedicated":
+            return self._launch_dedicated_request(request)
+        if operation == "stop_dedicated":
+            return self._stop_dedicated_request(request)
         if operation == "launch_profile":
             name = request.get("profile")
             session_id = request.get("session_id")
