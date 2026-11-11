@@ -35,6 +35,10 @@ class HudDemoPackTests(unittest.TestCase):
             self.assertIn("textures/gui/uibackgroundcompass.png", names)
             self.assertIn("gui/uicompass.jpg", names)
             self.assertIn("gui/uibackgroundcompass.png", names)
+            strip = volume.read("hudBarDemo_assets/compass_strip.png")
+            self.assertEqual(strip[:8], b"\x89PNG\r\n\x1a\n")
+            self.assertEqual(struct.unpack_from(">II", strip, 16), (630, 14))
+            self.assertEqual(strip[25], 6)  # RGBA alpha mask derived from the beta JPG.
             # The compass markers come from the stock textures.vl2.
             for direction in ("north", "south", "east", "west"):
                 self.assertNotIn(f"textures/gui/hud_{direction}.png", names)
@@ -48,9 +52,12 @@ class HudDemoPackTests(unittest.TestCase):
         self.assertIn('$T2Launch::HudDemo::CompassMode = "both"', script)
         self.assertIn("hook_hud_demo_heading()", script)
         self.assertNotIn("getEyeVector()", script)
+        self.assertIn("hook_hud_demo_compass_markers(HudDemoCompassNorth.getId()", script)
         for direction in ("north", "south", "east", "west"):
             self.assertIn(f'"gui/hud_{direction}"', script)
-        self.assertIn("%marker[%i].position = %x SPC", script)
+        self.assertIn('"hudBarDemo_assets/compass_strip.png"', script)
+        self.assertIn('HudDemoCompassNorth.visible = "0"', script)
+        self.assertIn('HudDemoCompassStrip.visible = "0"', script)
         self.assertIn('opacity = "0.9"', script)
         self.assertNotIn(".getClassName()", script)
         self.assertIn("compassHud.setVisible(%circle)", script)

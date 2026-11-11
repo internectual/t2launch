@@ -1052,8 +1052,9 @@ For the hook options and review regressions alone:
 python3 -m unittest tests.test_options tests.test_game_binaries -v
 ```
 
-`NativeReviewTests` builds and runs the review-patch, autobeacon, model/texture diagnostic,
-HUD-presentation, shortcut-parser, and native resource-lookup C fixtures with the host's 32-bit toolchain.
+`NativeReviewTests` builds and runs the review-patch, memPatch, autobeacon,
+model/texture diagnostic, HUD-presentation, shortcut-parser, and native resource-lookup
+C fixtures with the host's 32-bit toolchain.
 The first four use synthetic objects and mappings and need no installed game. The parser and
 resource-lookup fixtures require only the installed Loki client; the latter reproduces mixed
 volume/loose collision precedence using the client's actual lookup/registration code. Byte-anchor
@@ -1095,9 +1096,11 @@ Arguments are shown after the command name.
 
 | Command | Arguments | Description | Availability |
 |---------|-----------|-------------|--------------|
+| `memPatch` | `<hex-address> <hex-patch> [sha256:<64-hex>]` | Legacy-compatible memory patch command; writes only in `enabled` mode with a matching running-executable checksum. | Always registered; behavior set by `hook.mem_patch` |
 | `hook_test` | — | Returns `ok_from_c`. | Global |
 | `hook_option` | `<key>` | Returns the effective hook option value (config, environment override, or default). | Global |
 | `hook_hud_demo_heading` | — | Returns the controlled object's heading in degrees, or an empty string when unavailable. | Client; registered independently of `hook.console_commands` |
+| `hook_hud_demo_compass_markers` | `<north-id> <east-id> <south-id> <west-id> <strip-id>` | Supplies the bitmap control IDs used by the native horizon compass renderer. | Client; registered independently of `hook.console_commands` |
 | `hook_review_range` | `[0|1]` | Query or set extended review range; reports configured/applied state and stock/review far distances. | Client |
 | `hook_review_global_beacons` | `[0|1]` | Query or set review beacon visibility; reports configured/applied state. | Client |
 | `hook_review_ffi` | `[0|1]` | Query or set review IFF/FFI reconstruction; reports configured/applied state. | Client |
@@ -1136,6 +1139,14 @@ Arguments are shown after the command name.
 `HudBarBaseCtrl.getValue()` is a control method, not a global command; it is
 registered when `ui.hud_get_value` is enabled. `setVerticalSync` is also
 registered before the `hook.console_commands` gate.
+
+`hook.mem_patch` defaults to `warn`: every call is refused, and legacy
+two-argument calls print the running executable's SHA-256 in a copyable
+`sha256:<hex>` form. `off` silently ignores calls. `enabled` permits writes
+only when the third argument matches that executable hash; it refuses legacy
+calls without a checksum. The digest is platform-specific and does not
+translate Windows addresses to Linux addresses—scripts still need addresses
+for the host executable they target.
 
 ### Binary addresses (Tribes 2 Linux #25034)
 

@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <math.h>
+#include <ctype.h>
 
 typedef int S32;
 
@@ -104,6 +105,8 @@ static pthread_t game_main_thread;
 static volatile int registered = 0;
 static volatile int game_main_thread_known = 0;
 static int register_hook_commands(void);
+static int register_early_compat_commands(void);
+static int install_console_evaluate_gate(void);
 static void update_review_model_diagnostic(int active);
 static int review_model_hud_seen;
 static uint32_t review_model_hud_id;
@@ -114,6 +117,7 @@ static volatile int profile_browser_wake_seen = 0;
 static volatile int core_runtime_installed = 0;
 static volatile int tribesnext_runtime_installed = 0;
 static volatile int shell_audio_setup_done = 0;
+static int voice_capture_fix_done = 0; /* voice capture re-initialised after the launch audio setup */
 static volatile int player_pane_override_installed = 0;
 static volatile int filter_max_bots_override_installed = 0;
 static volatile int net_options_override_installed = 0;
@@ -148,6 +152,7 @@ struct hook_option {
 };
 static struct hook_option hook_options[] = {
     {"hook.console_commands", "1", "T2LAUNCH_DISABLE_HOOK_COMMANDS", 1, "", 0},
+    {"hook.mem_patch", "warn", NULL, 0, "", 0},
     {"hook.tribesnext", "1", NULL, 0, "", 0},
     {"hook.tribes_tab", "1", NULL, 0, "", 0},
     {"video.full_redraw", "1", "T2LAUNCH_FULL_REDRAW", 0, "", 0},
@@ -409,6 +414,12 @@ static const char core_runtime_script[] =
     "function t2launch_hudDemoRadarEnabled() {"
     " if (!$T2Launch::HudDemo::Radar || !isObject(PlayGui) || !PlayGui.isAwake()) return \"0\";"
     " if (!isObject(navHud) || !navHud.isAwake() || !navHud.visible) return \"0\";"
+    " return \"1\";"
+    "}\n"
+    "function t2launch_hudDemoCompassEnabled() {"
+    " if (!isObject(PlayGui) || !PlayGui.isAwake() || !isObject(ServerConnection)) return \"\";"
+    " %mode = $T2Launch::HudDemo::CompassMode;"
+    " if (%mode !$= \"horizontal\" && %mode !$= \"both\") return \"\";"
     " return \"1\";"
     "}\n"
     "function t2launch_skyRotationSpeed() { return $pref::skyRotationSpeed; }\n"
@@ -1320,6 +1331,73 @@ static int apply_code_patches(const char *name, const struct code_patch *patches
             return 0;
         }
     }
+    return 1;
+}
+
+/* Register the compatibility command on the first game-thread Torque
+   evaluation, before that script is executed. The ordinary swap/usleep poll
+   remains a fallback if the console table is not ready yet. */
+#define CON_EVALUATE_GATE_RESUME_OFFSET 8
+static const unsigned char con_evaluate_gate_original[] = {
+    0x55, 0x89, 0xe5, 0x83, 0xec, 0x0c, 0x57, 0x56
+};
+static con_evaluate_t real_con_evaluate;
+static int con_evaluate_gate_installed;
+static int early_compat_commands_registered;
+static int early_compat_commands_registering;
+
+static const char *con_evaluate_gate(const char *code, unsigned char echo,
+                                     const char *file_name, unsigned char no_calls) {
+    (void)register_early_compat_commands();
+    const char *result = real_con_evaluate
+        ? real_con_evaluate(code, echo, file_name, no_calls) : "";
+    (void)register_early_compat_commands();
+    return result;
+}
+
+static int install_console_evaluate_gate(void) {
+    if (con_evaluate_gate_installed) return 1;
+    int protection = 0;
+    if (!target || !target->con_evaluate ||
+        !readable_range(target->con_evaluate, sizeof con_evaluate_gate_original,
+                        &protection) || !(protection & PROT_EXEC) ||
+        memcmp((void *)target->con_evaluate, con_evaluate_gate_original,
+               sizeof con_evaluate_gate_original) != 0) {
+        fprintf(stderr, "[t2_hook] memPatch compatibility: console evaluate hook refused (unsupported prologue)\n");
+        return 0;
+    }
+
+    unsigned char *trampoline = mmap(NULL, 32, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (trampoline == MAP_FAILED) return 0;
+    memcpy(trampoline, con_evaluate_gate_original, sizeof con_evaluate_gate_original);
+    trampoline[CON_EVALUATE_GATE_RESUME_OFFSET] = 0xe9;
+    int32_t back = (int32_t)((target->con_evaluate + CON_EVALUATE_GATE_RESUME_OFFSET) -
+        ((uintptr_t)trampoline + CON_EVALUATE_GATE_RESUME_OFFSET + 5));
+    memcpy(trampoline + CON_EVALUATE_GATE_RESUME_OFFSET + 1, &back, sizeof back);
+    __builtin___clear_cache((char *)trampoline,
+        (char *)trampoline + CON_EVALUATE_GATE_RESUME_OFFSET + 5);
+    if (mprotect(trampoline, 32, PROT_READ | PROT_EXEC) != 0) {
+        munmap(trampoline, 32);
+        return 0;
+    }
+
+    unsigned char replacement[sizeof con_evaluate_gate_original];
+    replacement[0] = 0xe9;
+    int32_t to_gate = (int32_t)((uintptr_t)con_evaluate_gate -
+                                (target->con_evaluate + 5));
+    memcpy(replacement + 1, &to_gate, sizeof to_gate);
+    memset(replacement + 5, 0x90, sizeof replacement - 5);
+    const struct code_patch patch = {target->con_evaluate, con_evaluate_gate_original,
+        sizeof con_evaluate_gate_original, 0, replacement, sizeof replacement};
+    if (!apply_code_patches("Console evaluate command-registration gate", &patch, 1)) {
+        munmap(trampoline, 32);
+        return 0;
+    }
+    real_con_evaluate = (con_evaluate_t)trampoline;
+    Con__evaluate = con_evaluate_gate;
+    con_evaluate_gate_installed = 1;
+    fprintf(stderr, "[t2_hook] Installed early console command-registration gate (memory only)\n");
     return 1;
 }
 
@@ -3196,6 +3274,27 @@ static int shazbot_player_contact_normal(const struct rv_memory *memory, void *p
     return 1;
 }
 
+/* View direction from the Player's own eye transform. Unlike the view cone, this
+   needs no SensorData record: Move X/Y and pitch/yaw are view-relative, so the
+   policy needs the look direction even when the sensor radius is unavailable. */
+static int shazbot_player_eye_forward(const struct rv_memory *memory, void *player,
+                                      float forward[3]) {
+    if (!memory || !player || !forward || !rv_memory_range(memory, player, 0x24, PROT_READ))
+        return 0;
+    void *vtable = rv_pointer(player, 0);
+    if (!rv_memory_range(memory, vtable, SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET + 4, PROT_READ))
+        return 0;
+    void *eye_method = rv_pointer(vtable, SHAZBOT_EYE_TRANSFORM_VTABLE_OFFSET);
+    if (!rv_memory_range(memory, eye_method, 1, PROT_EXEC)) return 0;
+    float matrix[16];
+    memset(matrix, 0, sizeof matrix);
+    ((void (*)(void *, float *))eye_method)(player, matrix);
+    /* Torque eye transforms use local +Y as forward: MatrixF::mulV(0,1,0). */
+    forward[0] = matrix[1]; forward[1] = matrix[5]; forward[2] = matrix[9];
+    float norm2 = forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2];
+    return isfinite(norm2) && norm2 > 1.0e-8f;
+}
+
 static int shazbot_collect_observation(const struct rv_memory *memory, void *connection,
                                        void *dictionary, void *target_manager,
                                        void *visible_set, void *client_target_list,
@@ -3251,6 +3350,15 @@ static int shazbot_collect_observation(const struct rv_memory *memory, void *con
             shazbot_observation_put_vector(values, 21, objective_velocity_delta);
             values[25] = 1.0f;
         }
+    }
+    float eye_forward[3];
+    if (!(view_valid && view_forward && isfinite(fov_degrees) && fov_degrees > 0.0f &&
+          fov_degrees < 180.0f && isfinite(sensor_radius) && sensor_radius > 0.0f) &&
+        shazbot_player_eye_forward(memory, player, eye_forward)) {
+        view_valid = 1;
+        view_forward = eye_forward;
+        fov_degrees = 90.0f;     /* only gates this block; FOV is not an observation slot */
+        sensor_radius = 1.0f;    /* likewise; the view cone keeps its real radius */
     }
     if (view_valid && view_forward && isfinite(fov_degrees) && fov_degrees > 0.0f &&
         fov_degrees < 180.0f && isfinite(sensor_radius) && sensor_radius > 0.0f) {
@@ -6438,6 +6546,8 @@ static void install_datablock_overrides(void) {
 #define RADAR_PROJECTION 0x1701
 #define RADAR_MODELVIEW 0x1700
 #define RADAR_MATRIX_MODE 0x0ba0
+#define RADAR_PROJECTION_MATRIX 0x0ba7
+#define RADAR_MODELVIEW_MATRIX 0x0ba6
 #define RADAR_ALL_ATTRIB_BITS 0x000fffff
 #define RADAR_LINES 0x0001
 #define RADAR_LINE_LOOP 0x0002
@@ -6446,11 +6556,16 @@ static void install_datablock_overrides(void) {
 #define RADAR_BLEND 0x0be2
 #define RADAR_DEPTH_TEST 0x0b71
 #define RADAR_TEXTURE_2D 0x0de1
+#define RADAR_TEXTURE_ENV 0x2300
+#define RADAR_TEXTURE_ENV_MODE 0x2200
+#define RADAR_MODULATE 0x2100
 #define RADAR_CULL_FACE 0x0b44
 #define RADAR_SCISSOR_TEST 0x0c11
 #define RADAR_ALPHA_TEST 0x0bc0
 #define RADAR_SRC_ALPHA 0x0302
 #define RADAR_ONE_MINUS_SRC_ALPHA 0x0303
+#define RADAR_COMPASS_MARKER_COUNT 5
+static void sky_sincos(float angle, float *sine, float *cosine);
 
 struct radar_marker { float dx, dy; unsigned char kind; };
 struct radar_terrain {
@@ -6467,6 +6582,13 @@ static int radar_data_valid;
 static struct radar_terrain radar_terrain_map;
 static float radar_origin[3];
 static float radar_forward_x, radar_forward_y;
+static uint32_t hud_demo_compass_marker_ids[RADAR_COMPASS_MARKER_COUNT];
+static uint64_t hud_demo_compass_last_state_ns;
+static int hud_demo_compass_cached_enabled;
+static float hud_demo_compass_view_projection[16];
+static float hud_demo_compass_eye[3];
+static int hud_demo_compass_viewport[4];
+static int hud_demo_compass_camera_valid;
 static int sky_rotation_hook_attempted;
 static int sky_rotation_hook_installed;
 static void *sky_rotation_trampoline;
@@ -6475,6 +6597,7 @@ static uint64_t sky_rotation_last_ns;
 
 typedef struct {
     void (*GetIntegerv)(unsigned, int *);
+    void (*GetFloatv)(unsigned, float *);
     void (*PushAttrib)(unsigned);
     void (*PopAttrib)(void);
     void (*MatrixMode)(unsigned);
@@ -6486,6 +6609,9 @@ typedef struct {
     void (*Enable)(unsigned);
     void (*BlendFunc)(unsigned, unsigned);
     void (*Color4f)(float, float, float, float);
+    void (*TexEnvi)(unsigned, unsigned, int);
+    void (*BindTexture)(unsigned, uint32_t);
+    void (*TexCoord2f)(float, float);
     void (*Begin)(unsigned);
     void (*End)(void);
     void (*Vertex2f)(float, float);
@@ -6504,12 +6630,15 @@ static int radar_resolve_gl(void) {
     if (!radar_gl.field) return 0; \
 } while (0)
     RADAR_GL(GetIntegerv, "glGetIntegerv");
+    RADAR_GL(GetFloatv, "glGetFloatv");
     RADAR_GL(PushAttrib, "glPushAttrib"); RADAR_GL(PopAttrib, "glPopAttrib");
     RADAR_GL(MatrixMode, "glMatrixMode"); RADAR_GL(PushMatrix, "glPushMatrix");
     RADAR_GL(PopMatrix, "glPopMatrix"); RADAR_GL(LoadIdentity, "glLoadIdentity");
     RADAR_GL(Ortho, "glOrtho"); RADAR_GL(Disable, "glDisable");
     RADAR_GL(Enable, "glEnable"); RADAR_GL(BlendFunc, "glBlendFunc");
-    RADAR_GL(Color4f, "glColor4f"); RADAR_GL(Begin, "glBegin");
+    RADAR_GL(Color4f, "glColor4f"); RADAR_GL(TexEnvi, "glTexEnvi");
+    RADAR_GL(BindTexture, "glBindTexture");
+    RADAR_GL(TexCoord2f, "glTexCoord2f"); RADAR_GL(Begin, "glBegin");
     RADAR_GL(End, "glEnd"); RADAR_GL(Vertex2f, "glVertex2f");
     RADAR_GL(LineWidth, "glLineWidth");
 #undef RADAR_GL
@@ -6633,7 +6762,8 @@ static const char *hook_hud_demo_heading_cb(void *obj, S32 argc, const char **ar
     int team;
     if (!radar_control_view(&memory, connection, dictionary, origin, forward,
                             &object_id, &team)) return heading_text;
-    float y = -forward[0], x = forward[1];
+    /* Compass bearings increase clockwise: +world X is east from +world Y north. */
+    float y = forward[0], x = forward[1];
     float ay = y < 0.0f ? -y : y, ax = x < 0.0f ? -x : x;
     float ratio = ax >= ay ? ay / ax : ax / ay;
     /* atan(r) ~= r * (45 - 14.32 * (1 - r)); accurate enough for a HUD tick
@@ -6647,6 +6777,25 @@ static const char *hook_hud_demo_heading_cb(void *obj, S32 argc, const char **ar
     if (heading >= 360.0f) heading -= 360.0f;
     snprintf(heading_text, sizeof(heading_text), "%.3f", heading);
     return heading_text;
+}
+
+static const char *hook_hud_demo_compass_markers_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (target->dedicated) return "client only";
+    if (argc != RADAR_COMPASS_MARKER_COUNT + 1)
+        return "expected north, east, south, west, and strip bitmap IDs";
+    uint32_t ids[RADAR_COMPASS_MARKER_COUNT];
+    for (size_t i = 0; i < RADAR_COMPASS_MARKER_COUNT; i++) {
+        if (!argv[i + 1] || !argv[i + 1][0]) return "invalid bitmap control ID";
+        errno = 0;
+        char *end = NULL;
+        unsigned long value = strtoul(argv[i + 1], &end, 10);
+        if (errno || end == argv[i + 1] || !end || *end || !value || value > UINT32_MAX)
+            return "invalid bitmap control ID";
+        ids[i] = (uint32_t)value;
+    }
+    memcpy(hud_demo_compass_marker_ids, ids, sizeof ids);
+    return "ok";
 }
 
 static int radar_capture_terrain(const struct rv_memory *memory, void *dictionary) {
@@ -6913,6 +7062,164 @@ static void radar_draw_overlay(void) {
     radar_gl.MatrixMode((unsigned)matrix_mode); radar_gl.PopAttrib();
 }
 
+/* Project a T2 Z-up world point through the exact matrices active while the
+   game's sky was rendered. The horizon ring is at the camera eye's height. */
+static int hud_demo_compass_project(const float view_projection[16], const float eye[3],
+                                    const int camera_viewport[4], float screen_width,
+                                    float screen_height,
+                                    float bearing_degrees, float *screen_x, float *screen_y) {
+    if (!view_projection || !eye || !camera_viewport || !screen_x || !screen_y ||
+        !isfinite(bearing_degrees) || camera_viewport[2] <= 0 || camera_viewport[3] <= 0 ||
+        !isfinite(screen_width) || !isfinite(screen_height) ||
+        screen_width <= 0.0f || screen_height <= 0.0f) return 0;
+    float sine, cosine;
+    sky_sincos(bearing_degrees * (3.14159265358979323846f / 180.0f), &sine, &cosine);
+    const float point[4] = {
+        eye[0] + sine * 1000.0f,
+        eye[1] + cosine * 1000.0f,
+        eye[2],
+        1.0f
+    };
+    float clip_x = 0.0f, clip_y = 0.0f, clip_w = 0.0f;
+    for (unsigned int i = 0; i < 4; i++) {
+        clip_x += view_projection[i] * point[i];
+        clip_y += view_projection[4 + i] * point[i];
+        clip_w += view_projection[12 + i] * point[i];
+    }
+    if (!isfinite(clip_x) || !isfinite(clip_y) || !isfinite(clip_w) || clip_w <= 1.0e-4f)
+        return 0;
+    float nx = clip_x / clip_w, ny = clip_y / clip_w;
+    if (!isfinite(nx) || !isfinite(ny) || nx < -1.1f || nx > 1.1f) return 0;
+    /* Scale NDC into the current overlay viewport, not the scene's render
+       target size; this also follows a post-process render-scale resolve. */
+    *screen_x = (nx + 1.0f) * 0.5f * screen_width;
+    *screen_y = (1.0f - ny) * 0.5f * screen_height;
+    return isfinite(*screen_x) && isfinite(*screen_y);
+}
+
+struct hud_demo_bitmap_texture {
+    uint32_t gl_name;
+    uint32_t texture_width, texture_height;
+    uint32_t bitmap_width, bitmap_height;
+};
+
+static int hud_demo_bitmap_texture_get(const struct rv_memory *memory, void *dictionary,
+                                      uint32_t id, struct hud_demo_bitmap_texture *texture) {
+    if (!memory || !dictionary || !id || !texture) return 0;
+    void *control = rv_find_object(memory, dictionary, id);
+    if (!control || !rv_memory_range(memory, control, 0x20, PROT_READ)) return 0;
+    const char *class_name = rv_class_name(memory, control);
+    if (!class_name || strcmp(class_name, "HudBitmapCtrl") != 0) return 0;
+    uint32_t bitmap_offset;
+    if (!rv_persist_field_offset(memory, control, "bitmap", &bitmap_offset) ||
+        bitmap_offset < sizeof(uint32_t) ||
+        !rv_memory_range(memory, (unsigned char *)control + bitmap_offset, sizeof(uint32_t), PROT_READ))
+        return 0;
+    /* HudBitmapCtrl stores TextureHandle immediately before its registered
+       bitmap StringTableEntry; TextureHandle is one native pointer. */
+    void *handle = rv_pointer(control, bitmap_offset - sizeof(uint32_t));
+    if (!handle || !rv_memory_range(memory, handle, 0x2c, PROT_READ)) return 0;
+    texture->gl_name = rv_word(handle, 0x0c);
+    texture->texture_width = rv_word(handle, 0x1c);
+    texture->texture_height = rv_word(handle, 0x20);
+    texture->bitmap_width = rv_word(handle, 0x24);
+    texture->bitmap_height = rv_word(handle, 0x28);
+    return texture->gl_name && texture->texture_width && texture->texture_height &&
+           texture->bitmap_width && texture->bitmap_height;
+}
+
+static int hud_demo_compass_state(uint64_t now_ns) {
+    if (!Con__evaluate || !core_runtime_installed) return 0;
+    if (hud_demo_compass_last_state_ns && now_ns >= hud_demo_compass_last_state_ns &&
+        now_ns - hud_demo_compass_last_state_ns < 50000000ULL) {
+        return hud_demo_compass_cached_enabled;
+    }
+    hud_demo_compass_last_state_ns = now_ns;
+    hud_demo_compass_cached_enabled = 0;
+    const char *text = Con__evaluate("t2launch_hudDemoCompassEnabled();", 0, NULL, 0);
+    hud_demo_compass_cached_enabled = text && text[0] == '1' && text[1] == 0;
+    return hud_demo_compass_cached_enabled;
+}
+
+static void hud_demo_compass_draw_quad(float x, float y, float width, float height,
+                                       const struct hud_demo_bitmap_texture *texture,
+                                       float u0, float v0, float u1, float v1) {
+    radar_gl.BindTexture(RADAR_TEXTURE_2D, texture->gl_name);
+    radar_gl.Color4f(1.0f, 1.0f, 1.0f, 0.95f);
+    radar_gl.Begin(RADAR_QUADS);
+    radar_gl.TexCoord2f(u0, v0); radar_vertex(x - width * 0.5f, y - height * 0.5f);
+    radar_gl.TexCoord2f(u1, v0); radar_vertex(x + width * 0.5f, y - height * 0.5f);
+    radar_gl.TexCoord2f(u1, v1); radar_vertex(x + width * 0.5f, y + height * 0.5f);
+    radar_gl.TexCoord2f(u0, v1); radar_vertex(x - width * 0.5f, y + height * 0.5f);
+    radar_gl.End();
+}
+
+static void hud_demo_compass_draw(void) {
+    if (target->dedicated || !hud_demo_compass_camera_valid) return;
+    hud_demo_compass_camera_valid = 0;
+    if (!radar_resolve_gl()) return;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return;
+    uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+    if (!hud_demo_compass_state(now_ns)) return;
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (void *)SHAZBOT_ID_DICTIONARY, sizeof(uint32_t), PROT_READ)) return;
+    void *dictionary = rv_pointer((void *)SHAZBOT_ID_DICTIONARY, 0);
+    struct hud_demo_bitmap_texture markers[RADAR_COMPASS_MARKER_COUNT];
+    for (size_t i = 0; i < RADAR_COMPASS_MARKER_COUNT; i++)
+        if (!hud_demo_bitmap_texture_get(&memory, dictionary,
+            hud_demo_compass_marker_ids[i], &markers[i])) return;
+
+    int viewport[4], matrix_mode = RADAR_MODELVIEW;
+    radar_gl.GetIntegerv(RADAR_VIEWPORT, viewport);
+    if (viewport[2] <= 0 || viewport[3] <= 0 ||
+        hud_demo_compass_viewport[2] <= 0 || hud_demo_compass_viewport[3] <= 0) return;
+    radar_gl.GetIntegerv(RADAR_MATRIX_MODE, &matrix_mode);
+    radar_gl.PushAttrib(RADAR_ALL_ATTRIB_BITS);
+    radar_gl.MatrixMode(RADAR_PROJECTION); radar_gl.PushMatrix(); radar_gl.LoadIdentity();
+    radar_gl.Ortho(0, viewport[2], viewport[3], 0, -1, 1);
+    radar_gl.MatrixMode(RADAR_MODELVIEW); radar_gl.PushMatrix(); radar_gl.LoadIdentity();
+    radar_gl.Disable(RADAR_DEPTH_TEST); radar_gl.Disable(RADAR_CULL_FACE);
+    radar_gl.Disable(RADAR_SCISSOR_TEST); radar_gl.Disable(RADAR_ALPHA_TEST);
+    radar_gl.Enable(RADAR_BLEND); radar_gl.Enable(RADAR_TEXTURE_2D);
+    radar_gl.BlendFunc(RADAR_SRC_ALPHA, RADAR_ONE_MINUS_SRC_ALPHA);
+    radar_gl.TexEnvi(RADAR_TEXTURE_ENV, RADAR_TEXTURE_ENV_MODE, RADAR_MODULATE);
+
+    float scale = (float)viewport[3] / 720.0f;
+    if (scale < 1.0f) scale = 1.0f;
+    radar_gl.LineWidth(1.0f);
+    for (int degrees = 0; degrees < 360; degrees += 15) {
+        float x, y;
+        if (!hud_demo_compass_project(hud_demo_compass_view_projection, hud_demo_compass_eye,
+                                     hud_demo_compass_viewport, (float)viewport[2],
+                                     (float)viewport[3],
+                                     (float)degrees, &x, &y)) continue;
+        if (degrees % 90 == 0) {
+            size_t index = (size_t)(degrees / 90);
+            float marker_width = markers[index].bitmap_width * scale;
+            float marker_height = markers[index].bitmap_height * scale;
+            float u1 = (float)markers[index].bitmap_width / markers[index].texture_width;
+            float v1 = (float)markers[index].bitmap_height / markers[index].texture_height;
+            hud_demo_compass_draw_quad(x, y, marker_width, marker_height,
+                                       &markers[index], 0.0f, 0.0f, u1, v1);
+        } else {
+            const struct hud_demo_bitmap_texture *strip = &markers[4];
+            float half_width = degrees % 45 == 0 ? 7.0f : 1.5f;
+            float source_center = 4.5f + (float)degrees;
+            float u0 = (source_center - half_width) / (float)strip->texture_width;
+            float u1 = (source_center + half_width) / (float)strip->texture_width;
+            float v1 = (float)strip->bitmap_height / strip->texture_height;
+            hud_demo_compass_draw_quad(x, y, 2.0f * half_width * scale,
+                strip->bitmap_height * scale, strip, u0, 0.0f, u1, v1);
+        }
+    }
+    radar_gl.BindTexture(RADAR_TEXTURE_2D, 0);
+    radar_gl.MatrixMode(RADAR_MODELVIEW); radar_gl.PopMatrix();
+    radar_gl.MatrixMode(RADAR_PROJECTION); radar_gl.PopMatrix();
+    radar_gl.MatrixMode((unsigned)matrix_mode); radar_gl.PopAttrib();
+}
+
 /* The #25034 Sky::renderSkyBox entry at 0x08222390 reads the ten Sky::mPoints
    vertices beginning at this+0xd18, then submits the cube faces. Rotate those
    vertices only around that native call and restore the object immediately;
@@ -6956,6 +7263,51 @@ static void sky_rotate_points(unsigned char *sky, float angle) {
     }
 }
 
+static int hud_demo_compass_compose_view_projection(const float gl_modelview[16],
+                                                    const float gl_projection[16],
+                                                    float view_projection[16], float eye[3]) {
+    if (!gl_modelview || !gl_projection || !view_projection || !eye) return 0;
+    float modelview[16], projection[16];
+    /* GL matrices are column-major; store the equivalent row-major matrices
+       used by the Torch compass projection formula. */
+    for (unsigned int row = 0; row < 4; row++)
+        for (unsigned int column = 0; column < 4; column++) {
+            modelview[row * 4 + column] = gl_modelview[column * 4 + row];
+            projection[row * 4 + column] = gl_projection[column * 4 + row];
+        }
+    for (unsigned int row = 0; row < 4; row++)
+        for (unsigned int column = 0; column < 4; column++) {
+            float value = 0.0f;
+            for (unsigned int k = 0; k < 4; k++)
+                value += projection[row * 4 + k] * modelview[k * 4 + column];
+            view_projection[row * 4 + column] = value;
+        }
+    float tx = modelview[3], ty = modelview[7], tz = modelview[11];
+    eye[0] = -(modelview[0] * tx + modelview[4] * ty + modelview[8] * tz);
+    eye[1] = -(modelview[1] * tx + modelview[5] * ty + modelview[9] * tz);
+    eye[2] = -(modelview[2] * tx + modelview[6] * ty + modelview[10] * tz);
+    for (size_t i = 0; i < 16; i++)
+        if (!isfinite(view_projection[i])) return 0;
+    for (size_t i = 0; i < 3; i++)
+        if (!isfinite(eye[i])) return 0;
+    return 1;
+}
+
+static void sky_capture_compass_view(void) {
+    hud_demo_compass_camera_valid = 0;
+    if (!radar_resolve_gl()) return;
+    float gl_modelview[16], gl_projection[16];
+    int viewport[4];
+    radar_gl.GetFloatv(RADAR_MODELVIEW_MATRIX, gl_modelview);
+    radar_gl.GetFloatv(RADAR_PROJECTION_MATRIX, gl_projection);
+    radar_gl.GetIntegerv(RADAR_VIEWPORT, viewport);
+    if (viewport[2] <= 0 || viewport[3] <= 0 ||
+        !hud_demo_compass_compose_view_projection(gl_modelview, gl_projection,
+            hud_demo_compass_view_projection, hud_demo_compass_eye)) return;
+    memcpy(hud_demo_compass_viewport, viewport, sizeof viewport);
+    hud_demo_compass_camera_valid = 1;
+}
+
 static float sky_rotation_speed(void) {
     if (!Con__evaluate || !core_runtime_installed) return 0.0f;
     const char *text = Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0);
@@ -6984,6 +7336,7 @@ static sky_render_slices_t sky_render_slices_original_fn;
 
 static void sky_render_slices_wrapper(void *sky_object, float lower_band_height,
                                       float upper_alpha) {
+    sky_capture_compass_view();
     float speed = sky_rotation_speed();
     if (speed == 0.0f) {
         sky_rotation_last_ns = 0;
@@ -7069,7 +7422,10 @@ void SDL_GL_SwapBuffers(void) {
     int on_game_thread = game_main_thread_known && pthread_equal(pthread_self(), game_main_thread);
     if (on_game_thread && rt.active) rt_present();
     else if (on_game_thread) apply_gamma_pass();
-    if (on_game_thread) radar_draw_overlay();
+    if (on_game_thread) {
+        radar_draw_overlay();
+        hud_demo_compass_draw();
+    }
     real_sdl_gl_swap_buffers();
     if (on_game_thread && rt.active) gl_rt.BindFramebuffer(GL_FRAMEBUFFER_, rt_draw_fbo());
     cap_frame_rate();
@@ -7239,6 +7595,17 @@ void SDL_GL_SwapBuffers(void) {
             }
             shell_audio_setup_done = 1;
         }
+    }
+    /* The audio driver restarts above (and the stock initAudio before them) leave voice capture disabled:
+       alxIsEnabled("capture") is 0 although alxCaptureInit() returned 1, so push-to-talk showed "Recording"
+       but never read the microphone. Initialise it again once, after the audio setup has settled. */
+    if (shell_audio_setup_done && !voice_capture_fix_done && now != (time_t)-1 &&
+        last_shell_audio_setup && now - last_shell_audio_setup >= 5) {
+        voice_capture_fix_done = 1;
+        Con__evaluate(
+            "if ($Audio::initialized && $pref::Audio::enableVoiceCapture && !alxIsEnabled(\"capture\"))"
+            " $Audio::captureInitialized = alxCaptureInit();",
+            0, NULL, 0);
     }
     if (shell_audio_setup_done && now != (time_t)-1)
         poll_discord_presence(now);
@@ -7503,6 +7870,141 @@ static void sha1(const uint8_t *data, int len, char out[41]) {
     for(t=0;t<5;t++) sprintf(out+t*8,"%08x",h[t]);
 }
 
+/* Streaming SHA-256 for identifying the executable that owns the addresses a
+   script wants to patch. This is an identity check, not a signature or trust
+   boundary; writes are separately gated by hook.mem_patch. */
+struct sha256_context {
+    uint32_t state[8];
+    uint64_t bit_count;
+    uint8_t block[64];
+    size_t used;
+};
+
+static uint32_t sha256_rotr(uint32_t value, unsigned int count) {
+    return (value >> count) | (value << (32 - count));
+}
+
+static void sha256_transform(struct sha256_context *context, const uint8_t block[64]) {
+    static const uint32_t constants[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+        0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+        0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    };
+    uint32_t words[64];
+    for (unsigned int i = 0; i < 16; i++)
+        words[i] = ((uint32_t)block[i * 4] << 24) |
+                   ((uint32_t)block[i * 4 + 1] << 16) |
+                   ((uint32_t)block[i * 4 + 2] << 8) | block[i * 4 + 3];
+    for (unsigned int i = 16; i < 64; i++) {
+        uint32_t s0 = sha256_rotr(words[i - 15], 7) ^ sha256_rotr(words[i - 15], 18) ^
+                      (words[i - 15] >> 3);
+        uint32_t s1 = sha256_rotr(words[i - 2], 17) ^ sha256_rotr(words[i - 2], 19) ^
+                      (words[i - 2] >> 10);
+        words[i] = words[i - 16] + s0 + words[i - 7] + s1;
+    }
+    uint32_t a = context->state[0], b = context->state[1];
+    uint32_t c = context->state[2], d = context->state[3];
+    uint32_t e = context->state[4], f = context->state[5];
+    uint32_t g = context->state[6], h = context->state[7];
+    for (unsigned int i = 0; i < 64; i++) {
+        uint32_t sum1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+        uint32_t choice = (e & f) ^ (~e & g);
+        uint32_t temporary1 = h + sum1 + choice + constants[i] + words[i];
+        uint32_t sum0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t temporary2 = sum0 + majority;
+        h = g; g = f; f = e; e = d + temporary1;
+        d = c; c = b; b = a; a = temporary1 + temporary2;
+    }
+    context->state[0] += a; context->state[1] += b; context->state[2] += c;
+    context->state[3] += d; context->state[4] += e; context->state[5] += f;
+    context->state[6] += g; context->state[7] += h;
+}
+
+static void sha256_init(struct sha256_context *context) {
+    static const uint32_t initial[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+    memcpy(context->state, initial, sizeof initial);
+    context->bit_count = 0;
+    context->used = 0;
+}
+
+static void sha256_update(struct sha256_context *context, const uint8_t *data, size_t length) {
+    context->bit_count += (uint64_t)length * 8;
+    while (length) {
+        size_t available = sizeof context->block - context->used;
+        size_t copied = length < available ? length : available;
+        memcpy(context->block + context->used, data, copied);
+        context->used += copied;
+        data += copied;
+        length -= copied;
+        if (context->used == sizeof context->block) {
+            sha256_transform(context, context->block);
+            context->used = 0;
+        }
+    }
+}
+
+static void sha256_final(struct sha256_context *context, char output[65]) {
+    uint64_t bits = context->bit_count;
+    context->block[context->used++] = 0x80;
+    if (context->used > 56) {
+        memset(context->block + context->used, 0, 64 - context->used);
+        sha256_transform(context, context->block);
+        context->used = 0;
+    }
+    memset(context->block + context->used, 0, 56 - context->used);
+    for (unsigned int i = 0; i < 8; i++)
+        context->block[63 - i] = (uint8_t)(bits >> (i * 8));
+    sha256_transform(context, context->block);
+    for (unsigned int i = 0; i < 8; i++)
+        snprintf(output + i * 8, 9, "%08x", context->state[i]);
+    output[64] = 0;
+}
+
+static char mem_patch_executable_sha256[65];
+static int mem_patch_executable_sha256_state;
+
+/* Hash the running image via /proc/self/exe so argv[0], symlinks, and the
+   current working directory cannot select a different binary. Cache success
+   or failure for this process; the executable cannot change under it. */
+static const char *mem_patch_executable_hash(void) {
+    if (mem_patch_executable_sha256_state > 0) return mem_patch_executable_sha256;
+    if (mem_patch_executable_sha256_state < 0) return NULL;
+    int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) goto failed;
+    struct sha256_context context;
+    sha256_init(&context);
+    uint8_t buffer[16384];
+    for (;;) {
+        ssize_t count = read(fd, buffer, sizeof buffer);
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            goto failed;
+        }
+        sha256_update(&context, buffer, (size_t)count);
+    }
+    close(fd);
+    sha256_final(&context, mem_patch_executable_sha256);
+    mem_patch_executable_sha256_state = 1;
+    return mem_patch_executable_sha256;
+failed:
+    mem_patch_executable_sha256_state = -1;
+    return NULL;
+}
+
 /* ── Big Number ops for RSA (kept minimal to avoid stack issues) ────── */
 /* Full bn_ functions removed - using inline code in callback */
 
@@ -7733,6 +8235,172 @@ static int hex2nibble(char c) {
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
+}
+
+#define MEM_PATCH_MAX_BYTES 4096
+#define MEM_PATCH_MAX_PAGES 16
+
+static const char *mem_patch_mode(void) {
+    const char *mode = hook_option_str("hook.mem_patch");
+    if (mode && (strcmp(mode, "off") == 0 || strcmp(mode, "warn") == 0 ||
+                 strcmp(mode, "enabled") == 0)) return mode;
+    return "warn";  /* malformed or unknown values never enable writes */
+}
+
+static void mem_patch_message(const char *reason, const char *digest) {
+    char message[384], script[512];
+    if (digest)
+        snprintf(message, sizeof message, "T2Launch memPatch: %s Current executable SHA-256: sha256:%s",
+                 reason, digest);
+    else
+        snprintf(message, sizeof message, "T2Launch memPatch: %s Current executable SHA-256 unavailable",
+                 reason);
+    fprintf(stderr, "[t2_hook] %s\n", message);
+    /* reason and digest are internal constants/hex output, never script input. */
+    if (Con__evaluate && snprintf(script, sizeof script, "echo(\"%s\");", message) < (int)sizeof script)
+        (void)Con__evaluate(script, 0, "t2launch/memPatch.cs", 0);
+}
+
+static int mem_patch_parse_address(const char *text, uintptr_t *address) {
+    if (!text || !*text || !address) return 0;
+    if (text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) text += 2;
+    if (!*text) return 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+        if (!isxdigit(*p)) return 0;
+    errno = 0;
+    char *end = NULL;
+    unsigned long long value = strtoull(text, &end, 16);
+    if (errno == ERANGE || !end || *end || value > UINTPTR_MAX) return 0;
+    *address = (uintptr_t)value;
+    return 1;
+}
+
+/* Preserve TribesNEXT's old hex-pair convention: an odd leading nibble is
+   padded on the left ("ABC" -> 0A BC). */
+static int mem_patch_parse_bytes(const char *text, unsigned char *bytes,
+                                 size_t capacity, size_t *length) {
+    if (!text || !bytes || !length) return 0;
+    size_t digits = strlen(text);
+    if (!digits || digits > MEM_PATCH_MAX_BYTES * 2 || (digits + 1) / 2 > capacity) return 0;
+    size_t at = 0, output = 0;
+    if (digits & 1) {
+        int nibble = hex2nibble(text[at++]);
+        if (nibble < 0) return 0;
+        bytes[output++] = (unsigned char)nibble;
+    }
+    while (at < digits) {
+        int high = hex2nibble(text[at++]);
+        int low = hex2nibble(text[at++]);
+        if (high < 0 || low < 0) return 0;
+        bytes[output++] = (unsigned char)((high << 4) | low);
+    }
+    *length = output;
+    return output > 0;
+}
+
+static int mem_patch_checksum_matches(const char *supplied, const char *actual) {
+    if (!supplied || !actual) return 0;
+    if (strncasecmp(supplied, "sha256:", 7) == 0) supplied += 7;
+    if (strlen(supplied) != 64) return 0;
+    for (size_t i = 0; i < 64; i++) {
+        if (hex2nibble(supplied[i]) < 0 || tolower((unsigned char)supplied[i]) != actual[i]) return 0;
+    }
+    return 1;
+}
+
+static int mem_patch_write(uintptr_t address, const unsigned char *bytes, size_t length,
+                           const char **failure) {
+    if (!bytes || !length || length > MEM_PATCH_MAX_BYTES || address > UINTPTR_MAX - length) {
+        if (failure) *failure = "invalid patch range or length";
+        return 0;
+    }
+    int protection = 0;
+    if (!readable_range(address, length, &protection)) {
+        if (failure) *failure = "target is not in a readable memory mapping";
+        return 0;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || ((unsigned long)page_size & ((unsigned long)page_size - 1)) != 0) {
+        if (failure) *failure = "invalid system page size";
+        return 0;
+    }
+    uintptr_t page_mask = (uintptr_t)page_size - 1;
+    uintptr_t first_page = address & ~page_mask;
+    uintptr_t last_page = (address + length - 1) & ~page_mask;
+    size_t page_count = (size_t)((last_page - first_page) / (uintptr_t)page_size) + 1;
+    if (page_count > MEM_PATCH_MAX_PAGES) {
+        if (failure) *failure = "patch spans too many pages";
+        return 0;
+    }
+    uintptr_t pages[MEM_PATCH_MAX_PAGES];
+    size_t changed = 0;
+    for (size_t i = 0; i < page_count; i++) {
+        pages[i] = first_page + i * (uintptr_t)page_size;
+        if (mprotect((void *)pages[i], (size_t)page_size, protection | PROT_WRITE) != 0) {
+            for (size_t restore = changed; restore > 0; restore--)
+                (void)mprotect((void *)pages[restore - 1], (size_t)page_size, protection);
+            if (failure) *failure = "could not make target page writable";
+            return 0;
+        }
+        changed++;
+    }
+    volatile unsigned char *destination = (volatile unsigned char *)address;
+    for (size_t i = 0; i < length; i++) destination[i] = bytes[i];
+    __builtin___clear_cache((char *)address, (char *)(address + length));
+    int restored = 1;
+    for (size_t i = page_count; i > 0; i--)
+        if (mprotect((void *)pages[i - 1], (size_t)page_size, protection) != 0) restored = 0;
+    if (!restored) {
+        if (failure) *failure = "patch applied, but original page permissions could not be restored";
+        return -1;
+    }
+    return 1;
+}
+
+static const char *mem_patch_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    const char *mode = mem_patch_mode();
+    if (strcmp(mode, "off") == 0) return "";
+
+    const char *digest = mem_patch_executable_hash();
+    if (strcmp(mode, "warn") == 0) {
+        mem_patch_message(argc < 4 ? "legacy two-argument call refused; add the third SHA-256 argument."
+                                   : "warn-only mode; memory patch refused.", digest);
+        return "warn-only";
+    }
+    if (argc < 4 || !argv[1] || !argv[2] || !argv[3]) {
+        mem_patch_message("legacy two-argument call refused; add the third SHA-256 argument.", digest);
+        return "checksum required";
+    }
+    if (argc != 4) {
+        mem_patch_message("expected address, patch bytes, and one SHA-256 argument; patch refused.", digest);
+        return "invalid arguments";
+    }
+    if (!digest) {
+        mem_patch_message("executable checksum unavailable; patch refused.", NULL);
+        return "checksum unavailable";
+    }
+    if (!mem_patch_checksum_matches(argv[3], digest)) {
+        mem_patch_message("executable checksum mismatch; patch refused.", digest);
+        return "checksum mismatch";
+    }
+    uintptr_t address;
+    unsigned char bytes[MEM_PATCH_MAX_BYTES];
+    size_t length = 0;
+    if (!mem_patch_parse_address(argv[1], &address) ||
+        !mem_patch_parse_bytes(argv[2], bytes, sizeof bytes, &length)) {
+        mem_patch_message("invalid hexadecimal address or patch; patch refused.", digest);
+        return "invalid patch";
+    }
+    const char *failure = "patch refused";
+    int write_status = mem_patch_write(address, bytes, length, &failure);
+    if (write_status <= 0) {
+        mem_patch_message(failure, digest);
+        return write_status < 0 ? "applied; permission restore failed" : "patch refused";
+    }
+    fprintf(stderr, "[t2_hook] memPatch: applied %zu bytes at 0x%08lx\n",
+            length, (unsigned long)address);
+    return "ok";
 }
 
 static void bytes_to_hex(const uint8_t *data, int len, char *out) {
@@ -8788,21 +9456,53 @@ static const char *hook_depot_status_cb(void *obj, S32 argc, const char **argv) 
     return depot_result;
 }
 
+static int console_command_table_ready(uint32_t *table_size) {
+    int protection = 0;
+    if (!target) return 0;
+    if (!readable_range(target->string_table, sizeof(uint32_t), &protection)) return 0;
+    uint32_t console_ptr = *(volatile uint32_t *)target->string_table;
+    if (console_ptr > UINT32_MAX - CONSOLE_TABLE_SIZE_OFFS) return 0;
+    if (!console_ptr || !readable_range(console_ptr + CONSOLE_TABLE_SIZE_OFFS,
+                                        sizeof(uint32_t), &protection)) return 0;
+    uint32_t size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
+    if (!size) return 0;
+    if (table_size) *table_size = size;
+    return 1;
+}
+
+static int register_early_compat_commands(void) {
+    if (early_compat_commands_registered || early_compat_commands_registering) return 1;
+    uint32_t table_size = 0;
+    if (!console_command_table_ready(&table_size)) return 0;
+    if (!Con__addMethodS) Con__addMethodS = (con_addMethodS_t)target->con_add_method;
+    if (!Con__addMethodS) return 0;
+    early_compat_commands_registering = 1;
+    Con__addMethodS(NULL, "memPatch", mem_patch_cb,
+        "memPatch <hex-address> <hex-patch> [sha256:<64-hex>]", 3, 4);
+    if (!target->dedicated) {
+        Con__addMethodS(NULL, "hook_hud_demo_heading", hook_hud_demo_heading_cb,
+            "hook_hud_demo_heading() - native heading for the HUD demo compass", 1, 1);
+        Con__addMethodS(NULL, "hook_hud_demo_compass_markers", hook_hud_demo_compass_markers_cb,
+            "hook_hud_demo_compass_markers(north, east, south, west, strip)", 6, 6);
+    }
+    early_compat_commands_registering = 0;
+    early_compat_commands_registered = 1;
+    fprintf(stderr, "[t2_hook] Registered early script compatibility commands (table_size=%u)\n",
+            table_size);
+    return 1;
+}
+
 static int register_hook_commands(void) {
     if (registered) return 1;
-    uint32_t console_ptr = *(volatile uint32_t *)target->string_table;
-    if (console_ptr == 0) return 0;
-    uint32_t table_size = *(volatile uint32_t *)(console_ptr + CONSOLE_TABLE_SIZE_OFFS);
-    if (table_size == 0) return 0;
+    uint32_t table_size = 0;
+    if (!console_command_table_ready(&table_size)) return 0;
 
     Con__addMethodS = (con_addMethodS_t)target->con_add_method;
+    (void)register_early_compat_commands();
     /* Replaces the stock no-op; not one of the optional hook_* commands. */
     if (!target->dedicated && hook_option_bool("video.vsync"))
         Con__addMethodS(NULL, "setVerticalSync", set_vertical_sync_cb,
             "setVerticalSync( <bool> )", 2, 2);
-    if (!target->dedicated)
-        Con__addMethodS(NULL, "hook_hud_demo_heading", hook_hud_demo_heading_cb,
-            "hook_hud_demo_heading() - native heading for the HUD demo compass", 1, 1);
     if (hud_bar_store_value)
         Con__addMethodS("HudBarBaseCtrl", "getValue", hud_bar_get_value_cb,
             "bar.getValue() - the bar's current fill, 0 to 1", 2, 2);
@@ -8950,6 +9650,9 @@ static void __attribute__((constructor)) init(void) {
         return;
     }
     Con__evaluate = (con_evaluate_t)target->con_evaluate;
+    Con__addMethodS = (con_addMethodS_t)target->con_add_method;
+    if (!install_console_evaluate_gate())
+        fprintf(stderr, "[t2_hook] Early memPatch registration unavailable; using main-loop registration fallback\n");
     fprintf(stderr, "[t2_hook] Target: %s (%s)\n", target->executable, target->description);
     if (won && strcmp(won, "1") == 0) {
         /* The client copies the embedded verifier during its own global

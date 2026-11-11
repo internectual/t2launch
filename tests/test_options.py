@@ -46,6 +46,19 @@ class OptionTests(unittest.TestCase):
         for key, default in re.findall(r'\{"([a-z_]+\.[a-z_]+)", "([^"]*)"', table):
             self.assertEqual(default, t2options._text(t2options.BY_KEY[key].default), key)
 
+    def test_mem_patch_modes_default_to_warning(self):
+        option = t2options.BY_KEY["hook.mem_patch"]
+        self.assertEqual(option.kind, "choice")
+        self.assertEqual(option.choices, ("off", "warn", "enabled"))
+        self.assertEqual(option.default, "warn")
+        self.assertTrue(option.advanced)
+        self.assertEqual(t2options.effective({"hook.console_commands": False}, HOOKED)["hook.mem_patch"],
+                         "warn")
+        source = (ROOT / "t2_hook.c").read_text()
+        registration = source.index('Con__addMethodS(NULL, "memPatch"')
+        console_gate = source.index('if (!hook_option_bool("hook.console_commands"))', registration)
+        self.assertLess(registration, console_gate)
+
     def test_old_wonemu_flag_migrates_to_won_mode(self):
         self.assertEqual(t2options.migrate({"wonemu": True})["won.mode"], "local")
         self.assertEqual(t2options.migrate({"wonemu": False})["won.mode"], "off")

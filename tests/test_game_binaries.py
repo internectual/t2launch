@@ -120,6 +120,13 @@ class NativeReviewTests(unittest.TestCase):
     def test_review_patch_combinations_and_restoration(self):
         self.run_fixture("review_patch_test.c", "32 independent feature combinations")
 
+    def test_mem_patch_checksum_modes_and_page_restoration(self):
+        self.run_fixture("mem_patch_test.c", "memPatch modes, startup compatibility, SHA-256 identity, legacy warning, and page restoration passed")
+
+    def test_horizon_compass_projects_world_bearings(self):
+        self.run_fixture("horizon_compass_projection_test.c",
+                         "horizon compass world-bearing, counter-clockwise west, pitch, and FOV projection passed")
+
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
 
@@ -148,6 +155,13 @@ class NativeReviewTests(unittest.TestCase):
 @unittest.skipUnless((GAME / "tribes2d.dynamic").is_file() and (GAME / "tribes2.dynamic").is_file(),
                      "the Loki #25034 game is not installed in ~/t2-linux")
 class GameBinaryTests(unittest.TestCase):
+    def test_console_evaluate_early_mem_patch_gate_prologues(self):
+        for binary, address in (("tribes2.dynamic", 0x080E88F4),
+                                ("tribes2d.dynamic", 0x080E77E4)):
+            with self.subTest(binary=binary):
+                self.assertEqual(reader(GAME / binary)(address, 8),
+                                 bytes.fromhex("55 89 e5 83 ec 0c 57 56"))
+
     def test_sky_rotation_patch_anchor(self):
         self.assertEqual(reader(GAME / "tribes2.dynamic")(0x08222390, 9),
                          bytes.fromhex("55 89 e5 81 ec ac 00 00 00"))

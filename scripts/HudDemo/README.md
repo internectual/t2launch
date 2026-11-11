@@ -2,9 +2,10 @@
 
 `HudDemo.vl2` contains `tests/hudBarDemo.cs`, both Tani/HUDbot horizontal and
 vertical health/energy artwork sets, and the original beta compass strip/frame
-assets. Cardinal markers use `gui/hud_north`, `gui/hud_south`, `gui/hud_east`,
-and `gui/hud_west` from the game's existing `textures.vl2`; they are not copied
-into the demo archive. The script's compass mode can be changed in-game:
+assets. The hook uses an alpha-masked copy of the strip for its degree ticks;
+cardinal markers use `gui/hud_north`, `gui/hud_south`, `gui/hud_east`, and
+`gui/hud_west` from the game's existing `textures.vl2`, not duplicate image
+copies in the demo archive. The script's compass mode can be changed in-game:
 
 ```ts
 hudBarDemoSetCompassMode("circular");   // stock round compass only
@@ -13,9 +14,10 @@ hudBarDemoSetCompassMode("both");       // supplement the round one (default)
 ```
 
 The horizontal compass uses the beta `hud_north`, `hud_south`, `hud_east`, and
-`hud_west` marker images. It projects the cardinal markers along the screen
-horizon using the controlled object's native eye heading, including observer
-cameras. The demo's hook RadarHUD renders the active
+`hud_west` marker images. It projects the cardinal markers and intermediate
+bearing ticks along the screen horizon through the view/projection matrices
+captured from T2's active camera, so yaw and pitch move them with the world
+horizon, including in observer cameras. The demo's hook RadarHUD renders the active
 TerrainBlock height/material map, rotates it with the camera view, and shows
 teammates, the assigned waypoint, and opponents only from T2's visible
 ShapeBase set. It runs for Player and observer Camera control objects during

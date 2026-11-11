@@ -189,11 +189,20 @@ function hudBarDemoAddHorizontalCompass()
       "gui/hud_south");
    hudBarDemoBitmap(%group, HudDemoCompassWest, "0 0", "15 15",
       "gui/hud_west");
+   hudBarDemoBitmap(%group, HudDemoCompassStrip, "0 0", "630 14",
+      "hudBarDemo_assets/compass_strip.png");
    HudDemoCompassNorth.opacity = "0.9";
    HudDemoCompassEast.opacity = "0.9";
    HudDemoCompassSouth.opacity = "0.9";
    HudDemoCompassWest.opacity = "0.9";
+   HudDemoCompassNorth.visible = "0";
+   HudDemoCompassEast.visible = "0";
+   HudDemoCompassSouth.visible = "0";
+   HudDemoCompassWest.visible = "0";
+   HudDemoCompassStrip.visible = "0";
    PlayGui.add(%group);
+   hook_hud_demo_compass_markers(HudDemoCompassNorth.getId(), HudDemoCompassEast.getId(),
+      HudDemoCompassSouth.getId(), HudDemoCompassWest.getId(), HudDemoCompassStrip.getId());
 }
 
 function hudBarDemoUpdateCompass()
@@ -204,9 +213,7 @@ function hudBarDemoUpdateCompass()
       hudBarDemoApplyCompassMode();
       return;
    }
-   %width = getWord(PlayGui.extent, 0);
-   %height = getWord(PlayGui.extent, 1);
-   HudDemoHorizontalCompass.extent = %width SPC %height;
+   HudDemoHorizontalCompass.extent = PlayGui.extent;
    %heading = hook_hud_demo_heading();
    if (%heading $= "")
    {
@@ -214,25 +221,9 @@ function hudBarDemoUpdateCompass()
       return;
    }
 
-   // Put each beta cardinal image at its projected bearing along the horizon.
-   // A conventional 90-degree horizontal field of view is used when the
-   // player's preference is missing or outside the camera's valid range.
-   %fov = $pref::Player::defaultFov;
-   if (%fov < 30 || %fov > 150) %fov = 90;
-   %bearing[0] = 0;   %marker[0] = HudDemoCompassNorth;
-   %bearing[1] = 90;  %marker[1] = HudDemoCompassEast;
-   %bearing[2] = 180; %marker[2] = HudDemoCompassSouth;
-   %bearing[3] = 270; %marker[3] = HudDemoCompassWest;
-   for (%i = 0; %i < 4; %i++)
-   {
-      %delta = %bearing[%i] - %heading;
-      while (%delta > 180) %delta -= 360;
-      while (%delta < -180) %delta += 360;
-      %x = mFloor((%width / 2) + (%delta * %width / %fov) - 7);
-      %visible = (%x > -15 && %x < %width);
-      %marker[%i].position = %x SPC mFloor((%height / 2) - 7);
-      %marker[%i].visible = %visible;
-   }
+    // The native hook projects the marker bearings through the active camera
+    // view/projection matrices, so pitch follows the true horizon and yaw rotates
+    // west/east in the same direction as the world.
    $T2Launch::HudDemo::CompassHeadingValid = true;
    hudBarDemoApplyCompassMode();
 }

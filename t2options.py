@@ -123,7 +123,13 @@ OPTIONS = (
     # Hook: community and TribesNext
     Option("hook.console_commands", "Hook", "Console commands", "bool", True, hook=True,
            requires=(("launcher.load_hook", (True,)),),
-           help="Register the hook's hook_* console commands (SHA1, RSA, TribesNext key access)."),
+           help="Register the hook's hook_* commands (SHA1, RSA, TribesNext key access). "
+                "The memPatch compatibility command is controlled separately."),
+    Option("hook.mem_patch", "Hook", "Legacy memPatch handling", "choice", "warn",
+           choices=("off", "warn", "enabled"), hook=True, advanced=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="off silently ignores calls; warn refuses patches and prints the executable SHA-256; "
+                "enabled applies only three-argument calls with a matching SHA-256."),
     Option("hook.tribesnext", "Community", "TribesNext login and game-server auth", "bool", True,
            hook=True,
            requires=(("launcher.load_hook", (True,)), ("won.mode", ("local",)),
