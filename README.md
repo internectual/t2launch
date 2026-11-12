@@ -878,12 +878,14 @@ options bring the parts of it that fit the Linux client:
   `runtime/render-modifiers.objects.example.cfg`.
 
   The datablock example changes every `Sky` class instance's `materialList` to
-  `textures/grid.dml`. The minimal `zGridSkyBox.vl2` contains that one DML and
+  `grid.dml` (Torque resolves it under `textures/`). The minimal `zGridSkyBox.vl2` contains that one DML and
   its six `koko/skies/Grid_*` PNG cube faces—none of the original archive's
   unrelated DMLs. The DML uses the stock `lush/skies/lush_day_emap` environment
   map from `lush.vl2`. The grid volume is installed as `base/zGridSkyBox.vl2`; set
   `render.datablock_rules` to the example config path to use it. The assignment
-  runs client-side and changes only the local rendered sky.
+  runs client-side and changes only the local rendered sky. The example applies
+  it on connect and each frame so it can override server updates during mission
+  loading.
 - **Safe soundpacks** (`security.safe_soundpacks`, on). A chat message carrying
   `~w<file>` makes the client play `<file>` as a sound: `scripts/client.cs`
   hands `<file>` to `alxGetWaveLen` and `alxCreateSource`, which parse it as a

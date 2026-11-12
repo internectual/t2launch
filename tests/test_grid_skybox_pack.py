@@ -24,7 +24,8 @@ class GridSkyboxPackTests(unittest.TestCase):
 
     def test_datablock_example_points_at_the_pack_dml(self):
         config = (ROOT / "runtime/render-modifiers.datablocks.example.cfg").read_text()
-        self.assertIn('client connect class:Sky.materialList = "textures/grid.dml"', config)
+        self.assertIn('client connect class:Sky.materialList = "grid.dml"', config)
+        self.assertIn('client frame class:Sky.materialList = "grid.dml"', config)
         with ZipFile(ARCHIVE) as volume:
             self.assertIn("textures/grid.dml", volume.namelist())
 

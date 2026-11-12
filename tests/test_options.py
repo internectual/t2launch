@@ -80,8 +80,9 @@ class OptionTests(unittest.TestCase):
                       source)
         datablocks = (ROOT / "runtime/render-modifiers.datablocks.example.cfg").read_text()
         objects = (ROOT / "runtime/render-modifiers.objects.example.cfg").read_text()
-        self.assertIn('client connect class:Sky.materialList = "textures/grid.dml"',
+        self.assertIn('client connect class:Sky.materialList = "grid.dml"',
                       datablocks)
+        self.assertIn('client frame class:Sky.materialList = "grid.dml"', datablocks)
         self.assertIn("zGridSkyBox.vl2", datablocks)
         self.assertIn("client frame navHud.position", objects)
         self.assertEqual(t2options.BY_KEY["render.sky_rotation_speed"].default, 0.0)
