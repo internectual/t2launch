@@ -53,7 +53,7 @@ class HudBarDemoAssetTests(unittest.TestCase):
                 self.assertEqual(struct.unpack_from(">II", data, 16), expected)
                 self.assertIn(f"hudBarDemo_assets/{variant}/{name}", script)
         self.assertIn('$T2Launch::HudDemo::Radar = 1;', script)
-        self.assertIn('$pref::skyRotationSpeed = 0.2;', script)
+        self.assertIn('$pref::skyRotationSpeed = 0.0;', script)
         self.assertIn('$T2Launch::HudDemo::CompassMode = "both";', script)
         self.assertIn("hook_hud_demo_heading()", script)
         self.assertNotIn("getEyeVector()", script)

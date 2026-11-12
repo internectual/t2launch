@@ -9,8 +9,8 @@ sample sets contain health/energy bar and frame art. The T2 `HudDamage` and
 The standalone demo archive `scripts/HudDemo/HudDemo.vl2` packages these samples
 with the horizontal compass and `hudBarDemo.cs`. Install that `.vl2` into the
 game's `base/` folder. To run from loose files instead, copy this directory to
-`base/hudBarDemo_assets/` and the script to `base/scripts/autoexec/`. Set
-`$pref::skyRotationSpeed = 0` to stop sky rotation; use
+`base/hudBarDemo_assets/` and the script to `base/scripts/autoexec/`. Set the
+profile's `render.sky_rotation_speed` option to `0` to stop sky rotation; use
 `hudBarDemoSetCompassMode("circular"|"horizontal"|"both")` to choose compass
 presentation.
 

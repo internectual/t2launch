@@ -195,6 +195,7 @@ static struct hook_option hook_options[] = {
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"render.datablock_rules", "", NULL, 0, "", 0},
     {"render.object_rules", "", NULL, 0, "", 0},
+    {"render.sky_rotation_speed", "0.0", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
     {"review.replace_models", "0", "T2LAUNCH_REVIEW_MODELS", 0, "", 0},
     {"review.ffi", "1", NULL, 0, "", 0},
@@ -7680,14 +7681,19 @@ static void sky_capture_compass_view(void) {
     hud_demo_compass_camera_valid = 1;
 }
 
-static float sky_rotation_speed(void) {
-    if (!Con__evaluate || !core_runtime_installed) return 0.0f;
-    const char *text = Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0);
+static float sky_rotation_speed_value(const char *text) {
     if (!text || !text[0]) return 0.0f;
     char *end = NULL;
     float speed = strtof(text, &end);
     return end != text && !*end && isfinite(speed) && speed >= -20.0f && speed <= 20.0f
         ? speed : 0.0f;
+}
+
+static float sky_rotation_speed(void) {
+    const char *configured = hook_option_str("render.sky_rotation_speed");
+    if (configured && configured[0]) return sky_rotation_speed_value(configured);
+    if (!Con__evaluate || !core_runtime_installed) return 0.0f;
+    return sky_rotation_speed_value(Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0));
 }
 
 static void sky_rotation_update(uint64_t now_ns, float speed) {

@@ -35,7 +35,7 @@ if (!isObject(HudBarDemoLeftTextProfile)) new GuiControlProfile(HudBarDemoLeftTe
 // Native hook demo controls. The radar filters opposing players through the
 // client's already-visible ShapeBase set; it does not enumerate hidden foes.
 $T2Launch::HudDemo::Radar = 1;
-$pref::skyRotationSpeed = 0.2; // radians per second; set to 0 to stop.
+$pref::skyRotationSpeed = 0.0; // native rotation disabled in launcher profiles by default.
 $T2Launch::HudDemo::CompassMode = "both"; // circular, horizontal, or both
 
 // The fill is drawn in subRegion (x y width height), clipped to the extent.

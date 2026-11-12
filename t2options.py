@@ -237,6 +237,11 @@ OPTIONS = (
     Option("render.object_rules", "Render modifiers", "Object modifier rules", "text", "",
            hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
            help="Path to a commented line-based config for per-frame object field replacements."),
+    Option("render.sky_rotation_speed", "Render modifiers", "Sky rotation speed (radians/sec)",
+           "float", 0.0, minimum=-20.0, maximum=20.0, hook=True, advanced=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Native sky rotation speed. Zero disables sky rotation; this profile option "
+                "overrides pref::skyRotationSpeed."),
     # Demo review (anti-cheat forensics): reconstruct what a suspect saw. Use a
     # review launch to watch demos, not to play live.
     Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,

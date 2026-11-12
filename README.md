@@ -858,7 +858,10 @@ options bring the parts of it that fit the Linux client:
   `setTargetId()` ignores them; with this on, client scripts can use all three
   on ghosts, as with the Windows `l33thax` patch.
 - **Render modifier rules** (`render.datablock_rules` and
-  `render.object_rules`, both empty by default, advanced). Point either option
+  `render.object_rules`, both empty by default, advanced). Set
+  `render.sky_rotation_speed` to control the hook's native sky rotation; the
+  default is `0` (disabled), with speeds from `-20` to `20` radians/second.
+  Point either rules option
   at a line-based config file to replace object/datablock fields locally. Rule
   lines start with `client`, `server`, or `both`, then `connect` or `frame`,
   followed by `ObjectPattern.FieldPattern = value`. `connect` rules reapply

@@ -69,7 +69,7 @@ class OptionTests(unittest.TestCase):
         self.assertNotIn("[0|1]", registrations)
 
     def test_render_modifier_path_options_are_written_to_hook_config(self):
-        for key in ("render.datablock_rules", "render.object_rules"):
+        for key in ("render.datablock_rules", "render.object_rules", "render.sky_rotation_speed"):
             with self.subTest(key=key):
                 self.assertTrue(t2options.BY_KEY[key].hook)
                 self.assertIn(f"{key}=", t2options.hook_config({}, HOOKED))
@@ -84,6 +84,7 @@ class OptionTests(unittest.TestCase):
                       datablocks)
         self.assertIn("zGridSkyBox.vl2", datablocks)
         self.assertIn("client frame navHud.position", objects)
+        self.assertEqual(t2options.BY_KEY["render.sky_rotation_speed"].default, 0.0)
 
     def test_old_wonemu_flag_migrates_to_won_mode(self):
         self.assertEqual(t2options.migrate({"wonemu": True})["won.mode"], "local")

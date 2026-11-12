@@ -13,6 +13,15 @@ static const char *fake_material_field = "materialList";
 static const char *fake_position_field = "position";
 static const char *fake_extent_field = "extent";
 static const char *fake_dynamic_field_name = "customPosition";
+static unsigned int fake_sky_pref_reads;
+
+static const char *fake_sky_pref_evaluate(const char *code, unsigned char echo,
+                                          const char *file_name, unsigned char no_calls) {
+    assert(strcmp(code, "t2launch_skyRotationSpeed();") == 0);
+    (void)echo; (void)file_name; (void)no_calls;
+    fake_sky_pref_reads++;
+    return "0.2";
+}
 
 static void *fake_get_class_rep(void *object) {
     assert(object == fake_object);
@@ -47,6 +56,21 @@ static void setup_fake_object(void) {
 }
 
 int main(void) {
+    assert(sky_rotation_speed_value("0") == 0.0f);
+    assert(sky_rotation_speed_value("1.25") > 1.249f && sky_rotation_speed_value("1.25") < 1.251f);
+    assert(sky_rotation_speed_value("21") == 0.0f);
+    assert(sky_rotation_speed_value("not-a-speed") == 0.0f);
+    Con__evaluate = fake_sky_pref_evaluate;
+    core_runtime_installed = 1;
+    store_hook_option("render.sky_rotation_speed", "0.0");
+    assert(sky_rotation_speed() == 0.0f && fake_sky_pref_reads == 0);
+    store_hook_option("render.sky_rotation_speed", "1.5");
+    assert(sky_rotation_speed() > 1.499f && sky_rotation_speed() < 1.501f);
+    assert(fake_sky_pref_reads == 0);
+    store_hook_option("render.sky_rotation_speed", "");
+    float preference_speed = sky_rotation_speed();
+    assert(preference_speed > 0.199f && preference_speed < 0.201f);
+    assert(fake_sky_pref_reads == 1);
     assert(strstr(render_modifier_scan_script,
                   "%class $= \"SimGroup\" || %class $= \"SimSet\"") != NULL);
     assert(strstr(render_modifier_scan_script, "getSubStr(%class, 0, 3) $= \"Gui\"") == NULL);

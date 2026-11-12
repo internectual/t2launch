@@ -22,8 +22,9 @@ TerrainBlock height/material map, rotates it with the camera view, and shows
 teammates, the assigned waypoint, and opponents only from T2's visible
 ShapeBase set. It runs for Player and observer Camera control objects during
 play and demo playback, and is gated to an awake/visible PlayGui/NavHud. Sky
-rotation remains opt-in through `$pref::skyRotationSpeed`. `DOOMHud.vl2`
-remains a separate optional package.
+rotation is disabled by default; set the profile's `render.sky_rotation_speed`
+option above zero to enable it. `DOOMHud.vl2` remains a separate optional
+package.
 
 The bar-example cluster anchors to the bottom-right of the safe HUD area at
 each resolution, leaving a 176-pixel right-side reserve for the stock weapon
