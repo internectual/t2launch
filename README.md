@@ -865,7 +865,8 @@ options bring the parts of it that fit the Linux client:
   at a line-based config file to replace object/datablock fields locally. Rule
   lines start with `client`, `server`, or `both`, then `connect` or `frame`,
   followed by `ObjectPattern.FieldPattern = value`. `connect` rules reapply
-  when the connection, mission group, or server connection group changes;
+  when the connection, mission group, or server connection group changes, then
+  retry briefly while mission objects arrive;
   `frame` rules reapply every frame. `class:Pattern` selects by Torque class name;
   `*` matches any number of characters and `?` matches one in object/class
   selectors and field names.
