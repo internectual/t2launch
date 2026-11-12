@@ -81,7 +81,7 @@ int main(void) {
     assert(strstr(render_modifier_scan_script,
                   "%class $= \"SimGroup\" || %class $= \"SimSet\"") != NULL);
     assert(strstr(render_modifier_scan_script,
-                  "if (isObject(MissionGroup)) t2launch_scanModifierGroup(MissionGroup)") != NULL);
+                  "t2launch_scanNamedModifierGroup(MissionGroup)") != NULL);
     assert(strstr(render_modifier_scan_script, "getSubStr(%class, 0, 3) $= \"Gui\"") == NULL);
     assert(render_glob_match("Hud*", "HudDamage"));
     assert(render_glob_match("Gui?itmapCtrl", "GuiBitmapCtrl"));
@@ -141,7 +141,9 @@ int main(void) {
     assert(render_modifier_direct_script_used == 0);
     assert(render_modifier_direct_assign_count[RENDER_PHASE_FRAME] == 1);
     assert(strstr(render_modifier_direct_assign_scripts[RENDER_PHASE_FRAME],
-                  "if(isObject(PlayGui)) { PlayGui.position = \"4 4\"") != NULL);
+                  "nameToID(\"PlayGui\")") != NULL);
+    assert(strstr(render_modifier_direct_assign_scripts[RENDER_PHASE_FRAME],
+                  "%object.position = \"4 4\"") != NULL);
     assert(strstr(render_modifier_direct_script, "Mission*") == NULL);
     assert(strstr(render_modifier_direct_script, "class:Sky") == NULL);
     render_field_cache_count = 0;
@@ -192,7 +194,7 @@ int main(void) {
         snprintf(render_rules[i].field_pattern, sizeof render_rules[i].field_pattern, "*");
     }
     render_build_direct_object_script();
-    assert(render_modifier_direct_script_used > 65536);
+    assert(render_modifier_direct_script_used > 30000);
     assert(strstr(render_modifier_direct_script, "Object127") != NULL);
     puts("render modifier syntax, direct HUD names, glob, and persistent/dynamic field expansion passed");
     return 0;

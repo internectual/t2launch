@@ -6480,6 +6480,9 @@ static char *render_modifier_output;
 static size_t render_modifier_output_used;
 static size_t render_modifier_matches;
 static size_t render_modifier_direct_matches;
+static size_t render_modifier_objects_seen;
+static size_t render_modifier_selector_matches;
+static size_t render_modifier_field_matches;
 static void *render_modifier_seen_objects[RENDER_MODIFIER_SEEN_LIMIT];
 static size_t render_modifier_seen_count;
 static int render_modifier_collecting;
@@ -6604,6 +6607,10 @@ static int render_parse_rule(char *line, enum render_rule_scope default_scope,
 
 static int render_name_is_safe(const char *name, int field_name);
 
+static int render_literal_object_name_safe(const char *name) {
+    return render_name_is_safe(name, 0) && !strchr(name, '$');
+}
+
 static int render_rule_scope_applies(const struct render_rule *rule) {
     return rule->scope == RENDER_SCOPE_BOTH ||
         (rule->scope == RENDER_SCOPE_CLIENT && !target->dedicated) ||
@@ -6615,7 +6622,7 @@ static int render_rule_literal_assignment(const struct render_rule *rule) {
     const char *field = rule->field_pattern;
     return strncmp(object, "class:", 6) != 0 && !strchr(object, '*') && !strchr(object, '?') &&
            !strchr(field, '*') && !strchr(field, '?') &&
-           render_name_is_safe(object, 0) && render_name_is_safe(field, 1);
+           render_literal_object_name_safe(object) && render_name_is_safe(field, 1);
 }
 
 static size_t render_load_rules_file(const char *path, int object_rules_file) {
@@ -6658,6 +6665,7 @@ static size_t render_load_rules_file(const char *path, int object_rules_file) {
 static void render_build_direct_object_script(void) {
     render_modifier_direct_script[0] = 0;
     render_modifier_direct_script_used = 0;
+    int method_scan_rules = 0;
     for (size_t phase = 0; phase < 2; phase++) {
         render_modifier_direct_assign_scripts[phase][0] = 0;
         render_modifier_direct_assign_used[phase] = 0;
@@ -6673,8 +6681,9 @@ static void render_build_direct_object_script(void) {
                         render_modifier_direct_assign_used[phase],
                     sizeof render_modifier_direct_assign_scripts[phase] -
                         render_modifier_direct_assign_used[phase],
-                    "if(isObject(%s)) { %s.%s = %s; %%count = %%count + 1; }\n",
-                    name, name, rule->field_pattern, rule->value);
+                    "%%object = nameToID(\"%s\"); if(isObject(%%object)) { "
+                    "%%object.%s = %s; %%count = %%count + 1; }\n",
+                    name, rule->field_pattern, rule->value);
                 if (written < 0 || (size_t)written >=
                         sizeof render_modifier_direct_assign_scripts[phase] -
                         render_modifier_direct_assign_used[phase]) {
@@ -6687,7 +6696,7 @@ static void render_build_direct_object_script(void) {
             continue;
         }
         if (strncmp(name, "class:", 6) == 0 || strchr(name, '*') || strchr(name, '?') ||
-            !render_name_is_safe(name, 0)) continue;
+            !render_literal_object_name_safe(name)) continue;
         if (!strchr(rule->field_pattern, '*') && !strchr(rule->field_pattern, '?')) continue;
         int duplicate = 0;
         for (size_t previous = 0; previous < r; previous++)
@@ -6698,16 +6707,41 @@ static void render_build_direct_object_script(void) {
                 duplicate = 1; break;
             }
         if (duplicate) continue;
-        int written = snprintf(render_modifier_direct_script + render_modifier_direct_script_used,
+        int written;
+        if (!method_scan_rules) {
+            written = snprintf(render_modifier_direct_script, sizeof render_modifier_direct_script,
+                "function t2launch_collectNamedRenderModifiers() {");
+            if (written < 0 || (size_t)written >= sizeof render_modifier_direct_script) {
+                render_modifier_direct_script[0] = 0;
+                break;
+            }
+            render_modifier_direct_script_used = (size_t)written;
+            method_scan_rules = 1;
+        }
+        written = snprintf(render_modifier_direct_script + render_modifier_direct_script_used,
             sizeof render_modifier_direct_script - render_modifier_direct_script_used,
-            "if(isObject(%s)) %s.t2launch_collectRenderModifiers(%s.getName(), %s.getClassName());\n",
-            name, name, name, name);
+            " %%object = nameToID(\"%s\");"
+            " if(isObject(%%object)) %%object.t2launch_collectRenderModifiers("
+            "%%object.getName(), %%object.getClassName());",
+            name);
         if (written < 0 || (size_t)written >=
                 sizeof render_modifier_direct_script - render_modifier_direct_script_used) {
             fprintf(stderr, "[t2_hook] named render modifier scan reached its script limit\n");
             break;
         }
         render_modifier_direct_script_used += (size_t)written;
+    }
+    if (method_scan_rules) {
+        const char close_function[] = " }";
+        size_t remaining = sizeof render_modifier_direct_script - render_modifier_direct_script_used;
+        if (sizeof close_function > remaining) {
+            render_modifier_direct_script[0] = 0;
+            render_modifier_direct_script_used = 0;
+        } else {
+            memcpy(render_modifier_direct_script + render_modifier_direct_script_used,
+                   close_function, sizeof close_function);
+            render_modifier_direct_script_used += sizeof close_function - 1;
+        }
     }
     for (size_t phase = 0; phase < 2; phase++) {
         if (!render_modifier_direct_assign_count[phase]) continue;
@@ -6828,6 +6862,7 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
     const char *object_name = argv && argv[2] ? argv[2] : "";
     const char *class_name = argv && argv[3] ? argv[3] : "";
     if (!*object_name || !*class_name) return "";
+    render_modifier_objects_seen++;
     struct render_field_cache *fields = NULL;
     int fields_loaded = 0;
     for (size_t r = 0; r < render_rule_count; r++) {
@@ -6838,6 +6873,7 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
             (rule->scope == RENDER_SCOPE_SERVER && target->dedicated);
         if (!scope_ok || render_rule_literal_assignment(rule) ||
             !render_rule_object_applies(rule, object_name, class_name)) continue;
+        render_modifier_selector_matches++;
         if (!fields_loaded) {
             fields = render_fields_for_object(obj);
             fields_loaded = 1;
@@ -6846,6 +6882,7 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
         for (size_t field_index = 0; fields && field_index < fields->count; field_index++) {
             const char *name = fields->names[field_index];
             if (render_rule_applies(rule, object_name, class_name, name)) {
+                render_modifier_field_matches++;
                 seen_fields[seen_count++] = name;
                 (void)render_append_assignment(object_name, name, rule->value);
             }
@@ -6871,6 +6908,7 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
                 if (name && !seen && seen_count < sizeof seen_fields / sizeof seen_fields[0] &&
                     render_name_is_safe(name, 1) &&
                     render_rule_applies(rule, object_name, class_name, name)) {
+                    render_modifier_field_matches++;
                     seen_fields[seen_count++] = name;
                     (void)render_append_assignment(object_name, name, rule->value);
                 }
@@ -6894,10 +6932,22 @@ static const char render_modifier_scan_script[] =
     "   t2launch_scanModifierGroup(%object);"
     " }"
     "}"
+    "function t2launch_scanNamedModifierGroup(%group) {"
+    " if (!isObject(%group)) return;"
+    " %class = %group.getClassName();"
+    " if (%class $= \"SimGroup\" || %class $= \"SimSet\")"
+    "  t2launch_scanModifierGroup(%group);"
+    "}"
     "function t2launch_collectRenderModifiers() {"
     " $T2Launch::Render::Scanned = 0;"
-    " if (isObject(RootGroup)) t2launch_scanModifierGroup(RootGroup);"
-    " if (isObject(MissionGroup)) t2launch_scanModifierGroup(MissionGroup);"
+    " t2launch_scanNamedModifierGroup(RootGroup);"
+    " t2launch_scanNamedModifierGroup(MissionGroup);"
+    " t2launch_scanNamedModifierGroup(ClientGroup);"
+    " t2launch_scanNamedModifierGroup(DataBlockGroup);"
+    " t2launch_scanNamedModifierGroup(MissionCleanup);"
+    " t2launch_scanNamedModifierGroup(GuiGroup);"
+    " t2launch_scanNamedModifierGroup(GuiDataGroup);"
+    " t2launch_scanNamedModifierGroup(ServerGroup);"
     "} ";
 
 static const char render_modifier_context_script[] =
@@ -6931,8 +6981,10 @@ static void render_modifier_report_connect_matches(size_t matches, size_t direct
     render_modifier_connect_log_reported = 1;
     render_modifier_connect_last_logged_matches = matches;
     render_modifier_connect_last_logged_direct_matches = direct_matches;
-    fprintf(stderr, "[t2_hook] render modifier connect matches=%zu direct=%zu\n",
-            matches, direct_matches);
+    fprintf(stderr, "[t2_hook] render modifier connect matches=%zu direct=%zu "
+                    "objects=%zu selectors=%zu fields=%zu\n",
+            matches, direct_matches, render_modifier_objects_seen,
+            render_modifier_selector_matches, render_modifier_field_matches);
 }
 
 static size_t render_modifiers_apply(enum render_rule_phase phase) {
@@ -6944,6 +6996,9 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
     render_modifier_output = render_modifier_output_storage;
     render_modifier_output_used = render_modifier_matches = 0;
     render_modifier_direct_matches = 0;
+    render_modifier_objects_seen = 0;
+    render_modifier_selector_matches = 0;
+    render_modifier_field_matches = 0;
     render_modifier_seen_count = 0;
     render_modifier_output_truncated = 0;
     render_modifier_collecting = memory_ready;
