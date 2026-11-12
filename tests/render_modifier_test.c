@@ -14,13 +14,24 @@ static const char *fake_position_field = "position";
 static const char *fake_extent_field = "extent";
 static const char *fake_dynamic_field_name = "customPosition";
 static unsigned int fake_sky_pref_reads;
+static unsigned int fake_sky_material_sets;
+static char fake_sky_material_script[512];
 
 static const char *fake_sky_pref_evaluate(const char *code, unsigned char echo,
                                           const char *file_name, unsigned char no_calls) {
-    assert(strcmp(code, "t2launch_skyRotationSpeed();") == 0);
     (void)echo; (void)file_name; (void)no_calls;
-    fake_sky_pref_reads++;
-    return "0.2";
+    if (strcmp(code, "t2launch_skyRotationSpeed();") == 0) {
+        fake_sky_pref_reads++;
+        return "0.2";
+    }
+    if (strncmp(code, "t2launch_renderModifierObjectName(", 34) == 0) return "Sky";
+    if (strncmp(code, "t2launch_applySkyMaterialList(", 30) == 0) {
+        snprintf(fake_sky_material_script, sizeof fake_sky_material_script, "%s", code);
+        fake_sky_material_sets++;
+        return "1";
+    }
+    assert(!"unexpected Torque evaluation in render-modifier fixture");
+    return "";
 }
 
 static void *fake_get_class_rep(void *object) {
@@ -40,6 +51,7 @@ static void setup_fake_object(void) {
     static void *fake_vtable[3];
     fake_vtable[2] = (void *)fake_get_class_rep;
     fake_put_pointer(fake_object, 0, fake_vtable);
+    fake_put_word(fake_object, 0x20, 12345);
     fake_put_pointer(fake_object, SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET, fake_dictionary);
     fake_put_pointer(fake_class_rep, 0x18, fake_class_name);
     fake_put_pointer(fake_class_rep, 0x20, fake_fields);
@@ -182,6 +194,26 @@ int main(void) {
     render_modifier_output = NULL;
     assert(render_modifier_output_storage[0] == 0);
     assert(render_modifier_matches == 0);
+
+    snprintf(render_rules[3].object_pattern, sizeof render_rules[3].object_pattern, "Sky");
+    snprintf(render_rules[3].field_pattern, sizeof render_rules[3].field_pattern, "materialList");
+    snprintf(render_rules[3].value, sizeof render_rules[3].value, "\"grid.dml\"");
+    render_rules[3].scope = RENDER_SCOPE_CLIENT;
+    render_rules[3].phase = RENDER_PHASE_CONNECT;
+    render_rule_count = 4;
+    render_modifier_method_registered = 1;
+    render_sky_modifier_cached_object = NULL;
+    render_sky_modifier_cached_id = 0;
+    render_sky_modifier_cache_valid = 0;
+    render_sky_modifier_context[0] = 0;
+    render_sky_connect_retry_until_ns = 0;
+    render_sky_connect_last_apply_ns = 0;
+    fake_sky_material_sets = 0;
+    assert(render_apply_sky_material_modifiers(fake_object) == 2);
+    assert(fake_sky_material_sets == 2);
+    assert(strstr(fake_sky_material_script, "t2launch_applySkyMaterialList(12345, \"grid.dml\")") != NULL);
+    assert(render_apply_sky_material_modifiers(fake_object) == 1);
+    assert(fake_sky_material_sets == 3);
 
     render_rule_count = RENDER_RULE_LIMIT;
     for (size_t i = 0; i < render_rule_count; i++) {

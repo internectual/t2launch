@@ -6961,6 +6961,16 @@ static const char render_modifier_context_script[] =
     " return %connection @ \":\" @ %mission @ \":\" @ %serverConnections;"
     "}";
 
+static const char render_modifier_sky_helpers[] =
+    "function t2launch_renderModifierObjectName(%id) {"
+    " %object = %id; if (!isObject(%object)) return \"\";"
+    " return %object.getName();"
+    "}"
+    "function t2launch_applySkyMaterialList(%id, %value) {"
+    " %object = %id; if (!isObject(%object)) return 0;"
+    " %object.materialList = %value; return 1;"
+    "}";
+
 static uint64_t render_modifiers_now_ns(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
@@ -7055,6 +7065,7 @@ static void install_render_modifiers(void) {
     render_modifier_method_registered = 1;
     (void)Con__evaluate(render_modifier_scan_script, 0, "t2launch/render-modifiers.cs", 0);
     (void)Con__evaluate(render_modifier_context_script, 0, "t2launch/render-modifiers.cs", 0);
+    (void)Con__evaluate(render_modifier_sky_helpers, 0, "t2launch/render-modifiers.cs", 0);
     for (size_t phase = 0; phase < 2; phase++)
         if (render_modifier_direct_assign_used[phase])
             (void)Con__evaluate(render_modifier_direct_assign_scripts[phase], 0,
@@ -7162,6 +7173,15 @@ static int sky_rotation_hook_installed;
 static void *sky_rotation_trampoline;
 static float sky_rotation_angle;
 static uint64_t sky_rotation_last_ns;
+static void *render_sky_modifier_cached_object;
+static uint32_t render_sky_modifier_cached_id;
+static int render_sky_modifier_cache_valid;
+static char render_sky_modifier_cached_class[64];
+static char render_sky_modifier_cached_name[128];
+static char render_sky_modifier_context[64];
+static uint64_t render_sky_connect_retry_until_ns;
+static uint64_t render_sky_connect_last_apply_ns;
+static int render_sky_modifier_logged;
 
 typedef struct {
     void (*GetIntegerv)(unsigned, int *);
@@ -7891,6 +7911,79 @@ static float sky_rotation_speed(void) {
     return sky_rotation_speed_value(Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0));
 }
 
+/* Sky instances may be outside the SimGroup walk on a client. The Sky renderer
+   passes the actual object pointer, so apply the configured materialList rule
+   to the object being drawn, using its SimObject ID through TorqueScript. */
+static size_t render_apply_sky_material_modifiers(void *sky_object) {
+    if (!sky_object || !target || target->dedicated || !render_modifier_method_registered ||
+        !Con__evaluate || !render_rule_count) return 0;
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, sky_object, 0x24, PROT_READ)) return 0;
+    uint32_t object_id = rv_word(sky_object, 0x20), material_list_offset = 0;
+    const char *class_name = rv_class_name(&memory, sky_object);
+    if (!object_id || !class_name ||
+        !rv_persist_field_offset(&memory, sky_object, "materialList", &material_list_offset)) return 0;
+
+    uint64_t now_ns = render_modifiers_now_ns();
+    int object_changed = sky_object != render_sky_modifier_cached_object ||
+                         object_id != render_sky_modifier_cached_id;
+    if (object_changed) {
+        render_sky_modifier_cached_object = sky_object;
+        render_sky_modifier_cached_id = object_id;
+        snprintf(render_sky_modifier_cached_class, sizeof render_sky_modifier_cached_class,
+                 "%s", class_name);
+        char query[96];
+        snprintf(query, sizeof query, "t2launch_renderModifierObjectName(%u);", object_id);
+        const char *name = Con__evaluate(query, 0, NULL, 0);
+        snprintf(render_sky_modifier_cached_name, sizeof render_sky_modifier_cached_name,
+                 "%s", name ? name : "");
+        render_sky_modifier_cache_valid = 1;
+        render_sky_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
+        render_sky_connect_last_apply_ns = 0;
+        render_sky_modifier_logged = 0;
+    }
+    if (!render_sky_modifier_cache_valid) return 0;
+    if (strcmp(render_sky_modifier_context, render_modifier_last_context) != 0) {
+        snprintf(render_sky_modifier_context, sizeof render_sky_modifier_context, "%s",
+                 render_modifier_last_context);
+        render_sky_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
+        render_sky_connect_last_apply_ns = 0;
+        render_sky_modifier_logged = 0;
+    }
+    int connect_due = render_sky_connect_retry_until_ns &&
+        now_ns < render_sky_connect_retry_until_ns &&
+        (!render_sky_connect_last_apply_ns || now_ns < render_sky_connect_last_apply_ns ||
+         now_ns - render_sky_connect_last_apply_ns >= RENDER_CONNECT_RETRY_INTERVAL_NS);
+    size_t applied = 0, connect_rules = 0, frame_rules = 0;
+    for (size_t i = 0; i < render_rule_count; i++) {
+        const struct render_rule *rule = &render_rules[i];
+        if ((rule->scope != RENDER_SCOPE_BOTH && rule->scope != RENDER_SCOPE_CLIENT) ||
+            !render_rule_applies(rule, render_sky_modifier_cached_name,
+                                 render_sky_modifier_cached_class, "materialList")) continue;
+        if (rule->phase == RENDER_PHASE_CONNECT) {
+            if (!connect_due) continue;
+            connect_rules++;
+        } else {
+            frame_rules++;
+        }
+        char command[512];
+        int written = snprintf(command, sizeof command,
+            "t2launch_applySkyMaterialList(%u, %s);", object_id, rule->value);
+        if (written < 0 || (size_t)written >= sizeof command) continue;
+        const char *result = Con__evaluate(command, 0, NULL, 0);
+        if (result && strcmp(result, "1") == 0) applied++;
+    }
+    if (connect_due && connect_rules) render_sky_connect_last_apply_ns = now_ns;
+    if (applied && !render_sky_modifier_logged) {
+        fprintf(stderr, "[t2_hook] Sky materialList override applied: name=%s class=%s id=%u connect=%zu frame=%zu\n",
+                render_sky_modifier_cached_name, render_sky_modifier_cached_class, object_id,
+                connect_rules, frame_rules);
+        render_sky_modifier_logged = 1;
+    }
+    return applied;
+}
+
 static void sky_rotation_update(uint64_t now_ns, float speed) {
     if (!sky_rotation_last_ns || now_ns < sky_rotation_last_ns) {
         sky_rotation_last_ns = now_ns;
@@ -7910,6 +8003,7 @@ static sky_render_slices_t sky_render_slices_original_fn;
 static void sky_render_slices_wrapper(void *sky_object, float lower_band_height,
                                       float upper_alpha) {
     sky_capture_compass_view();
+    (void)render_apply_sky_material_modifiers(sky_object);
     float speed = sky_rotation_speed();
     if (speed == 0.0f) {
         sky_rotation_last_ns = 0;
