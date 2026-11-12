@@ -871,8 +871,21 @@ options bring the parts of it that fit the Linux client:
   `*` matches any number of characters and `?` matches one in object/class
   selectors and field names.
   A rule applies its value to every match, so keep wildcard patterns narrow.
-  Blank/comment lines are ignored, bare text values are quoted automatically,
-  and numeric/vector or explicitly quoted values are preserved. Example files
+  Rules reach every object in the client's object table (ghosts such as `Sky`,
+  datablocks, unnamed objects), not just those inside a SimGroup. A write is
+  skipped when the field already holds the value, and when it does change the
+  hook asks the engine to re-read the object (currently `Sky.materialList`
+  reloads the cube faces; new classes are one row in the hook's refresh
+  registry), so a rule overrides whatever the server sent.
+
+  Conditional rules test a field of the same object first:
+  `client frame class:Sky.materialList = "*lush*" ? materialList = "grid.dml"`.
+  The left side is `Object.field <op> value`, joined with `&` for more tests
+  (`=` and `!=` glob-match case-insensitively or compare numbers; `<`, `>`,
+  `<=`, `>=` compare numbers). After `?` come one or more comma-separated
+  `field = value` actions applied to that object when every test passes.
+  Blank/comment lines are ignored and every value is passed as a string, so
+  vectors such as `20 30` work without quotes. Example files
   with commented syntax documentation are in
   `runtime/render-modifiers.datablocks.example.cfg` and
   `runtime/render-modifiers.objects.example.cfg`.

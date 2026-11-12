@@ -14,8 +14,6 @@ static const char *fake_position_field = "position";
 static const char *fake_extent_field = "extent";
 static const char *fake_dynamic_field_name = "customPosition";
 static unsigned int fake_sky_pref_reads;
-static unsigned int fake_sky_material_sets;
-static char fake_sky_material_script[512];
 
 static const char *fake_sky_pref_evaluate(const char *code, unsigned char echo,
                                           const char *file_name, unsigned char no_calls) {
@@ -23,12 +21,6 @@ static const char *fake_sky_pref_evaluate(const char *code, unsigned char echo,
     if (strcmp(code, "t2launch_skyRotationSpeed();") == 0) {
         fake_sky_pref_reads++;
         return "0.2";
-    }
-    if (strncmp(code, "t2launch_renderModifierObjectName(", 34) == 0) return "Sky";
-    if (strncmp(code, "t2launch_applySkyMaterialList(", 30) == 0) {
-        snprintf(fake_sky_material_script, sizeof fake_sky_material_script, "%s", code);
-        fake_sky_material_sets++;
-        return "1";
     }
     assert(!"unexpected Torque evaluation in render-modifier fixture");
     return "";
@@ -118,7 +110,7 @@ int main(void) {
     assert(!render_rule_applies(&wildcard, "HudLayout", "GuiBitmapCtrl", "extent"));
     assert(render_rule_applies(&wildcard, "Other", "GuiBitmapCtrl", "position"));
     assert(!render_rule_applies(&wildcard, "HudLayout", "Sun", "position"));
-    assert(strcmp(wildcard.value, "20 30") == 0);
+    assert(strcmp(wildcard.value, "\"20 30\"") == 0);
 
     char legacy_line[] = "MissionSky.materialList=textures/sky_Rollercoaster.dml\n";
     struct render_rule legacy;
@@ -166,16 +158,17 @@ int main(void) {
     render_modifier_output_storage[0] = 0;
     render_modifier_output_used = render_modifier_matches = 0;
     const char *method_argv[] = {
-        "SimObject::t2launch_collectRenderModifiers", "object-id", "MissionSky", "Sky"
+        "SimObject::t2launch_collectRenderModifiers", "12345", "MissionSky", "Sky"
     };
     assert(strcmp(render_modifier_object_cb(fake_object, 4, method_argv), "") == 0);
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
     assert(strstr(render_modifier_output_storage,
-                  "MissionSky.materialList = \"textures/grid.dml\"") != NULL);
-    assert(strstr(render_modifier_output_storage, "MissionSky.position = \"20 30\"") != NULL);
-    assert(strstr(render_modifier_output_storage,
-                  "MissionSky.customPosition = \"20 30\"") != NULL);
+                  "%o = 12345; if(isObject(%o)) if(%o.materialList !$= \"textures/grid.dml\") "
+                  "{ %o.materialList = \"textures/grid.dml\"; "
+                  "t2launch_refresh(%o, \"materialList\"); }") != NULL);
+    assert(strstr(render_modifier_output_storage, "%o.position = \"20 30\"") != NULL);
+    assert(strstr(render_modifier_output_storage, "%o.customPosition = \"20 30\"") != NULL);
     assert(render_modifier_matches == 3);
     size_t unique_output_length = render_modifier_output_used;
     assert(strcmp(render_modifier_object_cb(fake_object, 4, method_argv), "") == 0);
@@ -185,7 +178,7 @@ int main(void) {
     render_modifier_output_used = render_modifier_matches = 0;
     render_modifier_seen_count = 0;
     const char *play_gui_argv[] = {
-        "SimObject::t2launch_collectRenderModifiers", "object-id", "PlayGui", "GuiCanvas"
+        "SimObject::t2launch_collectRenderModifiers", "12345", "PlayGui", "GuiCanvas"
     };
     render_modifier_collecting = 1;
     render_modifier_output = render_modifier_output_storage;
@@ -195,25 +188,62 @@ int main(void) {
     assert(render_modifier_output_storage[0] == 0);
     assert(render_modifier_matches == 0);
 
-    snprintf(render_rules[3].object_pattern, sizeof render_rules[3].object_pattern, "Sky");
-    snprintf(render_rules[3].field_pattern, sizeof render_rules[3].field_pattern, "materialList");
-    snprintf(render_rules[3].value, sizeof render_rules[3].value, "\"grid.dml\"");
-    render_rules[3].scope = RENDER_SCOPE_CLIENT;
-    render_rules[3].phase = RENDER_PHASE_CONNECT;
-    render_rule_count = 4;
-    render_modifier_method_registered = 1;
-    render_sky_modifier_cached_object = NULL;
-    render_sky_modifier_cached_id = 0;
-    render_sky_modifier_cache_valid = 0;
-    render_sky_modifier_context[0] = 0;
-    render_sky_connect_retry_until_ns = 0;
-    render_sky_connect_last_apply_ns = 0;
-    fake_sky_material_sets = 0;
-    assert(render_apply_sky_material_modifiers(fake_object) == 2);
-    assert(fake_sky_material_sets == 2);
-    assert(strstr(fake_sky_material_script, "t2launch_applySkyMaterialList(12345, \"grid.dml\")") != NULL);
-    assert(render_apply_sky_material_modifiers(fake_object) == 1);
-    assert(fake_sky_material_sets == 3);
+    /* Conditional rules: parse, expand actions, emit gated statements. */
+    char cond_line[] = "client frame class:Sky.materialList = \"*lush*\" & fogDistance >= 100 ? "
+                       "materialList = \"grid.dml\", visibleDistance = 900\n";
+    struct render_rule cond_rules[RENDER_ACTION_LIMIT];
+    assert(render_parse_rules(cond_line, RENDER_SCOPE_BOTH, RENDER_PHASE_CONNECT,
+                              cond_rules, RENDER_ACTION_LIMIT) == 2);
+    assert(cond_rules[0].phase == RENDER_PHASE_FRAME && cond_rules[0].scope == RENDER_SCOPE_CLIENT);
+    assert(strcmp(cond_rules[0].object_pattern, "class:Sky") == 0);
+    assert(cond_rules[0].cond_count == 2 && cond_rules[1].cond_count == 2);
+    assert(strcmp(cond_rules[0].conds[0].field, "materialList") == 0);
+    assert(cond_rules[0].conds[0].op == RENDER_OP_EQ);
+    assert(strcmp(cond_rules[0].conds[0].value, "\"*lush*\"") == 0);
+    assert(cond_rules[0].conds[1].op == RENDER_OP_GE);
+    assert(strcmp(cond_rules[0].conds[1].field, "fogDistance") == 0);
+    assert(strcmp(cond_rules[0].field_pattern, "materialList") == 0);
+    assert(strcmp(cond_rules[1].field_pattern, "visibleDistance") == 0);
+    assert(strcmp(cond_rules[1].value, "\"900\"") == 0);
+    assert(!render_rule_literal_assignment(&cond_rules[0]));
+    char quoted_line[] = "Obj.texture = \"a?b&c,d\" ? position = \"1,2,3\"\n";
+    assert(render_parse_rules(quoted_line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME,
+                              cond_rules, RENDER_ACTION_LIMIT) == 1);
+    assert(strcmp(cond_rules[0].conds[0].value, "\"a?b&c,d\"") == 0);
+    assert(strcmp(cond_rules[0].value, "\"1,2,3\"") == 0);
+    char bad_cond[] = "Obj.texture ? position = 1\n";
+    assert(render_parse_rules(bad_cond, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME,
+                              cond_rules, RENDER_ACTION_LIMIT) < 0);
+    char spaced_legacy[] = "Sky.materialList = \"grid.dml\"\n";
+    assert(render_parse_rule(spaced_legacy, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME, &legacy) == 1);
+    assert(strcmp(legacy.object_pattern, "Sky") == 0);
+
+    assert(render_condition_holds("textures/lush.dml", "=", "*lush*"));
+    assert(!render_condition_holds("textures/ice.dml", "=", "*lush*"));
+    assert(render_condition_holds("textures/ice.dml", "!=", "*lush*"));
+    assert(render_condition_holds("1.0", "=", "1"));
+    assert(render_condition_holds("5", ">", "4") && !render_condition_holds("5", "<", "4"));
+    assert(render_condition_holds("4", ">=", "4") && render_condition_holds("4", "<=", "4"));
+    assert(!render_condition_holds("abc", ">", "1"));
+
+    render_rule_count = 1;
+    render_rules[0] = (struct render_rule){0};
+    {
+        char line[] = "client frame Mission*.texture = \"*grid*\" ? position = \"20 30\"\n";
+        assert(render_parse_rules(line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME,
+                                  render_rules, 1) == 1);
+    }
+    render_modifier_active_phase = RENDER_PHASE_FRAME;
+    render_modifier_collecting = 1;
+    render_modifier_output = render_modifier_output_storage;
+    render_modifier_output_storage[0] = 0;
+    render_modifier_output_used = render_modifier_matches = 0;
+    render_collect_object(fake_object, "12345", "MissionSky", "Sky");
+    render_modifier_collecting = 0;
+    render_modifier_output = NULL;
+    assert(strstr(render_modifier_output_storage,
+                  "if(isObject(%o) && t2launch_test(%o.texture, \"=\", \"*grid*\")) "
+                  "if(%o.position !$= \"20 30\")") != NULL);
 
     render_rule_count = RENDER_RULE_LIMIT;
     for (size_t i = 0; i < render_rule_count; i++) {

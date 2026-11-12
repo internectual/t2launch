@@ -6461,12 +6461,22 @@ static void cap_frame_rate(void) {
 #define RENDER_FIELD_CACHE_FIELDS 512
 enum render_rule_scope { RENDER_SCOPE_CLIENT, RENDER_SCOPE_SERVER, RENDER_SCOPE_BOTH };
 enum render_rule_phase { RENDER_PHASE_CONNECT, RENDER_PHASE_FRAME };
+#define RENDER_COND_LIMIT 4
+#define RENDER_ACTION_LIMIT 8
+enum render_cond_op { RENDER_OP_EQ, RENDER_OP_NE, RENDER_OP_LT, RENDER_OP_GT, RENDER_OP_LE, RENDER_OP_GE };
+struct render_condition {
+    char field[RENDER_RULE_TEXT];
+    enum render_cond_op op;
+    char value[RENDER_RULE_VALUE]; /* script string literal */
+};
 struct render_rule {
     char object_pattern[RENDER_RULE_TEXT];
     char field_pattern[RENDER_RULE_TEXT];
     char value[RENDER_RULE_VALUE];
     enum render_rule_scope scope;
     enum render_rule_phase phase;
+    size_t cond_count;
+    struct render_condition conds[RENDER_COND_LIMIT];
 };
 static struct render_rule render_rules[RENDER_RULE_LIMIT];
 static size_t render_rule_count;
@@ -6530,24 +6540,15 @@ static int render_glob_match(const char *pattern, const char *text) {
 
 static void db_format_value(const char *raw, char *out, size_t outlen) {
     if (!raw || !outlen) return;
-    int numeric = *raw != 0;
-    for (const char *p = raw; *p; p++) {
-        if ((*p >= '0' && *p <= '9') || *p == ' ' || *p == '.' ||
-            *p == '-' || *p == '+' || *p == 'e' || *p == 'E') continue;
-        numeric = 0; break;
-    }
-    if (numeric || strcmp(raw, "true") == 0 || strcmp(raw, "false") == 0 ||
-        strcmp(raw, "True") == 0 || strcmp(raw, "False") == 0) {
-        snprintf(out, outlen, "%s", raw);
-        return;
-    }
-    if (raw[0] == '"' && raw[strlen(raw) - 1] == '"') {
+    /* Every Torque field value is a string, and a bare vector such as `20 30`
+       is a script syntax error, so quote everything not already quoted. */
+    if (raw[0] == '"' && strlen(raw) >= 2 && raw[strlen(raw) - 1] == '"') {
         snprintf(out, outlen, "%s", raw);
         return;
     }
     size_t used = 0;
     out[used++] = '"';
-    for (const unsigned char *p = (const unsigned char *)raw; *p && used + 2 < outlen; p++) {
+    for (const unsigned char *p = (const unsigned char *)raw; *p && used + 3 < outlen; p++) {
         if (*p == '"' || *p == '\\') out[used++] = '\\';
         if (*p == '\n' || *p == '\r') continue;
         out[used++] = (char)*p;
@@ -6555,54 +6556,158 @@ static void db_format_value(const char *raw, char *out, size_t outlen) {
     out[used++] = '"'; out[used] = 0;
 }
 
+static int render_name_is_safe(const char *name, int field_name);
+
+/* First occurrence of any character in `set` outside double quotes. */
+static char *render_find_unquoted(char *text, const char *set) {
+    int quoted = 0;
+    for (char *p = text; *p; p++) {
+        if (quoted && *p == '\\' && p[1]) { p++; continue; }
+        if (*p == '"') { quoted = !quoted; continue; }
+        if (!quoted && strchr(set, *p)) return p;
+    }
+    return NULL;
+}
+
+static int render_split_assignment(char *text, char **lhs, char **rhs) {
+    char *equals = render_find_unquoted(text, "=");
+    if (!equals) return 0;
+    *equals++ = 0;
+    *lhs = trim_space(text);
+    *rhs = trim_space(equals);
+    return **lhs && **rhs;
+}
+
+static const char *render_op_text(enum render_cond_op op) {
+    switch (op) {
+    case RENDER_OP_NE: return "!=";
+    case RENDER_OP_LT: return "<";
+    case RENDER_OP_GT: return ">";
+    case RENDER_OP_LE: return "<=";
+    case RENDER_OP_GE: return ">=";
+    default: return "=";
+    }
+}
+
+/* One `field <op> value` clause; the first clause of a rule carries Object.field. */
+static int render_parse_condition(char *clause, int first, char *object_out, size_t object_len,
+                                  struct render_condition *cond) {
+    char *op = render_find_unquoted(clause, "=!<>");
+    if (!op) return 0;
+    char *value = op + 1;
+    if (*op == '!') { if (*value != '=') return 0; cond->op = RENDER_OP_NE; value++; }
+    else if (*op == '<') { if (*value == '=') { cond->op = RENDER_OP_LE; value++; } else cond->op = RENDER_OP_LT; }
+    else if (*op == '>') { if (*value == '=') { cond->op = RENDER_OP_GE; value++; } else cond->op = RENDER_OP_GT; }
+    else cond->op = RENDER_OP_EQ;
+    *op = 0;
+    char *lhs = trim_space(clause), *rhs = trim_space(value);
+    if (!*lhs || !*rhs || strlen(rhs) >= sizeof cond->value || strchr(rhs, '\n')) return 0;
+    if (first) {
+        char *dot = strrchr(lhs, '.');
+        if (!dot) return 0;
+        *dot++ = 0;
+        lhs = trim_space(lhs);
+        char *field = trim_space(dot);
+        if (!*lhs || strlen(lhs) >= object_len) return 0;
+        snprintf(object_out, object_len, "%s", lhs);
+        lhs = field;
+    }
+    if (!render_name_is_safe(lhs, 1) || strlen(lhs) >= sizeof cond->field) return 0;
+    snprintf(cond->field, sizeof cond->field, "%s", lhs);
+    db_format_value(rhs, cond->value, sizeof cond->value);
+    return 1;
+}
+
+/* Parses one config line into up to `max` rules (a conditional line with
+   several comma-separated actions expands to one rule per action).
+   Returns the rule count, 0 for blank/comment lines, <0 when invalid.
+     [scope phase] Object.field = value
+     [scope phase] Object.testField <op> value [& field <op> value]... ? field = value[, field = value]... */
+static int render_parse_rules(char *line, enum render_rule_scope default_scope,
+                              enum render_rule_phase default_phase,
+                              struct render_rule *out, size_t max) {
+    char *text = trim_space(line);
+    if (!*text || *text == '#' || !max) return 0;
+    struct render_rule base;
+    memset(&base, 0, sizeof base);
+    base.scope = default_scope;
+    base.phase = default_phase;
+    char *rest = text;
+    /* Optional "scope phase" prefix; otherwise a legacy Object.field = value line. */
+    char *separator = strpbrk(text, " \t");
+    if (separator) {
+        size_t word = (size_t)(separator - text);
+        int has_scope = (word == 6 && strncmp(text, "client", 6) == 0) ||
+                        (word == 6 && strncmp(text, "server", 6) == 0) ||
+                        (word == 4 && strncmp(text, "both", 4) == 0);
+        if (has_scope) {
+            if (text[0] == 'c') base.scope = RENDER_SCOPE_CLIENT;
+            else if (text[0] == 's') base.scope = RENDER_SCOPE_SERVER;
+            else base.scope = RENDER_SCOPE_BOTH;
+            char *second = trim_space(separator + 1);
+            char *space = strpbrk(second, " \t");
+            if (!space) return -1;
+            *space++ = 0;
+            if (strcmp(second, "connect") == 0) base.phase = RENDER_PHASE_CONNECT;
+            else if (strcmp(second, "frame") == 0) base.phase = RENDER_PHASE_FRAME;
+            else return -1;
+            rest = trim_space(space);
+        }
+    }
+    char *question = render_find_unquoted(rest, "?");
+    char *action_text = rest;
+    if (question) {
+        *question++ = 0;
+        action_text = question;
+        char *clause = rest;
+        for (;;) {
+            char *amp = render_find_unquoted(clause, "&");
+            if (amp) *amp = 0;
+            if (base.cond_count >= RENDER_COND_LIMIT ||
+                !render_parse_condition(clause, base.cond_count == 0, base.object_pattern,
+                                        sizeof base.object_pattern, &base.conds[base.cond_count]))
+                return -1;
+            base.cond_count++;
+            if (!amp) break;
+            clause = amp + 1;
+        }
+    }
+    size_t produced = 0;
+    char *action = action_text;
+    for (;;) {
+        char *comma = question ? render_find_unquoted(action, ",") : NULL;
+        if (comma) *comma = 0;
+        char *lhs, *rhs;
+        if (!render_split_assignment(action, &lhs, &rhs) || strchr(rhs, '\n') || strchr(rhs, '\r'))
+            return -1;
+        struct render_rule *rule = &out[produced];
+        if (produced >= max) return -1;
+        *rule = base;
+        if (!question) {
+            char *dot = strrchr(lhs, '.');
+            if (!dot) return -1;
+            *dot++ = 0;
+            char *obj = trim_space(lhs);
+            lhs = trim_space(dot);
+            if (!*obj || strlen(obj) >= sizeof rule->object_pattern) return -1;
+            snprintf(rule->object_pattern, sizeof rule->object_pattern, "%s", obj);
+        }
+        if (!*lhs || strlen(lhs) >= sizeof rule->field_pattern || strlen(rhs) >= sizeof rule->value)
+            return -1;
+        snprintf(rule->field_pattern, sizeof rule->field_pattern, "%s", lhs);
+        db_format_value(rhs, rule->value, sizeof rule->value);
+        produced++;
+        if (!comma) break;
+        action = comma + 1;
+    }
+    return (int)produced;
+}
+
 static int render_parse_rule(char *line, enum render_rule_scope default_scope,
                              enum render_rule_phase default_phase,
                              struct render_rule *rule) {
-    char *text = trim_space(line);
-    if (!*text || *text == '#') return 0;
-    rule->scope = default_scope;
-    rule->phase = default_phase;
-    char *assignment;
-    /* Legacy datablocks.cfg entries were simply Object.field = value. */
-    char *separator = strpbrk(text, " \t");
-    char *dot = strrchr(text, '.');
-    char *equals = strchr(text, '=');
-    if (dot && equals && (!separator || dot < separator)) {
-        assignment = text;
-    } else {
-        if (!separator) return -1;
-        char *remainder = separator + 1;
-        *separator = 0;
-        char *second = trim_space(remainder);
-        char *space = strpbrk(second, " \t");
-        if (!space) return -1;
-        *space++ = 0;
-        if (strcmp(text, "client") == 0) rule->scope = RENDER_SCOPE_CLIENT;
-        else if (strcmp(text, "server") == 0) rule->scope = RENDER_SCOPE_SERVER;
-        else if (strcmp(text, "both") == 0) rule->scope = RENDER_SCOPE_BOTH;
-        else return -1;
-        if (strcmp(second, "connect") == 0) rule->phase = RENDER_PHASE_CONNECT;
-        else if (strcmp(second, "frame") == 0) rule->phase = RENDER_PHASE_FRAME;
-        else return -1;
-        assignment = trim_space(space);
-    }
-    equals = strchr(assignment, '=');
-    if (!equals) return -1;
-    *equals++ = 0;
-    char *lhs = trim_space(assignment);
-    char *rhs = trim_space(equals);
-    dot = strrchr(lhs, '.');
-    if (!dot || !*rhs) return -1;
-    *dot++ = 0;
-    char *obj = trim_space(lhs), *field = trim_space(dot);
-    if (!*obj || !*field || strlen(obj) >= sizeof rule->object_pattern ||
-        strlen(field) >= sizeof rule->field_pattern || strlen(rhs) >= sizeof rule->value)
-        return -1;
-    if (strchr(rhs, '\n') || strchr(rhs, '\r')) return -1;
-    snprintf(rule->object_pattern, sizeof rule->object_pattern, "%s", obj);
-    snprintf(rule->field_pattern, sizeof rule->field_pattern, "%s", field);
-    db_format_value(rhs, rule->value, sizeof rule->value);
-    return 1;
+    int count = render_parse_rules(line, default_scope, default_phase, rule, 1);
+    return count > 1 ? -1 : count;
 }
 
 static int render_name_is_safe(const char *name, int field_name);
@@ -6620,7 +6725,7 @@ static int render_rule_scope_applies(const struct render_rule *rule) {
 static int render_rule_literal_assignment(const struct render_rule *rule) {
     const char *object = rule->object_pattern;
     const char *field = rule->field_pattern;
-    return strncmp(object, "class:", 6) != 0 && !strchr(object, '*') && !strchr(object, '?') &&
+    return !rule->cond_count && strncmp(object, "class:", 6) != 0 && !strchr(object, '*') && !strchr(object, '?') &&
            !strchr(field, '*') && !strchr(field, '?') &&
            render_literal_object_name_safe(object) && render_name_is_safe(field, 1);
 }
@@ -6647,15 +6752,19 @@ static size_t render_load_rules_file(const char *path, int object_rules_file) {
             fprintf(stderr, "[t2_hook] render modifier rule limit (%d) reached\n", RENDER_RULE_LIMIT);
             break;
         }
-        struct render_rule rule;
-        int parsed = render_parse_rule(line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME, &rule);
-        if (parsed < 0 || (parsed > 0 && object_rules_file && rule.phase != RENDER_PHASE_FRAME)) {
+        struct render_rule parsed_rules[RENDER_ACTION_LIMIT];
+        int parsed = render_parse_rules(line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME,
+                                        parsed_rules, RENDER_ACTION_LIMIT);
+        if (parsed < 0 || (parsed > 0 && object_rules_file &&
+                           parsed_rules[0].phase != RENDER_PHASE_FRAME) ||
+            (parsed > 0 && render_rule_count + (size_t)parsed > RENDER_RULE_LIMIT)) {
             fprintf(stderr, "[t2_hook] invalid render modifier: %s:%lu\n", path, line_number);
             continue;
         }
-        if (!parsed) continue;
-        render_rules[render_rule_count++] = rule;
-        loaded++;
+        for (int i = 0; i < parsed; i++) {
+            render_rules[render_rule_count++] = parsed_rules[i];
+            loaded++;
+        }
     }
     fclose(file);
     fprintf(stderr, "[t2_hook] loaded %zu render modifier rules from %s\n", loaded, path);
@@ -6682,8 +6791,10 @@ static void render_build_direct_object_script(void) {
                     sizeof render_modifier_direct_assign_scripts[phase] -
                         render_modifier_direct_assign_used[phase],
                     "%%object = nameToID(\"%s\"); if(isObject(%%object)) { "
-                    "%%object.%s = %s; %%count = %%count + 1; }\n",
-                    name, rule->field_pattern, rule->value);
+                    "if(%%object.%s !$= %s) { %%object.%s = %s; "
+                    "t2launch_refresh(%%object, \"%s\"); } %%count = %%count + 1; }\n",
+                    name, rule->field_pattern, rule->value, rule->field_pattern, rule->value,
+                    rule->field_pattern);
                 if (written < 0 || (size_t)written >=
                         sizeof render_modifier_direct_assign_scripts[phase] -
                         render_modifier_direct_assign_used[phase]) {
@@ -6775,14 +6886,31 @@ static int render_name_is_safe(const char *name, int field_name) {
     return 1;
 }
 
-static int render_append_assignment(const char *object_name, const char *field_name,
-                                    const char *value) {
-    if (!render_modifier_output || !render_name_is_safe(object_name, 0) ||
-        !render_name_is_safe(field_name, 1) || render_modifier_output_truncated) return 0;
-    int written = snprintf(render_modifier_output + render_modifier_output_used,
-        RENDER_MODIFIER_SCRIPT_LIMIT - render_modifier_output_used,
-        "if(isObject(%s)) %s.%s = %s;\n", object_name, object_name, field_name, value);
-    if (written < 0 || (size_t)written >= RENDER_MODIFIER_SCRIPT_LIMIT - render_modifier_output_used) {
+/* One statement per matched object+field: test the rule's conditions, skip the
+   write when the value is already right (so per-frame rules are cheap and never
+   re-trigger a refresh), otherwise write and let the engine re-read the object. */
+static int render_append_assignment(const char *object_id, const struct render_rule *rule,
+                                    const char *field_name) {
+    if (!render_modifier_output || !render_name_is_safe(field_name, 1) ||
+        render_modifier_output_truncated || !object_id || !*object_id) return 0;
+    for (const char *p = object_id; *p; p++) if (*p < '0' || *p > '9') return 0;
+    char conditions[RENDER_COND_LIMIT * (RENDER_RULE_TEXT + RENDER_RULE_VALUE + 48) + 8];
+    conditions[0] = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < rule->cond_count; i++) {
+        int n = snprintf(conditions + used, sizeof conditions - used,
+            "%st2launch_test(%%o.%s, \"%s\", %s)", i ? " && " : "",
+            rule->conds[i].field, render_op_text(rule->conds[i].op), rule->conds[i].value);
+        if (n < 0 || (size_t)n >= sizeof conditions - used) return 0;
+        used += (size_t)n;
+    }
+    size_t room = RENDER_MODIFIER_SCRIPT_LIMIT - render_modifier_output_used;
+    int written = snprintf(render_modifier_output + render_modifier_output_used, room,
+        "%%o = %s; if(isObject(%%o)%s%s) if(%%o.%s !$= %s) { %%o.%s = %s; "
+        "t2launch_refresh(%%o, \"%s\"); }\n",
+        object_id, used ? " && " : "", conditions, field_name, rule->value, field_name,
+        rule->value, field_name);
+    if (written < 0 || (size_t)written >= room) {
         render_modifier_output_truncated = 1;
         return 0;
     }
@@ -6850,18 +6978,11 @@ static struct render_field_cache *render_fields_for_object(void *obj) {
     return cache;
 }
 
-/* The per-object ConsoleMethod uses the same registered Field metadata and
-   SimFieldDictionary used by the hook's other safe field readers. */
-static const char *render_modifier_object_cb(void *obj, S32 argc, const char **argv) {
-    if (!render_modifier_collecting || render_modifier_output_truncated || argc != 4 ||
-        !obj || !render_modifier_output) return "";
-    for (size_t i = 0; i < render_modifier_seen_count; i++)
-        if (render_modifier_seen_objects[i] == obj) return "";
-    if (render_modifier_seen_count >= RENDER_MODIFIER_SEEN_LIMIT) return "";
-    render_modifier_seen_objects[render_modifier_seen_count++] = obj;
-    const char *object_name = argv && argv[2] ? argv[2] : "";
-    const char *class_name = argv && argv[3] ? argv[3] : "";
-    if (!*object_name || !*class_name) return "";
+/* Matches every rule against one object (any class, named or not) and emits
+   the assignments. Used by the native ID-dictionary walk and by the script
+   scan's per-object method. */
+static void render_collect_object(void *obj, const char *object_id, const char *object_name,
+                                  const char *class_name) {
     render_modifier_objects_seen++;
     struct render_field_cache *fields = NULL;
     int fields_loaded = 0;
@@ -6884,7 +7005,7 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
             if (render_rule_applies(rule, object_name, class_name, name)) {
                 render_modifier_field_matches++;
                 seen_fields[seen_count++] = name;
-                (void)render_append_assignment(object_name, name, rule->value);
+                (void)render_append_assignment(object_id, rule, name);
             }
         }
         if (!rv_memory_range(&render_modifier_memory,
@@ -6910,13 +7031,57 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
                     render_rule_applies(rule, object_name, class_name, name)) {
                     render_modifier_field_matches++;
                     seen_fields[seen_count++] = name;
-                    (void)render_append_assignment(object_name, name, rule->value);
+                    (void)render_append_assignment(object_id, rule, name);
                 }
                 entry = rv_pointer(entry, 8);
             }
         }
     }
+}
+
+/* Script-scan fallback (dedicated server): the per-object ConsoleMethod. */
+static const char *render_modifier_object_cb(void *obj, S32 argc, const char **argv) {
+    if (!render_modifier_collecting || render_modifier_output_truncated || argc != 4 ||
+        !obj || !render_modifier_output) return "";
+    for (size_t i = 0; i < render_modifier_seen_count; i++)
+        if (render_modifier_seen_objects[i] == obj) return "";
+    if (render_modifier_seen_count >= RENDER_MODIFIER_SEEN_LIMIT) return "";
+    render_modifier_seen_objects[render_modifier_seen_count++] = obj;
+    const char *object_id = argv && argv[1] ? argv[1] : "";
+    const char *object_name = argv && argv[2] ? argv[2] : "";
+    const char *class_name = argv && argv[3] ? argv[3] : "";
+    if (!*object_id || !*class_name) return "";
+    render_collect_object(obj, object_id, object_name, class_name);
     return "";
+}
+
+/* Client: visit every object in the SimManager ID dictionary. Ghosts such as
+   Sky, datablocks and unnamed objects are not reachable through any SimGroup,
+   so a group walk misses them. */
+#define RENDER_ENUMERATE_LIMIT 32768
+static int render_enumerate_objects(void) {
+    if (!target || target->dedicated || !rv_memory_range(&render_modifier_memory,
+            (void *)RV_ID_DICTIONARY, 4, PROT_READ)) return 0;
+    void *dictionary = rv_pointer((void *)RV_ID_DICTIONARY, 0);
+    if (!rv_memory_range(&render_modifier_memory, dictionary, 0x4000, PROT_READ)) return 0;
+    size_t visited_total = 0;
+    for (size_t bucket = 0; bucket < 4096; bucket++) {
+        void *object = rv_pointer(dictionary, bucket * 4);
+        for (unsigned int depth = 0; object && depth < 256 &&
+             visited_total < RENDER_ENUMERATE_LIMIT; depth++, visited_total++) {
+            if (!rv_memory_range(&render_modifier_memory, object, 0x30, PROT_READ)) break;
+            uint32_t id = rv_word(object, 0x20);
+            const char *class_name = rv_class_name(&render_modifier_memory, object);
+            if (id && class_name) {
+                const char *name = rv_string(&render_modifier_memory, rv_pointer(object, 4), 128);
+                char id_text[16];
+                snprintf(id_text, sizeof id_text, "%u", id);
+                render_collect_object(object, id_text, name ? name : "", class_name);
+            }
+            object = rv_pointer(object, 0x10);
+        }
+    }
+    return 1;
 }
 
 static const char render_modifier_scan_script[] =
@@ -6961,15 +7126,175 @@ static const char render_modifier_context_script[] =
     " return %connection @ \":\" @ %mission @ \":\" @ %serverConnections;"
     "}";
 
-static const char render_modifier_sky_helpers[] =
-    "function t2launch_renderModifierObjectName(%id) {"
-    " %object = %id; if (!isObject(%object)) return \"\";"
-    " return %object.getName();"
-    "}"
-    "function t2launch_applySkyMaterialList(%id, %value) {"
-    " %object = %id; if (!isObject(%object)) return 0;"
-    " %object.materialList = %value; return 1;"
-    "}";
+/* ---- Native helpers called from the generated modifier scripts ---- */
+static int render_number(const char *text, double *value) {
+    if (!text || !*text) return 0;
+    char *end = NULL;
+    double parsed = strtod(text, &end);
+    while (end && *end == ' ') end++;
+    if (end == text || !end || *end || !isfinite(parsed)) return 0;
+    *value = parsed;
+    return 1;
+}
+
+/* Condition test: `=`/`!=` glob-match (case-insensitive, `*`/`?`) or compare
+   numerically; `<`,`>`,`<=`,`>=` compare numbers. */
+static int render_condition_holds(const char *value, const char *op, const char *operand) {
+    if (!value) value = "";
+    if (!operand || !op) return 0;
+    double a, b;
+    int numeric = render_number(value, &a) && render_number(operand, &b);
+    if (strcmp(op, "=") == 0 || strcmp(op, "!=") == 0) {
+        int equal = render_glob_match(operand, value) || (numeric && a == b);
+        return strcmp(op, "=") == 0 ? equal : !equal;
+    }
+    if (!numeric) return 0;
+    if (strcmp(op, "<") == 0) return a < b;
+    if (strcmp(op, ">") == 0) return a > b;
+    if (strcmp(op, "<=") == 0) return a <= b;
+    if (strcmp(op, ">=") == 0) return a >= b;
+    return 0;
+}
+
+static const char *render_test_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    return argc == 4 && render_condition_holds(argv[1], argv[2], argv[3]) ? "1" : "0";
+}
+
+/* Per-class refresh registry. A script field write only stores the value; classes
+   that cache state derived from a field need the engine's own "re-read" entry
+   point. Add a row here for each such class/field. */
+#define SKY_REFRESH_ADDRESS 0x0821fbf8 /* the call Sky::unpackUpdate makes after a re-sent Sky */
+#define SKY_MATERIAL_LIST_OFFSET 0x0db0
+#define SKY_MATERIAL_HANDLE_OFFSET 0x0de0
+#define SKY_RESOURCE_MANAGER 0x08493de4 /* ResourceManager* */
+#define SKY_RESOURCE_LOAD 0x081085f8    /* load(manager, path), as Sky::loadDml calls it */
+#define SKY_RESOURCE_RELEASE 0x0810863c /* release(manager, resource) */
+static const unsigned char sky_refresh_prologue[] = {
+    0x55, 0x89, 0xe5, 0x83, 0xec, 0x1c, 0x57, 0x8b, 0x7d, 0x08, 0x56, 0x53
+};
+static unsigned long render_refresh_count, render_refresh_failures;
+
+static int render_refresh_sky(void *sky, const struct rv_memory *memory) {
+    int protection;
+    if (target != &game_targets[0] || target->dedicated ||
+        !readable_range(SKY_REFRESH_ADDRESS, sizeof sky_refresh_prologue, &protection) ||
+        !(protection & PROT_EXEC) ||
+        memcmp((void *)SKY_REFRESH_ADDRESS, sky_refresh_prologue, sizeof sky_refresh_prologue) != 0)
+        return 0;
+    const char *name = rv_string(memory, rv_pointer(sky, SKY_MATERIAL_LIST_OFFSET), 200);
+    if (!name || !*name) return 0;
+    /* A DML the resource manager cannot open would leave the sky without faces
+       (the engine's loader does not check). Ask the same ResourceManager::load
+       the loader uses, then release our reference, so the check can't disagree. */
+    char probe[300];
+    snprintf(probe, sizeof probe, "textures/%s", name);
+    if (!rv_memory_range(memory, (void *)SKY_RESOURCE_MANAGER, 4, PROT_READ)) return 0;
+    void *manager = rv_pointer((void *)SKY_RESOURCE_MANAGER, 0);
+    if (!manager || !rv_memory_range(memory, (void *)SKY_RESOURCE_LOAD, 1, PROT_EXEC) ||
+        !rv_memory_range(memory, (void *)SKY_RESOURCE_RELEASE, 1, PROT_EXEC)) return 0;
+    void *resource = ((void *(*)(void *, const char *))SKY_RESOURCE_LOAD)(manager, probe);
+    if (!resource) {
+        static unsigned long reported;
+        if (reported++ < 3)
+            fprintf(stderr, "[t2_hook] Sky refresh waiting: %s not loadable\n", probe);
+        return 0;
+    }
+    ((void (*)(void *, void *))SKY_RESOURCE_RELEASE)(manager, resource);
+    ((void (*)(void *))SKY_REFRESH_ADDRESS)(sky);
+    fprintf(stderr, "[t2_hook] Sky refreshed for materialList=%s (handle=%p)\n", name,
+            rv_pointer(sky, SKY_MATERIAL_HANDLE_OFFSET));
+    return 1;
+}
+
+struct render_refresh_entry {
+    const char *class_name, *field;
+    int (*refresh)(void *object, const struct rv_memory *memory);
+};
+static const struct render_refresh_entry render_refresh_registry[] = {
+    {"Sky", "materialList", render_refresh_sky},
+};
+
+/* The callback only queues: re-entering Con__evaluate (the isFile probe) from
+   inside a running script crashes the interpreter, and the refresh itself should
+   run once the whole modifier script has finished writing. */
+#define RENDER_REFRESH_QUEUE 64
+static uint32_t render_refresh_ids[RENDER_REFRESH_QUEUE];
+static char render_refresh_fields[RENDER_REFRESH_QUEUE][64];
+static size_t render_refresh_queued;
+
+static const char *render_refresh_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc != 3 || !argv[1] || !argv[2] || !target || target->dedicated) return "0";
+    uint32_t id = (uint32_t)strtoul(argv[1], NULL, 10);
+    for (size_t i = 0; i < render_refresh_queued; i++)
+        if (render_refresh_ids[i] == id && strcasecmp(render_refresh_fields[i], argv[2]) == 0)
+            return "1";
+    if (render_refresh_queued >= RENDER_REFRESH_QUEUE || strlen(argv[2]) >= 64) return "0";
+    render_refresh_ids[render_refresh_queued] = id;
+    snprintf(render_refresh_fields[render_refresh_queued], 64, "%s", argv[2]);
+    render_refresh_queued++;
+    return "1";
+}
+
+static uint64_t render_modifiers_now_ns(void);
+
+/* Refreshes that could not run yet (resource not visible, object not ready) are
+   retried every frame for a few seconds; the field value is already written. */
+static uint64_t render_refresh_retry_deadline_ns;
+static uint32_t render_refresh_retry_ids[RENDER_REFRESH_QUEUE];
+static char render_refresh_retry_fields[RENDER_REFRESH_QUEUE][64];
+static size_t render_refresh_retry_count;
+
+static void render_flush_refreshes(void) {
+    uint64_t now_ns = render_modifiers_now_ns();
+    if (render_refresh_retry_count && now_ns > render_refresh_retry_deadline_ns) {
+        fprintf(stderr, "[t2_hook] gave up refreshing %zu object(s)\n", render_refresh_retry_count);
+        render_refresh_retry_count = 0;
+    }
+    for (size_t i = 0; i < render_refresh_retry_count; i++) {
+        int queued = 0;
+        for (size_t q = 0; q < render_refresh_queued; q++)
+            if (render_refresh_ids[q] == render_refresh_retry_ids[i] &&
+                strcasecmp(render_refresh_fields[q], render_refresh_retry_fields[i]) == 0) queued = 1;
+        if (!queued && render_refresh_queued < RENDER_REFRESH_QUEUE) {
+            render_refresh_ids[render_refresh_queued] = render_refresh_retry_ids[i];
+            snprintf(render_refresh_fields[render_refresh_queued], 64, "%s", render_refresh_retry_fields[i]);
+            render_refresh_queued++;
+        }
+    }
+    render_refresh_retry_count = 0;
+    if (!render_refresh_queued) return;
+    size_t count = render_refresh_queued;
+    render_refresh_queued = 0;
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) ||
+        !rv_memory_range(&memory, (void *)RV_ID_DICTIONARY, 4, PROT_READ)) return;
+    void *dictionary = rv_pointer((void *)RV_ID_DICTIONARY, 0);
+    if (!rv_memory_range(&memory, dictionary, 0x4000, PROT_READ)) return;
+    for (size_t q = 0; q < count; q++) {
+        void *object = rv_find_object(&memory, dictionary, render_refresh_ids[q]);
+        const char *class_name = object ? rv_class_name(&memory, object) : NULL;
+        if (!class_name) continue;
+        for (size_t i = 0; i < sizeof render_refresh_registry / sizeof render_refresh_registry[0]; i++) {
+            const struct render_refresh_entry *entry = &render_refresh_registry[i];
+            if (strcasecmp(entry->class_name, class_name) != 0 ||
+                strcasecmp(entry->field, render_refresh_fields[q]) != 0) continue;
+            if (entry->refresh(object, &memory)) render_refresh_count++;
+            else {
+                render_refresh_failures++;
+                if (!render_refresh_retry_count) render_refresh_retry_deadline_ns = now_ns + 10000000000ULL;
+                if (render_refresh_retry_count < RENDER_REFRESH_QUEUE) {
+                    render_refresh_retry_ids[render_refresh_retry_count] = render_refresh_ids[q];
+                    snprintf(render_refresh_retry_fields[render_refresh_retry_count], 64, "%s",
+                             render_refresh_fields[q]);
+                    render_refresh_retry_count++;
+                }
+            }
+            break;
+        }
+    }
+}
 
 static uint64_t render_modifiers_now_ns(void) {
     struct timespec now;
@@ -7002,9 +7327,12 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
         !render_modifier_method_registered || !target) return 0;
     int memory_ready = rv_memory_snapshot(&render_modifier_memory);
     if (!memory_ready && !render_modifier_direct_assign_count[phase]) return 0;
-    render_modifier_output_storage[0] = 0;
+    /* Statements use locals, which only exist inside a function. */
+    static const char output_header[] = "function t2launch_applyCollected() {\n";
+    memcpy(render_modifier_output_storage, output_header, sizeof output_header);
     render_modifier_output = render_modifier_output_storage;
-    render_modifier_output_used = render_modifier_matches = 0;
+    render_modifier_output_used = sizeof output_header - 1;
+    render_modifier_matches = 0;
     render_modifier_direct_matches = 0;
     render_modifier_objects_seen = 0;
     render_modifier_selector_matches = 0;
@@ -7013,13 +7341,17 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
     render_modifier_output_truncated = 0;
     render_modifier_collecting = memory_ready;
     render_modifier_active_phase = phase;
-    if (memory_ready) (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
-    if (memory_ready && render_modifier_direct_script_used)
-        (void)Con__evaluate(render_modifier_direct_script, 0, "t2launch/render-modifiers.cs", 0);
+    if (memory_ready && !render_enumerate_objects()) {
+        (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
+        if (render_modifier_direct_script_used)
+            (void)Con__evaluate(render_modifier_direct_script, 0, "t2launch/render-modifiers.cs", 0);
+    }
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
-    if (render_modifier_output_used) {
+    if (render_modifier_matches && render_modifier_output_used + 4 < RENDER_MODIFIER_SCRIPT_LIMIT) {
+        memcpy(render_modifier_output_storage + render_modifier_output_used, "}\n", 3);
         (void)Con__evaluate(render_modifier_output_storage, 0, "t2launch/render-modifiers.cs", 0);
+        (void)Con__evaluate("t2launch_applyCollected();", 0, NULL, 0);
         static int frame_count_reported;
         if (phase == RENDER_PHASE_CONNECT || !frame_count_reported) {
             fprintf(stderr, "[t2_hook] applied %zu render modifier matches (phase=%s)\n",
@@ -7038,6 +7370,20 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
             if (end != result && !*end) render_modifier_direct_matches = (size_t)count;
         }
     }
+    if (phase == RENDER_PHASE_FRAME) {
+        /* Report whenever the per-frame match picture changes (not every frame). */
+        static size_t last_matches = (size_t)-1, last_objects, last_selectors, last_fields;
+        if (render_modifier_matches != last_matches || render_modifier_objects_seen != last_objects ||
+            render_modifier_selector_matches != last_selectors ||
+            render_modifier_field_matches != last_fields) {
+            last_matches = render_modifier_matches; last_objects = render_modifier_objects_seen;
+            last_selectors = render_modifier_selector_matches; last_fields = render_modifier_field_matches;
+            fprintf(stderr, "[t2_hook] render modifier frame matches=%zu direct=%zu objects=%zu "
+                            "selectors=%zu fields=%zu\n", last_matches, render_modifier_direct_matches,
+                    last_objects, last_selectors, last_fields);
+        }
+    }
+    render_flush_refreshes();
     if (phase == RENDER_PHASE_CONNECT)
         render_modifier_report_connect_matches(render_modifier_matches,
                                                render_modifier_direct_matches);
@@ -7062,10 +7408,13 @@ static void install_render_modifiers(void) {
     render_build_direct_object_script();
     Con__addMethodS("SimObject", "t2launch_collectRenderModifiers", render_modifier_object_cb,
         "t2launch_collectRenderModifiers(name, class) - internal render-rule collector", 4, 4);
+    Con__addMethodS(NULL, "t2launch_test", render_test_cb,
+        "t2launch_test(value, op, operand) - internal render-rule condition", 4, 4);
+    Con__addMethodS(NULL, "t2launch_refresh", render_refresh_cb,
+        "t2launch_refresh(object, field) - internal render-rule engine refresh", 3, 3);
     render_modifier_method_registered = 1;
     (void)Con__evaluate(render_modifier_scan_script, 0, "t2launch/render-modifiers.cs", 0);
     (void)Con__evaluate(render_modifier_context_script, 0, "t2launch/render-modifiers.cs", 0);
-    (void)Con__evaluate(render_modifier_sky_helpers, 0, "t2launch/render-modifiers.cs", 0);
     for (size_t phase = 0; phase < 2; phase++)
         if (render_modifier_direct_assign_used[phase])
             (void)Con__evaluate(render_modifier_direct_assign_scripts[phase], 0,
@@ -7173,15 +7522,6 @@ static int sky_rotation_hook_installed;
 static void *sky_rotation_trampoline;
 static float sky_rotation_angle;
 static uint64_t sky_rotation_last_ns;
-static void *render_sky_modifier_cached_object;
-static uint32_t render_sky_modifier_cached_id;
-static int render_sky_modifier_cache_valid;
-static char render_sky_modifier_cached_class[64];
-static char render_sky_modifier_cached_name[128];
-static char render_sky_modifier_context[64];
-static uint64_t render_sky_connect_retry_until_ns;
-static uint64_t render_sky_connect_last_apply_ns;
-static int render_sky_modifier_logged;
 
 typedef struct {
     void (*GetIntegerv)(unsigned, int *);
@@ -7911,79 +8251,6 @@ static float sky_rotation_speed(void) {
     return sky_rotation_speed_value(Con__evaluate("t2launch_skyRotationSpeed();", 0, NULL, 0));
 }
 
-/* Sky instances may be outside the SimGroup walk on a client. The Sky renderer
-   passes the actual object pointer, so apply the configured materialList rule
-   to the object being drawn, using its SimObject ID through TorqueScript. */
-static size_t render_apply_sky_material_modifiers(void *sky_object) {
-    if (!sky_object || !target || target->dedicated || !render_modifier_method_registered ||
-        !Con__evaluate || !render_rule_count) return 0;
-    struct rv_memory memory;
-    if (!rv_memory_snapshot(&memory) ||
-        !rv_memory_range(&memory, sky_object, 0x24, PROT_READ)) return 0;
-    uint32_t object_id = rv_word(sky_object, 0x20), material_list_offset = 0;
-    const char *class_name = rv_class_name(&memory, sky_object);
-    if (!object_id || !class_name ||
-        !rv_persist_field_offset(&memory, sky_object, "materialList", &material_list_offset)) return 0;
-
-    uint64_t now_ns = render_modifiers_now_ns();
-    int object_changed = sky_object != render_sky_modifier_cached_object ||
-                         object_id != render_sky_modifier_cached_id;
-    if (object_changed) {
-        render_sky_modifier_cached_object = sky_object;
-        render_sky_modifier_cached_id = object_id;
-        snprintf(render_sky_modifier_cached_class, sizeof render_sky_modifier_cached_class,
-                 "%s", class_name);
-        char query[96];
-        snprintf(query, sizeof query, "t2launch_renderModifierObjectName(%u);", object_id);
-        const char *name = Con__evaluate(query, 0, NULL, 0);
-        snprintf(render_sky_modifier_cached_name, sizeof render_sky_modifier_cached_name,
-                 "%s", name ? name : "");
-        render_sky_modifier_cache_valid = 1;
-        render_sky_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
-        render_sky_connect_last_apply_ns = 0;
-        render_sky_modifier_logged = 0;
-    }
-    if (!render_sky_modifier_cache_valid) return 0;
-    if (strcmp(render_sky_modifier_context, render_modifier_last_context) != 0) {
-        snprintf(render_sky_modifier_context, sizeof render_sky_modifier_context, "%s",
-                 render_modifier_last_context);
-        render_sky_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
-        render_sky_connect_last_apply_ns = 0;
-        render_sky_modifier_logged = 0;
-    }
-    int connect_due = render_sky_connect_retry_until_ns &&
-        now_ns < render_sky_connect_retry_until_ns &&
-        (!render_sky_connect_last_apply_ns || now_ns < render_sky_connect_last_apply_ns ||
-         now_ns - render_sky_connect_last_apply_ns >= RENDER_CONNECT_RETRY_INTERVAL_NS);
-    size_t applied = 0, connect_rules = 0, frame_rules = 0;
-    for (size_t i = 0; i < render_rule_count; i++) {
-        const struct render_rule *rule = &render_rules[i];
-        if ((rule->scope != RENDER_SCOPE_BOTH && rule->scope != RENDER_SCOPE_CLIENT) ||
-            !render_rule_applies(rule, render_sky_modifier_cached_name,
-                                 render_sky_modifier_cached_class, "materialList")) continue;
-        if (rule->phase == RENDER_PHASE_CONNECT) {
-            if (!connect_due) continue;
-            connect_rules++;
-        } else {
-            frame_rules++;
-        }
-        char command[512];
-        int written = snprintf(command, sizeof command,
-            "t2launch_applySkyMaterialList(%u, %s);", object_id, rule->value);
-        if (written < 0 || (size_t)written >= sizeof command) continue;
-        const char *result = Con__evaluate(command, 0, NULL, 0);
-        if (result && strcmp(result, "1") == 0) applied++;
-    }
-    if (connect_due && connect_rules) render_sky_connect_last_apply_ns = now_ns;
-    if (applied && !render_sky_modifier_logged) {
-        fprintf(stderr, "[t2_hook] Sky materialList override applied: name=%s class=%s id=%u connect=%zu frame=%zu\n",
-                render_sky_modifier_cached_name, render_sky_modifier_cached_class, object_id,
-                connect_rules, frame_rules);
-        render_sky_modifier_logged = 1;
-    }
-    return applied;
-}
-
 static void sky_rotation_update(uint64_t now_ns, float speed) {
     if (!sky_rotation_last_ns || now_ns < sky_rotation_last_ns) {
         sky_rotation_last_ns = now_ns;
@@ -8003,7 +8270,6 @@ static sky_render_slices_t sky_render_slices_original_fn;
 static void sky_render_slices_wrapper(void *sky_object, float lower_band_height,
                                       float upper_alpha) {
     sky_capture_compass_view();
-    (void)render_apply_sky_material_modifiers(sky_object);
     float speed = sky_rotation_speed();
     if (speed == 0.0f) {
         sky_rotation_last_ns = 0;
@@ -8256,6 +8522,34 @@ void SDL_GL_SwapBuffers(void) {
                     autoplay);
                 Con__evaluate(script, 0, "t2launch/autoplay.cs", 0);
                 fprintf(stderr, "[t2_hook] Demo autoplay scheduled: %s\n", autoplay);
+            }
+            /* Verification automation: join a server through the stock
+               JoinGame() flow once the shell is up. Inert unless the env is set. */
+            const char *autoconnect = getenv("T2LAUNCH_AUTOCONNECT");
+            if (autoconnect && *autoconnect && !strchr(autoconnect, '"') && !strchr(autoconnect, '\\')) {
+                char script[512];
+                snprintf(script, sizeof script,
+                    "function t2launch_autoconnect() { echo(\"t2launch: autoconnect\"); "
+                    "JoinGame(\"%s\"); } schedule(2500, 0, \"t2launch_autoconnect\");",
+                    autoconnect);
+                Con__evaluate(script, 0, "t2launch/autoconnect.cs", 0);
+                fprintf(stderr, "[t2_hook] Autoconnect scheduled: %s\n", autoconnect);
+            }
+            /* Same automation for a self-hosted game: the stock
+               StartHostedGame() flow on a private port, then localConnect(). */
+            const char *autohost_map = getenv("T2LAUNCH_AUTOHOST_MAP");
+            const char *autohost_type = getenv("T2LAUNCH_AUTOHOST_TYPE");
+            if (autohost_map && *autohost_map && autohost_type && *autohost_type &&
+                !strpbrk(autohost_map, "\"\\") && !strpbrk(autohost_type, "\"\\")) {
+                char script[1024];
+                snprintf(script, sizeof script,
+                    "function t2launch_autohost() { $Host::Port = 28011; setNetPort($Host::Port);"
+                    " CreateServer(\"%s\", \"%s\"); %%p = $pref::Player[$pref::Player::Current];"
+                    " localConnect(getField(%%p, 0), getField(%%p, 1), getField(%%p, 2),"
+                    " getField(%%p, 3), getField(%%p, 4)); }"
+                    " schedule(2500, 0, \"t2launch_autohost\");", autohost_map, autohost_type);
+                Con__evaluate(script, 0, "t2launch/autohost.cs", 0);
+                fprintf(stderr, "[t2_hook] Autohost scheduled: %s %s\n", autohost_map, autohost_type);
             }
             shell_audio_setup_done = 1;
         }
