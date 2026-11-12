@@ -144,6 +144,19 @@ int main(void) {
     render_modifier_output = NULL;
     assert(strstr(render_modifier_output_storage, "PlayGui.position = \"4 4\"") != NULL);
     assert(render_modifier_matches == 1);
+
+    render_rule_count = RENDER_RULE_LIMIT;
+    for (size_t i = 0; i < render_rule_count; i++) {
+        char name[RENDER_RULE_TEXT];
+        snprintf(name, sizeof name, "Object%03u", (unsigned)i);
+        size_t length = strlen(name);
+        memset(name + length, 'x', sizeof name - length - 1);
+        name[sizeof name - 1] = 0;
+        snprintf(render_rules[i].object_pattern, sizeof render_rules[i].object_pattern, "%s", name);
+    }
+    render_build_direct_object_script();
+    assert(render_modifier_direct_script_used > 65536);
+    assert(strstr(render_modifier_direct_script, "Object127") != NULL);
     puts("render modifier syntax, direct HUD names, glob, and persistent/dynamic field expansion passed");
     return 0;
 }
