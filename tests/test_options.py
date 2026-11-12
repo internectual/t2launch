@@ -82,6 +82,7 @@ class OptionTests(unittest.TestCase):
         objects = (ROOT / "runtime/render-modifiers.objects.example.cfg").read_text()
         self.assertIn('client connect class:Sky.materialList = "grid.dml"',
                       datablocks)
+        self.assertIn('client connect MissionSky.materialList = "grid.dml"', datablocks)
         self.assertIn('client frame class:Sky.materialList = "grid.dml"', datablocks)
         self.assertIn("zGridSkyBox.vl2", datablocks)
         self.assertIn("client frame navHud.position", objects)

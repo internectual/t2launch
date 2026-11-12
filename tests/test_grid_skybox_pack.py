@@ -26,6 +26,8 @@ class GridSkyboxPackTests(unittest.TestCase):
         config = (ROOT / "runtime/render-modifiers.datablocks.example.cfg").read_text()
         self.assertIn('client connect class:Sky.materialList = "grid.dml"', config)
         self.assertIn('client frame class:Sky.materialList = "grid.dml"', config)
+        self.assertIn('client connect Sky.materialList = "grid.dml"', config)
+        self.assertIn('client connect MissionSky.materialList = "grid.dml"', config)
         with ZipFile(ARCHIVE) as volume:
             self.assertIn("textures/grid.dml", volume.namelist())
 
