@@ -6829,6 +6829,7 @@ static const char render_modifier_scan_script[] =
     "function t2launch_collectRenderModifiers() {"
     " $T2Launch::Render::Scanned = 0;"
     " if (isObject(RootGroup)) t2launch_scanModifierGroup(RootGroup);"
+    " if (isObject(MissionGroup)) t2launch_scanModifierGroup(MissionGroup);"
     "} ";
 
 static const char render_modifier_context_script[] =

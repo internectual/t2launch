@@ -80,6 +80,8 @@ int main(void) {
     assert(fake_sky_pref_reads == 1);
     assert(strstr(render_modifier_scan_script,
                   "%class $= \"SimGroup\" || %class $= \"SimSet\"") != NULL);
+    assert(strstr(render_modifier_scan_script,
+                  "if (isObject(MissionGroup)) t2launch_scanModifierGroup(MissionGroup)") != NULL);
     assert(strstr(render_modifier_scan_script, "getSubStr(%class, 0, 3) $= \"Gui\"") == NULL);
     assert(render_glob_match("Hud*", "HudDamage"));
     assert(render_glob_match("Gui?itmapCtrl", "GuiBitmapCtrl"));
