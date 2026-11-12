@@ -47,6 +47,9 @@ static void setup_fake_object(void) {
 }
 
 int main(void) {
+    assert(strstr(render_modifier_scan_script,
+                  "%class $= \"SimGroup\" || %class $= \"SimSet\"") != NULL);
+    assert(strstr(render_modifier_scan_script, "getSubStr(%class, 0, 3) $= \"Gui\"") == NULL);
     assert(render_glob_match("Hud*", "HudDamage"));
     assert(render_glob_match("Gui?itmapCtrl", "GuiBitmapCtrl"));
     assert(render_glob_match("*osition", "position"));
