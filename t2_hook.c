@@ -6455,6 +6455,8 @@ static void cap_frame_rate(void) {
 #define RENDER_MODIFIER_SCRIPT_LIMIT (256 * 1024)
 #define RENDER_DIRECT_SCRIPT_LIMIT (RENDER_RULE_LIMIT * (4 * RENDER_RULE_TEXT + 128))
 #define RENDER_MODIFIER_SEEN_LIMIT 8192
+#define RENDER_CONNECT_RETRY_WINDOW_NS 10000000000ULL
+#define RENDER_CONNECT_RETRY_INTERVAL_NS 500000000ULL
 #define RENDER_FIELD_CACHE_CLASSES 512
 #define RENDER_FIELD_CACHE_FIELDS 512
 enum render_rule_scope { RENDER_SCOPE_CLIENT, RENDER_SCOPE_SERVER, RENDER_SCOPE_BOTH };
@@ -6484,6 +6486,10 @@ static int render_modifier_method_registered;
 static int render_modifiers_installed;
 static char render_modifier_last_context[64];
 static uint64_t render_modifier_last_tick_ns;
+static uint64_t render_modifier_connect_retry_until_ns;
+static uint64_t render_modifier_connect_last_apply_ns;
+static size_t render_modifier_connect_last_logged_matches;
+static int render_modifier_connect_log_reported;
 static struct rv_memory render_modifier_memory;
 struct render_field_cache {
     void *class_rep;
@@ -6832,12 +6838,34 @@ static const char render_modifier_context_script[] =
     " if (isObject(ServerConnection)) %connection = ServerConnection.getId();"
     " if (isObject(MissionGroup)) %mission = MissionGroup.getId();"
     " if (isObject(ServerGroup)) %serverConnections = ServerGroup.getCount();"
+    " if (%connection $= \"\" && %mission $= \"\" && %serverConnections $= \"\") return \"\";"
     " return %connection @ \":\" @ %mission @ \":\" @ %serverConnections;"
     "}";
 
-static void render_modifiers_apply(enum render_rule_phase phase) {
+static uint64_t render_modifiers_now_ns(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+static int render_modifier_connect_retry_due(uint64_t now_ns) {
+    return render_modifier_connect_retry_until_ns &&
+        now_ns < render_modifier_connect_retry_until_ns &&
+        now_ns >= render_modifier_connect_last_apply_ns &&
+        now_ns - render_modifier_connect_last_apply_ns >= RENDER_CONNECT_RETRY_INTERVAL_NS;
+}
+
+static void render_modifier_report_connect_matches(size_t matches) {
+    if (render_modifier_connect_log_reported &&
+        matches == render_modifier_connect_last_logged_matches) return;
+    render_modifier_connect_log_reported = 1;
+    render_modifier_connect_last_logged_matches = matches;
+    fprintf(stderr, "[t2_hook] render modifier connect matches=%zu\n", matches);
+}
+
+static size_t render_modifiers_apply(enum render_rule_phase phase) {
     if (!render_rule_count || !render_rules_have_phase(phase) || !Con__evaluate ||
-        !render_modifier_method_registered || !target || !rv_memory_snapshot(&render_modifier_memory)) return;
+        !render_modifier_method_registered || !target || !rv_memory_snapshot(&render_modifier_memory)) return 0;
     render_modifier_output_storage[0] = 0;
     render_modifier_output = render_modifier_output_storage;
     render_modifier_output_used = render_modifier_matches = 0;
@@ -6859,11 +6887,14 @@ static void render_modifiers_apply(enum render_rule_phase phase) {
             if (phase == RENDER_PHASE_FRAME) frame_count_reported = 1;
         }
     }
+    if (phase == RENDER_PHASE_CONNECT)
+        render_modifier_report_connect_matches(render_modifier_matches);
     if (render_modifier_output_truncated && !render_modifier_truncation_reported) {
         fprintf(stderr, "[t2_hook] render modifier output capped at %u bytes\n",
                 (unsigned)RENDER_MODIFIER_SCRIPT_LIMIT);
         render_modifier_truncation_reported = 1;
     }
+    return render_modifier_matches;
 }
 
 static void install_render_modifiers(void) {
@@ -6882,9 +6913,16 @@ static void install_render_modifiers(void) {
     render_modifier_method_registered = 1;
     (void)Con__evaluate(render_modifier_scan_script, 0, "t2launch/render-modifiers.cs", 0);
     (void)Con__evaluate(render_modifier_context_script, 0, "t2launch/render-modifiers.cs", 0);
-    render_modifiers_apply(RENDER_PHASE_CONNECT);
+    (void)render_modifiers_apply(RENDER_PHASE_CONNECT);
     const char *context = Con__evaluate("t2launch_renderModifierContext();", 0, NULL, 0);
-    if (context) snprintf(render_modifier_last_context, sizeof render_modifier_last_context, "%s", context);
+    if (context) {
+        snprintf(render_modifier_last_context, sizeof render_modifier_last_context, "%s", context);
+        if (context[0]) {
+            uint64_t now_ns = render_modifiers_now_ns();
+            render_modifier_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
+            render_modifier_connect_last_apply_ns = now_ns;
+        }
+    }
 }
 
 static void render_modifiers_tick(void) {
@@ -6899,12 +6937,23 @@ static void render_modifiers_tick(void) {
     }
     if (!render_modifiers_installed) install_render_modifiers();
     if (!render_modifiers_installed || !render_modifier_method_registered) return;
-    render_modifiers_apply(RENDER_PHASE_FRAME);
+    (void)render_modifiers_apply(RENDER_PHASE_FRAME);
+    if (!render_rules_have_phase(RENDER_PHASE_CONNECT)) return;
+    uint64_t now_ns = render_modifiers_now_ns();
     const char *context = Con__evaluate("t2launch_renderModifierContext();", 0, NULL, 0);
-    if (render_rules_have_phase(RENDER_PHASE_CONNECT) && context &&
-        strcmp(context, render_modifier_last_context) != 0) {
-        render_modifiers_apply(RENDER_PHASE_CONNECT);
+    if (context && strcmp(context, render_modifier_last_context) != 0) {
         snprintf(render_modifier_last_context, sizeof render_modifier_last_context, "%s", context);
+        if (context[0]) {
+            render_modifier_connect_retry_until_ns = now_ns + RENDER_CONNECT_RETRY_WINDOW_NS;
+            render_modifier_connect_last_apply_ns = now_ns;
+            (void)render_modifiers_apply(RENDER_PHASE_CONNECT);
+        } else {
+            render_modifier_connect_retry_until_ns = 0;
+            render_modifier_connect_last_apply_ns = 0;
+        }
+    } else if (render_modifier_connect_retry_due(now_ns)) {
+        render_modifier_connect_last_apply_ns = now_ns;
+        (void)render_modifiers_apply(RENDER_PHASE_CONNECT);
     }
 }
 

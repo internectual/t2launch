@@ -56,6 +56,13 @@ static void setup_fake_object(void) {
 }
 
 int main(void) {
+    render_modifier_connect_retry_until_ns = 10000000000ULL;
+    render_modifier_connect_last_apply_ns = 1000000000ULL;
+    assert(!render_modifier_connect_retry_due(1499999999ULL));
+    assert(render_modifier_connect_retry_due(1500000000ULL));
+    assert(!render_modifier_connect_retry_due(10000000000ULL));
+    render_modifier_connect_retry_until_ns = 0;
+    render_modifier_connect_last_apply_ns = 0;
     assert(sky_rotation_speed_value("0") == 0.0f);
     assert(sky_rotation_speed_value("1.25") > 1.249f && sky_rotation_speed_value("1.25") < 1.251f);
     assert(sky_rotation_speed_value("21") == 0.0f);
