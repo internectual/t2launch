@@ -16,8 +16,11 @@ class GridSkyboxPackTests(unittest.TestCase):
         with ZipFile(ARCHIVE) as volume:
             self.assertIsNone(volume.testzip())
             self.assertEqual(set(volume.namelist()), expected)
-            dml = volume.read("textures/grid.dml").decode("ascii").splitlines()
-            self.assertEqual(dml, [f"koko/skies/Grid_{face}" for face in FACE_NAMES])
+            raw_dml = volume.read("textures/grid.dml")
+            self.assertTrue(raw_dml.endswith(b"\r\n"))
+            dml = raw_dml.decode("ascii").splitlines()
+            self.assertEqual(dml, [f"koko/skies/Grid_{face}" for face in FACE_NAMES] +
+                             ["lush/skies/lush_day_emap"])
 
     def test_datablock_example_points_at_the_pack_dml(self):
         config = (ROOT / "runtime/render-modifiers.datablocks.example.cfg").read_text()
