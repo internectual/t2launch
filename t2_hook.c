@@ -124,7 +124,6 @@ static volatile int net_options_override_installed = 0;
 static volatile int depot_downloads_installed = 0;
 static volatile int vsync_support_installed = 0;
 static volatile int discord_presence_installed = 0;
-static volatile int datablock_overrides_installed = 0;
 static char tribesnext_certificate[20001];
 static char tribesnext_modulus[2049];
 static char tribesnext_exponent[2049];
@@ -194,6 +193,8 @@ static struct hook_option hook_options[] = {
     {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
+    {"render.datablock_rules", "", NULL, 0, "", 0},
+    {"render.object_rules", "", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
     {"review.replace_models", "0", "T2LAUNCH_REVIEW_MODELS", 0, "", 0},
     {"review.ffi", "1", NULL, 0, "", 0},
@@ -6443,96 +6444,428 @@ static void cap_frame_rate(void) {
     }
 }
 
-/* ---- Datablock overrides (presentational, config-driven) -------------------
-   An external file lists "Object.field = value" entries the hook applies
-   in-game through the engine's own script interface: shape swaps (e.g. point a
-   flag's datablock at a replacement model), Sun/Sky weather, and so on. It is
-   not a cheat -- it changes only how datablocks look/render, never gameplay
-   state. The file path comes from T2LAUNCH_DATABLOCK_CONFIG, or the
-   datablock.config hook option. Format, one entry per line:
-       Flag.shapeFile = hm2_flag.dts     # bare string -> quoted
-       Sky.fogDistance = 200             # number/vector -> passed through
-   A field set to an already-"quoted" value is passed through verbatim. */
-static char datablock_override_body[8192];
+/* ---- Configurable render modifiers -----------------------------------------
+   Rules use: [client|server|both] [connect|frame] object-pattern.field-pattern = value
+   Object and field patterns support '*' and '?'; class:Pattern selects by
+   Torque class name. Rules are local presentation overrides. */
+#define RENDER_RULE_LIMIT 128
+#define RENDER_RULE_TEXT 128
+#define RENDER_RULE_VALUE 320
+#define RENDER_MODIFIER_SCRIPT_LIMIT (256 * 1024)
+#define RENDER_FIELD_CACHE_CLASSES 512
+#define RENDER_FIELD_CACHE_FIELDS 512
+enum render_rule_scope { RENDER_SCOPE_CLIENT, RENDER_SCOPE_SERVER, RENDER_SCOPE_BOTH };
+enum render_rule_phase { RENDER_PHASE_CONNECT, RENDER_PHASE_FRAME };
+struct render_rule {
+    char object_pattern[RENDER_RULE_TEXT];
+    char field_pattern[RENDER_RULE_TEXT];
+    char value[RENDER_RULE_VALUE];
+    enum render_rule_scope scope;
+    enum render_rule_phase phase;
+};
+static struct render_rule render_rules[RENDER_RULE_LIMIT];
+static size_t render_rule_count;
+static char render_modifier_output_storage[RENDER_MODIFIER_SCRIPT_LIMIT];
+static char *render_modifier_output;
+static size_t render_modifier_output_used;
+static size_t render_modifier_matches;
+static int render_modifier_collecting;
+static int render_modifier_output_truncated;
+static int render_modifier_truncation_reported;
+static enum render_rule_phase render_modifier_active_phase;
+static int render_modifier_method_registered;
+static int render_modifiers_installed;
+static char render_modifier_last_context[64];
+static uint64_t render_modifier_last_tick_ns;
+static struct rv_memory render_modifier_memory;
+struct render_field_cache {
+    void *class_rep;
+    const char *names[RENDER_FIELD_CACHE_FIELDS];
+    size_t count;
+};
+static struct render_field_cache render_field_caches[RENDER_FIELD_CACHE_CLASSES];
+static size_t render_field_cache_count;
+
+static int render_glob_match(const char *pattern, const char *text) {
+    if (!pattern || !text) return 0;
+    const char *star = NULL, *retry = NULL;
+    while (*text) {
+        if (*pattern == '?' || (*pattern && tolower((unsigned char)*pattern) ==
+                                tolower((unsigned char)*text))) {
+            pattern++; text++;
+        } else if (*pattern == '*') {
+            star = pattern++;
+            retry = text;
+        } else if (star) {
+            pattern = star + 1;
+            text = ++retry;
+        } else {
+            return 0;
+        }
+    }
+    while (*pattern == '*') pattern++;
+    return *pattern == 0;
+}
 
 static void db_format_value(const char *raw, char *out, size_t outlen) {
-    if (*raw == '"') { snprintf(out, outlen, "%s", raw); return; }
+    if (!raw || !outlen) return;
     int numeric = *raw != 0;
     for (const char *p = raw; *p; p++) {
         if ((*p >= '0' && *p <= '9') || *p == ' ' || *p == '.' ||
             *p == '-' || *p == '+' || *p == 'e' || *p == 'E') continue;
         numeric = 0; break;
     }
-    if (numeric) snprintf(out, outlen, "%s", raw);
-    else snprintf(out, outlen, "\"%s\"", raw);
+    if (numeric || strcmp(raw, "true") == 0 || strcmp(raw, "false") == 0 ||
+        strcmp(raw, "True") == 0 || strcmp(raw, "False") == 0) {
+        snprintf(out, outlen, "%s", raw);
+        return;
+    }
+    if (raw[0] == '"' && raw[strlen(raw) - 1] == '"') {
+        snprintf(out, outlen, "%s", raw);
+        return;
+    }
+    size_t used = 0;
+    out[used++] = '"';
+    for (const unsigned char *p = (const unsigned char *)raw; *p && used + 2 < outlen; p++) {
+        if (*p == '"' || *p == '\\') out[used++] = '\\';
+        if (*p == '\n' || *p == '\r') continue;
+        out[used++] = (char)*p;
+    }
+    out[used++] = '"'; out[used] = 0;
 }
 
-/* Parse the config into a TorqueScript statement list (returns entry count). */
-static int build_datablock_override_body(void) {
-    const char *path = getenv("T2LAUNCH_DATABLOCK_CONFIG");
-    if (!path || !*path) path = hook_option_str("datablock.config");
-    datablock_override_body[0] = 0;
+static int render_parse_rule(char *line, enum render_rule_scope default_scope,
+                             enum render_rule_phase default_phase,
+                             struct render_rule *rule) {
+    char *text = trim_space(line);
+    if (!*text || *text == '#') return 0;
+    rule->scope = default_scope;
+    rule->phase = default_phase;
+    char *assignment;
+    /* Legacy datablocks.cfg entries were simply Object.field = value. */
+    char *separator = strpbrk(text, " \t");
+    char *dot = strrchr(text, '.');
+    char *equals = strchr(text, '=');
+    if (dot && equals && (!separator || dot < separator)) {
+        assignment = text;
+    } else {
+        if (!separator) return -1;
+        char *remainder = separator + 1;
+        *separator = 0;
+        char *second = trim_space(remainder);
+        char *space = strpbrk(second, " \t");
+        if (!space) return -1;
+        *space++ = 0;
+        if (strcmp(text, "client") == 0) rule->scope = RENDER_SCOPE_CLIENT;
+        else if (strcmp(text, "server") == 0) rule->scope = RENDER_SCOPE_SERVER;
+        else if (strcmp(text, "both") == 0) rule->scope = RENDER_SCOPE_BOTH;
+        else return -1;
+        if (strcmp(second, "connect") == 0) rule->phase = RENDER_PHASE_CONNECT;
+        else if (strcmp(second, "frame") == 0) rule->phase = RENDER_PHASE_FRAME;
+        else return -1;
+        assignment = trim_space(space);
+    }
+    equals = strchr(assignment, '=');
+    if (!equals) return -1;
+    *equals++ = 0;
+    char *lhs = trim_space(assignment);
+    char *rhs = trim_space(equals);
+    dot = strrchr(lhs, '.');
+    if (!dot || !*rhs) return -1;
+    *dot++ = 0;
+    char *obj = trim_space(lhs), *field = trim_space(dot);
+    if (!*obj || !*field || strlen(obj) >= sizeof rule->object_pattern ||
+        strlen(field) >= sizeof rule->field_pattern || strlen(rhs) >= sizeof rule->value)
+        return -1;
+    if (strchr(rhs, '\n') || strchr(rhs, '\r')) return -1;
+    snprintf(rule->object_pattern, sizeof rule->object_pattern, "%s", obj);
+    snprintf(rule->field_pattern, sizeof rule->field_pattern, "%s", field);
+    db_format_value(rhs, rule->value, sizeof rule->value);
+    return 1;
+}
+
+static size_t render_load_rules_file(const char *path, int object_rules_file) {
     if (!path || !*path) return 0;
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[t2_hook] datablock config unavailable: %s (%s)\n",
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        fprintf(stderr, "[t2_hook] render modifier config unavailable: %s (%s)\n",
                 path, strerror(errno));
         return 0;
     }
-    char line[512];
-    size_t used = 0;
-    int count = 0;
-    while (fgets(line, sizeof line, f)) {
-        char *text = trim_space(line);
-        if (!*text || *text == '#') continue;
-        char *eq = strchr(text, '=');
-        if (!eq) continue;
-        *eq = 0;
-        char *lhs = trim_space(text);
-        char *rhs = trim_space(eq + 1);
-        char *dot = strrchr(lhs, '.');
-        if (!dot) continue;
-        *dot = 0;
-        char *obj = trim_space(lhs);
-        char *field = trim_space(dot + 1);
-        if (!*obj || !*field) continue;
-        char val[320];
-        db_format_value(rhs, val, sizeof val);
-        int n = snprintf(datablock_override_body + used,
-                         sizeof datablock_override_body - used,
-                         " if(isObject(%s)) %s.%s = %s;", obj, obj, field, val);
-        if (n < 0 || (size_t)n >= sizeof datablock_override_body - used) {
-            fprintf(stderr, "[t2_hook] datablock overrides truncated after %d entries\n", count);
+    size_t loaded = 0;
+    char line[768];
+    unsigned long line_number = 0;
+    while (fgets(line, sizeof line, file)) {
+        line_number++;
+        if (!strchr(line, '\n') && !feof(file)) {
+            int ch; while ((ch = fgetc(file)) != '\n' && ch != EOF) {}
+            fprintf(stderr, "[t2_hook] render modifier line too long: %s:%lu\n", path, line_number);
+            continue;
+        }
+        if (render_rule_count >= RENDER_RULE_LIMIT) {
+            fprintf(stderr, "[t2_hook] render modifier rule limit (%d) reached\n", RENDER_RULE_LIMIT);
             break;
         }
-        used += n;
-        count++;
+        struct render_rule rule;
+        int parsed = render_parse_rule(line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME, &rule);
+        if (parsed < 0 || (parsed > 0 && object_rules_file && rule.phase != RENDER_PHASE_FRAME)) {
+            fprintf(stderr, "[t2_hook] invalid render modifier: %s:%lu\n", path, line_number);
+            continue;
+        }
+        if (!parsed) continue;
+        render_rules[render_rule_count++] = rule;
+        loaded++;
     }
-    fclose(f);
-    fprintf(stderr, "[t2_hook] datablock overrides: %d entries from %s\n", count, path);
-    return count;
+    fclose(file);
+    fprintf(stderr, "[t2_hook] loaded %zu render modifier rules from %s\n", loaded, path);
+    return loaded;
 }
 
-/* Install a self-rescheduling watcher that re-applies the overrides every
-   half second, so they take hold as soon as the datablocks arrive (on connect
-   or at demo-playback start) and stay applied across mission changes. */
-static void install_datablock_overrides(void) {
-    if (build_datablock_override_body() <= 0) return;
-    size_t need = strlen(datablock_override_body) + 1024;
-    char *script = malloc(need);
-    if (!script) return;
-    snprintf(script, need,
-        "function t2launch_applyDatablocks(){%s}"
-        "function t2launch_datablockWatch(){"
-        " t2launch_applyDatablocks();"
-        " $T2Launch::DBWatch = schedule(500, 0, \"t2launch_datablockWatch\");"
-        "}"
-        "if($T2Launch::DBWatch $= \"\")"
-        " $T2Launch::DBWatch = schedule(500, 0, \"t2launch_datablockWatch\");",
-        datablock_override_body);
-    Con__evaluate(script, 0, "t2launch/datablocks.cs", 0);
-    free(script);
-    fprintf(stderr, "[t2_hook] datablock overrides watcher installed\n");
+static int render_name_is_safe(const char *name, int field_name) {
+    if (!name || !*name) return 0;
+    const unsigned char *first = (const unsigned char *)name;
+    if (!(isalpha(*first) || *first == '_' || (!field_name && (*first == '$' || *first == ':'))))
+        return 0;
+    for (const unsigned char *p = first; *p; p++) {
+        if (isalnum(*p) || *p == '_' || (!field_name && (*p == ':' || *p == '$'))) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int render_append_assignment(const char *object_name, const char *field_name,
+                                    const char *value) {
+    if (!render_modifier_output || !render_name_is_safe(object_name, 0) ||
+        !render_name_is_safe(field_name, 1) || render_modifier_output_truncated) return 0;
+    int written = snprintf(render_modifier_output + render_modifier_output_used,
+        RENDER_MODIFIER_SCRIPT_LIMIT - render_modifier_output_used,
+        "if(isObject(%s)) %s.%s = %s;\n", object_name, object_name, field_name, value);
+    if (written < 0 || (size_t)written >= RENDER_MODIFIER_SCRIPT_LIMIT - render_modifier_output_used) {
+        render_modifier_output_truncated = 1;
+        return 0;
+    }
+    render_modifier_output_used += (size_t)written;
+    render_modifier_matches++;
+    return 1;
+}
+
+static int render_rule_applies(const struct render_rule *rule, const char *object_name,
+                               const char *class_name, const char *field_name) {
+    const char *selector = rule->object_pattern;
+    if (strncmp(selector, "class:", 6) == 0) {
+        if (!render_glob_match(selector + 6, class_name)) return 0;
+    } else if (!render_glob_match(selector, object_name)) return 0;
+    return render_glob_match(rule->field_pattern, field_name);
+}
+
+static int render_rule_object_applies(const struct render_rule *rule, const char *object_name,
+                                      const char *class_name) {
+    const char *selector = rule->object_pattern;
+    if (strncmp(selector, "class:", 6) == 0)
+        return render_glob_match(selector + 6, class_name);
+    return render_glob_match(selector, object_name);
+}
+
+static int render_rules_have_phase(enum render_rule_phase phase) {
+    for (size_t i = 0; i < render_rule_count; i++)
+        if (render_rules[i].phase == phase) return 1;
+    return 0;
+}
+
+static struct render_field_cache *render_fields_for_object(void *obj) {
+    void *rep = rv_class_rep(&render_modifier_memory, obj);
+    if (!rep || !rv_memory_range(&render_modifier_memory, rep, 0x40, PROT_READ)) return NULL;
+    for (size_t i = 0; i < render_field_cache_count; i++)
+        if (render_field_caches[i].class_rep == rep) return &render_field_caches[i];
+    if (render_field_cache_count >= RENDER_FIELD_CACHE_CLASSES) return NULL;
+    struct render_field_cache *cache = &render_field_caches[render_field_cache_count++];
+    memset(cache, 0, sizeof *cache);
+    cache->class_rep = rep;
+    for (size_t slot = 4; slot < 0x40; slot += 4) {
+        void *fields = rv_pointer(rep, slot);
+        if (!rv_memory_range(&render_modifier_memory, fields, 24, PROT_READ)) continue;
+        for (size_t count_slot = 4; count_slot < 0x40; count_slot += 4) {
+            if (count_slot == slot) continue;
+            uint32_t count = rv_word(rep, count_slot);
+            if (!count || count > RENDER_FIELD_CACHE_FIELDS ||
+                !rv_memory_range(&render_modifier_memory, fields, (size_t)count * 24, PROT_READ))
+                continue;
+            for (uint32_t field_index = 0; field_index < count; field_index++) {
+                void *field = (unsigned char *)fields + (size_t)field_index * 24;
+                const char *name = rv_string(&render_modifier_memory, rv_pointer(field, 0), 128);
+                uint32_t offset = rv_word(field, 8), verified_offset = 0;
+                if (!name || offset > 0x10000 || !render_name_is_safe(name, 1) ||
+                    !rv_persist_field_offset(&render_modifier_memory, obj, name, &verified_offset) ||
+                    verified_offset != offset) continue;
+                int duplicate = 0;
+                for (size_t i = 0; i < cache->count; i++)
+                    if (strcmp(cache->names[i], name) == 0) { duplicate = 1; break; }
+                if (!duplicate && cache->count < RENDER_FIELD_CACHE_FIELDS)
+                    cache->names[cache->count++] = name;
+            }
+        }
+    }
+    return cache;
+}
+
+/* The per-object ConsoleMethod uses the same registered Field metadata and
+   SimFieldDictionary used by the hook's other safe field readers. */
+static const char *render_modifier_object_cb(void *obj, S32 argc, const char **argv) {
+    if (!render_modifier_collecting || render_modifier_output_truncated || argc != 4 ||
+        !obj || !render_modifier_output) return "";
+    const char *object_name = argv && argv[2] ? argv[2] : "";
+    const char *class_name = argv && argv[3] ? argv[3] : "";
+    if (!*object_name || !*class_name) return "";
+    struct render_field_cache *fields = NULL;
+    int fields_loaded = 0;
+    for (size_t r = 0; r < render_rule_count; r++) {
+        const struct render_rule *rule = &render_rules[r];
+        if (rule->phase != render_modifier_active_phase) continue;
+        int scope_ok = rule->scope == RENDER_SCOPE_BOTH ||
+            (rule->scope == RENDER_SCOPE_CLIENT && !target->dedicated) ||
+            (rule->scope == RENDER_SCOPE_SERVER && target->dedicated);
+        if (!scope_ok || !render_rule_object_applies(rule, object_name, class_name)) continue;
+        if (!fields_loaded) {
+            fields = render_fields_for_object(obj);
+            fields_loaded = 1;
+        }
+        const char *seen_fields[1024]; size_t seen_count = 0;
+        for (size_t field_index = 0; fields && field_index < fields->count; field_index++) {
+            const char *name = fields->names[field_index];
+            if (render_rule_applies(rule, object_name, class_name, name)) {
+                seen_fields[seen_count++] = name;
+                (void)render_append_assignment(object_name, name, rule->value);
+            }
+        }
+        if (!rv_memory_range(&render_modifier_memory,
+                (unsigned char *)obj + SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET,
+                sizeof(uint32_t), PROT_READ)) continue;
+        void *dictionary = rv_pointer(obj, SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET);
+        if (!rv_memory_range(&render_modifier_memory, dictionary,
+                SHAZBOT_SIM_FIELD_BUCKET_COUNT * sizeof(uint32_t), PROT_READ)) continue;
+        for (size_t bucket = 0; bucket < SHAZBOT_SIM_FIELD_BUCKET_COUNT; bucket++) {
+            void *entry = rv_pointer(dictionary, bucket * sizeof(uint32_t));
+            void *visited[128]; size_t visited_count = 0;
+            while (entry && visited_count < 128) {
+                int duplicate = 0;
+                for (size_t i = 0; i < visited_count; i++) if (visited[i] == entry) duplicate = 1;
+                if (duplicate || !rv_memory_range(&render_modifier_memory, entry, 12, PROT_READ)) break;
+                visited[visited_count++] = entry;
+                const char *name = rv_string(&render_modifier_memory, rv_pointer(entry, 0), 128);
+                int seen = 0;
+                for (size_t s = 0; name && s < seen_count; s++)
+                    if (strcmp(seen_fields[s], name) == 0) { seen = 1; break; }
+                if (name && !seen && seen_count < sizeof seen_fields / sizeof seen_fields[0] &&
+                    render_name_is_safe(name, 1) &&
+                    render_rule_applies(rule, object_name, class_name, name)) {
+                    seen_fields[seen_count++] = name;
+                    (void)render_append_assignment(object_name, name, rule->value);
+                }
+                entry = rv_pointer(entry, 8);
+            }
+        }
+    }
+    return "";
+}
+
+static const char render_modifier_scan_script[] =
+    "function t2launch_scanModifierGroup(%group) {"
+    " if (!isObject(%group) || $T2Launch::Render::Scanned >= 4096) return;"
+    " for (%i = 0; %i < %group.getCount(); %i++) {"
+    "  if ($T2Launch::Render::Scanned >= 4096) return;"
+    "  %object = %group.getObject(%i); if (!isObject(%object)) continue;"
+    "  $T2Launch::Render::Scanned++;"
+    "  %object.t2launch_collectRenderModifiers(%object.getName(), %object.getClassName());"
+    "  %class = %object.getClassName();"
+    "  %length = strLen(%class);"
+    "  if (%class $= \"SimGroup\" || %class $= \"SimSet\" ||"
+    "      getSubStr(%class, 0, 3) $= \"Gui\" ||"
+    "      (%length >= 5 && getSubStr(%class, %length - 5, 5) $= \"Group\"))"
+    "   t2launch_scanModifierGroup(%object);"
+    " }"
+    "}"
+    "function t2launch_collectRenderModifiers() {"
+    " $T2Launch::Render::Scanned = 0;"
+    " if (isObject(RootGroup)) t2launch_scanModifierGroup(RootGroup);"
+    "} ";
+
+static const char render_modifier_context_script[] =
+    "function t2launch_renderModifierContext() {"
+    " %connection = \"\"; %mission = \"\";"
+    " %serverConnections = \"\";"
+    " if (isObject(ServerConnection)) %connection = ServerConnection.getId();"
+    " if (isObject(MissionGroup)) %mission = MissionGroup.getId();"
+    " if (isObject(ServerGroup)) %serverConnections = ServerGroup.getCount();"
+    " return %connection @ \":\" @ %mission @ \":\" @ %serverConnections;"
+    "}";
+
+static void render_modifiers_apply(enum render_rule_phase phase) {
+    if (!render_rule_count || !render_rules_have_phase(phase) || !Con__evaluate ||
+        !render_modifier_method_registered || !target || !rv_memory_snapshot(&render_modifier_memory)) return;
+    render_modifier_output_storage[0] = 0;
+    render_modifier_output = render_modifier_output_storage;
+    render_modifier_output_used = render_modifier_matches = 0;
+    render_modifier_output_truncated = 0;
+    render_modifier_collecting = 1;
+    render_modifier_active_phase = phase;
+    (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
+    render_modifier_collecting = 0;
+    render_modifier_output = NULL;
+    if (render_modifier_output_used) {
+        (void)Con__evaluate(render_modifier_output_storage, 0, "t2launch/render-modifiers.cs", 0);
+        static int frame_count_reported;
+        if (phase == RENDER_PHASE_CONNECT || !frame_count_reported) {
+            fprintf(stderr, "[t2_hook] applied %zu render modifier matches (phase=%s)\n",
+                    render_modifier_matches, phase == RENDER_PHASE_CONNECT ? "connect" : "frame");
+            if (phase == RENDER_PHASE_FRAME) frame_count_reported = 1;
+        }
+    }
+    if (render_modifier_output_truncated && !render_modifier_truncation_reported) {
+        fprintf(stderr, "[t2_hook] render modifier output capped at %u bytes\n",
+                (unsigned)RENDER_MODIFIER_SCRIPT_LIMIT);
+        render_modifier_truncation_reported = 1;
+    }
+}
+
+static void install_render_modifiers(void) {
+    if (render_modifiers_installed || !Con__evaluate || !Con__addMethodS) return;
+    render_modifiers_installed = 1;
+    (void)render_load_rules_file(hook_option_str("render.datablock_rules"), 0);
+    (void)render_load_rules_file(hook_option_str("render.object_rules"), 1);
+    /* Preserve the legacy environment variable and extra hook-option key. */
+    const char *legacy = getenv("T2LAUNCH_DATABLOCK_CONFIG");
+    if (!legacy || !*legacy) legacy = hook_option_str("datablock.config");
+    (void)render_load_rules_file(legacy, 0);
+    if (!render_rule_count) return;
+    Con__addMethodS("SimObject", "t2launch_collectRenderModifiers", render_modifier_object_cb,
+        "t2launch_collectRenderModifiers(name, class) - internal render-rule collector", 4, 4);
+    render_modifier_method_registered = 1;
+    (void)Con__evaluate(render_modifier_scan_script, 0, "t2launch/render-modifiers.cs", 0);
+    (void)Con__evaluate(render_modifier_context_script, 0, "t2launch/render-modifiers.cs", 0);
+    render_modifiers_apply(RENDER_PHASE_CONNECT);
+    const char *context = Con__evaluate("t2launch_renderModifierContext();", 0, NULL, 0);
+    if (context) snprintf(render_modifier_last_context, sizeof render_modifier_last_context, "%s", context);
+}
+
+static void render_modifiers_tick(void) {
+    if (!registered) return;
+    if (target && target->dedicated) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0) return;
+        uint64_t now_ns = (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+        if (render_modifier_last_tick_ns && now_ns >= render_modifier_last_tick_ns &&
+            now_ns - render_modifier_last_tick_ns < 16666667ULL) return;
+        render_modifier_last_tick_ns = now_ns;
+    }
+    if (!render_modifiers_installed) install_render_modifiers();
+    if (!render_modifiers_installed || !render_modifier_method_registered) return;
+    render_modifiers_apply(RENDER_PHASE_FRAME);
+    const char *context = Con__evaluate("t2launch_renderModifierContext();", 0, NULL, 0);
+    if (render_rules_have_phase(RENDER_PHASE_CONNECT) && context &&
+        strcmp(context, render_modifier_last_context) != 0) {
+        render_modifiers_apply(RENDER_PHASE_CONNECT);
+        snprintf(render_modifier_last_context, sizeof render_modifier_last_context, "%s", context);
+    }
 }
 
 /* Small T2-native RadarHUD. It deliberately uses the client's *visible*
@@ -7437,6 +7770,7 @@ void SDL_GL_SwapBuffers(void) {
     }
     if (!registered)
         register_hook_commands();
+    if (on_game_thread) render_modifiers_tick();
     if (!registered || !Con__evaluate ||
         !game_main_thread_known ||
         !pthread_equal(pthread_self(), game_main_thread)) {
@@ -7550,10 +7884,6 @@ void SDL_GL_SwapBuffers(void) {
                 Con__evaluate(discord_presence_script, 0, "t2launch/discord.cs", 0);
                 start_discord_presence();
             }
-            if (!datablock_overrides_installed) {
-                datablock_overrides_installed = 1;
-                install_datablock_overrides();
-            }
             if (!vsync_support_installed && hook_option_bool("video.vsync")) {
                 Con__evaluate("$SwapIntervalSupported = 1;"
                               " setVerticalSync(!$pref::Video::disableVerticalSync);", 0, NULL, 0);
@@ -7621,6 +7951,7 @@ static void server_tick(void) {
     static time_t last_ready_check;
     if (!registered)
         register_hook_commands();
+    render_modifiers_tick();
     if (!registered || !hook_option_bool("hook.console_commands")) return;
     if (!core_installed) {
         Con__evaluate(server_core_script, 0, "t2launch/server.cs", 0);
@@ -9541,15 +9872,15 @@ static int register_hook_commands(void) {
     }
     if (!target->dedicated) {
         Con__addMethodS(NULL, "hook_review_range", hook_review_range_cb,
-            "hook_review_range([0|1]) - query or change demo-review range for this session", 1, 2);
+            "hook_review_range([enabled]) - query or change demo-review range for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_global_beacons", hook_review_global_beacons_cb,
-            "hook_review_global_beacons([0|1]) - query or change demo beacon visibility for this session", 1, 2);
+            "hook_review_global_beacons([enabled]) - query or change demo beacon visibility for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_ffi", hook_review_ffi_cb,
-            "hook_review_ffi([0|1]) - query or change demo IFF reconstruction for this session", 1, 2);
+            "hook_review_ffi([enabled]) - query or change demo IFF reconstruction for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_no_cloak", hook_review_no_cloak_cb,
-            "hook_review_no_cloak([0|1]) - query or change demo no-cloak reconstruction for this session", 1, 2);
+            "hook_review_no_cloak([enabled]) - query or change demo no-cloak reconstruction for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_autobeacon", hook_review_autobeacon_cb,
-            "hook_review_autobeacon([0|1]) - query or change demo target reassignment for this session", 1, 2);
+            "hook_review_autobeacon([enabled]) - query or change demo target reassignment for this session", 1, 2);
         Con__addMethodS(NULL, "hook_review_models", hook_review_models_cb,
             "hook_review_models([filename filter]) - log cached DTS backing files without loading or changing models", 1, 2);
         Con__addMethodS(NULL, "hook_review_textures", hook_review_textures_cb,

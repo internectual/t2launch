@@ -59,6 +59,32 @@ class OptionTests(unittest.TestCase):
         console_gate = source.index('if (!hook_option_bool("hook.console_commands"))', registration)
         self.assertLess(registration, console_gate)
 
+    def test_review_command_usage_has_single_optional_parameter(self):
+        source = (ROOT / "t2_hook.c").read_text()
+        registrations = source[source.index('Con__addMethodS(NULL, "hook_review_range"'):
+                               source.index('Con__addMethodS(NULL, "hook_sha1"')]
+        for command in ("range", "global_beacons", "ffi", "no_cloak", "autobeacon"):
+            with self.subTest(command=command):
+                self.assertIn(f'hook_review_{command}([enabled])', registrations)
+        self.assertNotIn("[0|1]", registrations)
+
+    def test_render_modifier_path_options_are_written_to_hook_config(self):
+        for key in ("render.datablock_rules", "render.object_rules"):
+            with self.subTest(key=key):
+                self.assertTrue(t2options.BY_KEY[key].hook)
+                self.assertIn(f"{key}=", t2options.hook_config({}, HOOKED))
+        source = (ROOT / "t2_hook.c").read_text()
+        self.assertIn('{"render.datablock_rules", ""', source)
+        self.assertIn('{"render.object_rules", ""', source)
+        self.assertIn('"t2launch_collectRenderModifiers(name, class) - internal render-rule collector", 4, 4',
+                      source)
+        datablocks = (ROOT / "runtime/render-modifiers.datablocks.example.cfg").read_text()
+        objects = (ROOT / "runtime/render-modifiers.objects.example.cfg").read_text()
+        self.assertIn('client connect class:Sky.materialList = "textures/grid.dml"',
+                      datablocks)
+        self.assertIn("zGridSkyBox.vl2", datablocks)
+        self.assertIn("client frame navHud.position", objects)
+
     def test_old_wonemu_flag_migrates_to_won_mode(self):
         self.assertEqual(t2options.migrate({"wonemu": True})["won.mode"], "local")
         self.assertEqual(t2options.migrate({"wonemu": False})["won.mode"], "off")

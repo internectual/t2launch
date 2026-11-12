@@ -857,6 +857,28 @@ options bring the parts of it that fit the Linux client:
   objects with "can't get/set the datablock of a client object!", and
   `setTargetId()` ignores them; with this on, client scripts can use all three
   on ghosts, as with the Windows `l33thax` patch.
+- **Render modifier rules** (`render.datablock_rules` and
+  `render.object_rules`, both empty by default, advanced). Point either option
+  at a line-based config file to replace object/datablock fields locally. Rule
+  lines start with `client`, `server`, or `both`, then `connect` or `frame`,
+  followed by `ObjectPattern.FieldPattern = value`. `connect` rules reapply
+  when the connection, mission group, or server connection group changes;
+  `frame` rules reapply every frame. `class:Pattern` selects by Torque class name;
+  `*` matches any number of characters and `?` matches one in object/class
+  selectors and field names.
+  A rule applies its value to every match, so keep wildcard patterns narrow.
+  Blank/comment lines are ignored, bare text values are quoted automatically,
+  and numeric/vector or explicitly quoted values are preserved. Example files
+  with commented syntax documentation are in
+  `runtime/render-modifiers.datablocks.example.cfg` and
+  `runtime/render-modifiers.objects.example.cfg`.
+
+  The datablock example changes every `Sky` class instance's `materialList` to
+  `textures/grid.dml`. The minimal `zGridSkyBox.vl2` contains that one DML and
+  its six `koko/skies/Grid_*` PNG cube faces—none of the original archive's
+  unrelated DMLs. It is installed as `base/zGridSkyBox.vl2`; set
+  `render.datablock_rules` to the example config path to use it. The assignment
+  runs client-side and changes only the local rendered sky.
 - **Safe soundpacks** (`security.safe_soundpacks`, on). A chat message carrying
   `~w<file>` makes the client play `<file>` as a sound: `scripts/client.cs`
   hands `<file>` to `alxGetWaveLen` and `alxCreateSource`, which parse it as a
@@ -1101,11 +1123,11 @@ Arguments are shown after the command name.
 | `hook_option` | `<key>` | Returns the effective hook option value (config, environment override, or default). | Global |
 | `hook_hud_demo_heading` | — | Returns the controlled object's heading in degrees, or an empty string when unavailable. | Client; registered independently of `hook.console_commands` |
 | `hook_hud_demo_compass_markers` | `<north-id> <east-id> <south-id> <west-id> <strip-id>` | Supplies the bitmap control IDs used by the native horizon compass renderer. | Client; registered independently of `hook.console_commands` |
-| `hook_review_range` | `[0|1]` | Query or set extended review range; reports configured/applied state and stock/review far distances. | Client |
-| `hook_review_global_beacons` | `[0|1]` | Query or set review beacon visibility; reports configured/applied state. | Client |
-| `hook_review_ffi` | `[0|1]` | Query or set review IFF/FFI reconstruction; reports configured/applied state. | Client |
-| `hook_review_no_cloak` | `[0|1]` | Query or set the review no-cloak alpha override; reports configured/applied state. | Client |
-| `hook_review_autobeacon` | `[0|1]` | Query or set review target reassignment; reports whether it is active during demo playback. | Client |
+| `hook_review_range` | `[enabled]` (`0` or `1`) | Query or set extended review range; reports configured/applied state and stock/review far distances. | Client |
+| `hook_review_global_beacons` | `[enabled]` (`0` or `1`) | Query or set review beacon visibility; reports configured/applied state. | Client |
+| `hook_review_ffi` | `[enabled]` (`0` or `1`) | Query or set review IFF/FFI reconstruction; reports configured/applied state. | Client |
+| `hook_review_no_cloak` | `[enabled]` (`0` or `1`) | Query or set the review no-cloak alpha override; reports configured/applied state. | Client |
+| `hook_review_autobeacon` | `[enabled]` (`0` or `1`) | Query or set review target reassignment; reports whether it is active during demo playback. | Client |
 | `hook_review_models` | `[filename-filter]` | Log cached DTS resources and backing loose files/volumes; does not load or replace models. | Client |
 | `hook_review_textures` | `[key-filter]` | Log texture-cache entries and beacon HUD handles; no filter lists all keys. | Client |
 | `hook_sha1` | `<string>` | Return the SHA-1 digest as 40 hexadecimal characters. | Global |

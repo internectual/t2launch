@@ -127,6 +127,10 @@ class NativeReviewTests(unittest.TestCase):
         self.run_fixture("horizon_compass_projection_test.c",
                          "horizon compass world-bearing, counter-clockwise west, pitch, and FOV projection passed")
 
+    def test_render_modifier_rule_syntax_and_wildcards(self):
+        self.run_fixture("render_modifier_test.c",
+                         "render modifier phases, scope, legacy syntax, and glob matching passed")
+
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
 

@@ -229,6 +229,14 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Drop the white flash (concussion grenades and the like) the server sends for your "
                 "player, as HappyMod 2's no-whiteout did."),
+    # Render modifiers. Empty paths keep the optional line files inactive.
+    Option("render.datablock_rules", "Render modifiers", "Datablock modifier rules", "text", "",
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Path to a commented line-based config for datablock field replacements on connect "
+                "or every frame."),
+    Option("render.object_rules", "Render modifiers", "Object modifier rules", "text", "",
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Path to a commented line-based config for per-frame object field replacements."),
     # Demo review (anti-cheat forensics): reconstruct what a suspect saw. Use a
     # review launch to watch demos, not to play live.
     Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,
