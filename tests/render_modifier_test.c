@@ -138,7 +138,10 @@ int main(void) {
     render_rules[2].scope = RENDER_SCOPE_CLIENT;
     render_rules[2].phase = RENDER_PHASE_FRAME;
     render_build_direct_object_script();
-    assert(strstr(render_modifier_direct_script, "if(isObject(PlayGui))") != NULL);
+    assert(render_modifier_direct_script_used == 0);
+    assert(render_modifier_direct_assign_count[RENDER_PHASE_FRAME] == 1);
+    assert(strstr(render_modifier_direct_assign_scripts[RENDER_PHASE_FRAME],
+                  "if(isObject(PlayGui)) { PlayGui.position = \"4 4\"") != NULL);
     assert(strstr(render_modifier_direct_script, "Mission*") == NULL);
     assert(strstr(render_modifier_direct_script, "class:Sky") == NULL);
     render_field_cache_count = 0;
@@ -175,8 +178,8 @@ int main(void) {
     assert(strcmp(render_modifier_object_cb(fake_object, 4, play_gui_argv), "") == 0);
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
-    assert(strstr(render_modifier_output_storage, "PlayGui.position = \"4 4\"") != NULL);
-    assert(render_modifier_matches == 1);
+    assert(render_modifier_output_storage[0] == 0);
+    assert(render_modifier_matches == 0);
 
     render_rule_count = RENDER_RULE_LIMIT;
     for (size_t i = 0; i < render_rule_count; i++) {
@@ -186,6 +189,7 @@ int main(void) {
         memset(name + length, 'x', sizeof name - length - 1);
         name[sizeof name - 1] = 0;
         snprintf(render_rules[i].object_pattern, sizeof render_rules[i].object_pattern, "%s", name);
+        snprintf(render_rules[i].field_pattern, sizeof render_rules[i].field_pattern, "*");
     }
     render_build_direct_object_script();
     assert(render_modifier_direct_script_used > 65536);

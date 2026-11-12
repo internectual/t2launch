@@ -6453,7 +6453,7 @@ static void cap_frame_rate(void) {
 #define RENDER_RULE_TEXT 128
 #define RENDER_RULE_VALUE 320
 #define RENDER_MODIFIER_SCRIPT_LIMIT (256 * 1024)
-#define RENDER_DIRECT_SCRIPT_LIMIT (RENDER_RULE_LIMIT * (4 * RENDER_RULE_TEXT + 128))
+#define RENDER_DIRECT_SCRIPT_LIMIT (RENDER_RULE_LIMIT * (4 * RENDER_RULE_TEXT + RENDER_RULE_VALUE + 128))
 #define RENDER_MODIFIER_SEEN_LIMIT 8192
 #define RENDER_CONNECT_RETRY_WINDOW_NS 10000000000ULL
 #define RENDER_CONNECT_RETRY_INTERVAL_NS 500000000ULL
@@ -6472,10 +6472,14 @@ static struct render_rule render_rules[RENDER_RULE_LIMIT];
 static size_t render_rule_count;
 static char render_modifier_direct_script[RENDER_DIRECT_SCRIPT_LIMIT];
 static size_t render_modifier_direct_script_used;
+static char render_modifier_direct_assign_scripts[2][RENDER_DIRECT_SCRIPT_LIMIT];
+static size_t render_modifier_direct_assign_used[2];
+static size_t render_modifier_direct_assign_count[2];
 static char render_modifier_output_storage[RENDER_MODIFIER_SCRIPT_LIMIT];
 static char *render_modifier_output;
 static size_t render_modifier_output_used;
 static size_t render_modifier_matches;
+static size_t render_modifier_direct_matches;
 static void *render_modifier_seen_objects[RENDER_MODIFIER_SEEN_LIMIT];
 static size_t render_modifier_seen_count;
 static int render_modifier_collecting;
@@ -6489,6 +6493,7 @@ static uint64_t render_modifier_last_tick_ns;
 static uint64_t render_modifier_connect_retry_until_ns;
 static uint64_t render_modifier_connect_last_apply_ns;
 static size_t render_modifier_connect_last_logged_matches;
+static size_t render_modifier_connect_last_logged_direct_matches;
 static int render_modifier_connect_log_reported;
 static struct rv_memory render_modifier_memory;
 struct render_field_cache {
@@ -6599,6 +6604,20 @@ static int render_parse_rule(char *line, enum render_rule_scope default_scope,
 
 static int render_name_is_safe(const char *name, int field_name);
 
+static int render_rule_scope_applies(const struct render_rule *rule) {
+    return rule->scope == RENDER_SCOPE_BOTH ||
+        (rule->scope == RENDER_SCOPE_CLIENT && !target->dedicated) ||
+        (rule->scope == RENDER_SCOPE_SERVER && target->dedicated);
+}
+
+static int render_rule_literal_assignment(const struct render_rule *rule) {
+    const char *object = rule->object_pattern;
+    const char *field = rule->field_pattern;
+    return strncmp(object, "class:", 6) != 0 && !strchr(object, '*') && !strchr(object, '?') &&
+           !strchr(field, '*') && !strchr(field, '?') &&
+           render_name_is_safe(object, 0) && render_name_is_safe(field, 1);
+}
+
 static size_t render_load_rules_file(const char *path, int object_rules_file) {
     if (!path || !*path) return 0;
     FILE *file = fopen(path, "r");
@@ -6639,13 +6658,43 @@ static size_t render_load_rules_file(const char *path, int object_rules_file) {
 static void render_build_direct_object_script(void) {
     render_modifier_direct_script[0] = 0;
     render_modifier_direct_script_used = 0;
+    for (size_t phase = 0; phase < 2; phase++) {
+        render_modifier_direct_assign_scripts[phase][0] = 0;
+        render_modifier_direct_assign_used[phase] = 0;
+        render_modifier_direct_assign_count[phase] = 0;
+    }
     for (size_t r = 0; r < render_rule_count; r++) {
+        const struct render_rule *rule = &render_rules[r];
         const char *name = render_rules[r].object_pattern;
+        if (render_rule_literal_assignment(rule)) {
+            size_t phase = (size_t)rule->phase;
+            if (render_rule_scope_applies(rule)) {
+                int written = snprintf(render_modifier_direct_assign_scripts[phase] +
+                        render_modifier_direct_assign_used[phase],
+                    sizeof render_modifier_direct_assign_scripts[phase] -
+                        render_modifier_direct_assign_used[phase],
+                    "if(isObject(%s)) { %s.%s = %s; %%count = %%count + 1; }\n",
+                    name, name, rule->field_pattern, rule->value);
+                if (written < 0 || (size_t)written >=
+                        sizeof render_modifier_direct_assign_scripts[phase] -
+                        render_modifier_direct_assign_used[phase]) {
+                    fprintf(stderr, "[t2_hook] literal render modifier scan reached its script limit\n");
+                    continue;
+                }
+                render_modifier_direct_assign_used[phase] += (size_t)written;
+                render_modifier_direct_assign_count[phase]++;
+            }
+            continue;
+        }
         if (strncmp(name, "class:", 6) == 0 || strchr(name, '*') || strchr(name, '?') ||
             !render_name_is_safe(name, 0)) continue;
+        if (!strchr(rule->field_pattern, '*') && !strchr(rule->field_pattern, '?')) continue;
         int duplicate = 0;
         for (size_t previous = 0; previous < r; previous++)
-            if (strcmp(render_rules[previous].object_pattern, name) == 0) {
+            if (!render_rule_literal_assignment(&render_rules[previous]) &&
+                strcmp(render_rules[previous].object_pattern, name) == 0 &&
+                (strchr(render_rules[previous].field_pattern, '*') ||
+                 strchr(render_rules[previous].field_pattern, '?'))) {
                 duplicate = 1; break;
             }
         if (duplicate) continue;
@@ -6659,6 +6708,24 @@ static void render_build_direct_object_script(void) {
             break;
         }
         render_modifier_direct_script_used += (size_t)written;
+    }
+    for (size_t phase = 0; phase < 2; phase++) {
+        if (!render_modifier_direct_assign_count[phase]) continue;
+        const char *function_name = phase == RENDER_PHASE_CONNECT
+            ? "t2launch_applyDirectConnectModifiers" : "t2launch_applyDirectFrameModifiers";
+        char complete[RENDER_DIRECT_SCRIPT_LIMIT];
+        int written = snprintf(complete, sizeof complete,
+            "function %s() { %%count = 0;%s return %%count; }",
+            function_name, render_modifier_direct_assign_scripts[phase]);
+        if (written < 0 || (size_t)written >= sizeof complete) {
+            fprintf(stderr, "[t2_hook] direct render modifier function exceeded script limit\n");
+            render_modifier_direct_assign_count[phase] = 0;
+            render_modifier_direct_assign_used[phase] = 0;
+            render_modifier_direct_assign_scripts[phase][0] = 0;
+            continue;
+        }
+        memcpy(render_modifier_direct_assign_scripts[phase], complete, (size_t)written + 1);
+        render_modifier_direct_assign_used[phase] = (size_t)written;
     }
 }
 
@@ -6769,7 +6836,8 @@ static const char *render_modifier_object_cb(void *obj, S32 argc, const char **a
         int scope_ok = rule->scope == RENDER_SCOPE_BOTH ||
             (rule->scope == RENDER_SCOPE_CLIENT && !target->dedicated) ||
             (rule->scope == RENDER_SCOPE_SERVER && target->dedicated);
-        if (!scope_ok || !render_rule_object_applies(rule, object_name, class_name)) continue;
+        if (!scope_ok || render_rule_literal_assignment(rule) ||
+            !render_rule_object_applies(rule, object_name, class_name)) continue;
         if (!fields_loaded) {
             fields = render_fields_for_object(obj);
             fields_loaded = 1;
@@ -6856,26 +6924,32 @@ static int render_modifier_connect_retry_due(uint64_t now_ns) {
         now_ns - render_modifier_connect_last_apply_ns >= RENDER_CONNECT_RETRY_INTERVAL_NS;
 }
 
-static void render_modifier_report_connect_matches(size_t matches) {
+static void render_modifier_report_connect_matches(size_t matches, size_t direct_matches) {
     if (render_modifier_connect_log_reported &&
-        matches == render_modifier_connect_last_logged_matches) return;
+        matches == render_modifier_connect_last_logged_matches &&
+        direct_matches == render_modifier_connect_last_logged_direct_matches) return;
     render_modifier_connect_log_reported = 1;
     render_modifier_connect_last_logged_matches = matches;
-    fprintf(stderr, "[t2_hook] render modifier connect matches=%zu\n", matches);
+    render_modifier_connect_last_logged_direct_matches = direct_matches;
+    fprintf(stderr, "[t2_hook] render modifier connect matches=%zu direct=%zu\n",
+            matches, direct_matches);
 }
 
 static size_t render_modifiers_apply(enum render_rule_phase phase) {
     if (!render_rule_count || !render_rules_have_phase(phase) || !Con__evaluate ||
-        !render_modifier_method_registered || !target || !rv_memory_snapshot(&render_modifier_memory)) return 0;
+        !render_modifier_method_registered || !target) return 0;
+    int memory_ready = rv_memory_snapshot(&render_modifier_memory);
+    if (!memory_ready && !render_modifier_direct_assign_count[phase]) return 0;
     render_modifier_output_storage[0] = 0;
     render_modifier_output = render_modifier_output_storage;
     render_modifier_output_used = render_modifier_matches = 0;
+    render_modifier_direct_matches = 0;
     render_modifier_seen_count = 0;
     render_modifier_output_truncated = 0;
-    render_modifier_collecting = 1;
+    render_modifier_collecting = memory_ready;
     render_modifier_active_phase = phase;
-    (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
-    if (render_modifier_direct_script_used)
+    if (memory_ready) (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
+    if (memory_ready && render_modifier_direct_script_used)
         (void)Con__evaluate(render_modifier_direct_script, 0, "t2launch/render-modifiers.cs", 0);
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
@@ -6888,14 +6962,26 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
             if (phase == RENDER_PHASE_FRAME) frame_count_reported = 1;
         }
     }
+    if (render_modifier_direct_assign_count[phase]) {
+        const char *call = phase == RENDER_PHASE_CONNECT
+            ? "t2launch_applyDirectConnectModifiers();"
+            : "t2launch_applyDirectFrameModifiers();";
+        const char *result = Con__evaluate(call, 0, NULL, 0);
+        if (result && result[0]) {
+            char *end = NULL;
+            unsigned long count = strtoul(result, &end, 10);
+            if (end != result && !*end) render_modifier_direct_matches = (size_t)count;
+        }
+    }
     if (phase == RENDER_PHASE_CONNECT)
-        render_modifier_report_connect_matches(render_modifier_matches);
+        render_modifier_report_connect_matches(render_modifier_matches,
+                                               render_modifier_direct_matches);
     if (render_modifier_output_truncated && !render_modifier_truncation_reported) {
         fprintf(stderr, "[t2_hook] render modifier output capped at %u bytes\n",
                 (unsigned)RENDER_MODIFIER_SCRIPT_LIMIT);
         render_modifier_truncation_reported = 1;
     }
-    return render_modifier_matches;
+    return render_modifier_matches + render_modifier_direct_matches;
 }
 
 static void install_render_modifiers(void) {
@@ -6914,6 +7000,10 @@ static void install_render_modifiers(void) {
     render_modifier_method_registered = 1;
     (void)Con__evaluate(render_modifier_scan_script, 0, "t2launch/render-modifiers.cs", 0);
     (void)Con__evaluate(render_modifier_context_script, 0, "t2launch/render-modifiers.cs", 0);
+    for (size_t phase = 0; phase < 2; phase++)
+        if (render_modifier_direct_assign_used[phase])
+            (void)Con__evaluate(render_modifier_direct_assign_scripts[phase], 0,
+                                "t2launch/render-modifiers.cs", 0);
     (void)render_modifiers_apply(RENDER_PHASE_CONNECT);
     const char *context = Con__evaluate("t2launch_renderModifierContext();", 0, NULL, 0);
     if (context) {
