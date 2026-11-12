@@ -129,7 +129,7 @@ class NativeReviewTests(unittest.TestCase):
 
     def test_render_modifier_rule_syntax_and_wildcards(self):
         self.run_fixture("render_modifier_test.c",
-                         "render modifier phases, scope, legacy syntax, and glob matching passed")
+                         "render modifier syntax, glob, and persistent/dynamic field expansion passed")
 
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")

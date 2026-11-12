@@ -3,6 +3,49 @@
 #include "../t2_hook.c"
 #include <assert.h>
 
+static unsigned char fake_class_rep[0x40];
+static unsigned char fake_object[0x60];
+static unsigned char fake_fields[3 * 24];
+static unsigned char fake_dictionary[19 * sizeof(uint32_t)];
+static unsigned char fake_dynamic_entry[12];
+static const char *fake_class_name = "Sky";
+static const char *fake_material_field = "materialList";
+static const char *fake_position_field = "position";
+static const char *fake_extent_field = "extent";
+static const char *fake_dynamic_field_name = "customPosition";
+
+static void *fake_get_class_rep(void *object) {
+    assert(object == fake_object);
+    return fake_class_rep;
+}
+
+static void fake_put_word(void *object, size_t offset, uint32_t value) {
+    memcpy((unsigned char *)object + offset, &value, sizeof value);
+}
+
+static void fake_put_pointer(void *object, size_t offset, const void *value) {
+    fake_put_word(object, offset, (uint32_t)(uintptr_t)value);
+}
+
+static void setup_fake_object(void) {
+    static void *fake_vtable[3];
+    fake_vtable[2] = (void *)fake_get_class_rep;
+    fake_put_pointer(fake_object, 0, fake_vtable);
+    fake_put_pointer(fake_object, SHAZBOT_SIM_FIELD_DICTIONARY_OFFSET, fake_dictionary);
+    fake_put_pointer(fake_class_rep, 0x18, fake_class_name);
+    fake_put_pointer(fake_class_rep, 0x20, fake_fields);
+    fake_put_word(fake_class_rep, 0x24, 3);
+
+    const char *field_names[] = {fake_material_field, fake_position_field, fake_extent_field};
+    for (size_t i = 0; i < 3; i++) {
+        fake_put_pointer(fake_fields, i * 24, field_names[i]);
+        fake_put_word(fake_fields, i * 24 + 8, (uint32_t)(0x40 + i * 4));
+    }
+    fake_put_pointer(fake_dictionary, 0, fake_dynamic_entry);
+    fake_put_pointer(fake_dynamic_entry, 0, fake_dynamic_field_name);
+    fake_put_pointer(fake_dynamic_entry, 4, "old");
+}
+
 int main(void) {
     assert(render_glob_match("Hud*", "HudDamage"));
     assert(render_glob_match("Gui?itmapCtrl", "GuiBitmapCtrl"));
@@ -37,6 +80,41 @@ int main(void) {
 
     char invalid_line[] = "client now MissionSky.materialList = foo\n";
     assert(render_parse_rule(invalid_line, RENDER_SCOPE_BOTH, RENDER_PHASE_FRAME, &legacy) < 0);
-    puts("render modifier phases, scope, legacy syntax, and glob matching passed");
+
+    setup_fake_object();
+    assert(rv_memory_snapshot(&render_modifier_memory));
+    target = &game_targets[0];
+    render_rule_count = 2;
+    memset(render_rules, 0, sizeof render_rules);
+    snprintf(render_rules[0].object_pattern, sizeof render_rules[0].object_pattern, "class:Sky");
+    snprintf(render_rules[0].field_pattern, sizeof render_rules[0].field_pattern, "material*");
+    snprintf(render_rules[0].value, sizeof render_rules[0].value, "\"textures/grid.dml\"");
+    render_rules[0].scope = RENDER_SCOPE_CLIENT;
+    render_rules[0].phase = RENDER_PHASE_FRAME;
+    snprintf(render_rules[1].object_pattern, sizeof render_rules[1].object_pattern, "Mission*");
+    snprintf(render_rules[1].field_pattern, sizeof render_rules[1].field_pattern, "*position*");
+    snprintf(render_rules[1].value, sizeof render_rules[1].value, "\"20 30\"");
+    render_rules[1].scope = RENDER_SCOPE_CLIENT;
+    render_rules[1].phase = RENDER_PHASE_FRAME;
+    render_field_cache_count = 0;
+    memset(render_field_caches, 0, sizeof render_field_caches);
+    render_modifier_active_phase = RENDER_PHASE_FRAME;
+    render_modifier_collecting = 1;
+    render_modifier_output = render_modifier_output_storage;
+    render_modifier_output_storage[0] = 0;
+    render_modifier_output_used = render_modifier_matches = 0;
+    const char *method_argv[] = {
+        "SimObject::t2launch_collectRenderModifiers", "object-id", "MissionSky", "Sky"
+    };
+    assert(strcmp(render_modifier_object_cb(fake_object, 4, method_argv), "") == 0);
+    render_modifier_collecting = 0;
+    render_modifier_output = NULL;
+    assert(strstr(render_modifier_output_storage,
+                  "MissionSky.materialList = \"textures/grid.dml\"") != NULL);
+    assert(strstr(render_modifier_output_storage, "MissionSky.position = \"20 30\"") != NULL);
+    assert(strstr(render_modifier_output_storage,
+                  "MissionSky.customPosition = \"20 30\"") != NULL);
+    assert(render_modifier_matches == 3);
+    puts("render modifier syntax, glob, and persistent/dynamic field expansion passed");
     return 0;
 }
