@@ -6452,6 +6452,8 @@ static void cap_frame_rate(void) {
 #define RENDER_RULE_TEXT 128
 #define RENDER_RULE_VALUE 320
 #define RENDER_MODIFIER_SCRIPT_LIMIT (256 * 1024)
+#define RENDER_DIRECT_SCRIPT_LIMIT (RENDER_RULE_LIMIT * 512)
+#define RENDER_MODIFIER_SEEN_LIMIT 8192
 #define RENDER_FIELD_CACHE_CLASSES 512
 #define RENDER_FIELD_CACHE_FIELDS 512
 enum render_rule_scope { RENDER_SCOPE_CLIENT, RENDER_SCOPE_SERVER, RENDER_SCOPE_BOTH };
@@ -6465,10 +6467,14 @@ struct render_rule {
 };
 static struct render_rule render_rules[RENDER_RULE_LIMIT];
 static size_t render_rule_count;
+static char render_modifier_direct_script[RENDER_DIRECT_SCRIPT_LIMIT];
+static size_t render_modifier_direct_script_used;
 static char render_modifier_output_storage[RENDER_MODIFIER_SCRIPT_LIMIT];
 static char *render_modifier_output;
 static size_t render_modifier_output_used;
 static size_t render_modifier_matches;
+static void *render_modifier_seen_objects[RENDER_MODIFIER_SEEN_LIMIT];
+static size_t render_modifier_seen_count;
 static int render_modifier_collecting;
 static int render_modifier_output_truncated;
 static int render_modifier_truncation_reported;
@@ -6584,6 +6590,8 @@ static int render_parse_rule(char *line, enum render_rule_scope default_scope,
     return 1;
 }
 
+static int render_name_is_safe(const char *name, int field_name);
+
 static size_t render_load_rules_file(const char *path, int object_rules_file) {
     if (!path || !*path) return 0;
     FILE *file = fopen(path, "r");
@@ -6619,6 +6627,32 @@ static size_t render_load_rules_file(const char *path, int object_rules_file) {
     fclose(file);
     fprintf(stderr, "[t2_hook] loaded %zu render modifier rules from %s\n", loaded, path);
     return loaded;
+}
+
+static void render_build_direct_object_script(void) {
+    render_modifier_direct_script[0] = 0;
+    render_modifier_direct_script_used = 0;
+    for (size_t r = 0; r < render_rule_count; r++) {
+        const char *name = render_rules[r].object_pattern;
+        if (strncmp(name, "class:", 6) == 0 || strchr(name, '*') || strchr(name, '?') ||
+            !render_name_is_safe(name, 0)) continue;
+        int duplicate = 0;
+        for (size_t previous = 0; previous < r; previous++)
+            if (strcmp(render_rules[previous].object_pattern, name) == 0) {
+                duplicate = 1; break;
+            }
+        if (duplicate) continue;
+        int written = snprintf(render_modifier_direct_script + render_modifier_direct_script_used,
+            sizeof render_modifier_direct_script - render_modifier_direct_script_used,
+            "if(isObject(%s)) %s.t2launch_collectRenderModifiers(%s.getName(), %s.getClassName());\n",
+            name, name, name, name);
+        if (written < 0 || (size_t)written >=
+                sizeof render_modifier_direct_script - render_modifier_direct_script_used) {
+            fprintf(stderr, "[t2_hook] named render modifier scan reached its script limit\n");
+            break;
+        }
+        render_modifier_direct_script_used += (size_t)written;
+    }
 }
 
 static int render_name_is_safe(const char *name, int field_name) {
@@ -6713,6 +6747,10 @@ static struct render_field_cache *render_fields_for_object(void *obj) {
 static const char *render_modifier_object_cb(void *obj, S32 argc, const char **argv) {
     if (!render_modifier_collecting || render_modifier_output_truncated || argc != 4 ||
         !obj || !render_modifier_output) return "";
+    for (size_t i = 0; i < render_modifier_seen_count; i++)
+        if (render_modifier_seen_objects[i] == obj) return "";
+    if (render_modifier_seen_count >= RENDER_MODIFIER_SEEN_LIMIT) return "";
+    render_modifier_seen_objects[render_modifier_seen_count++] = obj;
     const char *object_name = argv && argv[2] ? argv[2] : "";
     const char *class_name = argv && argv[3] ? argv[3] : "";
     if (!*object_name || !*class_name) return "";
@@ -6802,10 +6840,13 @@ static void render_modifiers_apply(enum render_rule_phase phase) {
     render_modifier_output_storage[0] = 0;
     render_modifier_output = render_modifier_output_storage;
     render_modifier_output_used = render_modifier_matches = 0;
+    render_modifier_seen_count = 0;
     render_modifier_output_truncated = 0;
     render_modifier_collecting = 1;
     render_modifier_active_phase = phase;
     (void)Con__evaluate("t2launch_collectRenderModifiers();", 0, NULL, 0);
+    if (render_modifier_direct_script_used)
+        (void)Con__evaluate(render_modifier_direct_script, 0, "t2launch/render-modifiers.cs", 0);
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
     if (render_modifier_output_used) {
@@ -6834,6 +6875,7 @@ static void install_render_modifiers(void) {
     if (!legacy || !*legacy) legacy = hook_option_str("datablock.config");
     (void)render_load_rules_file(legacy, 0);
     if (!render_rule_count) return;
+    render_build_direct_object_script();
     Con__addMethodS("SimObject", "t2launch_collectRenderModifiers", render_modifier_object_cb,
         "t2launch_collectRenderModifiers(name, class) - internal render-rule collector", 4, 4);
     render_modifier_method_registered = 1;

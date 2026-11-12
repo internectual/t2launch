@@ -87,7 +87,7 @@ int main(void) {
     setup_fake_object();
     assert(rv_memory_snapshot(&render_modifier_memory));
     target = &game_targets[0];
-    render_rule_count = 2;
+    render_rule_count = 3;
     memset(render_rules, 0, sizeof render_rules);
     snprintf(render_rules[0].object_pattern, sizeof render_rules[0].object_pattern, "class:Sky");
     snprintf(render_rules[0].field_pattern, sizeof render_rules[0].field_pattern, "material*");
@@ -99,6 +99,15 @@ int main(void) {
     snprintf(render_rules[1].value, sizeof render_rules[1].value, "\"20 30\"");
     render_rules[1].scope = RENDER_SCOPE_CLIENT;
     render_rules[1].phase = RENDER_PHASE_FRAME;
+    snprintf(render_rules[2].object_pattern, sizeof render_rules[2].object_pattern, "PlayGui");
+    snprintf(render_rules[2].field_pattern, sizeof render_rules[2].field_pattern, "position");
+    snprintf(render_rules[2].value, sizeof render_rules[2].value, "\"4 4\"");
+    render_rules[2].scope = RENDER_SCOPE_CLIENT;
+    render_rules[2].phase = RENDER_PHASE_FRAME;
+    render_build_direct_object_script();
+    assert(strstr(render_modifier_direct_script, "if(isObject(PlayGui))") != NULL);
+    assert(strstr(render_modifier_direct_script, "Mission*") == NULL);
+    assert(strstr(render_modifier_direct_script, "class:Sky") == NULL);
     render_field_cache_count = 0;
     memset(render_field_caches, 0, sizeof render_field_caches);
     render_modifier_active_phase = RENDER_PHASE_FRAME;
@@ -118,6 +127,23 @@ int main(void) {
     assert(strstr(render_modifier_output_storage,
                   "MissionSky.customPosition = \"20 30\"") != NULL);
     assert(render_modifier_matches == 3);
-    puts("render modifier syntax, glob, and persistent/dynamic field expansion passed");
+    size_t unique_output_length = render_modifier_output_used;
+    assert(strcmp(render_modifier_object_cb(fake_object, 4, method_argv), "") == 0);
+    assert(render_modifier_output_used == unique_output_length);
+
+    render_modifier_output_storage[0] = 0;
+    render_modifier_output_used = render_modifier_matches = 0;
+    render_modifier_seen_count = 0;
+    const char *play_gui_argv[] = {
+        "SimObject::t2launch_collectRenderModifiers", "object-id", "PlayGui", "GuiCanvas"
+    };
+    render_modifier_collecting = 1;
+    render_modifier_output = render_modifier_output_storage;
+    assert(strcmp(render_modifier_object_cb(fake_object, 4, play_gui_argv), "") == 0);
+    render_modifier_collecting = 0;
+    render_modifier_output = NULL;
+    assert(strstr(render_modifier_output_storage, "PlayGui.position = \"4 4\"") != NULL);
+    assert(render_modifier_matches == 1);
+    puts("render modifier syntax, direct HUD names, glob, and persistent/dynamic field expansion passed");
     return 0;
 }
