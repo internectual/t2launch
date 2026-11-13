@@ -8634,6 +8634,13 @@ void SDL_GL_SwapBuffers(void) {
                     " localConnect(getField(%%p, 0), getField(%%p, 1), getField(%%p, 2),"
                     " getField(%%p, 3), getField(%%p, 4)); }"
                     " schedule(2500, 0, \"t2launch_autohost\");", autohost_map, autohost_type);
+                const char *repeat = getenv("T2LAUNCH_AUTOHOST_REPEAT_MS");
+                if (repeat && atoi(repeat) > 0) {  /* debug: rejoin to exercise teardown */
+                    size_t used = strlen(script);
+                    snprintf(script + used, sizeof script - used,
+                        " schedule(%d, 0, \"disconnect\"); schedule(%d, 0, \"t2launch_autohost\");",
+                        atoi(repeat) - 1500, atoi(repeat));
+                }
                 Con__evaluate(script, 0, "t2launch/autohost.cs", 0);
                 fprintf(stderr, "[t2_hook] Autohost scheduled: %s %s\n", autohost_map, autohost_type);
             }

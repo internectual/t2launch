@@ -68,7 +68,7 @@ sudo pacman -Syu --needed \
 | `lib32-mesa`, `lib32-glu` | OpenGL |
 | `lib32-libx11`, `lib32-libxext`, `lib32-libxrandr` | X11 windowing (the bundled SDL links XRandR) |
 | `lib32-freetype2` | TrueType text rendering |
-| `lib32-libpulse` | `padsp`, which gives Loki OpenAL its OSS `/dev/dsp` |
+| `lib32-libpulse` | `t2_oss.so` (built from `t2_oss.c`) gives Loki OpenAL its OSS `/dev/dsp` through PulseAudio/PipeWire; `padsp` is the fallback |
 | `lib32-gmp` | the RSA helper used for TribesNext authentication |
 | `gcc` | compiling the hook, RSA helper, and stack-realignment shim |
 | `python` | the WON emulator and the desktop launcher |
@@ -253,7 +253,11 @@ the bundled Loki-era libraries in `runtime/compat-libs/`.
 | `T2LAUNCH_EXECUTABLE` | `client` (default) or `dedicated`; see [Dedicated server](#dedicated-server) |
 | `T2LAUNCH_SERVER_RESTART=1` | Restart the dedicated server after a crash |
 | `T2LAUNCH_SOFTWARE_GL=1` | Use software GL instead of the hardware driver |
-| `T2LAUNCH_USE_PADSP=0` | Manually skip the legacy PulseAudio OSS shim (the game uses it for OpenAL audio) |
+| `T2LAUNCH_USE_PADSP=0` | Run the game with no sound layer at all |
+| `T2LAUNCH_AUDIO_BACKEND` | `builtin` (default, `t2_oss.so`) or `padsp` (the legacy libpulsedsp shim) |
+| `T2LAUNCH_AUDIO_OUTPUT` / `T2LAUNCH_AUDIO_INPUT` | PulseAudio/PipeWire sink / source name (`pactl list short sinks`); blank = default |
+| `T2LAUNCH_MIC_GAIN` | Linear microphone gain, 0 to 8 (default 1) |
+| `T2LAUNCH_OSS_DEBUG=1` | Trace the OSS shim's calls on stderr |
 | `T2LAUNCH_FULL_REDRAW=0` | Turn off the full-canvas redraw (see [Runtime compatibility](#runtime-compatibility)) |
 | `T2LAUNCH_OPENAL_VOLUME_FIX=0` | Turn off the volume-slider fix |
 | `T2LAUNCH_PULSE_SINK` | Send game audio to this sink (from `pactl list short sinks`) instead of the default output |
@@ -275,8 +279,14 @@ falls back to a short built-in 4:3 list. The launcher enables SDL XRandR
 enumeration, and the hook substitutes the host display's real mode list for
 that case only.
 
-The bundled Loki OpenAL uses OSS `/dev/dsp`; `padsp` routes it through
-PulseAudio/PipeWire.
+The bundled Loki OpenAL can only use OSS (`/dev/dsp`, `/dev/mixer`). `t2_oss.so`,
+preloaded in place of `padsp`, answers those calls itself and plays/records
+through libpulse-simple on its own threads, so the game thread never enters
+libpulse (padsp aborted inside libpulse when a session changed servers). It also
+lets a profile pick the output and microphone device and the microphone gain
+(Audio options), and only opens the microphone while the game is reading it.
+Voice on the wire is still the game's GSM codec. `T2LAUNCH_AUDIO_BACKEND=padsp`
+restores the old shim.
 
 The game renders text from the font caches in `base.vl2` and, for other sizes,
 from the TrueType files in your install's `base/fonts/` (the Loki release ships

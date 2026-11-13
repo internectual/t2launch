@@ -29,5 +29,13 @@ if ! gcc "${CFLAGS[@]}" -o "$STAGE/rsa_helper" "$REPO_DIR/rsa_helper.c" -lgmp; t
     echo "  Fedora:        sudo dnf install gmp-devel.i686" >&2
     exit 1
 fi
+# The OSS shim for the game's sound is optional: without the PulseAudio headers
+# run-game falls back to padsp.
+if gcc "${CFLAGS[@]}" -std=gnu99 -shared -fPIC -o "$STAGE/t2_oss.so" "$REPO_DIR/t2_oss.c" -pthread -ldl 2>/dev/null; then
+    mv -f "$STAGE/t2_oss.so" "$OUT_DIR/"
+else
+    rm -f "$OUT_DIR/t2_oss.so"
+    echo "NOTE: t2_oss.so not built (needs the PulseAudio headers); the game will use padsp for sound." >&2
+fi
 mv -f "$STAGE/t2_realign.so" "$STAGE/t2_hook.so" "$STAGE/rsa_helper" "$OUT_DIR/"
 echo "Built Tribes 2 support binaries in $OUT_DIR"

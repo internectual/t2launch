@@ -131,6 +131,26 @@ class NativeReviewTests(unittest.TestCase):
         self.run_fixture("render_modifier_test.c",
                          "render modifier syntax, direct HUD names, glob, and persistent/dynamic field expansion passed")
 
+    def test_oss_shim_plays_and_records_through_pulseaudio(self):
+        if subprocess.run(["pactl", "info"], capture_output=True).returncode:
+            self.skipTest("a PulseAudio-compatible server is required")
+        repo = Path(__file__).resolve().parent.parent
+        shim = self.directory / "t2_oss.so"
+        build = subprocess.run([self.compiler, "-m32", "-O2", "-std=gnu99", "-mstackrealign", "-shared",
+                                "-fPIC", str(repo / "t2_oss.c"), "-o", str(shim), "-pthread", "-ldl"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        if build.returncode:
+            self.skipTest("32-bit PulseAudio headers required: " + build.stderr[-200:])
+        fixture = Path(__file__).resolve().with_name("oss_shim_test.c")
+        output = self.directory / "oss_shim_test"
+        build = subprocess.run([self.compiler, "-m32", "-O2", "-std=gnu99", str(fixture), "-o", str(output), "-lm"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        environment = dict(self.environment, LD_PRELOAD=str(shim))
+        result = subprocess.run([str(output)], env=environment, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK", result.stdout)
+
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
 

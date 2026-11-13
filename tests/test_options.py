@@ -261,6 +261,15 @@ class OptionTests(unittest.TestCase):
         self.assertIn("telemetry.shazbot_actions=1", action_config.splitlines())
         self.assertIn("telemetry.shazbot_action_socket=/tmp/custom-action.sock", action_config.splitlines())
         self.assertIn("telemetry.shazbot_command_labels=1", action_config.splitlines())
+        audio_env = t2options.launch_env({"audio.output_device": "alsa_output.test",
+                                          "audio.mic_gain": 2.0}, HOOKED)
+        self.assertEqual(audio_env["T2LAUNCH_AUDIO_BACKEND"], "builtin")
+        self.assertEqual(audio_env["T2LAUNCH_AUDIO_OUTPUT"], "alsa_output.test")
+        self.assertEqual(float(audio_env["T2LAUNCH_MIC_GAIN"]), 2.0)
+        legacy_env = t2options.launch_env({"audio.backend": "padsp",
+                                           "audio.output_device": "ignored"}, HOOKED)
+        self.assertEqual(legacy_env["T2LAUNCH_AUDIO_BACKEND"], "padsp")
+        self.assertNotIn("T2LAUNCH_AUDIO_OUTPUT", legacy_env)
         self.assertNotIn("T2LAUNCH_USE_PADSP", t2options.launch_env({enabled.key: True}, HOOKED))
         self.assertNotIn("T2LAUNCH_USE_PADSP",
                          t2options.launch_env({enabled.key: True, actions.key: True}, HOOKED))

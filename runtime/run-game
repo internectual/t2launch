@@ -423,7 +423,7 @@ launch_game() {
     for artifact in t2_hook.so rsa_helper t2_realign.so; do
         [[ -x "$support_dir/$artifact" ]] || rebuild=1
     done
-    for source in t2_hook.c rsa_helper.c t2_realign.c; do
+    for source in t2_hook.c rsa_helper.c t2_realign.c t2_oss.c; do
         for artifact in t2_hook.so rsa_helper t2_realign.so; do
             [[ "$REPO_DIR/$source" -nt "$support_dir/$artifact" ]] && rebuild=1
         done
@@ -455,7 +455,9 @@ launch_game() {
     local preload=()
     [[ "$LOAD_HOOK" == "1" ]] && preload+=("$support_dir/t2_hook.so")
     if [[ "$USE_PADSP" == "1" ]]; then
-        if [[ -n "$pulse_dsp" ]]; then
+        if [[ "${T2LAUNCH_AUDIO_BACKEND:-builtin}" != "padsp" && -f "$support_dir/t2_oss.so" ]]; then
+            preload+=("$support_dir/t2_oss.so")
+        elif [[ -n "$pulse_dsp" ]]; then
             preload+=("$pulse_dsp")
         else
             echo "NOTE: no 32-bit libpulsedsp.so found; the game will have no sound. Install it:" >&2
