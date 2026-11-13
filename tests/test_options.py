@@ -2,6 +2,8 @@ import ast
 import re
 import tempfile
 import unittest
+import subprocess
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -261,6 +263,18 @@ class OptionTests(unittest.TestCase):
         self.assertIn("telemetry.shazbot_actions=1", action_config.splitlines())
         self.assertIn("telemetry.shazbot_action_socket=/tmp/custom-action.sock", action_config.splitlines())
         self.assertIn("telemetry.shazbot_command_labels=1", action_config.splitlines())
+        listing = json.dumps([
+            {"name": "alsa_output.a", "description": "Speakers"},
+            {"name": "alsa_output.a.monitor", "description": "Monitor of Speakers"},
+            {"name": "alsa_input.b", "description": "Headset Mic"}])
+        completed = subprocess.CompletedProcess([], 0, listing, "")
+        with mock.patch.object(t2options.subprocess, "run", return_value=completed):
+            self.assertEqual(t2options.audio_devices("sources"),
+                             [("alsa_output.a", "Speakers"), ("alsa_input.b", "Headset Mic")])
+        with mock.patch.object(t2options.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertEqual(t2options.audio_devices("sinks"), [])
+        self.assertEqual(t2options.BY_KEY["audio.output_device"].devices, "sinks")
+        self.assertEqual(t2options.BY_KEY["audio.input_device"].devices, "sources")
         audio_env = t2options.launch_env({"audio.output_device": "alsa_output.test",
                                           "audio.mic_gain": 2.0}, HOOKED)
         self.assertEqual(audio_env["T2LAUNCH_AUDIO_BACKEND"], "builtin")

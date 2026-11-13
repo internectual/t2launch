@@ -174,8 +174,14 @@ static pa_simple *oss_open_stream(struct oss_fd *entry, int out) {
     int error = 0;
     pa_simple *stream = pulse.new_stream(NULL, "Tribes 2", out ? PA_STREAM_PLAYBACK : PA_STREAM_RECORD,
                                          device, out ? "game audio" : "voice", &spec, NULL, &attr, &error);
-    if (!stream) fprintf(stderr, "[t2_oss] cannot open %s%s%s: %s\n", out ? "output" : "input",
-                         device ? " " : "", device ? device : "", pulse_error(error));
+    if (!stream && device) {  /* the chosen device is unplugged: use the default rather than go silent */
+        fprintf(stderr, "[t2_oss] %s device %s is unavailable (%s); using the default\n",
+                out ? "output" : "input", device, pulse_error(error));
+        device = NULL;
+        stream = pulse.new_stream(NULL, "Tribes 2", out ? PA_STREAM_PLAYBACK : PA_STREAM_RECORD, NULL,
+                                  out ? "game audio" : "voice", &spec, NULL, &attr, &error);
+    }
+    if (!stream) fprintf(stderr, "[t2_oss] cannot open %s: %s\n", out ? "output" : "input", pulse_error(error));
     else TRACE("%s stream %uHz %uch fmt=%d device=%s", out ? "playback" : "capture", spec.rate,
                spec.channels, entry->format, device ? device : "default");
     return stream;

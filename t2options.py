@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -55,6 +56,7 @@ class Option:
     env: str | None = None  # applied as an environment variable for run-game
     hook: bool = False  # applied through the hook's config file
     tab: str = field(default="hook")
+    devices: str = ""  # "sinks" or "sources": the launcher offers the audio devices as a list
 
     @property
     def off_value(self):
@@ -431,10 +433,10 @@ OPTIONS = (
            help="builtin: T2Launch's own OSS-to-PulseAudio layer (device choice, no padsp aborts "
                 "when changing servers). padsp: the legacy libpulsedsp shim."),
     Option("audio.output_device", "Audio", "Output device", "text", "",
-           env="T2LAUNCH_AUDIO_OUTPUT", requires=(("audio.backend", ("builtin",)),),
+           env="T2LAUNCH_AUDIO_OUTPUT", devices="sinks", requires=(("audio.backend", ("builtin",)),),
            help="PulseAudio/PipeWire sink name (see `pactl list short sinks`); blank uses the default."),
     Option("audio.input_device", "Audio", "Microphone device", "text", "",
-           env="T2LAUNCH_AUDIO_INPUT", requires=(("audio.backend", ("builtin",)),),
+           env="T2LAUNCH_AUDIO_INPUT", devices="sources", requires=(("audio.backend", ("builtin",)),),
            help="PulseAudio/PipeWire source name (see `pactl list short sources`); blank uses the default."),
     Option("audio.mic_gain", "Audio", "Microphone gain", "float", 1.0, minimum=0.0, maximum=8.0,
            env="T2LAUNCH_MIC_GAIN", requires=(("audio.backend", ("builtin",)),),
@@ -669,6 +671,30 @@ def validate(options, context=None):
             raise ValueError("Remote WON emulation needs the remote host:port to connect to")
         if not values["won.verifier"]:
             raise ValueError("Remote WON emulation needs the remote wonemu's verifier file")
+
+
+def audio_devices(kind):
+    """(name, description) pairs of PulseAudio/PipeWire sinks or sources.
+
+    Monitor sources (loopbacks of an output) are left out of the source list.
+    An empty list means no server or no pactl; the launcher then offers only
+    the default plus a typed name.
+    """
+    if kind not in ("sinks", "sources"):
+        raise ValueError("kind must be 'sinks' or 'sources'")
+    try:
+        result = subprocess.run(["pactl", "-f", "json", "list", kind], capture_output=True,
+                                text=True, timeout=3)
+        entries = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    devices = []
+    for entry in entries:
+        name = str(entry.get("name", ""))
+        if not name or (kind == "sources" and name.endswith(".monitor")):
+            continue
+        devices.append((name, str(entry.get("description") or name)))
+    return devices
 
 
 def _text(value):

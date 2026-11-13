@@ -280,6 +280,49 @@ def is_safe_launch_diagnostic(line):
                  "syntax error", "unable to find function")))
 
 
+class DeviceCombo(QComboBox):
+    """Audio device picker: Default plus the server's devices, or a typed name.
+
+    The list is re-read each time it opens, so a headset plugged in after the
+    launcher started appears. text()/setText() carry the PulseAudio device name
+    (blank = default), like the plain line edit this replaces.
+    """
+
+    def __init__(self, kind, value):
+        super().__init__()
+        self.kind = kind
+        self.setEditable(True)
+        self.setInsertPolicy(QComboBox.NoInsert)
+        self.populate(value)
+
+    def populate(self, value):
+        self.blockSignals(True)
+        self.clear()
+        self.addItem("Default", "")
+        for name, description in t2options.audio_devices(self.kind):
+            self.addItem(f"{description}  [{name}]", name)
+        self.blockSignals(False)
+        self.setText(value)
+
+    def showPopup(self):
+        self.populate(self.text())
+        super().showPopup()
+
+    def text(self):
+        index = self.findText(self.currentText())
+        if index >= 0:
+            return str(self.itemData(index) or "")
+        return self.currentText().strip()
+
+    def setText(self, value):
+        value = str(value or "")
+        index = self.findData(value)
+        if index >= 0:
+            self.setCurrentIndex(index)
+        else:  # a device that is not plugged in right now, or typed by hand
+            self.setEditText(value)
+
+
 class EndpointsEdit(QLineEdit):
     """One line of host:port entries for the hook's WON bootstrap slots."""
     changed = Signal()
@@ -521,6 +564,8 @@ class ProfileEditor(QWidget):
             signal = {"bool": "toggled", "choice": "currentTextChanged", "int": "valueChanged",
                       "float": "valueChanged", "endpoints": "changed",
                       "backends": "changed"}.get(t2options.BY_KEY[key].kind, "textChanged")
+            if isinstance(widget, DeviceCombo):
+                signal = "currentTextChanged"
             getattr(widget, signal).connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_options)
         self.show_advanced.toggled.connect(self.refresh_game_rows)
@@ -592,6 +637,8 @@ class ProfileEditor(QWidget):
                             option.maximum if option.maximum is not None else 1e9)
             widget.setDecimals(3)
             widget.setValue(float(value))
+        elif option.devices:
+            widget = DeviceCombo(option.devices, str(value))
         else:
             widget = QLineEdit(str(value))
         return widget
