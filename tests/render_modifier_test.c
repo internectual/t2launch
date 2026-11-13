@@ -164,9 +164,9 @@ int main(void) {
     render_modifier_collecting = 0;
     render_modifier_output = NULL;
     assert(strstr(render_modifier_output_storage,
-                  "%o = 12345; if(isObject(%o)) if(%o.materialList !$= \"textures/grid.dml\") "
-                  "{ %o.materialList = \"textures/grid.dml\"; "
-                  "t2launch_refresh(%o, \"materialList\"); }") != NULL);
+                  "%o = 12345; if(isObject(%o)) { if(%o.materialList !$= \"textures/grid.dml\") "
+                  "%o.materialList = \"textures/grid.dml\"; "
+                  "t2launch_refresh(%o, \"materialList\", \"textures/grid.dml\"); }") != NULL);
     assert(strstr(render_modifier_output_storage, "%o.position = \"20 30\"") != NULL);
     assert(strstr(render_modifier_output_storage, "%o.customPosition = \"20 30\"") != NULL);
     assert(render_modifier_matches == 3);
@@ -243,7 +243,7 @@ int main(void) {
     render_modifier_output = NULL;
     assert(strstr(render_modifier_output_storage,
                   "if(isObject(%o) && t2launch_test(%o.texture, \"=\", \"*grid*\")) "
-                  "if(%o.position !$= \"20 30\")") != NULL);
+                  "{ if(%o.position !$= \"20 30\")") != NULL);
 
     render_rule_count = RENDER_RULE_LIMIT;
     for (size_t i = 0; i < render_rule_count; i++) {
