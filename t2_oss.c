@@ -630,3 +630,18 @@ int select(int count, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, stru
         nanosleep(&nap, NULL);
     }
 }
+
+/* Called by the hook after it changes T2LAUNCH_AUDIO_OUTPUT/INPUT: every open
+   stream is reopened on the new device the next time its thread runs. */
+void t2_oss_reopen(void) {
+    pthread_mutex_lock(&oss_table_lock);
+    for (int fd = 0; fd < OSS_MAX_FDS; fd++) {
+        struct oss_fd *entry = oss_table[fd];
+        if (!entry || entry->kind != OSS_DSP) continue;
+        pthread_mutex_lock(&entry->lock);
+        entry->dirty = 1;
+        pthread_cond_broadcast(&entry->cond);
+        pthread_mutex_unlock(&entry->lock);
+    }
+    pthread_mutex_unlock(&oss_table_lock);
+}

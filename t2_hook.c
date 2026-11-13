@@ -442,6 +442,99 @@ static const char core_runtime_script[] =
     "t2launch_refreshServerBrowser();\n"
     "t2launch_audioMenuPoll();\n";
 
+/* Output and microphone device pickers for the in-game Options dialog. The
+ * stock sound page has no device choice; bit rate and channels are disabled on
+ * Linux, so their row is reused. */
+static const char audio_device_menu_script[] =
+    "function t2launch_audioDeviceName(%kind) {\n"
+    " %pref = %kind $= \"sinks\" ? $pref::T2Launch::AudioOutput : $pref::T2Launch::AudioInput;\n"
+    " if (%pref $= \"*\") return \"\";\n"
+    " if (%pref !$= \"\") return %pref;\n"
+    " return t2launch_getAudioDevice(%kind);\n"
+    "}\n"
+    "function t2launch_pickAudioDevice(%kind, %id) {\n"
+    " %name = $T2Launch::AudioDev[%kind, %id];\n"
+    " t2launch_setAudioDevice(%kind, %name);\n"
+    " %pref = %name $= \"\" ? \"*\" : %name;\n"
+    " if (%kind $= \"sinks\") $pref::T2Launch::AudioOutput = %pref;\n"
+    " else $pref::T2Launch::AudioInput = %pref;\n"
+    "}\n"
+    "function OP_T2LOutputMenu::onSelect(%this, %id, %text) { t2launch_pickAudioDevice(\"sinks\", %id); }\n"
+    "function OP_T2LInputMenu::onSelect(%this, %id, %text) { t2launch_pickAudioDevice(\"sources\", %id); }\n"
+    "function t2launch_fillAudioDeviceMenu(%menu, %kind) {\n"
+    " %menu.clear();\n"
+    " %menu.add(\"Default\", 0);\n"
+    " $T2Launch::AudioDev[%kind, 0] = \"\";\n"
+    " %list = t2launch_audioDevices(%kind);\n"
+    " %count = getRecordCount(%list);\n"
+    " %selected = 0;\n"
+    " %current = t2launch_audioDeviceName(%kind);\n"
+    " for (%i = 0; %i < %count; %i++) {\n"
+    "  %record = getRecord(%list, %i);\n"
+    "  %name = getField(%record, 0);\n"
+    "  %menu.add(getSubStr(getField(%record, 1), 0, 44), %i + 1);\n"
+    "  $T2Launch::AudioDev[%kind, %i + 1] = %name;\n"
+    "  if (%name $= %current) %selected = %i + 1;\n"
+    " }\n"
+    " %menu.setSelected(%selected);\n"
+    "}\n"
+    "function t2launch_buildAudioDeviceMenus() {\n"
+    " if ($T2Launch::AudioMenusBuilt || !isObject(OP_SoundPane) || !isObject(OP_VoicePane) ||\n"
+    "     !isObject(OP_AudioBitRateMenu) || !$T2Launch::AudioDevicesNative) return;\n"
+    " $T2Launch::AudioMenusBuilt = 1;\n"
+    " OP_AudioBitRateMenu.setVisible(false);\n"
+    " OP_AudioChannelsMenu.setVisible(false);\n"
+    " for (%i = 0; %i < OP_SoundPane.getCount(); %i++) {\n"
+    "  %object = OP_SoundPane.getObject(%i);\n"
+    "  if (%object.getClassName() $= \"GuiTextCtrl\" && (%object.text $= \"Bit Rate:\" || %object.text $= \"Channels:\"))\n"
+    "   %object.setVisible(false);\n"
+    " }\n"
+    " %label = new GuiTextCtrl() {\n"
+    "  profile = \"ShellTextRightProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"11 127\"; extent = \"72 22\"; minExtent = \"8 8\"; visible = \"1\"; text = \"Output:\";\n"
+    " };\n"
+    " OP_SoundPane.add(%label);\n"
+    " %menu = new ShellPopupMenu(OP_T2LOutputMenu) {\n"
+    "  profile = \"ShellPopupProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"80 118\"; extent = \"338 36\"; minExtent = \"49 36\"; visible = \"1\"; text = \"Select Output\";\n"
+    "  maxLength = \"255\"; maxPopupHeight = \"200\"; buttonBitmap = \"gui/shll_pulldown\";\n"
+    "  rolloverBarBitmap = \"gui/shll_pulldownbar_rol\"; selectedBarBitmap = \"gui/shll_pulldownbar_act\"; noButtonStyle = \"0\";\n"
+    " };\n"
+    " OP_SoundPane.add(%menu);\n"
+    " %label = new GuiTextCtrl() {\n"
+    "  profile = \"ShellTextRightProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"46 312\"; extent = \"140 22\"; minExtent = \"8 8\"; visible = \"1\"; text = \"Microphone Device:\";\n"
+    " };\n"
+    " OP_VoicePane.add(%label);\n"
+    " %menu = new ShellPopupMenu(OP_T2LInputMenu) {\n"
+    "  profile = \"ShellPopupProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"183 303\"; extent = \"238 36\"; minExtent = \"49 36\"; visible = \"1\"; text = \"Select Microphone\";\n"
+    "  maxLength = \"255\"; maxPopupHeight = \"200\"; buttonBitmap = \"gui/shll_pulldown\";\n"
+    "  rolloverBarBitmap = \"gui/shll_pulldownbar_rol\"; selectedBarBitmap = \"gui/shll_pulldownbar_act\"; noButtonStyle = \"0\";\n"
+    " };\n"
+    " OP_VoicePane.add(%menu);\n"
+    "}\n"
+    "function t2launch_audioDeviceMenuPoll() {\n"
+    " if (isObject(OptionsDlg) && OptionsDlg.isAwake()) {\n"
+    "  t2launch_buildAudioDeviceMenus();\n"
+    "  if ($T2Launch::AudioMenusBuilt && !$T2Launch::AudioMenusFilled) {\n"
+    "   $T2Launch::AudioMenusFilled = 1;\n"
+    "   t2launch_fillAudioDeviceMenu(OP_T2LOutputMenu, \"sinks\");\n"
+    "   t2launch_fillAudioDeviceMenu(OP_T2LInputMenu, \"sources\");\n"
+    "  }\n"
+    " } else $T2Launch::AudioMenusFilled = 0;\n"
+    " schedule(250, 0, \"t2launch_audioDeviceMenuPoll\");\n"
+    "}\n"
+    "function t2launch_applySavedAudioDevices() {\n"
+    " if (!$T2Launch::AudioDevicesNative) return;\n"
+    " if ($pref::T2Launch::AudioOutput !$= \"\")\n"
+    "  t2launch_setAudioDevice(\"sinks\", $pref::T2Launch::AudioOutput $= \"*\" ? \"\" : $pref::T2Launch::AudioOutput);\n"
+    " if ($pref::T2Launch::AudioInput !$= \"\")\n"
+    "  t2launch_setAudioDevice(\"sources\", $pref::T2Launch::AudioInput $= \"*\" ? \"\" : $pref::T2Launch::AudioInput);\n"
+    "}\n"
+    "t2launch_applySavedAudioDevices();\n"
+    "t2launch_audioDeviceMenuPoll();\n";
+
 /* Mirror the stock HUD's weapon inventory/selection events. Torque does not
    replicate Player dynamic inventory fields to client ghosts; the HUD messages
    are the client-visible record of weaponSlot changes. */
@@ -8507,6 +8600,9 @@ void SDL_GL_SwapBuffers(void) {
        instead of an unattributed "Syntax error in input." */
     if (!core_runtime_installed) {
         Con__evaluate(core_runtime_script, 0, "t2launch/core.cs", 0);
+        if (hook_option_bool("hook.console_commands"))
+            Con__evaluate("$T2Launch::AudioDevicesNative = 1;", 0, NULL, 0);
+        Con__evaluate(audio_device_menu_script, 0, "t2launch/audio_devices.cs", 0);
         core_runtime_installed = 1;
     }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot") &&
@@ -8623,6 +8719,11 @@ void SDL_GL_SwapBuffers(void) {
             }
             /* Same automation for a self-hosted game: the stock
                StartHostedGame() flow on a private port, then localConnect(). */
+            const char *debug_eval = getenv("T2LAUNCH_DEBUG_EVAL");  /* test harness only */
+            if (debug_eval && *debug_eval) {
+                Con__evaluate(debug_eval, 0, "t2launch/debug_eval.cs", 0);
+                fprintf(stderr, "[t2_hook] Evaluated T2LAUNCH_DEBUG_EVAL\n");
+            }
             const char *autohost_map = getenv("T2LAUNCH_AUTOHOST_MAP");
             const char *autohost_type = getenv("T2LAUNCH_AUTOHOST_TYPE");
             if (autohost_map && *autohost_map && autohost_type && *autohost_type &&
@@ -9946,6 +10047,73 @@ static const char* hook_tn_ip_trace_cb(void *obj, S32 argc, const char **argv) {
     return "ok";
 }
 
+/* Audio devices for the in-game pickers: "name<TAB>description" records from
+   pactl (monitors left out). The command runs with the game's 32-bit library
+   environment removed so the host's 64-bit pactl starts normally. */
+static const char *hook_audio_devices_cb(void *obj, S32 argc, const char **argv) {
+    static char result[8192];
+    (void)obj;
+    result[0] = 0;
+    if (argc < 2 || !argv[1] || (strcmp(argv[1], "sinks") != 0 && strcmp(argv[1], "sources") != 0))
+        return result;
+    char command[160];
+    snprintf(command, sizeof command,
+             "env -u LD_PRELOAD -u LD_LIBRARY_PATH -u LD_AUDIT LC_ALL=C pactl list %s 2>/dev/null", argv[1]);
+    FILE *pipe = popen(command, "r");
+    if (!pipe) return result;
+    char line[1024], name[256] = "";
+    size_t used = 0;
+    while (fgets(line, sizeof line, pipe)) {
+        char *text = line;
+        while (*text == ' ' || *text == '\t') text++;
+        text[strcspn(text, "\r\n")] = 0;
+        if (strncmp(text, "Name: ", 6) == 0) {
+            snprintf(name, sizeof name, "%s", text + 6);
+        } else if (strncmp(text, "Description: ", 13) == 0 && name[0]) {
+            size_t length = strlen(name);
+            int usable = length < 200 && (length < 8 || strcmp(name + length - 8, ".monitor") != 0);
+            for (size_t i = 0; usable && name[i]; i++)
+                if (!isalnum((unsigned char)name[i]) && !strchr("._-:+@", name[i])) usable = 0;
+            if (usable) {
+                int written = snprintf(result + used, sizeof result - used, "%s%s\t%s", used ? "\n" : "",
+                                       name, text + 13);
+                if (written > 0 && used + (size_t)written < sizeof result) used += (size_t)written;
+                else { result[used] = 0; break; }
+            }
+            name[0] = 0;
+        }
+    }
+    pclose(pipe);
+    for (char *c = result; *c; c++) if (*c == '"' || *c == '\\') *c = '\'';
+    return result;
+}
+
+static const char *hook_get_audio_device_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 2 || !argv[1]) return "";
+    const char *value = getenv(strcmp(argv[1], "sinks") == 0 ? "T2LAUNCH_AUDIO_OUTPUT" : "T2LAUNCH_AUDIO_INPUT");
+    return value ? value : "";
+}
+
+/* Switch the OSS shim's device while the game runs: set the environment value
+   its stream opener reads, then ask it to reopen its streams. */
+static const char *hook_set_audio_device_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    if (argc < 3 || !argv[1] || !argv[2]) return "invalid";
+    int output = strcmp(argv[1], "sinks") == 0;
+    if (!output && strcmp(argv[1], "sources") != 0) return "invalid";
+    size_t length = strlen(argv[2]);
+    if (length >= 200) return "invalid";
+    for (size_t i = 0; i < length; i++)
+        if (!isalnum((unsigned char)argv[2][i]) && !strchr("._-:+@", argv[2][i])) return "invalid";
+    setenv(output ? "T2LAUNCH_AUDIO_OUTPUT" : "T2LAUNCH_AUDIO_INPUT", argv[2], 1);
+    void (*reopen)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "t2_oss_reopen");
+    if (!reopen) return "no shim";
+    reopen();
+    fprintf(stderr, "[t2_hook] Audio %s device: %s\n", output ? "output" : "input", length ? argv[2] : "default");
+    return "ok";
+}
+
 static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     if (argc < 2 || !argv[1]) return "";
@@ -10569,6 +10737,14 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
+    if (!target->dedicated) {
+        Con__addMethodS(NULL, "t2launch_audioDevices", hook_audio_devices_cb,
+            "t2launch_audioDevices(sinks|sources) - name<TAB>description records", 2, 2);
+        Con__addMethodS(NULL, "t2launch_getAudioDevice", hook_get_audio_device_cb,
+            "t2launch_getAudioDevice(sinks|sources) - the selected device name", 2, 2);
+        Con__addMethodS(NULL, "t2launch_setAudioDevice", hook_set_audio_device_cb,
+            "t2launch_setAudioDevice(sinks|sources, name) - switch audio device", 3, 3);
+    }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot_command_labels")) {
         Con__addMethodS(NULL, "shazbot_command_label", shazbot_command_label_cb,
             "shazbot_command_label <id> <pressed> - record an opted-in command label", 3, 3);

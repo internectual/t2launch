@@ -284,7 +284,12 @@ preloaded in place of `padsp`, answers those calls itself and plays/records
 through libpulse-simple on its own threads, so the game thread never enters
 libpulse (padsp aborted inside libpulse when a session changed servers). It also
 lets a profile pick the output and microphone device and the microphone gain
-(Audio options), and only opens the microphone while the game is reading it.
+(Audio options), and only opens the microphone while the game is reading it. The
+in-game Settings dialog also gets an **Output** list on the Sound page (in the
+Bit Rate/Channels row, which the game disables on Linux) and a **Microphone
+Device** list on the Voice page. Picking one switches the running streams at
+once and is remembered in the game's prefs (`$pref::T2Launch::AudioOutput` /
+`AudioInput`, which override the launcher's choice).
 Voice on the wire is still the game's GSM codec. `T2LAUNCH_AUDIO_BACKEND=padsp`
 restores the old shim.
 
