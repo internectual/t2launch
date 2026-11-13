@@ -10,6 +10,7 @@
  *   T2LAUNCH_AUDIO_OUTPUT  PulseAudio sink name (default: the server default)
  *   T2LAUNCH_AUDIO_INPUT   PulseAudio source name (default: the server default)
  *   T2LAUNCH_MIC_GAIN      linear microphone gain, 0..8 (default 1.0)
+ *   T2LAUNCH_MIC_GATE     noise gate threshold, 0..50 percent of full scale (default 0 = off)
  *   T2LAUNCH_OSS_DEBUG     1 = trace calls on stderr
  */
 #define _GNU_SOURCE
@@ -132,6 +133,45 @@ static float mic_gain(void) {
     return gain < 0.0f ? 0.0f : gain > 8.0f ? 8.0f : (text ? gain : 1.0f);
 }
 
+static float mic_gate(void) {
+    const char *text = getenv("T2LAUNCH_MIC_GATE");
+    float percent = text ? (float)atof(text) : 0.0f;
+    return percent <= 0.0f ? 0.0f : (percent > 50.0f ? 50.0f : percent) / 100.0f;
+}
+
+/* Noise gate with a peak envelope follower, a hold time and smoothed gain
+ * changes so speech is not clipped and the gate does not click. */
+struct oss_gate {
+    float envelope, level;
+    int hold;
+};
+
+static void oss_gate_apply(struct oss_fd *entry, struct oss_gate *gate, unsigned char *data,
+                           size_t bytes, float threshold) {
+    if (threshold <= 0.0f) return;
+    int s16 = entry->format == AFMT_S16_LE;
+    size_t count = s16 ? bytes / 2 : bytes;
+    float rate = (float)(entry->speed > 0 ? entry->speed : 8000) * (float)(entry->channels > 0 ? entry->channels : 1);
+    int hold_samples = (int)(rate * 0.25f);           /* stay open 250 ms after speech */
+    float decay = 1.0f - 1.0f / (rate * 0.02f);       /* envelope falls over ~20 ms */
+    float up = 1.0f / (rate * 0.005f);                /* open in ~5 ms */
+    float down = 1.0f / (rate * 0.04f);               /* close in ~40 ms */
+    short *samples = (short *)data;
+    for (size_t i = 0; i < count; i++) {
+        float value = s16 ? samples[i] / 32768.0f : ((int)data[i] - 128) / 128.0f;
+        float magnitude = value < 0.0f ? -value : value;
+        gate->envelope = magnitude > gate->envelope ? magnitude : gate->envelope * decay;
+        if (gate->envelope >= threshold) gate->hold = hold_samples;
+        else if (gate->hold > 0) gate->hold--;
+        float target = gate->hold > 0 ? 1.0f : 0.0f;
+        if (gate->level < target) { gate->level += up; if (gate->level > target) gate->level = target; }
+        else if (gate->level > target) { gate->level -= down; if (gate->level < target) gate->level = target; }
+        value *= gate->level;
+        if (s16) samples[i] = (short)(value * 32767.0f);
+        else data[i] = (unsigned char)(value * 127.0f + 128.5f);
+    }
+}
+
 static struct oss_fd *oss_lookup(int fd) {
     if (fd < 0 || fd >= OSS_MAX_FDS) return NULL;
     pthread_mutex_lock(&oss_table_lock);
@@ -251,6 +291,8 @@ static void *oss_capture_thread(void *argument) {
     struct oss_fd *entry = argument;
     unsigned char chunk[512];
     float gain = mic_gain();
+    float gate_threshold = mic_gate();
+    struct oss_gate gate = {0};
     pthread_mutex_lock(&entry->lock);
     while (!entry->stop) {
         int active = now_ms() - entry->last_read_ms < OSS_CAPTURE_IDLE_MS;
@@ -295,6 +337,7 @@ static void *oss_capture_thread(void *argument) {
             continue;
         }
         oss_scale(entry, chunk, want, gain);
+        oss_gate_apply(entry, &gate, chunk, want, gate_threshold);
         for (size_t i = 0; i < want; i++) {
             if (entry->count == OSS_RING) { entry->head = (entry->head + 1) % OSS_RING; entry->count--; }
             entry->ring[(entry->head + entry->count++) % OSS_RING] = chunk[i];

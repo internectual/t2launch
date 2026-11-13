@@ -257,6 +257,7 @@ the bundled Loki-era libraries in `runtime/compat-libs/`.
 | `T2LAUNCH_AUDIO_BACKEND` | `builtin` (default, `t2_oss.so`) or `padsp` (the legacy libpulsedsp shim) |
 | `T2LAUNCH_AUDIO_OUTPUT` / `T2LAUNCH_AUDIO_INPUT` | PulseAudio/PipeWire sink / source name (`pactl list short sinks`); blank = default |
 | `T2LAUNCH_MIC_GAIN` | Linear microphone gain, 0 to 8 (default 1) |
+| `T2LAUNCH_MIC_GATE` | Microphone noise gate threshold, 0 to 50 percent of full scale (default 0 = off) |
 | `T2LAUNCH_OSS_DEBUG=1` | Trace the OSS shim's calls on stderr |
 | `T2LAUNCH_FULL_REDRAW=0` | Turn off the full-canvas redraw (see [Runtime compatibility](#runtime-compatibility)) |
 | `T2LAUNCH_OPENAL_VOLUME_FIX=0` | Turn off the volume-slider fix |

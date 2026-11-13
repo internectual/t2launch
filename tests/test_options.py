@@ -276,10 +276,12 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(t2options.BY_KEY["audio.output_device"].devices, "sinks")
         self.assertEqual(t2options.BY_KEY["audio.input_device"].devices, "sources")
         audio_env = t2options.launch_env({"audio.output_device": "alsa_output.test",
-                                          "audio.mic_gain": 2.0}, HOOKED)
+                                          "audio.mic_gain": 2.0,
+                                          "audio.mic_gate": 4.0}, HOOKED)
         self.assertEqual(audio_env["T2LAUNCH_AUDIO_BACKEND"], "builtin")
         self.assertEqual(audio_env["T2LAUNCH_AUDIO_OUTPUT"], "alsa_output.test")
         self.assertEqual(float(audio_env["T2LAUNCH_MIC_GAIN"]), 2.0)
+        self.assertEqual(float(audio_env["T2LAUNCH_MIC_GATE"]), 4.0)
         legacy_env = t2options.launch_env({"audio.backend": "padsp",
                                            "audio.output_device": "ignored"}, HOOKED)
         self.assertEqual(legacy_env["T2LAUNCH_AUDIO_BACKEND"], "padsp")
