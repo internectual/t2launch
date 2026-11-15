@@ -82,16 +82,17 @@ struct game_target {
     uintptr_t demo_tag_writer;       /* recorder's 32-bit .rec header tag */
     uintptr_t demo_tag_compare;      /* playback's strict .rec tag compare */
     uintptr_t demo_tag_helper;       /* getDemoVersion() result */
+    uintptr_t con_constructor_first; /* ConsoleConstructor::first, the head of the console function list */
 };
 
 static const struct game_target game_targets[] = {
     {"tribes2.dynamic", "client", 0, 0x080E85C0, 0x080E88F4, 0x08493DEC, 0x081CFA44,
      {0x084846B1, 0x084846CD, 0x084846E9}, 0x0849A860, 0x08495CEC, 0x08495CF0,
      {0x081F8EAE, 0x081FB382, 0x081FB683}, 0x08309168, 0x0823E9B3,
-     0x081F9AF8, 0x081F9EEC, 0x081FB978},
+     0x081F9AF8, 0x081F9EEC, 0x081FB978, 0x084921F4},
     {"tribes2d.dynamic", "dedicated server", 1, 0x080E74B0, 0x080E77E4, 0x0848902C, 0x081CD014,
      {0x08479751, 0x0847976D, 0x08479789}, 0x0848F520, 0x0848ADCC, 0x0848ADD0,
-     {0x081EDB4E, 0x081F0022, 0x081F0323}, 0x082FDE08, 0, 0, 0, 0},
+     {0x081EDB4E, 0x081F0022, 0x081F0323}, 0x082FDE08, 0, 0, 0, 0, 0x08487434},
 };
 #define GAME_TARGET_COUNT (sizeof(game_targets) / sizeof(game_targets[0]))
 static const struct game_target *target = &game_targets[0];
@@ -10198,6 +10199,130 @@ static const char *hook_set_audio_device_cb(void *obj, S32 argc, const char **ar
     return "ok";
 }
 
+/* ConsoleConstructor list dump (IFC22's dumpConsoleConstructor). Every console function the engine
+   registers is a static ConsoleConstructor chained from ConsoleConstructor::first (Windows 0x9E8734;
+   client 0x084921F4 and dedicated server 0x08487434, the `mov first,%ebx` at the top of
+   ConsoleConstructor::setup(), 0x080E6F20 / 0x080E5E10). Node layout, same as the Windows build:
+   sc, ic, fc, vc, bc callbacks (one is set), mina, maxa, usage, funcName, className, next. */
+struct con_constructor_node {
+    uintptr_t sc, ic, fc, vc, bc;   /* 0x00..0x10: string, int, float, void, bool callbacks */
+    int mina, maxa;                 /* 0x14, 0x18 */
+    uintptr_t usage, func_name, class_name;   /* 0x1c, 0x20, 0x24 */
+    uintptr_t next;                 /* 0x28 */
+};
+
+#define CON_CONSTRUCTOR_LIMIT 20000
+
+/* A C string at an address in this process, copied only as far as it is readable. */
+static void con_constructor_string(uintptr_t address, char *out, size_t size) {
+    static const size_t spans[] = {256, 128, 64, 16, 1};
+    out[0] = 0;
+    if (!address || size < 2) return;
+    int protection;
+    for (size_t i = 0; i < sizeof(spans) / sizeof(spans[0]); i++) {
+        if (!readable_range(address, spans[i], &protection)) continue;
+        size_t length = strnlen((const char *)address, spans[i]);
+        if (length > size - 1) length = size - 1;
+        for (size_t c = 0; c < length; c++) {
+            unsigned char ch = ((const unsigned char *)address)[c];
+            out[c] = (ch == '\n' || ch == '\r' || ch == '\t') ? ' ' : (char)ch;
+        }
+        out[length] = 0;
+        return;
+    }
+}
+
+/* Write one line per registered console function to `out` and return how many there were:
+   `\t0x<node> name: <class>::<func> - <sc|ic|fc|vc|bc>: 0x<callback> <min> <max>  usage: <text>`.
+   Stops at the end of the chain, an unreadable node, a loop or CON_CONSTRUCTOR_LIMIT. */
+static size_t dump_console_constructors(uintptr_t head, FILE *out) {
+    size_t count = 0, visited = 0;
+    uintptr_t node = head;
+    uintptr_t *seen = malloc(CON_CONSTRUCTOR_LIMIT * sizeof *seen);
+    int protection;
+    if (!seen) return 0;
+    while (node && visited < CON_CONSTRUCTOR_LIMIT &&
+           readable_range(node, sizeof(struct con_constructor_node), &protection)) {
+        int repeated = 0;
+        for (size_t i = 0; i < visited && !repeated; i++) repeated = seen[i] == node;
+        if (repeated) break;   /* a loop in the chain */
+        seen[visited++] = node;
+        const struct con_constructor_node *entry = (const struct con_constructor_node *)node;
+        const char *kind = "";
+        uintptr_t callback = 0;
+        if (entry->sc) { kind = "sc"; callback = entry->sc; }
+        else if (entry->ic) { kind = "ic"; callback = entry->ic; }
+        else if (entry->fc) { kind = "fc"; callback = entry->fc; }
+        else if (entry->vc) { kind = "vc"; callback = entry->vc; }
+        else if (entry->bc) { kind = "bc"; callback = entry->bc; }
+        if (callback) {
+            char class_name[96], func_name[96], usage[160];
+            con_constructor_string(entry->class_name, class_name, sizeof class_name);
+            con_constructor_string(entry->func_name, func_name, sizeof func_name);
+            con_constructor_string(entry->usage, usage, sizeof usage);
+            fprintf(out, "\t0x%08lX name: %s::%s - %s: 0x%08lX %i %i  usage: %s\n", (unsigned long)node,
+                    class_name, func_name, kind, (unsigned long)callback, entry->mina, entry->maxa, usage);
+            count++;
+        }
+        node = entry->next;
+    }
+    free(seen);
+    return count;
+}
+
+static const char *dump_console_constructor_cb(void *obj, S32 argc, const char **argv) {
+    static char result[1200];
+    (void)obj;
+    const char *base = getenv("T2LAUNCH_TRACE_DIR");
+    char directory[900], path[1000];
+    if (argc >= 2 && argv[1] && argv[1][0]) {
+        if (strpbrk(argv[1], "\"\n\r;") || strlen(argv[1]) >= sizeof path) {
+            snprintf(result, sizeof result, "refused: bad file name");
+            return result;
+        }
+        snprintf(path, sizeof path, "%s", argv[1]);
+    } else {
+        if (base && *base) {
+            snprintf(directory, sizeof directory, "%s", base);
+        } else {
+            const char *state = getenv("XDG_STATE_HOME");
+            const char *home = getenv("HOME");
+            if (state && *state) snprintf(directory, sizeof directory, "%s/t2launch/diagnostics", state);
+            else snprintf(directory, sizeof directory, "%s/.local/state/t2launch/diagnostics", home ? home : ".");
+            char parent[900];
+            snprintf(parent, sizeof parent, "%s", directory);
+            char *slash = strrchr(parent, '/');
+            if (slash) { *slash = 0; mkdir(parent, 0755); }   /* .../t2launch, then the diagnostics folder */
+            mkdir(directory, 0755);
+        }
+        snprintf(path, sizeof path, "%s/console-constructors-%s.txt", directory,
+                 target->dedicated ? "dedicated" : "client");
+    }
+    FILE *file = fopen(path, "w");
+    int wrote_file = file != NULL;
+    size_t count = 0;
+    uintptr_t head = 0;
+    int protection;
+    if (target->con_constructor_first && readable_range(target->con_constructor_first, sizeof(uintptr_t), &protection))
+        head = *(const uintptr_t *)target->con_constructor_first;
+    fprintf(stderr, "[t2_hook] ConsoleConstructor entries (list head 0x%08lX):\n", (unsigned long)head);
+    if (file) {
+        count = dump_console_constructors(head, file);
+        fclose(file);
+        file = fopen(path, "r");   /* the same lines into the game log */
+        if (file) {
+            char line[512];
+            while (fgets(line, sizeof line, file)) fputs(line, stderr);
+            fclose(file);
+        }
+    } else {
+        count = dump_console_constructors(head, stderr);
+    }
+    snprintf(result, sizeof result, "%zu entries -> %s", count, wrote_file ? path : "(game log only)");
+    fprintf(stderr, "[t2_hook] %s\n", result);
+    return result;
+}
+
 static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     if (argc < 2 || !argv[1]) return "";
@@ -10821,6 +10946,8 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
+    Con__addMethodS(NULL, "dumpConsoleConstructor", dump_console_constructor_cb,
+        "dumpConsoleConstructor([file]) - list every registered console function to the log and a file", 1, 2);
     if (!target->dedicated) {
         Con__addMethodS(NULL, "t2launch_audioDevices", hook_audio_devices_cb,
             "t2launch_audioDevices(sinks|sources) - name<TAB>description records", 2, 2);

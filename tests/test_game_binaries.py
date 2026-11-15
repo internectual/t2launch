@@ -127,6 +127,9 @@ class NativeReviewTests(unittest.TestCase):
     def test_demo_playback_fix_patches_one_branch(self):
         self.run_fixture("demo_playback_fix_test.c", "demo playback fix applies only to the expected je")
 
+    def test_console_constructor_dump_walk_and_head_pointers(self):
+        self.run_fixture("console_constructor_dump_test.c", "ConsoleConstructor dump order, callbacks, loop guards")
+
     def test_mem_patch_checksum_modes_and_page_restoration(self):
         self.run_fixture("mem_patch_test.c", "memPatch modes, startup compatibility, SHA-256 identity, legacy warning, and page restoration passed")
 
