@@ -99,8 +99,13 @@ const char *t2fx_technique_annotations(const t2fx_effect *effect, int technique)
 int t2fx_pass_count(const t2fx_effect *effect, int technique);
 int t2fx_pass_get(const t2fx_effect *effect, int technique, int pass, t2fx_pass *out);
 
-/* GLSL source (#version 430, OpenGL semantics) for one entry point, or NULL. */
+/* GLSL source (#version 430, OpenGL semantics, vertex Y flipped so textures keep the
+ * effect convention of row 0 = top) for one entry point, or NULL. */
 const char *t2fx_shader_source(t2fx_effect *effect, const char *entry_point);
+
+/* Decode a PNG/JPEG/BMP/TGA into RGBA8 (top row first). Free with t2fx_free_image. */
+unsigned char *t2fx_load_image(const char *path, int *width, int *height);
+void t2fx_free_image(unsigned char *pixels);
 
 #ifdef __cplusplus
 }

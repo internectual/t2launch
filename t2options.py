@@ -167,6 +167,16 @@ OPTIONS = (
                 "keeps the aspect ratio (bars where it differs), stretch fills the screen. The game "
                 "keeps rendering at its own resolution, so the HUD stays large, and windowed mode is "
                 "unchanged. Works on Wayland, where a real mode switch is impossible."),
+    Option("video.reshade", "Video", "ReShade effects", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
+    Option("video.reshade_preset", "Video", "ReShade preset", "text", "",
+           hook=True, requires=(("video.reshade", (True,)),),
+           help="Preset .ini: a path, or a file name inside <ReShade folder>/Presets."),
+    Option("video.reshade_shaders", "Video", "ReShade folder", "text", "",
+           hook=True, requires=(("video.reshade", (True,)),),
+           help="Folder with Shaders/ and Textures/ (the reshade-shaders layout). "
+                "Blank uses ~/.local/share/t2launch/reshade."),
     Option("video.sharpen", "Video", "Sharpening (0 = off)", "float", 0.0, minimum=0.0, maximum=1.0,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Contrast-adaptive sharpening in the post pass, 0 to 1. Useful with a scaled "
@@ -490,7 +500,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",

@@ -992,6 +992,26 @@ options bring the parts of it that fit the Linux client:
 - **Sharpening** (`video.sharpen`, 0 = off, up to 1). AMD-style
   contrast-adaptive sharpening added to the gamma shader pass; useful with a
   scaled fullscreen.
+- **ReShade effects** (`video.reshade`, off; `video.reshade_preset`,
+  `video.reshade_shaders`). Runs real ReShade `.fx` shaders and `.ini` presets on
+  the finished frame. ReShade itself is a Windows DLL and cannot be loaded into
+  this native OpenGL client, so the hook carries its own runtime: ReShade's open
+  source FX compiler (`third_party/reshadefx`, v6.8.0) builds into `t2_fx.so`,
+  which translates each effect to GLSL, and the hook draws the technique chain
+  through ping-pong buffers (multi-pass effects, render targets, mipmaps,
+  blending, image textures such as LUTs, and the usual built-in uniforms:
+  `frametime`, `framecount`, `timer`, `pingpong`, `random`, `date`). Point
+  `video.reshade_shaders` at a folder laid out like the reshade-shaders
+  repository (`Shaders/`, `Textures/`; default
+  `~/.local/share/t2launch/reshade`) that includes `ReShade.fxh`, and
+  `video.reshade_preset` at a preset (a path, or a file name inside `Presets/`).
+  Presets use ReShade's format (`Techniques`, `TechniqueSorting`,
+  `PreprocessorDefinitions`, and one `[effect.fx]` section of uniform values);
+  editing the preset file reloads it in the running game. Not supported: Windows
+  `.addon` DLLs, sRGB texture sampling and compute shaders; depth-buffer effects
+  see a constant far plane until depth capture is added. Needs `g++` with
+  32-bit support at build time (`runtime/build` prints a note when it is
+  missing). Shaders are not bundled.
 - **Anti-aliasing** (`video.msaa`, 0/2/4/8). The game draws into a
   multisampled framebuffer that is resolved each frame (window-system MSAA
   would break the copy-based gamma pass and the game's `glReadPixels`

@@ -179,6 +179,9 @@ static struct hook_option hook_options[] = {
     {"video.gamma", "1", NULL, 0, "", 0},
     {"video.render_scale", "off", NULL, 0, "", 0},
     {"video.sharpen", "0.0", NULL, 0, "", 0},
+    {"video.reshade", "0", "T2LAUNCH_RESHADE", 0, "", 0},
+    {"video.reshade_preset", "", "T2LAUNCH_RESHADE_PRESET", 0, "", 0},
+    {"video.reshade_shaders", "", "T2LAUNCH_RESHADE_SHADERS", 0, "", 0},
     {"video.msaa", "0", NULL, 0, "", 0},
     {"video.disable_locked_arrays", "0", NULL, 0, "", 0},
     {"net.depot_downloads", "0", NULL, 0, "", 0},
@@ -5937,6 +5940,8 @@ static int resolve_gl_gamma(void) {
     return 1;
 }
 
+#include "t2_reshade.h"
+
 /* video.sharpen: 0 (off) to 1 (strongest). */
 static float post_sharpness(void) {
     static float sharpness = -1.0f;
@@ -5955,7 +5960,7 @@ static float post_sharpness(void) {
 static float post_exponent(void) {
     float gamma = gamma_requested;
     int flat = gamma > 0.999f && gamma < 1.001f;
-    if (flat && post_sharpness() <= 0.0f) return 0.0f;
+    if (flat && post_sharpness() <= 0.0f && !reshade_wanted()) return 0.0f;
     return flat ? 1.0f : 1.0f / gamma;
 }
 
@@ -6023,7 +6028,9 @@ static void apply_gamma_pass(void) {
     }
     gl_gamma.ReadBuffer(GL_BACK_);
     gl_gamma.CopyTexSubImage2D(GL_TEXTURE_2D_, 0, 0, 0, 0, 0, gamma_width, gamma_height);
-    post_quad(gl_gamma.texture, gamma_width, gamma_height, exponent, post_sharpness());
+    unsigned effects = reshade_wanted() ? reshade_run(gl_gamma.texture, gamma_width, gamma_height) : 0;
+    if (effects) gl_gamma.Viewport(0, 0, gamma_width, gamma_height);
+    post_quad(effects ? effects : gl_gamma.texture, gamma_width, gamma_height, exponent, post_sharpness());
     post_end();
 }
 
@@ -6300,8 +6307,9 @@ static void rt_present(void) {
     }
     if (exponent > 0.0f && gl_gamma.state > 0) {
         post_begin();
+        unsigned effects = reshade_wanted() ? reshade_run(rt.color_texture, rt.game_w, rt.game_h) : 0;
         gl_gamma.Viewport(rt.rect.x, rt.rect.y, rt.rect.w, rt.rect.h);
-        post_quad(rt.color_texture, rt.game_w, rt.game_h, exponent, post_sharpness());
+        post_quad(effects ? effects : rt.color_texture, rt.game_w, rt.game_h, exponent, post_sharpness());
         post_end();
     } else {
         gl_rt.BindFramebuffer(GL_READ_FRAMEBUFFER_, rt.fbo);
@@ -8958,6 +8966,7 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         gl_gamma.texture_width = gl_gamma.texture_height = 0;
         if (gl_gamma.state > 0) gl_gamma.state = 0;
         if (gl_rt.state > 0) gl_rt.state = 0;
+        reshade_context_lost();
         if ((flags & SDL_OPENGL_FLAG) && render_target_wanted())
             rt_setup(width, height, real_w, real_h, scale, msaa_samples());
     }

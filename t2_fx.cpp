@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 #include <vector>
+#define STB_IMAGE_IMPLEMENTATION
+#include "third_party/stb/stb_image.h"
 
 struct t2fx_effect {
     std::unique_ptr<reshadefx::codegen> backend;
@@ -106,7 +108,7 @@ t2fx_effect *t2fx_compile(const char *path, const char *const *include_dirs, int
         "#define tex2Dgather3 tex2DgatherA\n");
     if (!pp.append_file(path)) { copy_error(error, error_size, pp.errors()); return nullptr; }
 
-    effect->backend.reset(reshadefx::create_codegen_glsl(false, false, false));
+    effect->backend.reset(reshadefx::create_codegen_glsl(false, false, false, false, true));
     reshadefx::parser parser;
     if (!parser.parse(pp.output(), effect->backend.get())) {
         copy_error(error, error_size, pp.errors() + parser.errors());
@@ -260,5 +262,12 @@ const char *t2fx_shader_source(t2fx_effect *effect, const char *entry_point) {
     }
     return effect->shaders.emplace(entry_point, std::move(code)).first->second.c_str();
 }
+
+unsigned char *t2fx_load_image(const char *path, int *width, int *height) {
+    int channels = 0;
+    return path && width && height ? stbi_load(path, width, height, &channels, 4) : nullptr;
+}
+
+void t2fx_free_image(unsigned char *pixels) { stbi_image_free(pixels); }
 
 }  // extern "C"
