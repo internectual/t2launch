@@ -37,5 +37,18 @@ else
     rm -f "$OUT_DIR/t2_oss.so"
     echo "NOTE: t2_oss.so not built (needs the PulseAudio headers); the game will use padsp for sound." >&2
 fi
+# The ReShade FX compiler (C++) is optional: without g++ -m32 the hook just has no
+# shader-effect support. It links its C++ runtime statically so the game process
+# does not depend on the host's 32-bit libstdc++.
+FX_DIR="$REPO_DIR/third_party/reshadefx"
+if [[ -f "$REPO_DIR/t2_fx.cpp" ]] && g++ -m32 -std=c++20 -O2 -fPIC -shared -I"$REPO_DIR" -I"$FX_DIR" \
+        -o "$STAGE/t2_fx.so" "$REPO_DIR/t2_fx.cpp" "$FX_DIR"/effect_*.cpp \
+        -static-libstdc++ -static-libgcc 2>/dev/null; then
+    mv -f "$STAGE/t2_fx.so" "$OUT_DIR/"
+else
+    rm -f "$OUT_DIR/t2_fx.so"
+    echo "NOTE: t2_fx.so not built (needs g++ with 32-bit support); ReShade FX shaders are unavailable." >&2
+    echo "  Arch/CachyOS: sudo pacman -S --needed gcc lib32-gcc-libs   Debian/Ubuntu: sudo apt install g++-multilib" >&2
+fi
 mv -f "$STAGE/t2_realign.so" "$STAGE/t2_hook.so" "$STAGE/rsa_helper" "$OUT_DIR/"
 echo "Built Tribes 2 support binaries in $OUT_DIR"

@@ -151,6 +151,36 @@ class NativeReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("OK", result.stdout)
 
+    def test_reshade_fx_compiler_reflects_and_generates_glsl(self):
+        repo = Path(__file__).resolve().parent.parent
+        gxx = shutil.which("g++")
+        if not gxx:
+            self.skipTest("g++ is required for the ReShade FX compiler")
+        library = self.directory / "t2_fx.so"
+        vendor = repo / "third_party" / "reshadefx"
+        sources = [str(repo / "t2_fx.cpp")] + sorted(str(path) for path in vendor.glob("effect_*.cpp"))
+        build = subprocess.run([gxx, "-m32", "-std=c++20", "-O1", "-fPIC", "-shared", "-I" + str(repo),
+                                "-I" + str(vendor), "-o", str(library), *sources,
+                                "-static-libstdc++", "-static-libgcc"],
+                               env=self.environment, text=True, capture_output=True, timeout=300)
+        if build.returncode:
+            self.skipTest("32-bit C++ toolchain required: " + build.stderr[-200:])
+        fixture = Path(__file__).resolve().with_name("fx_compile_test.c")
+        output = self.directory / "fx_compile_test"
+        build = subprocess.run([self.compiler, "-m32", "-O2", "-std=gnu99", str(fixture), "-o", str(output), "-ldl"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        scratch = self.directory / "fx"
+        scratch.mkdir()
+        result = subprocess.run([str(output), str(library), str(scratch), str(scratch / "out")],
+                                env=self.environment, text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        validator = shutil.which("glslangValidator")
+        if validator:
+            for stage, name in (("vert", "out.vert"), ("frag", "out.frag")):
+                check = subprocess.run([validator, "-S", stage, str(scratch / name)], text=True, capture_output=True)
+                self.assertEqual(check.returncode, 0, check.stdout)
+
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
 
