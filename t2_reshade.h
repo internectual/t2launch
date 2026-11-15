@@ -1357,6 +1357,12 @@ static const char *rs_uniforms_cb(void *obj, S32_ argc, const char **argv) {
         double minimum = kind == 'f' ? 0.0 : 0.0, maximum = kind == 'f' ? 1.0 : 10.0;
         if (rs_annotation(uniform->info.annotations, "ui_min", text, sizeof text)) minimum = atof(text);
         if (rs_annotation(uniform->info.annotations, "ui_max", text, sizeof text)) maximum = atof(text);
+        char items[512];
+        if (kind == 'i' && rs_annotation(uniform->info.annotations, "ui_items", items, sizeof items)) {
+            int count = 1;   /* ui_items: "A|B|C|" (the compiler turns the NULs into bars): a choice */
+            for (const char *p = items; *p; p++) if (*p == '|' && p[1]) count++;
+            minimum = 0.0; maximum = count > 1 ? count - 1 : 1;
+        }
         if (maximum <= minimum) maximum = minimum + 1.0;
         for (int c = 0; c < uniform->info.rows; c++) {
             unsigned offset = uniform->info.offset + (unsigned)c * 4;

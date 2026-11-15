@@ -96,6 +96,7 @@ int main(int argc, char **argv) {
         "uniform float Strength = 0.5;\n"
         "uniform float3 Tint = float3(1.0, 1.0, 1.0);\n"
         "uniform bool Invert = false;\n"
+        "uniform int Mode < ui_type = \"combo\"; ui_items = \"One\\0Two\\0Three\\0\"; > = 1;\n"
         "uniform int Defines = GLOBAL_DEF * 10 + EXTRA;\n"
         "uniform int Reversed = RESHADE_DEPTH_INPUT_IS_REVERSED;\n"
         "uniform float Far = RESHADE_DEPTH_LINEARIZATION_FAR_PLANE;\n"
@@ -147,6 +148,7 @@ int main(int argc, char **argv) {
         CHECK(strstr(listing, "Strength\tf\t0\t1\t1.25") != NULL);      /* label, kind, default range, value */
         CHECK(strstr(listing, "Tint x\tf") != NULL && strstr(listing, "Tint z\tf") != NULL);
         CHECK(strstr(listing, "Invert\tb") != NULL);
+        CHECK(strstr(listing, "Mode\ti\t0\t2\t1") != NULL);               /* a three-item combo is a 0..2 integer */
         CHECK(strstr(listing, "Far") != NULL);                              /* editable although no ui_ annotations */
         const char *set[5] = {"cmd", "0", "0", "0", "0.75"};   /* Strength is the first uniform */
         CHECK(!strcmp(rs_set_cb(NULL, 5, set), "1"));

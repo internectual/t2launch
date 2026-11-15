@@ -46,6 +46,7 @@ std::string format_annotations(const std::vector<reshadefx::annotation> &list) {
             value = v.string_data;
         }
         for (char &c : value) if (c == '\n') c = ' ';
+        for (char &c : value) if (c == '\0') c = '|';  // ui_items is NUL-separated; keep every item
         out += item.name + "=" + value + "\n";
     }
     if (!out.empty()) out.pop_back();
