@@ -66,6 +66,8 @@ struct oss_fd {
     int thread_running, stop, flush_pending;
     int out;                   /* 1 playback, 0 capture */
     uint64_t last_read_ms;
+    uint64_t next_open_ms;     /* after a failed open, do not try again before this */
+    int open_failed;           /* the last open failed (logged once per outage) */
 };
 
 static struct oss_fd *oss_table[OSS_MAX_FDS];
@@ -196,7 +198,27 @@ static void oss_scale(struct oss_fd *entry, unsigned char *data, size_t bytes, f
     }
 }
 
+#define OSS_REOPEN_DELAY_MS 1000   /* between attempts while the sound server is gone */
+
+static pa_simple *oss_open_stream_once(struct oss_fd *entry, int out);
+
+/* Open a stream, retrying at most once a second after a failure (a stopped or restarting sound
+   server) and saying so once per outage instead of on every attempt. */
 static pa_simple *oss_open_stream(struct oss_fd *entry, int out) {
+    if (now_ms() < entry->next_open_ms) return NULL;
+    pa_simple *stream = oss_open_stream_once(entry, out);
+    if (!stream) {
+        entry->next_open_ms = now_ms() + OSS_REOPEN_DELAY_MS;
+        entry->open_failed = 1;
+    } else {
+        if (entry->open_failed) fprintf(stderr, "[t2_oss] %s is back\n", out ? "audio output" : "microphone");
+        entry->open_failed = 0;
+        entry->next_open_ms = 0;
+    }
+    return stream;
+}
+
+static pa_simple *oss_open_stream_once(struct oss_fd *entry, int out) {
     pa_sample_spec spec = {
         .format = entry->format == AFMT_U8 ? PA_SAMPLE_U8 : PA_SAMPLE_S16LE,
         .rate = (uint32_t)entry->speed,
@@ -221,7 +243,8 @@ static pa_simple *oss_open_stream(struct oss_fd *entry, int out) {
         stream = pulse.new_stream(NULL, "Tribes 2", out ? PA_STREAM_PLAYBACK : PA_STREAM_RECORD, NULL,
                                   out ? "game audio" : "voice", &spec, NULL, &attr, &error);
     }
-    if (!stream) fprintf(stderr, "[t2_oss] cannot open %s: %s\n", out ? "output" : "input", pulse_error(error));
+    if (!stream && !entry->open_failed)
+        fprintf(stderr, "[t2_oss] cannot open %s: %s (retrying every second)\n", out ? "output" : "input", pulse_error(error));
     else TRACE("%s stream %uHz %uch fmt=%d device=%s", out ? "playback" : "capture", spec.rate,
                spec.channels, entry->format, device ? device : "default");
     return stream;
@@ -493,6 +516,7 @@ ssize_t read(int fd, void *data, size_t bytes) {
 static void oss_mark_dirty(struct oss_fd *entry) {
     pthread_mutex_lock(&entry->lock);
     entry->dirty = 1;
+    entry->next_open_ms = 0;  /* a changed format or device is worth an immediate try */
     pthread_cond_broadcast(&entry->cond);
     pthread_mutex_unlock(&entry->lock);
 }
@@ -683,6 +707,7 @@ void t2_oss_reopen(void) {
         if (!entry || entry->kind != OSS_DSP) continue;
         pthread_mutex_lock(&entry->lock);
         entry->dirty = 1;
+        entry->next_open_ms = 0;
         pthread_cond_broadcast(&entry->cond);
         pthread_mutex_unlock(&entry->lock);
     }

@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -207,6 +208,48 @@ class NativeReviewTests(unittest.TestCase):
             for stage, name in (("vert", "out.vert"), ("frag", "out.frag")):
                 check = subprocess.run([validator, "-S", stage, str(scratch / name)], text=True, capture_output=True)
                 self.assertEqual(check.returncode, 0, check.stdout)
+
+    def test_oss_shim_survives_sound_server_restart(self):
+        """The server going away must not block the game, and the shim must reconnect by itself."""
+        repo = Path(__file__).resolve().parent.parent
+        shim = self.directory / "t2_oss.so"
+        build = subprocess.run([self.compiler, "-m32", "-O2", "-std=gnu99", "-mstackrealign", "-shared",
+                                "-fPIC", str(repo / "t2_oss.c"), "-o", str(shim), "-pthread", "-ldl"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        if build.returncode:
+            self.skipTest("32-bit PulseAudio headers required: " + build.stderr[-200:])
+        fake = self.directory / "fake"
+        fake.mkdir()
+        tests = Path(__file__).resolve().parent
+        for source, target in (("fake_pulse.c", "libpulse-simple.so.0"),):
+            build = subprocess.run([self.compiler, "-m32", "-O1", "-fPIC", "-shared", str(tests / source),
+                                    "-o", str(fake / target)], env=self.environment, text=True,
+                                   capture_output=True, timeout=60)
+            self.assertEqual(build.returncode, 0, build.stderr)
+        program = self.directory / "oss_reconnect_test"
+        build = subprocess.run([self.compiler, "-m32", "-O1", str(tests / "oss_reconnect_test.c"), "-o",
+                                str(program), "-lm"], env=self.environment, text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        down, log = fake / "down", fake / "log"
+        environment = dict(self.environment, LD_PRELOAD=str(shim), LD_LIBRARY_PATH=str(fake),
+                           FAKE_PULSE_LOG=str(log), FAKE_PULSE_DOWN=str(down))
+        process = subprocess.Popen([str(program), "11"], env=environment, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(3)
+        down.write_text("")
+        time.sleep(4)
+        down.unlink()
+        output, errors = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 0, errors)
+        worst = float(output.split("worst_write=")[1].split("s")[0])
+        self.assertLess(worst, 0.5, "a write blocked while the sound server was away")
+        events = log.read_text().split()
+        self.assertEqual(events.count("open-ok"), 2)                 # the first stream and the reconnect
+        self.assertTrue(2 <= events.count("open-fail") <= 8, events.count("open-fail"))  # about one a second
+        self.assertEqual(errors.count("cannot open output"), 1)      # logged once per outage
+        self.assertIn("audio output is back", errors)
+        played = [int(events[i + 1]) for i, word in enumerate(events) if word == "played"]
+        self.assertGreater(sum(played[-3:]), 100000)                 # audio flowing again at the end
 
     def test_autobeacon_assignment_and_restoration(self):
         self.run_fixture("autobeacon_test.c", "draw-time restoration and gates passed")
