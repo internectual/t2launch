@@ -729,6 +729,18 @@ options bring the parts of it that fit the Linux client:
   while PlayGui/NavHud is active. Credits: PenguinOfDoom, Andrew (HUDbot 0.2b),
   and NoFix. See
   `scripts/HudDemo/README.md` for install and rebuild instructions.
+- **Switch players in demos** (`review.demo_camera`, off). Build 25034 hides every
+  script object whose flag bit `0x40` is set from the script engine: the object
+  dump loop skips it (`0x080FA598`), `SimSet.getObject()` returns -1 for it
+  (`0x080FCD8A`) and a method call on it is refused as "Unable to find object"
+  (`0x080F0E1E`). The hook removes those three checks, the native equivalent of the
+  three `memPatch()` lines in Lou Cypher's DemoCam script (Windows `437462`,
+  `4376BC`, `42E93B`). Use it with the DemoCam pack (`scripts/DemoCam/DemoCam.vl2`,
+  the original script without its memPatch calls): Down locks on or off, Left and
+  Right pick the player you watch. The patch is applied when the client starts and
+  is not limited to demos, so scripts can see those objects in live games too while
+  it is on. Verified on a 28-player demo: with the option, the control object moves
+  to players it cannot reach without it. See `scripts/DemoCam/README.md`.
 - **Observer IFF** (`ui.observer_iff`, off). The IFF render draws no markers
   while the control object is an observer camera; the hook skips that check
   (`0x081936BF`), as the Windows `l33thax` patch did.

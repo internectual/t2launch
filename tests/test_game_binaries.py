@@ -121,6 +121,9 @@ class NativeReviewTests(unittest.TestCase):
     def test_review_patch_combinations_and_restoration(self):
         self.run_fixture("review_patch_test.c", "32 independent feature combinations")
 
+    def test_demo_camera_patches_all_or_nothing(self):
+        self.run_fixture("demo_camera_patch_test.c", "demo camera patches applied together or not at all")
+
     def test_mem_patch_checksum_modes_and_page_restoration(self):
         self.run_fixture("mem_patch_test.c", "memPatch modes, startup compatibility, SHA-256 identity, legacy warning, and page restoration passed")
 

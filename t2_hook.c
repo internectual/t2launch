@@ -195,6 +195,7 @@ static struct hook_option hook_options[] = {
     {"ui.lan_join_anywhere", "0", NULL, 0, "", 0},
     {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.visible_distance", "0", NULL, 0, "", 0},
+    {"review.demo_camera", "0", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"render.datablock_rules", "", NULL, 0, "", 0},
     {"render.object_rules", "", NULL, 0, "", 0},
@@ -5177,6 +5178,39 @@ static int install_visible_distance(void) {
                                      sizeof(visdist_clamp_original), 0, nops, sizeof(nops)};
     if (!apply_code_patches("Visible distance", &patch, 1)) return 0;
     fprintf(stderr, "[t2_hook] visibleDistanceMod is no longer capped at 1.0 (memory only)\n");
+    return 1;
+}
+
+/* Demo camera. Build 25034 hides every SimObject whose flags (+0x18) have bit 0x40 from the script
+   engine in three places, and the TribesNext-era DemoCam script removed those checks with memPatch on
+   the Windows exe (437462, 4376BC, 42E93B) so a script could take control of another player in a
+   demo. These are the Linux equivalents:
+   - the object dump loop skips flagged objects: jne -> NOPs (0x080FA598);
+   - SimSet.getObject(i) returns -1 for a flagged object: je -> jmp, so it returns the id (0x080FCD8A);
+   - a method call on a flagged object is refused as "Unable to find object": je -> jmp, so the
+     object is accepted (0x080F0E1E).
+   The other flagged-object checks are left alone, as in the original script. Client only. */
+#define DEMO_CAMERA_DUMP_ADDRESS 0x080FA598
+#define DEMO_CAMERA_GETOBJECT_ADDRESS 0x080FCD8A
+#define DEMO_CAMERA_CALL_ADDRESS 0x080F0E1E
+static const unsigned char demo_camera_dump_original[] = {0x0f, 0x85, 0xa5, 0x00, 0x00, 0x00};
+static const unsigned char demo_camera_getobject_original[] = {0x74, 0x07};
+static const unsigned char demo_camera_call_original[] = {0x74, 0x45};
+
+static int install_demo_camera(void) {
+    static const unsigned char dump_nops[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    static const unsigned char getobject_jump[] = {0xeb, 0x07};
+    static const unsigned char call_jump[] = {0xeb, 0x45};
+    const struct code_patch patches[] = {
+        {DEMO_CAMERA_DUMP_ADDRESS, demo_camera_dump_original, sizeof(demo_camera_dump_original), 0,
+         dump_nops, sizeof(dump_nops)},
+        {DEMO_CAMERA_GETOBJECT_ADDRESS, demo_camera_getobject_original,
+         sizeof(demo_camera_getobject_original), 0, getobject_jump, sizeof(getobject_jump)},
+        {DEMO_CAMERA_CALL_ADDRESS, demo_camera_call_original, sizeof(demo_camera_call_original), 0,
+         call_jump, sizeof(call_jump)},
+    };
+    if (!apply_code_patches("Demo camera", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
+    fprintf(stderr, "[t2_hook] Scripts can see and control every object, including a demo's players (memory only)\n");
     return 1;
 }
 
@@ -10945,6 +10979,7 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("ui.observer_iff")) install_observer_iff();
     if (hook_option_bool("ui.lan_join_anywhere")) install_lan_join_anywhere();
     if (hook_option_bool("ui.visible_distance")) install_visible_distance();
+    if (hook_option_bool("review.demo_camera")) install_demo_camera();
     if (hook_option_bool("ui.no_whiteout")) install_no_whiteout();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();

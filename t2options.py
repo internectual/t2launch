@@ -256,6 +256,12 @@ OPTIONS = (
                 "overrides pref::skyRotationSpeed."),
     # Demo review (anti-cheat forensics): reconstruct what a suspect saw. Use a
     # review launch to watch demos, not to play live.
+    Option("review.demo_camera", "Demo review", "Switch players in demos", "bool", False,
+           hook=True, requires=(("launcher.load_hook", (True,)),),
+           help="Lets scripts see and take control of the players in a demo, which build 25034 hides "
+                "from the script engine, so the DemoCam script (scripts/DemoCam) can switch the "
+                "player you watch (Down locks, Left/Right pick). While on, scripts can see these "
+                "objects in every game, not only demos."),
     Option("review.cheat_view", "Demo review", "Demo-review reconstruction", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="A launch for reviewing a suspected cheater's demo: show what their hacked client "
@@ -506,7 +512,7 @@ CLIENT_ONLY = frozenset((
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",
     "audio.launch_reset", "debug.trace_openal", "ui.hud_get_value", "ui.vertical_fill", "ui.bar_flip",
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
-    "ui.visible_distance", "ui.no_whiteout", "review.cheat_view", "review.autobeacon", "review.replace_models",
+    "ui.visible_distance", "ui.no_whiteout", "review.demo_camera", "review.cheat_view", "review.autobeacon", "review.replace_models",
     "review.extended_range", "review.global_beacons", "review.shortcuts",
       "review.ffi", "review.no_cloak", "demo.protocol_tag",
        "telemetry.shazbot", "telemetry.shazbot_socket", "telemetry.shazbot_packet_capture",
