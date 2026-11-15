@@ -1008,7 +1008,7 @@ options bring the parts of it that fit the Linux client:
   Presets use ReShade's format (`Techniques`, `TechniqueSorting`,
   `PreprocessorDefinitions`, and one `[effect.fx]` section of uniform values);
   editing the preset file reloads it in the running game. Not supported: Windows
-  `.addon` DLLs, sRGB texture sampling and compute shaders. Depth-buffer effects
+  `.addon` DLLs and compute shaders. Depth-buffer effects
   (DoF, fog, SSAO) get the scene's depth: the hook copies it just before the
   game clears the depth buffer for the HUD, flips it to ReShade's top-row-first
   convention (also with `video.msaa` and `video.render_scale`), and defines

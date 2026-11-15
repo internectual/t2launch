@@ -118,6 +118,9 @@ static struct {
     void (*CopyTexSubImage2D)(unsigned, int, int, int, int, int, int, int);
     int (*GetUniformLocation)(unsigned, const char *);
     void (*Uniform1i)(int, int);
+    void (*TexStorage2D)(unsigned, int, unsigned, int, int);
+    void (*TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
+    void (*TextureView)(unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned);
 } rs_gl;
 
 static int rs_resolve_gl(void) {
@@ -158,7 +161,8 @@ static int rs_resolve_gl(void) {
     RS_FN(BlendFuncSeparate, "glBlendFuncSeparate"); RS_FN(BlendEquationSeparate, "glBlendEquationSeparate");
     RS_FN(ColorMask, "glColorMask"); RS_FN(PixelStorei, "glPixelStorei");
     RS_FN(CopyTexSubImage2D, "glCopyTexSubImage2D"); RS_FN(GetUniformLocation, "glGetUniformLocation");
-    RS_FN(Uniform1i, "glUniform1i");
+    RS_FN(Uniform1i, "glUniform1i"); RS_FN(TexStorage2D, "glTexStorage2D");
+    RS_FN(TexSubImage2D, "glTexSubImage2D"); RS_FN(TextureView, "glTextureView");
 #undef RS_FN
     rs_gl.state = 1;
     return 1;
@@ -278,6 +282,8 @@ static struct {
     unsigned buffer[2], output, fbo, read_fbo, dummy_depth, white;
     unsigned depth_copy, depth_flipped, depth_program;   /* hardware depth, then top-row-first R32F */
     int need_depth, depth_taken, paused, reload_now;
+    struct { unsigned id, view; int levels; } srgb[512];   /* RGBA8 textures that can be viewed as sRGB */
+    int srgb_count;
     double frustum_near, frustum_far;       /* committed from the last frame's glFrustum calls */
     double frame_near, frame_far;           /* being collected this frame */
     double depth_ratio_used;                /* far / near the effects were compiled for */
@@ -397,21 +403,49 @@ static int rs_internal_format(int format, unsigned *base, unsigned *type) {
     }
 }
 
+static void rs_srgb_clear(void) {
+    for (int i = 0; i < rs.srgb_count; i++)
+        if (rs.srgb[i].view) rs_gl.DeleteTextures(1, &rs.srgb[i].view);
+    rs.srgb_count = 0;
+}
+
+/* The sRGB view of an RGBA8 texture made by rs_make_texture (created on first use); other textures
+   are returned unchanged, so they are read or written as plain values. */
+static unsigned rs_srgb_view(unsigned texture) {
+    for (int i = 0; i < rs.srgb_count; i++) {
+        if (rs.srgb[i].id != texture) continue;
+        if (!rs.srgb[i].view) {
+            rs_gl.GenTextures(1, &rs.srgb[i].view);
+            rs_gl.TextureView(rs.srgb[i].view, RS_TEXTURE_2D, texture, 0x8C43, 0, (unsigned)rs.srgb[i].levels, 0, 1);
+        }
+        return rs.srgb[i].view;
+    }
+    return texture;
+}
+
 static unsigned rs_make_texture(int width, int height, int levels, int format, const void *pixels, int is_image) {
     unsigned id = 0, base, type;
     int internal = is_image ? RS_RGBA8 : rs_internal_format(format, &base, &type);
     if (is_image) { base = RS_RGBA; type = RS_UNSIGNED_BYTE; }
+    int possible = 1;
+    for (int size = width > height ? width : height; size > 1; size /= 2) possible++;
+    if (levels < 1) levels = 1;
+    if (levels > possible) levels = possible;
     rs_gl.GenTextures(1, &id);
     rs_gl.BindTexture(RS_TEXTURE_2D, id);
-    for (int level = 0, w = width, h = height; level < (levels > 0 ? levels : 1); level++) {
-        rs_gl.TexImage2D(RS_TEXTURE_2D, level, internal, w, h, 0, base, type, level == 0 ? pixels : NULL);
-        w = w > 1 ? w / 2 : 1; h = h > 1 ? h / 2 : 1;
-    }
+    rs_gl.TexStorage2D(RS_TEXTURE_2D, levels, (unsigned)internal, width, height);  /* immutable: views need it */
+    if (pixels) rs_gl.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, width, height, base, type, pixels);
     rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MIN_FILTER, levels > 1 ? RS_LINEAR_MIPMAP_LINEAR : RS_LINEAR);
     rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MAG_FILTER, RS_LINEAR);
     rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_S, RS_CLAMP_TO_EDGE);
     rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_T, RS_CLAMP_TO_EDGE);
     if (pixels && levels > 1) rs_gl.GenerateMipmap(RS_TEXTURE_2D);
+    if (internal == RS_RGBA8 && rs.srgb_count < 512) {
+        rs.srgb[rs.srgb_count].id = id;
+        rs.srgb[rs.srgb_count].view = 0;
+        rs.srgb[rs.srgb_count].levels = levels;
+        rs.srgb_count++;
+    }
     return id;
 }
 
@@ -648,8 +682,6 @@ static int rs_load_effect(struct rs_effect *effect, const char *file, const char
         rs_gl.SamplerParameterf(id, RS_TEXTURE_LOD_BIAS, info->lod_bias);
         if (info->min_lod > -1000.0f) rs_gl.SamplerParameterf(id, RS_TEXTURE_MIN_LOD, info->min_lod);
         if (info->max_lod < 1000.0f) rs_gl.SamplerParameterf(id, RS_TEXTURE_MAX_LOD, info->max_lod);
-        if (info->srgb) fprintf(stderr, "[t2_hook] ReShade: %s: sRGB sampling of %s is not supported; reading linear\n",
-                                file, info->name);
     }
     effect->uniform_count = rs.uniform_count(effect->fx);
     effect->uniforms = calloc((size_t)(effect->uniform_count + 1), sizeof(struct rs_uniform_value));
@@ -707,6 +739,7 @@ static struct rs_effect *rs_effect_for(const char *file, const char *path) {
 }
 
 static void rs_unload(void) {
+    if (rs_gl.state > 0 && rs.initialised) rs_srgb_clear();
     if (rs_gl.state > 0 && rs.initialised)
         for (int i = 0; i < rs.effect_count; i++) rs_free_effect(&rs.effects[i]);
     rs.effect_count = rs.chain_count = 0;
@@ -872,24 +905,18 @@ static int rs_setup(int width, int height) {
         return 0;
     }
     if (!rs_load_preset()) return 0;
-    if (!rs.buffer[0]) {
-        rs_gl.GenTextures(2, rs.buffer);
-        rs_gl.GenTextures(1, &rs.output);
+    if (!rs.fbo) {
         rs_gl.GenFramebuffers(1, &rs.fbo);
         rs_gl.GenFramebuffers(1, &rs.read_fbo);
         unsigned white = 0xFFFFFFFFu;
         rs.white = rs_make_texture(1, 1, 1, 28, &white, 1);
     }
     rs_make_depth_resources(width, height);
-    unsigned targets[3] = {rs.buffer[0], rs.buffer[1], rs.output};
-    for (int i = 0; i < 3; i++) {
-        rs_gl.BindTexture(RS_TEXTURE_2D, targets[i]);
-        rs_gl.TexImage2D(RS_TEXTURE_2D, 0, RS_RGBA8, width, height, 0, RS_RGBA, RS_UNSIGNED_BYTE, NULL);
-        rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MIN_FILTER, RS_LINEAR);
-        rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MAG_FILTER, RS_LINEAR);
-        rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_S, RS_CLAMP_TO_EDGE);
-        rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_T, RS_CLAMP_TO_EDGE);
-    }
+    unsigned old[3] = {rs.buffer[0], rs.buffer[1], rs.output};
+    for (int i = 0; i < 3; i++) if (old[i]) rs_gl.DeleteTextures(1, &old[i]);
+    rs.buffer[0] = rs_make_texture(width, height, 1, 28, NULL, 0);
+    rs.buffer[1] = rs_make_texture(width, height, 1, 28, NULL, 0);
+    rs.output = rs_make_texture(width, height, 1, 28, NULL, 0);
     return 1;
 }
 
@@ -1073,11 +1100,19 @@ static int rs_run_pass(struct rs_effect *effect, struct rs_pass *pass, unsigned 
     rs_gl.BindFramebuffer(RS_FRAMEBUFFER, rs.fbo);
     unsigned draw_buffers[T2FX_MAX_TARGETS];
     for (int i = 0; i < target_count; i++) {
-        rs_gl.FramebufferTexture2D(RS_FRAMEBUFFER, RS_COLOR_ATTACHMENT0 + (unsigned)i, RS_TEXTURE_2D, attachments[i], 0);
+        /* SRGBWriteEnable: render into the sRGB view so GL_FRAMEBUFFER_SRGB encodes the output */
+        unsigned attached = info->srgb_write ? rs_srgb_view(attachments[i]) : attachments[i];
+        rs_gl.FramebufferTexture2D(RS_FRAMEBUFFER, RS_COLOR_ATTACHMENT0 + (unsigned)i, RS_TEXTURE_2D, attached, 0);
         draw_buffers[i] = RS_COLOR_ATTACHMENT0 + (unsigned)i;
     }
     rs_gl.DrawBuffers(target_count, draw_buffers);
-    if (rs_gl.CheckFramebufferStatus(RS_FRAMEBUFFER) != RS_FRAMEBUFFER_COMPLETE) return 0;
+    if (rs_gl.CheckFramebufferStatus(RS_FRAMEBUFFER) != RS_FRAMEBUFFER_COMPLETE) {
+        static int reported;
+        if (reported++ < 8)
+            fprintf(stderr, "[t2_hook] ReShade: %s: pass %s skipped, its render target is not usable\n",
+                    effect->file, info->name);
+        return 0;
+    }
     rs_gl.Viewport(0, 0, info->viewport_width ? (int)info->viewport_width : target_w,
                    info->viewport_height ? (int)info->viewport_height : target_h);
     if (info->clear) { rs_gl.ClearColor(0, 0, 0, 0); rs_gl.Clear(RS_COLOR_BUFFER_BIT); }
@@ -1096,7 +1131,9 @@ static int rs_run_pass(struct rs_effect *effect, struct rs_pass *pass, unsigned 
     for (int i = 0; i < info->sampler_count; i++) {
         int sampler = info->sampler_index[i], binding = info->sampler_binding[i];
         rs_gl.ActiveTexture(RS_TEXTURE0 + (unsigned)binding);
-        rs_gl.BindTexture(RS_TEXTURE_2D, rs_texture_for(effect, effect->sampler_info[sampler].texture_name, *current));
+        unsigned bound = rs_texture_for(effect, effect->sampler_info[sampler].texture_name, *current);
+        if (effect->sampler_info[sampler].srgb) bound = rs_srgb_view(bound);  /* SRGBTexture: decode on read */
+        rs_gl.BindTexture(RS_TEXTURE_2D, bound);
         rs_gl.BindSampler((unsigned)binding, effect->samplers[sampler]);
     }
     rs_gl.DrawArrays(rs_topology(info->topology), 0, (int)info->num_vertices);
@@ -1185,6 +1222,7 @@ static void reshade_context_lost(void) {
     rs.effect_count = rs.chain_count = 0;
     memset(rs.buffer, 0, sizeof rs.buffer);
     rs.depth_copy = rs.depth_flipped = rs.depth_program = 0;
+    rs.srgb_count = 0;
     rs.output = rs.fbo = rs.read_fbo = rs.white = 0;
     memset(rs.effects, 0, sizeof rs.effects);
     if (rs_gl.state > 0) rs_gl.state = 0;
