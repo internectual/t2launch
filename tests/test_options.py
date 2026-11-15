@@ -282,6 +282,15 @@ class OptionTests(unittest.TestCase):
         self.assertEqual(audio_env["T2LAUNCH_AUDIO_OUTPUT"], "alsa_output.test")
         self.assertEqual(float(audio_env["T2LAUNCH_MIC_GAIN"]), 2.0)
         self.assertEqual(float(audio_env["T2LAUNCH_MIC_GATE"]), 4.0)
+        with tempfile.TemporaryDirectory() as folder:
+            presets = Path(folder) / "Presets"
+            presets.mkdir()
+            for name in ("b.ini", "A.INI", "notes.txt"):
+                (presets / name).write_text("")
+            self.assertEqual(t2options.device_choices("reshade_presets", folder),
+                             [("A.INI", "A.INI"), ("b.ini", "b.ini")])
+            self.assertEqual(t2options.device_choices("reshade_presets", folder + "/missing"), [])
+        self.assertEqual(t2options.BY_KEY["video.reshade_preset"].devices, "reshade_presets")
         legacy_env = t2options.launch_env({"audio.backend": "padsp",
                                            "audio.output_device": "ignored"}, HOOKED)
         self.assertEqual(legacy_env["T2LAUNCH_AUDIO_BACKEND"], "padsp")

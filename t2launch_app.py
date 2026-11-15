@@ -291,6 +291,7 @@ class DeviceCombo(QComboBox):
     def __init__(self, kind, value):
         super().__init__()
         self.kind = kind
+        self.folder = None  # callable giving the ReShade folder, for the preset list
         self.setEditable(True)
         self.setInsertPolicy(QComboBox.NoInsert)
         self.populate(value)
@@ -298,9 +299,10 @@ class DeviceCombo(QComboBox):
     def populate(self, value):
         self.blockSignals(True)
         self.clear()
-        self.addItem("Default", "")
-        for name, description in t2options.audio_devices(self.kind):
-            self.addItem(f"{description}  [{name}]", name)
+        presets = self.kind == "reshade_presets"
+        self.addItem("None" if presets else "Default", "")
+        for name, description in t2options.device_choices(self.kind, self.folder() if self.folder else ""):
+            self.addItem(name if presets else f"{description}  [{name}]", name)
         self.blockSignals(False)
         self.setText(value)
 
@@ -608,6 +610,9 @@ class ProfileEditor(QWidget):
         note.setWordWrap(True)
         row_layout.addWidget(note)
         self.option_widgets[option.key] = widget
+        if option.key == "video.reshade_preset":
+            widget.folder = lambda: (self.option_widgets["video.reshade_shaders"].text()
+                                     if "video.reshade_shaders" in self.option_widgets else "")
         self.option_default_buttons[option.key] = reset
         self.option_rows[option.key] = (row, note)
         return row

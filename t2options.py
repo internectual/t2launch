@@ -56,7 +56,7 @@ class Option:
     env: str | None = None  # applied as an environment variable for run-game
     hook: bool = False  # applied through the hook's config file
     tab: str = field(default="hook")
-    devices: str = ""  # "sinks" or "sources": the launcher offers the audio devices as a list
+    devices: str = ""  # "sinks", "sources" or "reshade_presets": the launcher offers a list to pick from
 
     @property
     def off_value(self):
@@ -170,7 +170,7 @@ OPTIONS = (
     Option("video.reshade", "Video", "ReShade effects", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
-    Option("video.reshade_preset", "Video", "ReShade preset", "text", "",
+    Option("video.reshade_preset", "Video", "ReShade preset", "text", "", devices="reshade_presets",
            hook=True, requires=(("video.reshade", (True,)),),
            help="Preset .ini: a path, or a file name inside <ReShade folder>/Presets."),
     Option("video.reshade_shaders", "Video", "ReShade folder", "text", "",
@@ -709,6 +709,24 @@ def audio_devices(kind):
             continue
         devices.append((name, str(entry.get("description") or name)))
     return devices
+
+
+def reshade_presets(folder=""):
+    """(file name, file name) pairs of the ReShade presets in <folder>/Presets."""
+    root = Path(folder).expanduser() if folder else Path.home() / ".local/share/t2launch/reshade"
+    try:
+        names = sorted(path.name for path in (root / "Presets").iterdir()
+                       if path.suffix.lower() == ".ini" and path.is_file())
+    except OSError:
+        return []
+    return [(name, name) for name in names]
+
+
+def device_choices(kind, folder=""):
+    """Entries for an option whose value is picked from what the system offers."""
+    if kind == "reshade_presets":
+        return reshade_presets(folder)
+    return audio_devices(kind)
 
 
 def _text(value):

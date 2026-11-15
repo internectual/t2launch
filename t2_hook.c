@@ -5940,6 +5940,7 @@ static int resolve_gl_gamma(void) {
     return 1;
 }
 
+static unsigned rt_depth_read_source(void);
 #include "t2_reshade.h"
 
 /* video.sharpen: 0 (off) to 1 (strongest). */
@@ -6292,6 +6293,19 @@ static void rt_resolve(void) {
     gl_gamma.PopAttrib();
 }
 
+/* Where the scene's depth can be read from (see reshade_run): the window, or the render target's
+   single-sampled framebuffer after resolving a multisampled one. The caller restores the bindings. */
+static unsigned rt_depth_read_source(void) {
+    if (!rt.active) return 0;
+    if (rt.samples) {
+        gl_rt.BindFramebuffer(GL_READ_FRAMEBUFFER_, rt.ms_fbo);
+        gl_rt.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, rt.fbo);
+        gl_rt.BlitFramebuffer(0, 0, rt.game_w, rt.game_h, 0, 0, rt.game_w, rt.game_h,
+                              0x00000100, GL_NEAREST_);
+    }
+    return rt.fbo;
+}
+
 /* Before the swap: draw the game's frame into the window. */
 static void rt_present(void) {
     float exponent = post_exponent();
@@ -6409,6 +6423,7 @@ int SDL_PollEvent(void *event) {
     if (!real_poll_event) real_poll_event = (int (*)(void *))next_symbol("SDL_PollEvent");
     if (!real_poll_event) return 0;
     int pending = real_poll_event(event);
+    if (pending && event) reshade_key_event((const unsigned char *)event);
     if (pending && event && rt.active && rt.scaling)
         scale_mouse_event((unsigned char *)event, rt.rect, rt.real_h, rt.game_w, rt.game_h);
     return pending;
@@ -6498,6 +6513,8 @@ void *SDL_GL_GetProcAddress(const char *proc) {
     void *address = real_get_proc(proc);
     if (!proc) return address;
     void *wrapper = render_target_proc(proc, address);
+    if (wrapper) return wrapper;
+    wrapper = reshade_gl_proc(proc, address);
     if (wrapper) return wrapper;
     if (address && hook_option_bool("ui.no_fog") && strcmp(proc, "glEnable") == 0) {
         real_gl_enable = (void (*)(unsigned))address;

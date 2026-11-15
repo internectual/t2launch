@@ -115,6 +115,9 @@ static struct {
     void (*BlendEquationSeparate)(unsigned, unsigned);
     void (*ColorMask)(unsigned char, unsigned char, unsigned char, unsigned char);
     void (*PixelStorei)(unsigned, int);
+    void (*CopyTexSubImage2D)(unsigned, int, int, int, int, int, int, int);
+    int (*GetUniformLocation)(unsigned, const char *);
+    void (*Uniform1i)(int, int);
 } rs_gl;
 
 static int rs_resolve_gl(void) {
@@ -154,6 +157,8 @@ static int rs_resolve_gl(void) {
     RS_FN(SamplerParameterf, "glSamplerParameterf"); RS_FN(GetIntegerv, "glGetIntegerv");
     RS_FN(BlendFuncSeparate, "glBlendFuncSeparate"); RS_FN(BlendEquationSeparate, "glBlendEquationSeparate");
     RS_FN(ColorMask, "glColorMask"); RS_FN(PixelStorei, "glPixelStorei");
+    RS_FN(CopyTexSubImage2D, "glCopyTexSubImage2D"); RS_FN(GetUniformLocation, "glGetUniformLocation");
+    RS_FN(Uniform1i, "glUniform1i");
 #undef RS_FN
     rs_gl.state = 1;
     return 1;
@@ -188,6 +193,8 @@ static char *rs_trim(char *text) {
 }
 
 static int rs_text_equal(const char *a, const char *b) { return strcasecmp(a, b) == 0; }
+
+static void rs_make_depth_resources(int width, int height);
 
 /* ── State ─────────────────────────────────────────────────────────── */
 
@@ -269,6 +276,11 @@ static struct {
 
     int width, height;           /* buffer size the effects were compiled for */
     unsigned buffer[2], output, fbo, read_fbo, dummy_depth, white;
+    unsigned depth_copy, depth_flipped, depth_program;   /* hardware depth, then top-row-first R32F */
+    int need_depth, depth_taken, paused, reload_now;
+    double frustum_near, frustum_far;       /* committed from the last frame's glFrustum calls */
+    double frame_near, frame_far;           /* being collected this frame */
+    double depth_ratio_used;                /* far / near the effects were compiled for */
     unsigned long frame;
     double start_time, last_time, frame_time_ms;
     char global_defines[RS_MAX_DEFINES][160]; int global_define_count;
@@ -553,8 +565,16 @@ static void rs_free_effect(struct rs_effect *effect) {
 static int rs_load_effect(struct rs_effect *effect, const char *file, const char *path) {
     snprintf(effect->file, sizeof effect->file, "%s", file);
     snprintf(effect->path, sizeof effect->path, "%s", path);
-    const char *definitions[2 * RS_MAX_DEFINES];
+    const char *definitions[2 * RS_MAX_DEFINES + 2];
     int definition_count = 0;
+    /* The engine's depth buffer is an ordinary (not reversed) perspective depth. The linearisation
+       far plane is far / near of the scene's frustum, so DepthBuffer reads like ReShade expects. */
+    char far_define[80];
+    double ratio = rs.frustum_near > 0.0 && rs.frustum_far > rs.frustum_near ? rs.frustum_far / rs.frustum_near : 1000.0;
+    snprintf(far_define, sizeof far_define, "RESHADE_DEPTH_LINEARIZATION_FAR_PLANE=%.1f", ratio);
+    rs.depth_ratio_used = ratio;
+    definitions[definition_count++] = "RESHADE_DEPTH_INPUT_IS_REVERSED=0";
+    definitions[definition_count++] = far_define;
     for (int i = 0; i < rs.global_define_count && definition_count < 2 * RS_MAX_DEFINES; i++)
         definitions[definition_count++] = rs.global_defines[i];
     for (int i = 0; i < effect->define_count && definition_count < 2 * RS_MAX_DEFINES; i++)
@@ -582,7 +602,7 @@ static int rs_load_effect(struct rs_effect *effect, const char *file, const char
         texture->width = (int)texture->info.width;
         texture->height = (int)texture->info.height;
         if (!strcmp(texture->info.semantic, "COLOR")) { texture->kind = 1; continue; }
-        if (!strcmp(texture->info.semantic, "DEPTH")) { texture->kind = 2; continue; }
+        if (!strcmp(texture->info.semantic, "DEPTH")) { texture->kind = 2; rs.need_depth = 1; continue; }
         char image[512];
         if (rs_annotation(texture->info.annotations, "source", image, sizeof image)) {
             const char *base = strrchr(image, '/');
@@ -690,6 +710,7 @@ static void rs_unload(void) {
     if (rs_gl.state > 0 && rs.initialised)
         for (int i = 0; i < rs.effect_count; i++) rs_free_effect(&rs.effects[i]);
     rs.effect_count = rs.chain_count = 0;
+    rs.need_depth = 0;
 }
 
 /* Load the preset: which techniques run, in what order, with which values. */
@@ -818,11 +839,13 @@ static void rs_build_paths(void) {
     }
     snprintf(rs.shaders_dir, sizeof rs.shaders_dir, "%s", shaders);
     const char *preset = hook_option_str("video.reshade_preset");
-    rs.preset_path[0] = '\0';
-    if (preset && *preset) {
+    if (!rs.preset_path[0] && preset && *preset) {  /* kept once set, so a preset picked with the keys sticks */
         if (strchr(preset, '/')) snprintf(rs.preset_path, sizeof rs.preset_path, "%s", preset);
         else snprintf(rs.preset_path, sizeof rs.preset_path, "%s/Presets/%s", rs.shaders_dir, preset);
     }
+    for (int i = 0; i < rs.shader_file_count; i++) { free(rs.shader_files[i].name); free(rs.shader_files[i].path); }
+    for (int i = 0; i < rs.texture_file_count; i++) { free(rs.texture_files[i].name); free(rs.texture_files[i].path); }
+    for (int i = 0; i < rs.include_count; i++) free(rs.include_dirs[i]);
     rs.shader_file_count = rs.texture_file_count = 0;
     char path[1280];
     snprintf(path, sizeof path, "%s/Shaders", rs.shaders_dir);
@@ -843,7 +866,7 @@ static int rs_setup(int width, int height) {
     }
     rs.initialised = 1;
     rs_unload();
-    if (!rs.shaders_dir[0]) rs_build_paths();
+    rs_build_paths();  /* every load: files may have been added since the last one */
     if (!rs.preset_path[0]) {
         fprintf(stderr, "[t2_hook] ReShade: no preset set (video.reshade_preset)\n");
         return 0;
@@ -857,6 +880,7 @@ static int rs_setup(int width, int height) {
         unsigned white = 0xFFFFFFFFu;
         rs.white = rs_make_texture(1, 1, 1, 28, &white, 1);
     }
+    rs_make_depth_resources(width, height);
     unsigned targets[3] = {rs.buffer[0], rs.buffer[1], rs.output};
     for (int i = 0; i < 3; i++) {
         rs_gl.BindTexture(RS_TEXTURE_2D, targets[i]);
@@ -870,6 +894,119 @@ static int rs_setup(int width, int height) {
 }
 
 /* ── Rendering ─────────────────────────────────────────────────────── */
+
+/* ── Depth ─────────────────────────────────────────────────────────── */
+
+static void (*rs_real_frustum)(double, double, double, double, double, double);
+
+/* The scene is the glFrustum call with the farthest far plane in a frame (the HUD only uses glOrtho). */
+static void rs_frustum_wrapper(double left, double right, double bottom, double top, double near_plane, double far_plane) {
+    if (near_plane > 0.0 && far_plane > rs.frame_far) { rs.frame_near = near_plane; rs.frame_far = far_plane; }
+    if (rs_real_frustum) rs_real_frustum(left, right, bottom, top, near_plane, far_plane);
+}
+
+/* Defined by the hook: the framebuffer to read the scene's depth from (0 = the window). With a
+   multisampled render target it resolves the depth first. */
+static unsigned rt_depth_read_source(void);
+
+static void (*rs_real_clear)(unsigned);
+
+/* The game clears the depth buffer once per frame right after the 3D scene (the HUD is drawn
+   without it), so that is where the scene's depth still exists: copy it just before. */
+static void rs_clear_wrapper(unsigned mask) {
+    if ((mask & 0x100) && rs.need_depth && rs.depth_copy && rs.frame_far > 0.0 && !rs.depth_taken &&
+        rs_gl.state > 0) {
+        int old_read = 0, old_draw = 0, old_texture = 0;
+        rs_gl.GetIntegerv(RS_READ_FRAMEBUFFER_BINDING, &old_read);
+        rs_gl.GetIntegerv(RS_DRAW_FRAMEBUFFER_BINDING, &old_draw);
+        rs_gl.GetIntegerv(0x8069, &old_texture);
+        unsigned source = rt_depth_read_source();
+        rs_gl.BindFramebuffer(RS_READ_FRAMEBUFFER, source);
+        rs_gl.BindTexture(RS_TEXTURE_2D, rs.depth_copy);
+        rs_gl.CopyTexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, 0, 0, rs.width, rs.height);
+        rs_gl.BindTexture(RS_TEXTURE_2D, (unsigned)old_texture);
+        rs_gl.BindFramebuffer(RS_READ_FRAMEBUFFER, (unsigned)old_read);
+        rs_gl.BindFramebuffer(RS_DRAW_FRAMEBUFFER, (unsigned)old_draw);
+        rs.depth_taken = 1;
+    }
+    if (rs_real_clear) rs_real_clear(mask);
+}
+
+/* A wrapper for a GL entry point the game resolves through SDL_GL_GetProcAddress, or NULL. */
+static void *reshade_gl_proc(const char *proc, void *address) {
+    if (!address || !hook_option_bool("video.reshade")) return NULL;
+    if (!strcmp(proc, "glFrustum")) {
+        rs_real_frustum = (void (*)(double, double, double, double, double, double))address;
+        return (void *)rs_frustum_wrapper;
+    }
+    if (!strcmp(proc, "glClear")) {
+        rs_real_clear = (void (*)(unsigned))address;
+        return (void *)rs_clear_wrapper;
+    }
+    return NULL;
+}
+
+static const char rs_depth_vertex[] =
+    "#version 330 compatibility\n"
+    "out vec2 uv;\n"
+    "void main() { vec2 p = vec2((gl_VertexID == 2) ? 2.0 : 0.0, (gl_VertexID == 1) ? 2.0 : 0.0);\n"
+    "  uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+static const char rs_depth_fragment[] =
+    "#version 330 compatibility\n"
+    "uniform sampler2D source; in vec2 uv; layout(location = 0) out float result;\n"
+    "void main() { result = texture(source, vec2(uv.x, 1.0 - uv.y)).r; }\n";
+
+static void rs_make_depth_resources(int width, int height) {
+    if (!rs.depth_copy) {
+        rs_gl.GenTextures(1, &rs.depth_copy);
+        rs_gl.GenTextures(1, &rs.depth_flipped);
+        unsigned vs = rs_compile_shader(RS_VERTEX_SHADER, rs_depth_vertex, "depth");
+        unsigned fs = vs ? rs_compile_shader(RS_FRAGMENT_SHADER, rs_depth_fragment, "depth") : 0;
+        if (vs && fs) {
+            rs.depth_program = rs_gl.CreateProgram();
+            rs_gl.AttachShader(rs.depth_program, vs);
+            rs_gl.AttachShader(rs.depth_program, fs);
+            rs_gl.LinkProgram(rs.depth_program);
+            int linked = 0;
+            rs_gl.GetProgramiv(rs.depth_program, RS_LINK_STATUS, &linked);
+            if (!linked) {
+                char log[1024] = "";
+                rs_gl.GetProgramInfoLog(rs.depth_program, sizeof log - 1, NULL, log);
+                fprintf(stderr, "[t2_hook] ReShade: depth program did not link: %s\n", log);
+                rs_gl.DeleteProgram(rs.depth_program);
+                rs.depth_program = 0;
+            }
+        }
+        if (vs) rs_gl.DeleteShader(vs);
+        if (fs) rs_gl.DeleteShader(fs);
+    }
+    rs_gl.BindTexture(RS_TEXTURE_2D, rs.depth_copy);
+    rs_gl.TexImage2D(RS_TEXTURE_2D, 0, 0x81A6, width, height, 0, 0x1902, 0x1405, NULL);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MIN_FILTER, RS_NEAREST);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MAG_FILTER, RS_NEAREST);
+    rs_gl.BindTexture(RS_TEXTURE_2D, rs.depth_flipped);
+    rs_gl.TexImage2D(RS_TEXTURE_2D, 0, 0x822E, width, height, 0, 0x1903, RS_FLOAT, NULL);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MIN_FILTER, RS_NEAREST);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_MAG_FILTER, RS_NEAREST);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_S, RS_CLAMP_TO_EDGE);
+    rs_gl.TexParameteri(RS_TEXTURE_2D, RS_TEXTURE_WRAP_T, RS_CLAMP_TO_EDGE);
+}
+
+/* Turn the depth copied at the clear into depth_flipped, top row first. */
+static void rs_capture_depth(int width, int height) {
+    if (!rs.depth_program || !rs.depth_taken) return;
+    rs_gl.BindFramebuffer(RS_FRAMEBUFFER, rs.fbo);
+    rs_gl.FramebufferTexture2D(RS_FRAMEBUFFER, RS_COLOR_ATTACHMENT0, RS_TEXTURE_2D, rs.depth_flipped, 0);
+    unsigned draw = RS_COLOR_ATTACHMENT0;
+    rs_gl.DrawBuffers(1, &draw);
+    rs_gl.Viewport(0, 0, width, height);
+    rs_gl.Disable(RS_BLEND);
+    rs_gl.UseProgram(rs.depth_program);
+    rs_gl.ActiveTexture(RS_TEXTURE0);
+    rs_gl.BindTexture(RS_TEXTURE_2D, rs.depth_copy);
+    rs_gl.Uniform1i(rs_gl.GetUniformLocation(rs.depth_program, "source"), 0);
+    rs_gl.DrawArrays(4, 0, 3);
+}
 
 static unsigned rs_blend_factor(int factor) {
     static const unsigned table[] = {0, 1, 0x0300, 0x0301, 0x0306, 0x0307, 0x0302, 0x0303, 0x0304, 0x0305};
@@ -891,7 +1028,7 @@ static unsigned rs_texture_for(struct rs_effect *effect, const char *unique_name
         struct rs_texture *texture = &effect->textures[i];
         if (strcmp(texture->info.unique_name, unique_name)) continue;
         if (texture->kind == 1) return current;
-        if (texture->kind == 2) return rs.white;
+        if (texture->kind == 2) return rs.depth_flipped ? rs.depth_flipped : rs.white;
         return texture->id;
     }
     return rs.white;
@@ -980,12 +1117,23 @@ static int rs_run_pass(struct rs_effect *effect, struct rs_pass *pass, unsigned 
    Returns the texture holding the result in GL orientation, or 0 when there is
    nothing to draw. */
 static unsigned reshade_run(unsigned src_texture, int width, int height) {
-    if (!rs.enabled || rs.failed || width <= 0 || height <= 0) return 0;
+    if (!rs.enabled || rs.failed || rs.paused || width <= 0 || height <= 0) return 0;
     if (!rs_resolve_gl() || !rs_load_library()) { rs.failed = 1; return 0; }
     double now = rs_now();
     rs.frame_time_ms = (now - rs.last_time) * 1000.0;
     rs.last_time = now;
-    if (!rs.initialised || width != rs.width || height != rs.height) {
+    int frustum_changed = 0;
+    if (rs.frame_far > 0.0) {
+        frustum_changed = rs.frustum_far != rs.frame_far || rs.frustum_near != rs.frame_near;
+        rs.frustum_near = rs.frame_near; rs.frustum_far = rs.frame_far;
+        rs.frame_near = rs.frame_far = 0.0;
+        if (frustum_changed) fprintf(stderr, "[t2_hook] ReShade: scene frustum near %.3f far %.1f\n", rs.frustum_near, rs.frustum_far);
+    }
+    double ratio = rs.frustum_near > 0.0 ? rs.frustum_far / rs.frustum_near : 0.0;
+    int depth_stale = rs.need_depth && frustum_changed && ratio > 0.0 &&
+                      (ratio > rs.depth_ratio_used * 1.05 || ratio < rs.depth_ratio_used / 1.05);
+    if (!rs.initialised || width != rs.width || height != rs.height || depth_stale || rs.reload_now) {
+        rs.reload_now = 0;
         if (!rs_setup(width, height)) { if (!rs.chain_count) { rs.reload_check = 0; } }
     } else if (++rs.reload_check >= 60) {
         rs.reload_check = 0;
@@ -1002,6 +1150,7 @@ static unsigned reshade_run(unsigned src_texture, int width, int height) {
     rs_gl.GetIntegerv(RS_READ_FRAMEBUFFER_BINDING, &previous_read);
     rs_gl.GetIntegerv(RS_ACTIVE_TEXTURE, &previous_unit);
 
+    if (rs.need_depth) { rs_capture_depth(width, height); rs.depth_taken = 0; }
     rs_flip_copy(src_texture, rs.buffer[0], width, height);
     unsigned current = rs.buffer[0];
     int spare = 1;
@@ -1035,6 +1184,7 @@ static void reshade_context_lost(void) {
     rs.initialised = 0;
     rs.effect_count = rs.chain_count = 0;
     memset(rs.buffer, 0, sizeof rs.buffer);
+    rs.depth_copy = rs.depth_flipped = rs.depth_program = 0;
     rs.output = rs.fbo = rs.read_fbo = rs.white = 0;
     memset(rs.effects, 0, sizeof rs.effects);
     if (rs_gl.state > 0) rs_gl.state = 0;
@@ -1047,4 +1197,64 @@ static int reshade_wanted(void) {
         rs.enabled = wanted;
     }
     return wanted;
+}
+
+/* ── Keys ──────────────────────────────────────────────────────────── */
+
+/* Scroll Lock toggles the effects; Ctrl+Scroll Lock loads the next preset from <shaders>/Presets and
+   Shift+Scroll Lock the previous one. */
+#define RS_KEY_TOGGLE 302   /* SDLK_SCROLLOCK */
+
+static int rs_compare_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+static void rs_notify(const char *message) {
+    fprintf(stderr, "[t2_hook] ReShade: %s\n", message);
+    char script[256];
+    if (Con__evaluate && snprintf(script, sizeof script, "echo(\"ReShade: %s\");", message) < (int)sizeof script)
+        (void)Con__evaluate(script, 0, "t2launch/reshade.cs", 0);
+}
+
+static void rs_cycle_preset(int step) {
+    char directory[1100];
+    snprintf(directory, sizeof directory, "%s/Presets", rs.shaders_dir);
+    DIR *handle = opendir(directory);
+    if (!handle) { rs_notify("no Presets folder to cycle through"); return; }
+    char *names[256]; int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(handle)) && count < 256) {
+        size_t length = strlen(entry->d_name);
+        if (entry->d_name[0] != '.' && length > 4 && !strcasecmp(entry->d_name + length - 4, ".ini"))
+            names[count++] = strdup(entry->d_name);
+    }
+    closedir(handle);
+    if (!count) { rs_notify("no presets found"); return; }
+    qsort(names, (size_t)count, sizeof names[0], rs_compare_names);
+    const char *current = strrchr(rs.preset_path, '/');
+    current = current ? current + 1 : rs.preset_path;
+    int index = -1;
+    for (int i = 0; i < count; i++) if (!strcmp(names[i], current)) index = i;
+    index = (index + step + count) % count;
+    snprintf(rs.preset_path, sizeof rs.preset_path, "%s/%s", directory, names[index]);
+    rs.reload_now = 1;
+    rs.paused = 0;
+    char message[300];
+    snprintf(message, sizeof message, "preset %s", names[index]);
+    rs_notify(message);
+    for (int i = 0; i < count; i++) free(names[i]);
+}
+
+/* An SDL 1.2 key event as the game's SDL lays it out: type, which, state at 0..2, then the 32-bit
+   scancode at 4, sym at 8 and mod at 12 (read from the live events; not the header's packed guess). */
+static void reshade_key_event(const unsigned char *event) {
+    if (event[0] != 2 || !rs.enabled || rs.failed) return;  /* SDL_KEYDOWN */
+    unsigned sym, mod;
+    memcpy(&sym, event + 8, sizeof sym);
+    memcpy(&mod, event + 12, sizeof mod);
+    if (sym != RS_KEY_TOGGLE) return;
+    if (mod & 0x00C0) rs_cycle_preset(1);          /* KMOD_CTRL */
+    else if (mod & 0x0003) rs_cycle_preset(-1);    /* KMOD_SHIFT */
+    else {
+        rs.paused = !rs.paused;
+        rs_notify(rs.paused ? "effects off" : "effects on");
+    }
 }

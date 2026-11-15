@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Download the reshade-shaders effect collection into t2launch's ReShade folder
+# (the default of video.reshade_shaders). Nothing is bundled with t2launch and
+# nothing is downloaded unless you run this. Branch: slim (default) or legacy.
+set -Eeuo pipefail
+BRANCH="${1:-slim}"
+DEST="${T2LAUNCH_RESHADE_DIR:-$HOME/.local/share/t2launch/reshade}"
+case "$BRANCH" in slim|legacy|nvidia) ;; *) echo "usage: $0 [slim|legacy|nvidia]" >&2; exit 2 ;; esac
+command -v git >/dev/null || { echo "git is required" >&2; exit 1; }
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+git clone --depth 1 --branch "$BRANCH" https://github.com/crosire/reshade-shaders "$TMP/src"
+mkdir -p "$DEST/Shaders" "$DEST/Textures" "$DEST/Presets"
+cp -rn "$TMP/src/Shaders/." "$DEST/Shaders/"
+[[ -d "$TMP/src/Textures" ]] && cp -rn "$TMP/src/Textures/." "$DEST/Textures/"
+echo "Installed the $BRANCH shaders into $DEST"
+echo "Put preset .ini files in $DEST/Presets, then set video.reshade_preset."

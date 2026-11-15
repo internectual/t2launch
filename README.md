@@ -1008,8 +1008,18 @@ options bring the parts of it that fit the Linux client:
   Presets use ReShade's format (`Techniques`, `TechniqueSorting`,
   `PreprocessorDefinitions`, and one `[effect.fx]` section of uniform values);
   editing the preset file reloads it in the running game. Not supported: Windows
-  `.addon` DLLs, sRGB texture sampling and compute shaders; depth-buffer effects
-  see a constant far plane until depth capture is added. Needs `g++` with
+  `.addon` DLLs, sRGB texture sampling and compute shaders. Depth-buffer effects
+  (DoF, fog, SSAO) get the scene's depth: the hook copies it just before the
+  game clears the depth buffer for the HUD, flips it to ReShade's top-row-first
+  convention (also with `video.msaa` and `video.render_scale`), and defines
+  `RESHADE_DEPTH_INPUT_IS_REVERSED=0` and a `RESHADE_DEPTH_LINEARIZATION_FAR_PLANE`
+  of far/near taken from the game's own frustum (500/0.1 on most maps);
+  override either in the preset's `PreprocessorDefinitions`. In the game,
+  Scroll Lock turns the effects on and off, Ctrl+Scroll Lock loads the next
+  preset in `Presets/` and Shift+Scroll Lock the previous one (the launcher
+  lists the presets in a drop-down). `runtime/fetch-reshade-shaders [slim|legacy]`
+  downloads the crosire/reshade-shaders collection into the default folder when
+  you run it. Needs `g++` with
   32-bit support at build time (`runtime/build` prints a note when it is
   missing). Shaders are not bundled.
 - **Anti-aliasing** (`video.msaa`, 0/2/4/8). The game draws into a
