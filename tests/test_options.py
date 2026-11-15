@@ -183,6 +183,15 @@ class OptionTests(unittest.TestCase):
                                       "net.build_identifier": 24834}, HOOKED)
         self.assertEqual(server["net.build_identifier"], 24834)
 
+    def test_demo_playback_fix_is_on_by_default_and_client_only(self):
+        option = t2options.BY_KEY["demo.playback_fix"]
+        self.assertTrue(option.default)
+        self.assertIn("demo.playback_fix", t2options.hook_config({}, HOOKED))
+        self.assertIn("demo.playback_fix=1", t2options.hook_config({}, HOOKED).splitlines())
+        self.assertIn("demo.playback_fix=0", t2options.hook_config({"demo.playback_fix": False}, HOOKED).splitlines())
+        dedicated = t2options.effective({"game.executable": "dedicated"}, HOOKED)
+        self.assertFalse(dedicated["demo.playback_fix"])
+
     def test_demo_protocol_tag_is_client_scoped_and_profile_configurable(self):
         option = t2options.BY_KEY["demo.protocol_tag"]
         self.assertEqual(option.default, 3342340)

@@ -196,6 +196,7 @@ static struct hook_option hook_options[] = {
     {"ui.no_fog", "0", NULL, 0, "", 0},
     {"ui.visible_distance", "0", NULL, 0, "", 0},
     {"review.demo_camera", "0", NULL, 0, "", 0},
+    {"demo.playback_fix", "1", NULL, 0, "", 0},
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"render.datablock_rules", "", NULL, 0, "", 0},
     {"render.object_rules", "", NULL, 0, "", 0},
@@ -5211,6 +5212,27 @@ static int install_demo_camera(void) {
     };
     if (!apply_code_patches("Demo camera", patches, sizeof(patches) / sizeof(patches[0]))) return 0;
     fprintf(stderr, "[t2_hook] Scripts can see and control every object, including a demo's players (memory only)\n");
+    return 1;
+}
+
+/* Demo playback fix. Tribes2DemoPlayback.exe is the 25034 exe with exactly one byte changed (file offset
+   0x2018BE, VA 0x6024BE: a je becomes jmp), a patch that stops a hang during demo playback in certain
+   events; T2TV's .t2tv playback depended on the same patch. The routine (Linux 0x0827C9AC) sizes a packet
+   write in 32-bit words and, after casting the server-connection global (0x08495CDC) to its connection
+   class, asks a helper (0x0827C434, 0x601E50 on Windows) whether this is the server connection with a full
+   packet buffer: this == ServerConnection && (+0x83FC - +0x8400) == +0x840C && +0x840C >= 30. When it is,
+   the routine takes a fast path that stores its bit position and returns. The patch skips that test
+   (`test %al,%al; je` -> `jmp`) so the generic path at 0x0827CA86 is always used. The Linux site is the
+   je at 0x0827CA5A. Client only. */
+#define DEMO_PLAYBACK_FIX_ADDRESS 0x0827CA5A
+static const unsigned char demo_playback_fix_original[] = {0x74, 0x2a};
+
+static int install_demo_playback_fix(void) {
+    static const unsigned char jump[] = {0xeb, 0x2a};
+    const struct code_patch patch = {DEMO_PLAYBACK_FIX_ADDRESS, demo_playback_fix_original,
+                                     sizeof(demo_playback_fix_original), 0, jump, sizeof(jump)};
+    if (!apply_code_patches("Demo playback fix", &patch, 1)) return 0;
+    fprintf(stderr, "[t2_hook] Demo playback always uses the generic packet path (memory only)\n");
     return 1;
 }
 
@@ -10980,6 +11002,7 @@ static void __attribute__((constructor)) init(void) {
     if (hook_option_bool("ui.lan_join_anywhere")) install_lan_join_anywhere();
     if (hook_option_bool("ui.visible_distance")) install_visible_distance();
     if (hook_option_bool("review.demo_camera")) install_demo_camera();
+    if (hook_option_bool("demo.playback_fix")) install_demo_playback_fix();
     if (hook_option_bool("ui.no_whiteout")) install_no_whiteout();
     if (hook_option_bool("ui.fov_range")) install_fov_range();
     if (hook_option_bool("ui.client_datablocks")) install_client_datablocks();

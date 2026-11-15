@@ -729,6 +729,16 @@ options bring the parts of it that fit the Linux client:
   while PlayGui/NavHud is active. Credits: PenguinOfDoom, Andrew (HUDbot 0.2b),
   and NoFix. See
   `scripts/HudDemo/README.md` for install and rebuild instructions.
+- **Avoid demo playback hangs** (`demo.playback_fix`, on). `Tribes2DemoPlayback.exe`
+  is the 25034 executable with one byte changed (file offset `0x2018BE`, VA
+  `0x6024BE`: a `je` becomes `jmp`) to stop a hang during demo playback in certain
+  events; T2TV's `.t2tv` playback needed the same patch. The routine (Linux
+  `0x0827C9AC`) takes a fast path when it is the server connection with a full
+  packet buffer (`0x0827C434`: `+0x83FC - +0x8400 == +0x840C >= 30`); the hook
+  changes the `je` at `0x0827CA5A` to `jmp` so the generic path is always used.
+  It is applied at startup, so live games use the generic path too. Verified that a
+  28-player demo and a self-hosted match both run normally with it on and off; the
+  hang's trigger itself was not reproduced.
 - **Switch players in demos** (`review.demo_camera`, off). Build 25034 hides every
   script object whose flag bit `0x40` is set from the script engine: the object
   dump loop skips it (`0x080FA598`), `SimSet.getObject()` returns -1 for it

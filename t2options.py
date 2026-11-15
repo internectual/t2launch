@@ -297,6 +297,12 @@ OPTIONS = (
                  "autobeacon (all with Ctrl+Shift). "
                  "Status appears on the HUD. Existing bindings "
                  "are preserved, and the review bindings are removed when playback ends."),
+     Option("demo.playback_fix", "Demo review", "Avoid demo playback hangs", "bool", True,
+            hook=True, requires=(("launcher.load_hook", (True,)),),
+            help="Skip the packet routine's fast path for a full demo buffer, the one-byte change in the "
+                 "Windows Tribes2DemoPlayback.exe that prevents a hang during demo playback in certain "
+                 "events (the same patch .t2tv playback needs). The generic path is always used, in live "
+                 "games as well."),
      Option("demo.protocol_tag", "Demo review", "Demo header tag", "int", 3342340,
             hook=True, advanced=True, minimum=1, maximum=2147483647,
             help="Set the 32-bit tag written to new demo headers and required when playing them. "
@@ -514,7 +520,7 @@ CLIENT_ONLY = frozenset((
     "ui.observer_iff", "ui.fov_range", "ui.client_datablocks", "ui.lan_join_anywhere", "ui.no_fog",
     "ui.visible_distance", "ui.no_whiteout", "review.demo_camera", "review.cheat_view", "review.autobeacon", "review.replace_models",
     "review.extended_range", "review.global_beacons", "review.shortcuts",
-      "review.ffi", "review.no_cloak", "demo.protocol_tag",
+      "review.ffi", "review.no_cloak", "demo.playback_fix", "demo.protocol_tag",
        "telemetry.shazbot", "telemetry.shazbot_socket", "telemetry.shazbot_packet_capture",
        "telemetry.shazbot_notification_socket",
        "telemetry.shazbot_actions",
