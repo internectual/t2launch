@@ -1017,7 +1017,12 @@ options bring the parts of it that fit the Linux client:
   override either in the preset's `PreprocessorDefinitions`. In the game,
   Scroll Lock turns the effects on and off, Ctrl+Scroll Lock loads the next
   preset in `Presets/` and Shift+Scroll Lock the previous one (the launcher
-  lists the presets in a drop-down). `runtime/fetch-reshade-shaders [slim|legacy]`
+  lists the presets in a drop-down). Ctrl+Home opens an in-game ReShade panel
+  built from the game's own dialog controls (the hook evaluates it at runtime;
+  no game files change): effects on/off, a preset list, an effect list, and
+  sliders and check boxes for every uniform of the selected effect (8 per page,
+  vectors as one slider per component, ranges from `ui_min`/`ui_max`). Changes
+  apply immediately; SAVE writes them back to the preset file. `runtime/fetch-reshade-shaders [slim|legacy]`
   downloads the crosire/reshade-shaders collection into the default folder when
   you run it. Needs `g++` with
   32-bit support at build time (`runtime/build` prints a note when it is

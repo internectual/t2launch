@@ -8628,6 +8628,8 @@ void SDL_GL_SwapBuffers(void) {
         if (hook_option_bool("hook.console_commands"))
             Con__evaluate("$T2Launch::AudioDevicesNative = 1;", 0, NULL, 0);
         Con__evaluate(audio_device_menu_script, 0, "t2launch/audio_devices.cs", 0);
+        if (hook_option_bool("video.reshade") && hook_option_bool("hook.console_commands"))
+            Con__evaluate(reshade_dialog_script, 0, "t2launch/reshade_dialog.cs", 0);
         core_runtime_installed = 1;
     }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot") &&
@@ -10770,6 +10772,7 @@ static int register_hook_commands(void) {
             "t2launch_getAudioDevice(sinks|sources) - the selected device name", 2, 2);
         Con__addMethodS(NULL, "t2launch_setAudioDevice", hook_set_audio_device_cb,
             "t2launch_setAudioDevice(sinks|sources, name) - switch audio device", 3, 3);
+        if (hook_option_bool("video.reshade")) reshade_register_commands();
     }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot_command_labels")) {
         Con__addMethodS(NULL, "shazbot_command_label", shazbot_command_label_cb,

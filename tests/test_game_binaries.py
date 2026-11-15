@@ -151,7 +151,11 @@ class NativeReviewTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("OK", result.stdout)
 
-    def test_reshade_fx_compiler_reflects_and_generates_glsl(self):
+    def build_fx_library(self):
+        """Build t2_fx.so once per run (it takes about 20 s); skip when no 32-bit C++ toolchain."""
+        cached = getattr(type(self), "_fx_library", None)
+        if cached:
+            return cached
         repo = Path(__file__).resolve().parent.parent
         gxx = shutil.which("g++")
         if not gxx:
@@ -165,6 +169,29 @@ class NativeReviewTests(unittest.TestCase):
                                env=self.environment, text=True, capture_output=True, timeout=300)
         if build.returncode:
             self.skipTest("32-bit C++ toolchain required: " + build.stderr[-200:])
+        keep = Path(tempfile.mkdtemp(prefix="t2_fx_lib."))
+        self.addClassCleanup(shutil.rmtree, keep, True)
+        kept = keep / "t2_fx.so"
+        shutil.copy(library, kept)
+        type(self)._fx_library = kept
+        return kept
+
+    def test_reshade_preset_runner_with_stubbed_gl(self):
+        library = self.build_fx_library()
+        fixture = Path(__file__).resolve().with_name("reshade_preset_test.c")
+        output = self.directory / "reshade_preset_test"
+        build = subprocess.run([self.compiler, "-m32", "-O1", "-std=gnu99", str(fixture), "-o", str(output), "-ldl"],
+                               env=self.environment, text=True, capture_output=True, timeout=60)
+        self.assertEqual(build.returncode, 0, build.stderr)
+        scratch = self.directory / "preset"
+        scratch.mkdir()
+        result = subprocess.run([str(output), str(library), str(scratch)], env=self.environment,
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_reshade_fx_compiler_reflects_and_generates_glsl(self):
+        library = self.build_fx_library()
         fixture = Path(__file__).resolve().with_name("fx_compile_test.c")
         output = self.directory / "fx_compile_test"
         build = subprocess.run([self.compiler, "-m32", "-O2", "-std=gnu99", str(fixture), "-o", str(output), "-ldl"],

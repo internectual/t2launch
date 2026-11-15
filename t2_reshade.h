@@ -269,7 +269,7 @@ static struct {
     unsigned char *(*load_image)(const char *, int *, int *);
     void (*free_image)(unsigned char *);
 
-    char shaders_dir[1024], preset_path[1024];
+    char shaders_dir[1024], preset_path[2048];
     struct rs_file shader_files[RS_MAX_FILES]; int shader_file_count;
     struct rs_file texture_files[RS_MAX_FILES]; int texture_file_count;
     char **include_dirs; int include_count;
@@ -1242,6 +1242,7 @@ static int reshade_wanted(void) {
 /* Scroll Lock toggles the effects; Ctrl+Scroll Lock loads the next preset from <shaders>/Presets and
    Shift+Scroll Lock the previous one. */
 #define RS_KEY_TOGGLE 302   /* SDLK_SCROLLOCK */
+#define RS_KEY_PANEL 278    /* SDLK_HOME */
 
 static int rs_compare_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
@@ -1288,6 +1289,10 @@ static void reshade_key_event(const unsigned char *event) {
     unsigned sym, mod;
     memcpy(&sym, event + 8, sizeof sym);
     memcpy(&mod, event + 12, sizeof mod);
+    if (sym == RS_KEY_PANEL && (mod & 0x00C0) && Con__evaluate) {   /* Ctrl+Home */
+        (void)Con__evaluate("t2launch_reshadeHotkey();", 0, "t2launch/reshade_key.cs", 0);
+        return;
+    }
     if (sym != RS_KEY_TOGGLE) return;
     if (mod & 0x00C0) rs_cycle_preset(1);          /* KMOD_CTRL */
     else if (mod & 0x0003) rs_cycle_preset(-1);    /* KMOD_SHIFT */
@@ -1296,3 +1301,377 @@ static void reshade_key_event(const unsigned char *event) {
         rs_notify(rs.paused ? "effects off" : "effects on");
     }
 }
+
+/* ── In-game control (console commands used by the dialog script below) ───────── */
+
+typedef int S32_;   /* the hook's S32 */
+
+static struct rs_effect *rs_effect_at(int index) {
+    int seen = 0;
+    for (int i = 0; i < rs.effect_count; i++)
+        if (rs.effects[i].ok == 1) { if (seen++ == index) return &rs.effects[i]; }
+    return NULL;
+}
+
+/* A uniform component the dialog can edit: scalar or vector float/int/bool, no builtin source, no matrix. */
+static int rs_uniform_editable(const struct rs_uniform_value *uniform) {
+    return !uniform->source[0] && uniform->info.cols <= 1 && uniform->info.array_length == 0 &&
+           uniform->info.rows >= 1 && uniform->info.rows <= 4 && uniform->info.size > 0;
+}
+
+static const char *rs_status_cb(void *obj, S32_ argc, const char **argv) {
+    static char result[1200];
+    (void)obj; (void)argc; (void)argv;
+    const char *name = strrchr(rs.preset_path, '/');
+    snprintf(result, sizeof result, "%d\t%s", rs.enabled && !rs.paused && !rs.failed, name ? name + 1 : rs.preset_path);
+    return result;
+}
+
+static const char *rs_effects_cb(void *obj, S32_ argc, const char **argv) {
+    static char result[4096];
+    (void)obj; (void)argc; (void)argv;
+    size_t used = 0;
+    result[0] = 0;
+    for (int i = 0; i < rs.effect_count; i++) {
+        if (rs.effects[i].ok != 1) continue;
+        int written = snprintf(result + used, sizeof result - used, "%s%s", used ? "\n" : "", rs.effects[i].file);
+        if (written < 0 || used + (size_t)written >= sizeof result) break;
+        used += (size_t)written;
+    }
+    return result;
+}
+
+static const char *rs_uniforms_cb(void *obj, S32_ argc, const char **argv) {
+    static char result[16384];
+    (void)obj;
+    result[0] = 0;
+    struct rs_effect *effect = rs_effect_at(argc > 1 ? atoi(argv[1]) : 0);
+    if (!effect) return result;
+    size_t used = 0;
+    for (int u = 0; u < effect->uniform_count; u++) {
+        struct rs_uniform_value *uniform = &effect->uniforms[u];
+        if (!rs_uniform_editable(uniform)) continue;
+        char text[96], label[96];
+        if (!rs_annotation(uniform->info.annotations, "ui_label", label, sizeof label)) snprintf(label, sizeof label, "%s", uniform->info.name);
+        char kind = uniform->info.base == 3 ? 'f' : uniform->info.base == 0 ? 'b' : 'i';
+        double minimum = kind == 'f' ? 0.0 : 0.0, maximum = kind == 'f' ? 1.0 : 10.0;
+        if (rs_annotation(uniform->info.annotations, "ui_min", text, sizeof text)) minimum = atof(text);
+        if (rs_annotation(uniform->info.annotations, "ui_max", text, sizeof text)) maximum = atof(text);
+        if (maximum <= minimum) maximum = minimum + 1.0;
+        for (int c = 0; c < uniform->info.rows; c++) {
+            unsigned offset = uniform->info.offset + (unsigned)c * 4;
+            if (offset + 4 > effect->ubo_size) break;
+            double value;
+            if (kind == 'f') { float f; memcpy(&f, effect->ubo_data + offset, 4); value = f; }
+            else { int v; memcpy(&v, effect->ubo_data + offset, 4); value = v; }
+            char shown[120];
+            if (uniform->info.rows > 1) snprintf(shown, sizeof shown, "%.80s %c", label, "xyzw"[c]);
+            else snprintf(shown, sizeof shown, "%.100s", label);
+            for (char *p = shown; *p; p++) if (*p == '"' || *p == '\\' || *p == '\t' || *p == '\n') *p = ' ';
+            int written = snprintf(result + used, sizeof result - used, "%s%d\t%d\t%s\t%c\t%g\t%g\t%g", used ? "\n" : "",
+                                   u, c, shown, kind, minimum, maximum, value);
+            if (written < 0 || used + (size_t)written >= sizeof result) return result;
+            used += (size_t)written;
+        }
+    }
+    return result;
+}
+
+static const char *rs_set_cb(void *obj, S32_ argc, const char **argv) {
+    (void)obj;
+    if (argc < 5) return "";
+    struct rs_effect *effect = rs_effect_at(atoi(argv[1]));
+    int u = atoi(argv[2]), c = atoi(argv[3]);
+    if (!effect || u < 0 || u >= effect->uniform_count) return "";
+    struct rs_uniform_value *uniform = &effect->uniforms[u];
+    if (!rs_uniform_editable(uniform) || c < 0 || c >= uniform->info.rows) return "";
+    unsigned offset = uniform->info.offset + (unsigned)c * 4;
+    if (offset + 4 > effect->ubo_size) return "";
+    if (uniform->info.base == 3) { float f = (float)atof(argv[4]); memcpy(effect->ubo_data + offset, &f, 4); }
+    else { int v = (int)(atof(argv[4]) + (atof(argv[4]) < 0 ? -0.5 : 0.5)); if (uniform->info.base == 0) v = v != 0; memcpy(effect->ubo_data + offset, &v, 4); }
+    return "1";
+}
+
+static const char *rs_presets_cb(void *obj, S32_ argc, const char **argv) {
+    static char result[8192];
+    (void)obj; (void)argc; (void)argv;
+    result[0] = 0;
+    char directory[1100];
+    snprintf(directory, sizeof directory, "%s/Presets", rs.shaders_dir);
+    DIR *handle = opendir(directory);
+    if (!handle) return result;
+    char *names[256]; int count = 0;
+    struct dirent *entry;
+    while ((entry = readdir(handle)) && count < 256) {
+        size_t length = strlen(entry->d_name);
+        if (entry->d_name[0] != '.' && length > 4 && !strcasecmp(entry->d_name + length - 4, ".ini") &&
+            !strpbrk(entry->d_name, "\"\\;"))
+            names[count++] = strdup(entry->d_name);
+    }
+    closedir(handle);
+    qsort(names, (size_t)count, sizeof names[0], rs_compare_names);
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        int written = snprintf(result + used, sizeof result - used, "%s%s", used ? "\n" : "", names[i]);
+        if (written > 0 && used + (size_t)written < sizeof result) used += (size_t)written;
+        free(names[i]);
+    }
+    return result;
+}
+
+static const char *rs_preset_cb(void *obj, S32_ argc, const char **argv) {
+    (void)obj;
+    if (argc < 2 || !argv[1] || strchr(argv[1], '/') || argv[1][0] == '.') return "";
+    snprintf(rs.preset_path, sizeof rs.preset_path, "%s/Presets/%s", rs.shaders_dir, argv[1]);
+    rs.reload_now = 1;
+    rs.paused = 0;
+    return "1";
+}
+
+static const char *rs_toggle_cb(void *obj, S32_ argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    rs.paused = !rs.paused;
+    return rs.paused ? "0" : "1";
+}
+
+/* Write the chain and its current values back to the preset file (ReShade's "save"). */
+static const char *rs_save_cb(void *obj, S32_ argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    if (!rs.preset_path[0] || !rs.chain_count) return "0";
+    char temporary[2100];
+    snprintf(temporary, sizeof temporary, "%s.tmp", rs.preset_path);
+    FILE *file = fopen(temporary, "w");
+    if (!file) return "0";
+    if (rs.global_define_count) {
+        fputs("PreprocessorDefinitions=", file);
+        for (int i = 0; i < rs.global_define_count; i++) fprintf(file, "%s%s", i ? "," : "", rs.global_defines[i]);
+        fputc('\n', file);
+    }
+    fputs("Techniques=", file);
+    for (int i = 0; i < rs.chain_count; i++)
+        fprintf(file, "%s%s@%s", i ? "," : "", rs.chain[i].effect->technique_names[rs.chain[i].index], rs.chain[i].effect->file);
+    fputs("\nTechniqueSorting=", file);
+    for (int i = 0; i < rs.chain_count; i++)
+        fprintf(file, "%s%s@%s", i ? "," : "", rs.chain[i].effect->technique_names[rs.chain[i].index], rs.chain[i].effect->file);
+    fputc('\n', file);
+    for (int e = 0; e < rs.effect_count; e++) {
+        struct rs_effect *effect = &rs.effects[e];
+        if (effect->ok != 1) continue;
+        fprintf(file, "\n[%s]\n", effect->file);
+        if (effect->define_count) {
+            fputs("PreprocessorDefinitions=", file);
+            for (int i = 0; i < effect->define_count; i++) fprintf(file, "%s%s", i ? "," : "", effect->defines[i]);
+            fputc('\n', file);
+        }
+        for (int u = 0; u < effect->uniform_count; u++) {
+            struct rs_uniform_value *uniform = &effect->uniforms[u];
+            if (!rs_uniform_editable(uniform)) continue;
+            fprintf(file, "%s=", uniform->info.name);
+            for (int c = 0; c < uniform->info.rows; c++) {
+                unsigned offset = uniform->info.offset + (unsigned)c * 4;
+                if (uniform->info.base == 3) { float f; memcpy(&f, effect->ubo_data + offset, 4); fprintf(file, "%s%.6f", c ? "," : "", (double)f); }
+                else { int v; memcpy(&v, effect->ubo_data + offset, 4); fprintf(file, "%s%d", c ? "," : "", v); }
+            }
+            fputc('\n', file);
+        }
+    }
+    int failed = ferror(file);
+    failed |= fclose(file) != 0;
+    if (failed || rename(temporary, rs.preset_path) != 0) { unlink(temporary); return "0"; }
+    rs_notify("preset saved");
+    return "1";
+}
+
+static void reshade_register_commands(void) {
+    Con__addMethodS(NULL, "t2launch_reshadeStatus", rs_status_cb, "t2launch_reshadeStatus() - enabled<TAB>preset", 1, 1);
+    Con__addMethodS(NULL, "t2launch_reshadeEffects", rs_effects_cb, "t2launch_reshadeEffects() - effect files in use", 1, 1);
+    Con__addMethodS(NULL, "t2launch_reshadeUniforms", rs_uniforms_cb, "t2launch_reshadeUniforms(effect) - editable values", 2, 2);
+    Con__addMethodS(NULL, "t2launch_reshadeSet", rs_set_cb, "t2launch_reshadeSet(effect, uniform, component, value)", 5, 5);
+    Con__addMethodS(NULL, "t2launch_reshadePresets", rs_presets_cb, "t2launch_reshadePresets() - preset files", 1, 1);
+    Con__addMethodS(NULL, "t2launch_reshadePreset", rs_preset_cb, "t2launch_reshadePreset(name) - load a preset", 2, 2);
+    Con__addMethodS(NULL, "t2launch_reshadeToggle", rs_toggle_cb, "t2launch_reshadeToggle() - effects on/off", 1, 1);
+    Con__addMethodS(NULL, "t2launch_reshadeSave", rs_save_cb, "t2launch_reshadeSave() - write the preset file", 1, 1);
+}
+
+static const char reshade_dialog_script[] =
+    "$T2LRS::Rows = 8;\n"
+    "function t2launch_rsText(%name, %text, %x, %y, %w, %profile) {\n"
+    " %t = new GuiTextCtrl(%name) {\n"
+    "  profile = %profile; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = %x SPC %y; extent = %w SPC 22; minExtent = \"8 8\"; visible = \"1\"; text = %text;\n"
+    " };\n"
+    " return %t;\n"
+    "}\n"
+    "function t2launch_rsButton(%name, %text, %x, %y, %command) {\n"
+    " %b = new ShellBitmapButton(%name) {\n"
+    "  profile = \"ShellButtonProfile\"; horizSizing = \"right\"; vertSizing = \"top\";\n"
+    "  position = %x SPC %y; extent = \"100 38\"; minExtent = \"32 38\"; visible = \"1\";\n"
+    "  command = %command; text = %text; simpleStyle = \"0\";\n"
+    " };\n"
+    " return %b;\n"
+    "}\n"
+    "function t2launch_rsPopup(%name, %x, %y, %w, %text) {\n"
+    " %m = new ShellPopupMenu(%name) {\n"
+    "  profile = \"ShellPopupProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = %x SPC %y; extent = %w SPC 36; minExtent = \"49 36\"; visible = \"1\"; text = %text;\n"
+    "  maxLength = \"255\"; maxPopupHeight = \"200\"; buttonBitmap = \"gui/shll_pulldown\";\n"
+    "  rolloverBarBitmap = \"gui/shll_pulldownbar_rol\"; selectedBarBitmap = \"gui/shll_pulldownbar_act\"; noButtonStyle = \"0\";\n"
+    " };\n"
+    " return %m;\n"
+    "}\n"
+    "function t2launch_rsBuild() {\n"
+    " if (isObject(T2LReshadeDlg)) return;\n"
+    " new GuiControl(T2LReshadeDlg) {\n"
+    "  profile = \"DlgBackProfile\"; horizSizing = \"width\"; vertSizing = \"height\";\n"
+    "  position = \"0 0\"; extent = \"640 480\"; minExtent = \"8 8\"; visible = \"1\";\n"
+    " };\n"
+    " %pane = new ShellPaneCtrl() {\n"
+    "  profile = \"ShellDlgPaneProfile\"; horizSizing = \"center\"; vertSizing = \"center\";\n"
+    "  position = \"20 30\"; extent = \"600 420\"; minExtent = \"48 92\"; visible = \"1\"; text = \"RESHADE\"; noTitleBar = \"0\";\n"
+    " };\n"
+    " T2LReshadeDlg.add(%pane);\n"
+    " %tgl = new ShellToggleButton(T2LRS_OnTgl) {\n"
+    "  profile = \"ShellRadioProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"24 46\"; extent = \"120 30\"; minExtent = \"26 27\"; visible = \"1\"; text = \"EFFECTS ON\";\n"
+    "  command = \"t2launch_rsToggle();\";\n"
+    " };\n"
+    " %pane.add(%tgl);\n"
+    " %pane.add(t2launch_rsPopup(\"T2LRS_PresetMenu\", 150, 42, 210, \"Preset\"));\n"
+    " %pane.add(t2launch_rsPopup(\"T2LRS_EffectMenu\", 366, 42, 210, \"Effect\"));\n"
+    " for (%r = 0; %r < $T2LRS::Rows; %r++) {\n"
+    "  %y = 92 + %r * 31;\n"
+    "  %pane.add(t2launch_rsText(\"T2LRS_Label\" @ %r, \"\", 24, %y, 190, \"ShellTextProfile\"));\n"
+    "  %s = new ShellSliderCtrl(\"T2LRS_Slider\" @ %r) {\n"
+    "   profile = \"ShellSliderProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "   position = \"230 \" @ (%y - 2); extent = \"250 24\"; minExtent = \"12 24\"; visible = \"1\";\n"
+    "   variable = \"value\"; altCommand = \"t2launch_rsSlider(\" @ %r @ \");\"; range = \"0.000000 1.000000\";\n"
+    "   ticks = \"1000\"; value = \"0\"; usePlusMinus = \"1\";\n"
+    "  };\n"
+    "  %pane.add(%s);\n"
+    "  %b = new ShellToggleButton(\"T2LRS_Check\" @ %r) {\n"
+    "   profile = \"ShellRadioProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "   position = \"230 \" @ (%y - 4); extent = \"60 30\"; minExtent = \"26 27\"; visible = \"0\"; text = \"\";\n"
+    "   command = \"t2launch_rsCheck(\" @ %r @ \");\";\n"
+    "  };\n"
+    "  %pane.add(%b);\n"
+    "  %pane.add(t2launch_rsText(\"T2LRS_Value\" @ %r, \"\", 490, %y, 90, \"ShellTextProfile\"));\n"
+    " }\n"
+    " %pane.add(t2launch_rsText(\"T2LRS_PageText\", \"\", 250, 346, 100, \"ShellTextProfile\"));\n"
+    " %pane.add(t2launch_rsButton(\"T2LRS_PrevBtn\", \"PREV\", 140, 362, \"t2launch_rsPage($T2LRS::Page - 1);\"));\n"
+    " %pane.add(t2launch_rsButton(\"T2LRS_NextBtn\", \"NEXT\", 350, 362, \"t2launch_rsPage($T2LRS::Page + 1);\"));\n"
+    " %pane.add(t2launch_rsButton(\"T2LRS_SaveBtn\", \"SAVE\", 460, 362, \"t2launch_rsSave();\"));\n"
+    " %pane.add(t2launch_rsButton(\"T2LRS_DoneBtn\", \"DONE\", 24, 362, \"t2launch_reshadeClose();\"));\n"
+    "}\n"
+    "function T2LRS_PresetMenu::onSelect(%this, %id, %text) {\n"
+    " if ($T2LRS::Filling) return;\n"
+    " t2launch_reshadePreset(%text);\n"
+    " schedule(900, 0, \"t2launch_rsRefresh\");\n"
+    "}\n"
+    "function T2LRS_EffectMenu::onSelect(%this, %id, %text) {\n"
+    " if ($T2LRS::Filling) return;\n"
+    " $T2LRS::Effect = %id - 1;\n"
+    " t2launch_rsPage(0);\n"
+    "}\n"
+    "function t2launch_rsToggle() {\n"
+    " t2launch_reshadeToggle();\n"
+    " t2launch_rsRefresh();\n"
+    "}\n"
+    "function t2launch_rsRefresh() {\n"
+    " if (!isObject(T2LReshadeDlg)) return;\n"
+    " $T2LRS::Filling = 1;\n"
+    " %status = t2launch_reshadeStatus();\n"
+    " T2LRS_OnTgl.setValue(getField(%status, 0));\n"
+    " T2LRS_PresetMenu.clear();\n"
+    " %list = t2launch_reshadePresets();\n"
+    " %count = getRecordCount(%list);\n"
+    " %selected = 0;\n"
+    " for (%i = 0; %i < %count; %i++) {\n"
+    "  %name = getRecord(%list, %i);\n"
+    "  T2LRS_PresetMenu.add(%name, %i + 1);\n"
+    "  if (%name $= getField(%status, 1)) %selected = %i + 1;\n"
+    " }\n"
+    " if (%selected) T2LRS_PresetMenu.setSelected(%selected);\n"
+    " T2LRS_EffectMenu.clear();\n"
+    " %list = t2launch_reshadeEffects();\n"
+    " %count = getRecordCount(%list);\n"
+    " for (%i = 0; %i < %count; %i++) T2LRS_EffectMenu.add(getRecord(%list, %i), %i + 1);\n"
+    " if ($T2LRS::Effect >= %count || $T2LRS::Effect $= \"\") $T2LRS::Effect = 0;\n"
+    " if (%count) T2LRS_EffectMenu.setSelected($T2LRS::Effect + 1);\n"
+    " $T2LRS::Filling = 0;\n"
+    " t2launch_rsPage($T2LRS::Page);\n"
+    "}\n"
+    "function t2launch_rsPage(%page) {\n"
+    " if (!isObject(T2LReshadeDlg)) return;\n"
+    " $T2LRS::Filling = 1;\n"
+    " %data = t2launch_reshadeUniforms($T2LRS::Effect);\n"
+    " %count = getRecordCount(%data);\n"
+    " %pages = mCeil(%count / $T2LRS::Rows);\n"
+    " if (%page >= %pages) %page = %pages - 1;\n"
+    " if (%page < 0) %page = 0;\n"
+    " $T2LRS::Page = %page;\n"
+    " for (%r = 0; %r < $T2LRS::Rows; %r++) {\n"
+    "  %i = %page * $T2LRS::Rows + %r;\n"
+    "  %label = \"T2LRS_Label\" @ %r;\n"
+    "  %slider = \"T2LRS_Slider\" @ %r;\n"
+    "  %check = \"T2LRS_Check\" @ %r;\n"
+    "  %value = \"T2LRS_Value\" @ %r;\n"
+    "  if (%i >= %count) {\n"
+    "   %label.setVisible(false); %slider.setVisible(false); %check.setVisible(false); %value.setVisible(false);\n"
+    "   continue;\n"
+    "  }\n"
+    "  %rec = getRecord(%data, %i);\n"
+    "  $T2LRS::U[%r] = getField(%rec, 0);\n"
+    "  $T2LRS::C[%r] = getField(%rec, 1);\n"
+    "  $T2LRS::K[%r] = getField(%rec, 3);\n"
+    "  $T2LRS::Min[%r] = getField(%rec, 4);\n"
+    "  $T2LRS::Max[%r] = getField(%rec, 5);\n"
+    "  %current = getField(%rec, 6);\n"
+    "  %label.setText(getSubStr(getField(%rec, 2), 0, 30));\n"
+    "  %label.setVisible(true);\n"
+    "  if ($T2LRS::K[%r] $= \"b\") {\n"
+    "   %slider.setVisible(false); %value.setVisible(false);\n"
+    "   %check.setVisible(true);\n"
+    "   %check.setValue(%current != 0);\n"
+    "  } else {\n"
+    "   %check.setVisible(false);\n"
+    "   %span = $T2LRS::Max[%r] - $T2LRS::Min[%r];\n"
+    "   if (%span <= 0) %span = 1;\n"
+    "   %slider.setValue((%current - $T2LRS::Min[%r]) / %span);\n"
+    "   %slider.setVisible(true);\n"
+    "   %value.setText(mFloatLength(%current, 3));\n"
+    "   %value.setVisible(true);\n"
+    "  }\n"
+    " }\n"
+    " T2LRS_PageText.setText(\"Page \" @ (%page + 1) @ \" / \" @ (%pages > 0 ? %pages : 1));\n"
+    " $T2LRS::Filling = 0;\n"
+    "}\n"
+    "function t2launch_rsSlider(%r) {\n"
+    " if ($T2LRS::Filling) return;\n"
+    " %o = \"T2LRS_Slider\" @ %r;\n"
+    " %span = $T2LRS::Max[%r] - $T2LRS::Min[%r];\n"
+    " %real = $T2LRS::Min[%r] + %o.getValue() * %span;\n"
+    " if ($T2LRS::K[%r] $= \"i\") %real = mFloor(%real + 0.5);\n"
+    " t2launch_reshadeSet($T2LRS::Effect, $T2LRS::U[%r], $T2LRS::C[%r], %real);\n"
+    " %v = \"T2LRS_Value\" @ %r;\n"
+    " %v.setText(mFloatLength(%real, 3));\n"
+    "}\n"
+    "function t2launch_rsCheck(%r) {\n"
+    " if ($T2LRS::Filling) return;\n"
+    " %o = \"T2LRS_Check\" @ %r;\n"
+    " t2launch_reshadeSet($T2LRS::Effect, $T2LRS::U[%r], $T2LRS::C[%r], %o.getValue() ? 1 : 0);\n"
+    "}\n"
+    "function t2launch_rsSave() {\n"
+    " t2launch_reshadeSave();\n"
+    "}\n"
+    "function t2launch_reshadeOpen() {\n"
+    " t2launch_rsBuild();\n"
+    " t2launch_rsRefresh();\n"
+    " Canvas.pushDialog(T2LReshadeDlg);\n"
+    "}\n"
+    "function t2launch_reshadeClose() {\n"
+    " if (isObject(T2LReshadeDlg)) Canvas.popDialog(T2LReshadeDlg);\n"
+    "}\n"
+    "function t2launch_reshadeHotkey() {\n"
+    " if (isObject(T2LReshadeDlg) && T2LReshadeDlg.isAwake()) t2launch_reshadeClose();\n"
+    " else t2launch_reshadeOpen();\n"
+    "}\n";
