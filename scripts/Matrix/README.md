@@ -29,8 +29,25 @@ both off again.
 `face` is `fr`, `rt`, `bk`, `lf`, `up`, `dn` (the order of the DML), `0`-`5`, or `front`/`right`/`back`/`left`/`top`/
 `bottom`. A view's rectangle is in displayed coordinates: `0,0` is the top left of the face as you see it from inside
 (on the top and bottom faces north is up). Sources today: `builtin:plasma`, `builtin:stars`, `builtin:aurora`,
-`builtin:gradient[:#rrggbb]`, `builtin:solid:#rrggbb` and `builtin:calibrate` (a labelled test pattern). A face with
-no enabled view shows its original graphics.
+`builtin:gradient[:#rrggbb]`, `builtin:solid:#rrggbb` and `builtin:calibrate` (a labelled test pattern), plus media
+through ffmpeg (see below). A face with no enabled view shows its original graphics.
+
+### Video, images and 360 video
+
+| Spec | |
+|---|---|
+| `video:<file or URL>` | any video ffmpeg reads (file, http(s), rtsp), scaled to fit the view's rectangle |
+| `image:<file>` | a picture or animated GIF/APNG |
+| `video360:<file or URL>[@layout]` | a 360 video on the whole sky: use face `all`, which makes six views sharing one decoder. Layouts: equirectangular (default), `c3x2`, `c6x1`, `c1x6`, `c2x3`, `eac`, `e-sbs`, `e-tb` (stereo) |
+
+Example: `t2launch_skyViewAdd("all", "video360:/home/me/tour.mp4");` or
+`t2launch_skyViewAdd("fr", "video:/home/me/clip.mp4", 0.1, 0.1, 0.8, 0.8, 1);`. The centre of a 360 video is north
+(the BK wall); east is to the right. Each distinct source is one 64-bit `ffmpeg` process (the game is 32-bit), killed
+when its last view is removed, when it fails or ends (the faces then show the regular sky again) and when the game
+exits. Sound comes from a second `ffmpeg` to PulseAudio/PipeWire (`Tribes 2 sky`, honours the audio output device;
+approximately in sync). Paths are used as given, so no `file:`/`concat:`/pipe tricks: only plain paths and
+http/https/rtsp URLs. Options: `sky.media`, `sky.ffmpeg`, `sky.stream_audio`, `sky.stream_volume`, `sky.stream_loop`,
+`sky.stream_fps`, `sky.video_width`, `sky.sphere_width`. Spaces in a path do not survive a saved layout.
 
 Geometry (from the engine): FR = south wall, RT = east, BK = north, LF = west, UP = top, DN = bottom.
 

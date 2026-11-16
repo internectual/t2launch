@@ -5,6 +5,7 @@
 #define T2_HOOK_TEST
 #include "../t2_hook.c"
 #include <assert.h>
+#include <sys/wait.h>
 
 static unsigned char *map_site(uintptr_t address, const unsigned char *bytes, size_t length, size_t *size_out) {
     size_t size = (size_t)sysconf(_SC_PAGESIZE);
@@ -29,7 +30,154 @@ int main(void) {
     assert(!sky_parse_color("ff8000", color) && !sky_parse_color("#ff80", color) && !sky_parse_color("#gg0000", color));
     assert(sky_parse_spec("builtin:plasma", color) == SKY_PLASMA);
     assert(sky_parse_spec("builtin:SOLID:#102030", color) == SKY_SOLID && color[2] > 0.18f && color[2] < 0.2f);
-    assert(sky_parse_spec("builtin:nonsense", color) < 0 && sky_parse_spec("video:/x.mp4", color) < 0 && sky_parse_spec(NULL, color) < 0);
+    assert(sky_parse_spec("builtin:nonsense", color) < 0 && sky_parse_spec("clip:/x.mp4", color) < 0 && sky_parse_spec(NULL, color) < 0);
+
+    /* media specs */
+    struct sky_media media;
+    assert(sky_parse_media("video:/tmp/a.mp4", &media) && media.kind == SKY_VIDEO && !media.still);
+    assert(sky_parse_media("image:./x.png", &media) && media.kind == SKY_VIDEO && media.still);
+    assert(sky_parse_media("video360:/tmp/a.mp4", &media) && media.kind == SKY_EQUIRECT && !strcmp(media.layout, "e"));
+    assert(sky_parse_media("video360:https://h.example/v.mp4@c3x2", &media) && !strcmp(media.layout, "c3x2") &&
+           !strcmp(media.source, "https://h.example/v.mp4"));
+    assert(sky_parse_media("video360:/tmp/a.mp4@e-sbs", &media) && !strcmp(media.layout, "e-sbs"));
+    assert(sky_parse_media("video:rtsp://cam.local/stream", &media));
+    assert(!sky_parse_media("video:", &media) && !sky_parse_media("video:-i", &media) && !sky_parse_media("video:file:/x", &media));
+    assert(!sky_parse_media("video:concat:a|b", &media) && !sky_parse_media("video:pipe:0", &media) && !sky_parse_media("video:ftp://x/y", &media));
+    assert(!sky_parse_media("video:/tmp/a\nb", &media) && !sky_parse_media("movie:/tmp/a", &media) && !sky_parse_media(NULL, &media));
+    assert(sky_parse_spec("video:/tmp/a.mp4", color) == SKY_VIDEO && sky_parse_spec("video360:/a", color) == SKY_EQUIRECT);
+    assert(sky_parse_spec("video:-x", color) < 0);
+
+    /* helper command lines */
+    char *argv[40];
+    assert(sky_parse_media("video:/tmp/my clip.mp4", &media));
+    int argc = sky_build_video_argv(&media, 1280, 720, 24, 1, argv, 40);
+    assert(argc > 10 && !strcmp(argv[0], "ffmpeg"));
+    int saw_input = 0, saw_loop = 0, saw_re = 0, saw_filter = 0;
+    for (int i = 0; i < argc; i++) {
+        saw_input |= !strcmp(argv[i], "file:/tmp/my clip.mp4");
+        saw_loop |= !strcmp(argv[i], "-stream_loop");
+        saw_re |= !strcmp(argv[i], "-re");
+        saw_filter |= strstr(argv[i], "scale=1280:720") && strstr(argv[i], "fps=24") && strstr(argv[i], "format=rgba");
+    }
+    assert(saw_input && saw_loop && saw_re && saw_filter && !strcmp(argv[argc - 1], "pipe:1"));
+    sky_free_argv(argv);
+    assert(sky_parse_media("video360:/tmp/c.mp4@c3x2", &media));
+    argc = sky_build_video_argv(&media, 2048, 1024, 30, 0, argv, 40);
+    int saw_v360 = 0; saw_loop = 0;
+    for (int i = 0; i < argc; i++) {
+        saw_v360 |= strstr(argv[i], "v360=input=c3x2:output=e") && strstr(argv[i], "w=2048:h=1024");
+        saw_loop |= !strcmp(argv[i], "-stream_loop");
+    }
+    assert(saw_v360 && !saw_loop);
+    sky_free_argv(argv);
+    assert(sky_parse_media("video:rtsp://cam/s", &media));
+    argc = sky_build_video_argv(&media, 1280, 720, 24, 1, argv, 40);
+    saw_re = 0;
+    for (int i = 0; i < argc; i++) saw_re |= !strcmp(argv[i], "-re");
+    assert(!saw_re);                                   /* live streams are not paced */
+    sky_free_argv(argv);
+    assert(sky_parse_media("video:/tmp/a.mp4", &media));
+    argc = sky_build_audio_argv(&media, 1, 0.5, "alsa_output.pci-0000_00_1f.3.analog-stereo", argv, 40);
+    int saw_pulse = 0, saw_vn = 0, saw_device = 0, saw_volume = 0;
+    for (int i = 0; i < argc; i++) {
+        saw_pulse |= !strcmp(argv[i], "pulse"); saw_vn |= !strcmp(argv[i], "-vn");
+        saw_device |= !strcmp(argv[i], "alsa_output.pci-0000_00_1f.3.analog-stereo"); saw_volume |= !strcmp(argv[i], "volume=0.50");
+    }
+    assert(saw_pulse && saw_vn && saw_device && saw_volume);
+    sky_free_argv(argv);
+    argc = sky_build_audio_argv(&media, 0, 1.0, "bad device;rm", argv, 40);      /* an odd device name is dropped */
+    for (int i = 0; i < argc; i++) assert(strcmp(argv[i], "-device") != 0);
+    sky_free_argv(argv);
+
+    /* a fake ffmpeg that records its arguments and writes five 1280x720 RGBA frames */
+    char directory[] = "/tmp/sky_views_test_XXXXXX";
+    assert(mkdtemp(directory));
+    char fake[256], record[256];
+    snprintf(fake, sizeof fake, "%s/ffmpeg", directory);
+    snprintf(record, sizeof record, "%s/args", directory);
+    FILE *script = fopen(fake, "w");
+    assert(script);
+    fprintf(script, "#!/bin/sh\nprintf '%%s\\n' \"$@\" >> %s/args.$$\n"
+                    "case \" $* \" in *\" -vn \"*) sleep 30; exit 0;; esac\n"
+                    "i=0; while [ $i -lt 5 ]; do head -c 3686400 /dev/zero; sleep 0.05; i=$((i+1)); done\n", directory);
+    fclose(script);
+    chmod(fake, 0755);
+    setenv("T2LAUNCH_SKY_FFMPEG", fake, 1);
+    memset(&sky, 0, sizeof sky);
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) sky.sources[i].fd = -1;
+
+    /* a flat video: a source starts, frames arrive, it ends on its own */
+    int video = sky_add_view(2, "video:/tmp/clip.mp4", 0.1f, 0.1f, 0.5f, 0.5f, 1);
+    assert(video);
+    struct sky_view *flat = sky_find_view(video);
+    assert(flat->kind == SKY_VIDEO && flat->source >= 0 && sky.sources[flat->source].in_use);
+    struct sky_source *source = &sky.sources[flat->source];
+    assert(source->width == 1280 && source->height == 720 && source->audio_pid > 0);
+    for (int i = 0; i < 100 && !source->ended; i++) usleep(50000);
+    assert(source->ended && !source->failed && source->seq >= 1);
+    unsigned seq = 0;
+    unsigned char *frame = sky_source_take_frame(source, &seq);
+    assert(frame && seq == source->seq && source->reading >= 0);
+    sky_source_done_with_frame(source, seq);
+    assert(sky_source_take_frame(source, &seq) == NULL && source->reading == -1);
+    sky_media_reap();                                                  /* ended: the view goes, the helper is gone */
+    assert(sky_view_count() == 0 && !source->in_use);
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);       /* no stray children, audio included */
+
+    /* two views of one spec share a source; the last release stops it */
+    int first = sky_add_view(0, "video:/tmp/clip.mp4", 0, 0, 1, 1, 1), second = sky_add_view(1, "video:/tmp/clip.mp4", 0, 0, 1, 1, 1);
+    assert(first && second && sky_find_view(first)->source == sky_find_view(second)->source);
+    int shared = sky_find_view(first)->source;
+    assert(sky.sources[shared].refs == 2);
+    sky_remove_view(sky_find_view(first));
+    assert(sky.sources[shared].in_use && sky.sources[shared].refs == 1);
+    sky_remove_view(sky_find_view(second));
+    assert(!sky.sources[shared].in_use);
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+
+    /* a 360 view: six faces, one source, one group; edits and removal apply to the group */
+    assert(sky_add_view(SKY_ALL, "builtin:plasma", 0, 0, 1, 1, 1) == 0);                 /* only 360 video can cover the sky */
+    assert(sky_add_view(0, "video360:/tmp/eq.mp4", 0, 0, 1, 1, 1) == 0);                 /* and it needs all the faces */
+    int sphere = sky_add_view(SKY_ALL, "video360:/tmp/eq.mp4", 0, 0, 1, 1, 0.8f);
+    assert(sphere && sky_view_count() == 6);
+    int members = 0, src = -1;
+    for (int i = 0; i < SKY_MAX_VIEWS; i++) {
+        if (!sky.views[i].id) continue;
+        members++;
+        assert(sky.views[i].group == sphere && sky.views[i].kind == SKY_EQUIRECT);
+        if (src < 0) src = sky.views[i].source;
+        assert(sky.views[i].source == src);
+    }
+    assert(members == 6 && sky.sources[src].refs == 6);
+    assert(sky_set_field_group(sky_find_view(sphere), "opacity", "0.3"));
+    for (int i = 0; i < SKY_MAX_VIEWS; i++) if (sky.views[i].id) assert(fabsf(sky.views[i].opacity - 0.3f) < 1e-4f);
+    assert(!sky_set_field(sky_find_view(sphere), "face", "up") && !sky_set_field(sky_find_view(sphere), "spec", "builtin:stars"));
+    sky_remove_view(sky_find_view(sphere));
+    assert(sky_view_count() == 0 && !sky.sources[src].in_use);
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+
+    /* a spec that cannot run: the view exists until the helper dies without a frame, then it is reaped */
+    setenv("T2LAUNCH_SKY_FFMPEG", "/nonexistent/ffmpeg", 1);
+    int broken = sky_add_view(3, "video:/tmp/clip.mp4", 0, 0, 1, 1, 1);
+    assert(broken);
+    source = &sky.sources[sky_find_view(broken)->source];
+    for (int i = 0; i < 100 && !source->failed; i++) usleep(50000);
+    assert(source->failed && source->error[0]);
+    sky_media_reap();
+    assert(sky_view_count() == 0 && !sky.sources[0].in_use);
+    setenv("T2LAUNCH_SKY_FFMPEG", fake, 1);
+
+    /* sky.media off: no helper starts */
+    for (size_t i = 0; i < HOOK_OPTION_COUNT; i++)
+        if (!strcmp(hook_options[i].key, "sky.media")) { snprintf(hook_options[i].value, sizeof hook_options[i].value, "0"); hook_options[i].set = 1; }
+    assert(sky_add_view(0, "video:/tmp/clip.mp4", 0, 0, 1, 1, 1) == 0);
+    for (size_t i = 0; i < HOOK_OPTION_COUNT; i++)
+        if (!strcmp(hook_options[i].key, "sky.media")) { snprintf(hook_options[i].value, sizeof hook_options[i].value, "1"); }
+    unlink(record);
+    char command[400];
+    snprintf(command, sizeof command, "rm -rf %s", directory);
+    assert(system(command) == 0);
+    unsetenv("T2LAUNCH_SKY_FFMPEG");
 
     /* views: clamping, fields, lines */
     memset(&sky, 0, sizeof sky);

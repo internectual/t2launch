@@ -177,6 +177,34 @@ OPTIONS = (
            help="Draw the lower half of the four sky walls too. The engine clips them at the camera's height "
                 "because terrain normally hides them; maps without terrain (like Matrix, which turns this on "
                 "itself) need it. Affects every sky while on."),
+    Option("sky.media", "Sky views", "Video sources on the sky", "bool", True,
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Let sky views play video, images, streams and 360 video through ffmpeg (a separate 64-bit "
+                "process per source, started when a view is added and stopped when it is removed)."),
+    Option("sky.ffmpeg", "Sky views", "ffmpeg program", "text", "",
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Path of the ffmpeg to use for sky video; blank uses ffmpeg from PATH."),
+    Option("sky.stream_audio", "Sky views", "Play the video's audio", "bool", True,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Play the sound of sky videos through the audio output (a second ffmpeg; the sync with the "
+                "picture is approximate)."),
+    Option("sky.stream_volume", "Sky views", "Video volume (percent)", "int", 50, minimum=0, maximum=200,
+           hook=True, advanced=True, requires=(("sky.stream_audio", (True,)),),
+           help="Volume of sky video audio, 100 = as recorded."),
+    Option("sky.stream_loop", "Sky views", "Loop videos", "bool", True,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Start a video over when it ends; otherwise its views are removed and the faces show the "
+                "regular sky again."),
+    Option("sky.stream_fps", "Sky views", "Video frame rate", "int", 24, minimum=1, maximum=60,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Frames per second decoded for sky video."),
+    Option("sky.video_width", "Sky views", "Video width", "int", 1280, minimum=128, maximum=3840,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Decoded width of flat video (16:9); the sky face textures are only 512 pixels wide, so more "
+                "than 1280 buys little."),
+    Option("sky.sphere_width", "Sky views", "360 video width", "int", 2048, minimum=256, maximum=4096,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Decoded width of 360 video (the height is half); 4096 needs a fast CPU."),
     Option("video.reshade", "Video", "ReShade effects", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
@@ -522,7 +550,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "sky.media", "sky.ffmpeg", "sky.stream_audio", "sky.stream_volume", "sky.stream_loop", "sky.stream_fps", "sky.video_width", "sky.sphere_width", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",

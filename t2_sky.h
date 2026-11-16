@@ -14,6 +14,8 @@
  * Runs on the game thread from the SDL_GL_SwapBuffers hook, with the game's GL context current.
  */
 #include <ctype.h>
+#include <signal.h>
+#include <sys/prctl.h>
 
 #define RS_TEXTURE_BINDING_2D_VALUE 0x8069
 #define SKY_FACES 6
@@ -23,10 +25,15 @@
 #define SKY_RESOLVE_INTERVAL 30      /* frames between looking the Sky up again */
 #define SKY_ANIMATION_MS 33          /* animated views redraw at about 30 fps */
 
-enum sky_kind { SKY_SOLID, SKY_GRADIENT, SKY_PLASMA, SKY_STARS, SKY_AURORA, SKY_CALIBRATE, SKY_KIND_COUNT };
-static const char *const sky_kind_names[SKY_KIND_COUNT] = {"solid", "gradient", "plasma", "stars", "aurora", "calibrate"};
-static const int sky_kind_animated[SKY_KIND_COUNT] = {0, 0, 1, 1, 1, 0};
-static const char *const sky_face_names[SKY_FACES] = {"fr", "rt", "bk", "lf", "up", "dn"};
+enum sky_kind { SKY_SOLID, SKY_GRADIENT, SKY_PLASMA, SKY_STARS, SKY_AURORA, SKY_CALIBRATE,
+                SKY_VIDEO, SKY_EQUIRECT, SKY_KIND_COUNT };
+#define SKY_BUILTIN_COUNT 6          /* the kinds above that need no helper process */
+#define SKY_ALL 6                    /* "face" value: a 360 view that covers all six faces */
+#define SKY_SPEC_SIZE 512
+#define SKY_MAX_SOURCES 12
+static const char *const sky_kind_names[SKY_BUILTIN_COUNT] = {"solid", "gradient", "plasma", "stars", "aurora", "calibrate"};
+static const int sky_kind_animated[SKY_KIND_COUNT] = {0, 0, 1, 1, 1, 0, 1, 1};
+static const char *const sky_face_names[SKY_FACES + 1] = {"fr", "rt", "bk", "lf", "up", "dn", "all"};
 /* Views are placed in displayed coordinates: the face as a viewer sees it from inside, walls upright, the top
    and bottom with north (+Y) at the top of the view. The engine maps the textures differently (Sky::renderSkyBox
    and calcPoints: wall u runs along the viewer's left, the top's u along +X which is the viewer's left, the
@@ -38,7 +45,9 @@ static const int sky_face_flip_y[SKY_FACES] = {0, 0, 0, 0, 0, 1};
 struct sky_view {
     int id;                 /* 0 = free slot */
     int face;               /* 0..5 */
-    char spec[256];         /* "builtin:plasma", ... */
+    char spec[SKY_SPEC_SIZE];   /* "builtin:plasma", "video:/path/clip.mp4", ... */
+    int group;              /* views made together (a 360 view is six); removed together */
+    int source;             /* index into sky.sources for video kinds, else -1 */
     int kind;               /* enum sky_kind */
     float color[4];         /* builtin colour (solid/gradient), rgba */
     float x, y, w, h;       /* rect in face space, 0..1, origin top-left */
@@ -55,7 +64,34 @@ struct sky_face {
     unsigned backup;        /* original pixels */
     int modified;           /* the engine texture currently holds our composite */
     uint64_t last_draw_ms;
+    int force;              /* a media source delivered a new frame: redraw this face */
     unsigned retry_frame;   /* the original pixels were not there yet: look again at this frame */
+};
+
+struct sky_media {
+    int kind;                 /* SKY_VIDEO or SKY_EQUIRECT */
+    int still;                /* image: (a picture or GIF), played slowly */
+    char source[480];         /* a local path or an http/https/rtsp URL */
+    char layout[16];          /* 360 input layout for v360 (default "e", equirect) */
+};
+
+struct sky_source {
+    int in_use, refs;
+    char key[SKY_SPEC_SIZE];
+    struct sky_media media;
+    int width, height, fps;
+    pid_t video_pid, audio_pid;
+    int fd, error_fd;
+    pthread_t thread;
+    int thread_running;
+    volatile int stop, ended, failed;
+    unsigned char *slots[3];
+    int latest, reading, writing;
+    unsigned seq, uploaded;
+    pthread_mutex_t lock;
+    unsigned texture;
+    int texture_ready, failure_reported;
+    char error[200];
 };
 
 static struct {
@@ -66,6 +102,7 @@ static struct {
     void (*Uniform3f)(int, float, float, float);
     void (*Uniform4f)(int, float, float, float, float);
     void (*BlendFunc)(unsigned, unsigned);
+    void (*TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void *);
     void *sky;                          /* the Sky object found last */
     unsigned frame;
     struct sky_face faces[SKY_FACES];
@@ -75,6 +112,8 @@ static struct {
     int u_kind, u_time, u_face, u_color, u_opacity;
     int full_box_applied;
     int gl_name_offset;                 /* where TextureObject keeps its GL name (found by probing) */
+    struct sky_source sources[SKY_MAX_SOURCES];
+    int u_tex;
     uint64_t start_ms;
 } sky;
 
@@ -84,12 +123,289 @@ static uint64_t sky_now_ms(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
+
+/* ── Media sources (ffmpeg helper processes) ───────────────────────── */
+
+/* The game is 32-bit, so video is decoded by a 64-bit ffmpeg started with the game's loader settings removed;
+   it writes raw RGBA frames to a pipe and a reader thread keeps the newest one for the game thread to upload. */
+/* "http://", "https://", "rtsp://" or a path: no option-looking or control characters. */
+static int sky_media_source_ok(const char *text) {
+    if (!text || !*text || strlen(text) >= sizeof(((struct sky_media *)0)->source)) return 0;
+    for (const unsigned char *c = (const unsigned char *)text; *c; c++) if (*c < 0x20 || *c == 0x7f) return 0;
+    if (text[0] == '-') return 0;
+    const char *colon = strstr(text, "://");
+    if (colon) return !strncmp(text, "http://", 7) || !strncmp(text, "https://", 8) || !strncmp(text, "rtsp://", 7);
+    return !strchr(text, ':') || text[0] == '/' || text[0] == '.';   /* no other scheme (file:, concat:, pipe:) */
+}
+
+static int sky_layout_token_ok(const char *token) {
+    static const char *const allowed[] = {"e", "equirect", "c3x2", "c6x1", "c1x6", "c2x3", "eac", "fisheye",
+                                          "e-sbs", "e-tb"};
+    for (size_t i = 0; i < sizeof allowed / sizeof allowed[0]; i++) if (!strcmp(token, allowed[i])) return 1;
+    return 0;
+}
+
+/* "video:<src>", "image:<src>" or "video360:<src>[@layout]"; 0 when it is none of those or invalid. */
+static int sky_parse_media(const char *spec, struct sky_media *media) {
+    memset(media, 0, sizeof *media);
+    if (!spec) return 0;
+    const char *rest;
+    if (!strncmp(spec, "video360:", 9)) { media->kind = SKY_EQUIRECT; rest = spec + 9; }
+    else if (!strncmp(spec, "video:", 6)) { media->kind = SKY_VIDEO; rest = spec + 6; }
+    else if (!strncmp(spec, "image:", 6)) { media->kind = SKY_VIDEO; media->still = 1; rest = spec + 6; }
+    else return 0;
+    snprintf(media->source, sizeof media->source, "%s", rest);
+    snprintf(media->layout, sizeof media->layout, "e");
+    if (media->kind == SKY_EQUIRECT) {
+        char *at = strrchr(media->source, '@');
+        if (at && sky_layout_token_ok(at + 1)) {
+            snprintf(media->layout, sizeof media->layout, "%s", at + 1);
+            *at = 0;
+        }
+        if (!strcmp(media->layout, "equirect")) snprintf(media->layout, sizeof media->layout, "e");
+    }
+    return sky_media_source_ok(media->source);
+}
+
+static double sky_option_number(const char *key, double fallback, double minimum, double maximum) {
+    const char *text = hook_option_str(key);
+    double value = text && *text ? atof(text) : fallback;
+    return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+
+static const char *sky_ffmpeg_path(void) {
+    const char *override = getenv("T2LAUNCH_SKY_FFMPEG");
+    if (override && *override) return override;
+    const char *configured = hook_option_str("sky.ffmpeg");
+    return configured && *configured ? configured : "ffmpeg";
+}
+
+static char *sky_dup(const char *text) { return strdup(text ? text : ""); }
+
+static int sky_input_argument(const struct sky_media *media, char *out, size_t size) {
+    if (strstr(media->source, "://")) return snprintf(out, size, "%s", media->source) < (int)size;
+    return snprintf(out, size, "file:%s", media->source) < (int)size;   /* "file:" keeps a path from being an option */
+}
+
+/* The video helper's command line (strdup'ed strings, NULL-terminated); returns the number of arguments. */
+static int sky_build_video_argv(const struct sky_media *media, int width, int height, int fps, int loop, char **argv, int max) {
+    char input[540], filter[400];
+    if (max < 28 || !sky_input_argument(media, input, sizeof input)) return 0;
+    if (media->kind == SKY_EQUIRECT && strcmp(media->layout, "e") != 0) {
+        const char *stereo = "";
+        const char *layout = media->layout;
+        if (!strcmp(layout, "e-sbs")) { layout = "e"; stereo = ":in_stereo=sbs:out_stereo=2d"; }
+        else if (!strcmp(layout, "e-tb")) { layout = "e"; stereo = ":in_stereo=tb:out_stereo=2d"; }
+        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=lin,fps=%d,format=rgba", layout, stereo, width, height, fps);
+    } else if (media->kind == SKY_EQUIRECT) {
+        snprintf(filter, sizeof filter, "scale=%d:%d,fps=%d,format=rgba", width, height, fps);
+    } else {
+        snprintf(filter, sizeof filter, "scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,fps=%d,format=rgba",
+                 width, height, width, height, fps);
+    }
+    int n = 0;
+    argv[n++] = sky_dup(sky_ffmpeg_path());
+    argv[n++] = sky_dup("-hide_banner"); argv[n++] = sky_dup("-loglevel"); argv[n++] = sky_dup("error");
+    argv[n++] = sky_dup("-nostdin"); argv[n++] = sky_dup("-nostats");
+    argv[n++] = sky_dup("-protocol_whitelist"); argv[n++] = sky_dup("file,http,https,tcp,tls,crypto,rtsp,rtp,udp");
+    if (strncmp(media->source, "rtsp://", 7) != 0) argv[n++] = sky_dup("-re");   /* pace files; live streams pace themselves */
+    if (loop || media->still) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
+    argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(input);
+    argv[n++] = sky_dup("-an"); argv[n++] = sky_dup("-sn");
+    argv[n++] = sky_dup("-vf"); argv[n++] = sky_dup(filter);
+    argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("rawvideo");
+    argv[n++] = sky_dup("-pix_fmt"); argv[n++] = sky_dup("rgba");
+    argv[n++] = sky_dup("pipe:1");
+    argv[n] = NULL;
+    return n;
+}
+
+/* The audio helper: the same input, video dropped, played to PulseAudio/PipeWire. */
+static int sky_build_audio_argv(const struct sky_media *media, int loop, double volume, const char *device, char **argv, int max) {
+    char input[540], filter[48];
+    if (max < 28 || !sky_input_argument(media, input, sizeof input)) return 0;
+    int n = 0;
+    argv[n++] = sky_dup(sky_ffmpeg_path());
+    argv[n++] = sky_dup("-hide_banner"); argv[n++] = sky_dup("-loglevel"); argv[n++] = sky_dup("error");
+    argv[n++] = sky_dup("-nostdin"); argv[n++] = sky_dup("-nostats");
+    argv[n++] = sky_dup("-protocol_whitelist"); argv[n++] = sky_dup("file,http,https,tcp,tls,crypto,rtsp,rtp,udp");
+    if (strncmp(media->source, "rtsp://", 7) != 0) argv[n++] = sky_dup("-re");
+    if (loop) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
+    argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(input);
+    argv[n++] = sky_dup("-vn"); argv[n++] = sky_dup("-sn");
+    snprintf(filter, sizeof filter, "volume=%.2f", volume);
+    argv[n++] = sky_dup("-af"); argv[n++] = sky_dup(filter);
+    argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("pulse");
+    if (device && *device && strspn(device, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:+@-") == strlen(device)) {
+        argv[n++] = sky_dup("-device"); argv[n++] = sky_dup(device);
+    }
+    argv[n++] = sky_dup("Tribes 2 sky");
+    argv[n] = NULL;
+    return n;
+}
+
+static void sky_free_argv(char **argv) { for (int i = 0; argv[i]; i++) free(argv[i]); }
+
+/* Start a helper with stdout (and optionally stderr) on pipes the hook reads; returns its pid or -1. */
+static pid_t sky_spawn(char **argv, int stdout_fd, int stderr_fd) {
+    char **env = helper_environment();
+    if (!env) return -1;
+    pid_t child = fork();
+    if (child == 0) {
+        prctl(PR_SET_PDEATHSIG, SIGKILL);   /* never outlive the game */
+        int null = open("/dev/null", O_RDWR);
+        dup2(null, STDIN_FILENO);
+        dup2(stdout_fd >= 0 ? stdout_fd : null, STDOUT_FILENO);
+        dup2(stderr_fd >= 0 ? stderr_fd : null, STDERR_FILENO);
+        execvpe(argv[0], argv, env);
+        _exit(127);
+    }
+    free(env);
+    return child;
+}
+
+static void *sky_reader_thread(void *argument) {
+    struct sky_source *source = argument;
+    size_t frame_bytes = (size_t)source->width * (size_t)source->height * 4;
+    while (!source->stop) {
+        unsigned char *slot = source->slots[source->writing];
+        size_t got = 0;
+        while (got < frame_bytes && !source->stop) {
+            ssize_t n = read(source->fd, slot + got, frame_bytes - got);
+            if (n > 0) { got += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
+        if (got < frame_bytes) break;                       /* the helper ended */
+        pthread_mutex_lock(&source->lock);
+        source->latest = source->writing;
+        source->seq++;
+        for (int i = 0; i < 3; i++) if (i != source->latest && i != source->reading) { source->writing = i; break; }
+        pthread_mutex_unlock(&source->lock);
+    }
+    if (!source->stop) {
+        if (!source->seq) {   /* it never produced a frame: say why */
+            source->failed = 1;
+            char text[200] = "";
+            ssize_t n = source->error_fd >= 0 ? read(source->error_fd, text, sizeof text - 1) : 0;
+            if (n > 0) { text[n] = 0; for (char *c = text; *c; c++) if (*c == '\n' || *c == '\r') { *c = 0; break; } }
+            snprintf(source->error, sizeof source->error, "%s", text[0] ? text : "the helper produced no frames (is ffmpeg installed and the source readable?)");
+        }
+        source->ended = 1;
+    }
+    return NULL;
+}
+
+static void sky_source_destroy(struct sky_source *source) {
+    source->stop = 1;
+    /* killing the helper closes the pipe's write end, which ends the reader thread's read() */
+    if (source->video_pid > 0) kill(source->video_pid, SIGKILL);
+    if (source->audio_pid > 0) kill(source->audio_pid, SIGKILL);
+    if (source->thread_running) pthread_join(source->thread, NULL);
+    if (source->fd >= 0) close(source->fd);
+    if (source->error_fd >= 0) close(source->error_fd);
+    if (source->video_pid > 0) waitpid(source->video_pid, NULL, 0);
+    if (source->audio_pid > 0) waitpid(source->audio_pid, NULL, 0);
+    for (int i = 0; i < 3; i++) free(source->slots[i]);
+    if (source->texture && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->texture);
+    pthread_mutex_destroy(&source->lock);
+    memset(source, 0, sizeof *source);
+}
+
+static void sky_source_release(int index) {
+    if (index < 0 || index >= SKY_MAX_SOURCES || !sky.sources[index].in_use) return;
+    if (--sky.sources[index].refs <= 0) sky_source_destroy(&sky.sources[index]);
+}
+
+/* A running source for this spec, started now when there is none (views of the same spec share one). */
+static int sky_source_acquire(const char *spec, const struct sky_media *media) {
+    for (int i = 0; i < SKY_MAX_SOURCES; i++)
+        if (sky.sources[i].in_use && !strcmp(sky.sources[i].key, spec)) { sky.sources[i].refs++; return i; }
+    if (!hook_option_bool("sky.media")) { fprintf(stderr, "[t2_hook] Sky views: media sources are turned off (sky.media)\n"); return -1; }
+    int index = -1;
+    for (int i = 0; i < SKY_MAX_SOURCES && index < 0; i++) if (!sky.sources[i].in_use) index = i;
+    if (index < 0) return -1;
+    struct sky_source *source = &sky.sources[index];
+    memset(source, 0, sizeof *source);
+    snprintf(source->key, sizeof source->key, "%s", spec);
+    source->media = *media;
+    source->fd = source->error_fd = -1;
+    int fps = media->still ? 5 : (int)sky_option_number("sky.stream_fps", 24, 1, 60);
+    if (media->kind == SKY_EQUIRECT) {
+        source->width = (int)sky_option_number("sky.sphere_width", 2048, 256, 4096) & ~1;
+        source->height = source->width / 2;
+    } else {
+        source->width = (int)sky_option_number("sky.video_width", 1280, 128, 3840) & ~1;
+        source->height = (source->width * 9 / 16) & ~1;
+    }
+    source->fps = fps;
+    int loop = hook_option_bool("sky.stream_loop");
+    char *argv[40];
+    int argc = sky_build_video_argv(media, source->width, source->height, fps, loop, argv, 40);
+    if (!argc) return -1;
+    int out[2], err[2];
+    if (pipe2(out, O_CLOEXEC) != 0) { sky_free_argv(argv); return -1; }
+    if (pipe2(err, O_CLOEXEC) != 0) { close(out[0]); close(out[1]); sky_free_argv(argv); return -1; }
+    pthread_mutex_init(&source->lock, NULL);
+    size_t frame_bytes = (size_t)source->width * (size_t)source->height * 4;
+    for (int i = 0; i < 3; i++) source->slots[i] = malloc(frame_bytes);
+    source->latest = -1; source->reading = -1; source->writing = 0;
+    source->video_pid = sky_spawn(argv, out[1], err[1]);
+    sky_free_argv(argv);
+    close(out[1]); close(err[1]);
+    source->fd = out[0];
+    source->error_fd = err[0];
+    fcntl(source->error_fd, F_SETFL, O_NONBLOCK);
+    if (source->video_pid < 0 || !source->slots[0] || !source->slots[1] || !source->slots[2]) {
+        source->in_use = 1;
+        sky_source_destroy(source);
+        return -1;
+    }
+    source->in_use = 1;
+    source->refs = 1;
+    if (pthread_create(&source->thread, NULL, sky_reader_thread, source) == 0) source->thread_running = 1;
+    if (media->kind != SKY_VIDEO || !media->still) {
+        if (hook_option_bool("sky.stream_audio")) {
+            char *audio[40];
+            const char *device = getenv("T2LAUNCH_AUDIO_OUTPUT");
+            if (sky_build_audio_argv(media, loop, sky_option_number("sky.stream_volume", 50, 0, 200) / 100.0, device, audio, 40)) {
+                source->audio_pid = sky_spawn(audio, -1, -1);
+                sky_free_argv(audio);
+            }
+        }
+    }
+    fprintf(stderr, "[t2_hook] Sky views: started %s (%dx%d at %d fps%s)\n", spec, source->width, source->height, fps,
+            source->audio_pid > 0 ? ", with audio" : "");
+    return index;
+}
+
+/* Take the newest frame, if there is a new one: its slot is held until the caller is done with it. */
+static unsigned char *sky_source_take_frame(struct sky_source *source, unsigned *seq) {
+    unsigned char *frame = NULL;
+    pthread_mutex_lock(&source->lock);
+    if (source->latest >= 0 && source->seq != source->uploaded) {
+        source->reading = source->latest;
+        frame = source->slots[source->latest];
+        *seq = source->seq;
+    }
+    pthread_mutex_unlock(&source->lock);
+    return frame;
+}
+
+static void sky_source_done_with_frame(struct sky_source *source, unsigned seq) {
+    pthread_mutex_lock(&source->lock);
+    source->uploaded = seq;
+    source->reading = -1;
+    pthread_mutex_unlock(&source->lock);
+}
+
 /* ── Specs and views ───────────────────────────────────────────────── */
 
 /* "fr".."dn", "0".."5", "front"... -> 0..5, or -1. */
 static int sky_parse_face(const char *text) {
     if (!text || !*text) return -1;
     if (text[0] >= '0' && text[0] <= '5' && !text[1]) return text[0] - '0';
+    if (!strcasecmp(text, "all") || !strcasecmp(text, "sphere")) return SKY_ALL;
     static const char *const long_names[SKY_FACES] = {"front", "right", "back", "left", "up", "down"};
     for (int i = 0; i < SKY_FACES; i++)
         if (!strcasecmp(text, sky_face_names[i]) || !strcasecmp(text, long_names[i]) ||
@@ -114,14 +430,16 @@ static int sky_parse_color(const char *text, float *out) {
 static int sky_parse_spec(const char *spec, float *color) {
     static const char prefix[] = "builtin:";
     color[0] = 0.0f; color[1] = 0.8f; color[2] = 0.2f; color[3] = 1.0f;
-    if (!spec || strncmp(spec, prefix, sizeof prefix - 1) != 0) return -1;
+    struct sky_media media;
+    if (spec && strncmp(spec, prefix, sizeof prefix - 1) != 0) return sky_parse_media(spec, &media) ? media.kind : -1;
+    if (!spec) return -1;
     char name[32] = "";
     const char *rest = spec + sizeof prefix - 1;
     size_t length = strcspn(rest, ":");
     if (length == 0 || length >= sizeof name) return -1;
     memcpy(name, rest, length); name[length] = 0;
     int kind = -1;
-    for (int i = 0; i < SKY_KIND_COUNT; i++) if (!strcasecmp(name, sky_kind_names[i])) kind = i;
+    for (int i = 0; i < SKY_BUILTIN_COUNT; i++) if (!strcasecmp(name, sky_kind_names[i])) kind = i;
     if (kind < 0) return -1;
     if (rest[length] == ':') sky_parse_color(rest + length + 1, color);
     return kind;
@@ -138,29 +456,89 @@ static int sky_view_count(void) {
     return count;
 }
 
-/* Add a view; returns its id (> 0) or 0 when the spec/face is invalid or the table is full. */
-static int sky_add_view(int face, const char *spec, float x, float y, float w, float h, float opacity) {
+static void sky_view_free(struct sky_view *view) {
+    if (view->id && view->source >= 0) sky_source_release(view->source);
+    memset(view, 0, sizeof *view);
+}
+
+static void sky_views_clear(void) {
+    for (int i = 0; i < SKY_MAX_VIEWS; i++) sky_view_free(&sky.views[i]);
+}
+
+/* Point a view at a source spec (starting its helper when it is media); 0 when the spec is invalid or the
+   source cannot start. The old source is released only once the new one is running. */
+static int sky_view_bind(struct sky_view *view, const char *spec) {
     float color[4];
     int kind = sky_parse_spec(spec, color);
-    if (face < 0 || face >= SKY_FACES || kind < 0 || strlen(spec) >= sizeof sky.views[0].spec) return 0;
+    if (kind < 0 || strlen(spec) >= sizeof view->spec) return 0;
+    int source = -1;
+    if (kind >= SKY_VIDEO) {
+        struct sky_media media;
+        if (!sky_parse_media(spec, &media)) return 0;
+        source = sky_source_acquire(spec, &media);
+        if (source < 0) return 0;
+    }
+    if (view->source >= 0) sky_source_release(view->source);
+    view->source = source;
+    snprintf(view->spec, sizeof view->spec, "%s", spec);
+    view->kind = kind;
+    memcpy(view->color, color, sizeof color);
+    return 1;
+}
+
+static struct sky_view *sky_add_one(int face, const char *spec, float x, float y, float w, float h, float opacity) {
     for (int i = 0; i < SKY_MAX_VIEWS; i++) {
         if (sky.views[i].id) continue;
         struct sky_view *view = &sky.views[i];
         memset(view, 0, sizeof *view);
-        view->id = ++sky.next_id;
+        view->source = -1;
         view->face = face;
-        snprintf(view->spec, sizeof view->spec, "%s", spec);
-        view->kind = kind;
-        memcpy(view->color, color, sizeof color);
+        if (!sky_view_bind(view, spec)) { memset(view, 0, sizeof *view); return NULL; }
+        view->id = ++sky.next_id;
         view->x = x < 0 ? 0 : x > 1 ? 1 : x;
         view->y = y < 0 ? 0 : y > 1 ? 1 : y;
         view->w = w <= 0 ? 0.01f : w > 1 ? 1 : w;
         view->h = h <= 0 ? 0.01f : h > 1 ? 1 : h;
         view->opacity = opacity < 0 ? 0 : opacity > 1 ? 1 : opacity;
         view->enabled = 1;
-        return view->id;
+        return view;
     }
-    return 0;
+    return NULL;
+}
+
+/* Add a view; returns its id (> 0) or 0 when the spec/face is invalid, the source cannot start or the table is
+   full. Face "all" (a 360 video on the whole sky) makes six views that share one source and one group. */
+static int sky_add_view(int face, const char *spec, float x, float y, float w, float h, float opacity) {
+    float color[4];
+    int kind = sky_parse_spec(spec, color);
+    if (face < 0 || face > SKY_ALL || kind < 0) return 0;
+    if (face != SKY_ALL) {
+        if (kind == SKY_EQUIRECT) return 0;   /* a sphere needs all six faces */
+        struct sky_view *view = sky_add_one(face, spec, x, y, w, h, opacity);
+        return view ? view->id : 0;
+    }
+    if (kind != SKY_EQUIRECT) return 0;
+    int free_slots = 0;
+    for (int i = 0; i < SKY_MAX_VIEWS; i++) free_slots += sky.views[i].id == 0;
+    if (free_slots < SKY_FACES) return 0;
+    int first = 0;
+    for (int f = 0; f < SKY_FACES; f++) {
+        struct sky_view *view = sky_add_one(f, spec, 0, 0, 1, 1, opacity);
+        if (!view) {                                    /* cannot happen after the slot check; undo anyway */
+            for (int i = 0; i < SKY_MAX_VIEWS; i++) if (sky.views[i].id && sky.views[i].group == first && first) sky_view_free(&sky.views[i]);
+            return 0;
+        }
+        if (!first) first = view->id;
+        view->group = first;
+    }
+    return first;
+}
+
+/* Remove a view, and the rest of its 360 group. */
+static void sky_remove_view(struct sky_view *view) {
+    int group = view->group;
+    sky_view_free(view);
+    if (group) for (int i = 0; i < SKY_MAX_VIEWS; i++) if (sky.views[i].id && sky.views[i].group == group) sky_view_free(&sky.views[i]);
 }
 
 static int sky_set_field(struct sky_view *view, const char *field, const char *value) {
@@ -173,16 +551,27 @@ static int sky_set_field(struct sky_view *view, const char *field, const char *v
     else if (!strcmp(field, "blend")) view->blend = !strcasecmp(value, "add") || atoi(value) == 1;
     else if (!strcmp(field, "z")) view->z = atoi(value);
     else if (!strcmp(field, "enabled")) view->enabled = !strcasecmp(value, "true") || atoi(value) != 0;
-    else if (!strcmp(field, "face")) { int face = sky_parse_face(value); if (face < 0) return 0; view->face = face; }
-    else if (!strcmp(field, "spec")) {
+    else if (!strcmp(field, "face")) {
+        int face = sky_parse_face(value);
+        if (face < 0 || face >= SKY_FACES || view->kind == SKY_EQUIRECT) return 0;   /* a sphere stays on its faces */
+        view->face = face;
+    } else if (!strcmp(field, "spec")) {
+        if (view->group) return 0;   /* the faces of a 360 view share one source: remove it and add another */
         float color[4];
         int kind = sky_parse_spec(value, color);
-        if (kind < 0 || strlen(value) >= sizeof view->spec) return 0;
-        snprintf(view->spec, sizeof view->spec, "%s", value);
-        view->kind = kind;
-        memcpy(view->color, color, sizeof color);
+        if (kind < 0 || kind == SKY_EQUIRECT) return 0;
+        return sky_view_bind(view, value);
     } else return 0;
     return 1;
+}
+
+/* Apply a field to a view and, for a 360 group, to every face of it. */
+static int sky_set_field_group(struct sky_view *view, const char *field, const char *value) {
+    int ok = sky_set_field(view, field, value);
+    if (ok && view->group && strcmp(field, "face") && strcmp(field, "spec"))
+        for (int i = 0; i < SKY_MAX_VIEWS; i++)
+            if (sky.views[i].id && sky.views[i].group == view->group && &sky.views[i] != view) sky_set_field(&sky.views[i], field, value);
+    return ok;
 }
 
 /* ── Layouts: one view per line ────────────────────────────────────── */
@@ -219,10 +608,10 @@ static void sky_view_line(const struct sky_view *view, char *out, size_t size) {
 
 /* Parse "key=value key=value ..." (values have no spaces) into a new view; returns its id or 0. */
 static int sky_view_from_line(const char *line) {
-    char copy[600];
+    char copy[1000];
     snprintf(copy, sizeof copy, "%s", line);
     int face = -1;
-    char spec[256] = "";
+    char spec[SKY_SPEC_SIZE] = "";
     char *tokens[16][2];
     int count = 0;
     for (char *token = strtok(copy, " \t\r\n"); token && count < 16; token = strtok(NULL, " \t\r\n")) {
@@ -239,7 +628,7 @@ static int sky_view_from_line(const char *line) {
     if (!id) return 0;
     struct sky_view *view = sky_find_view(id);
     for (int i = 0; i < count; i++)
-        if (strcmp(tokens[i][0], "face") && strcmp(tokens[i][0], "spec")) sky_set_field(view, tokens[i][0], tokens[i][1]);
+        if (strcmp(tokens[i][0], "face") && strcmp(tokens[i][0], "spec")) sky_set_field_group(view, tokens[i][0], tokens[i][1]);
     return id;
 }
 
@@ -250,7 +639,7 @@ static const char sky_vertex_shader[] =
 
 /* One fragment shader for every built-in source; uv is local to the view's rectangle, (0,0) top-left. */
 static const char sky_fragment_shader[] =
-    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity;\n"
+    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity; uniform sampler2D tex;\n"
     "float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }\n"
     "float box(vec2 uv, vec2 lo, vec2 hi) { return step(lo.x, uv.x) * step(uv.x, hi.x) * step(lo.y, uv.y) * step(uv.y, hi.y); }\n"
     "vec4 faceColor() {\n"
@@ -286,6 +675,14 @@ static const char sky_fragment_shader[] =
     "  float arrow = box(uv, vec2(0.78, 0.35), vec2(0.82, 0.65)) + step(abs(uv.x - 0.80), (0.35 - uv.y) * 0.5) * step(0.1, uv.y) * step(uv.y, 0.35);\n"
     "  float mark = clamp(edge + glyph + dots + arrow, 0.0, 1.0);\n"
     "  c = vec4(mix(f.rgb * 0.25 + gridv * 0.15, f.rgb, mark), 1.0); }\n"
+    " else if (kind == 6) { c = vec4(texture2D(tex, uv).rgb, 1.0); }\n"
+    " else if (kind == 7) {\n"
+    "  vec2 p = uv * 2.0 - 1.0; float u = p.x, w = -p.y; vec3 d;\n"
+    "  if (face == 0) d = vec3(-u, -1.0, w); else if (face == 1) d = vec3(1.0, -u, w);\n"
+    "  else if (face == 2) d = vec3(u, 1.0, w); else if (face == 3) d = vec3(-1.0, u, w);\n"
+    "  else if (face == 4) d = vec3(u, w, 1.0); else d = vec3(u, w, -1.0);\n"
+    "  d = normalize(d); float lon = atan(d.x, d.y); float lat = asin(clamp(d.z, -1.0, 1.0));\n"
+    "  c = vec4(texture2D(tex, vec2(0.5 + lon / 6.2831853, 0.5 - lat / 3.1415927)).rgb, 1.0); }\n"
     " gl_FragColor = vec4(c.rgb, c.a * opacity);\n"
     "}\n";
 
@@ -302,7 +699,7 @@ static int sky_resolve_gl(void) {
          if (!sky.field) { fprintf(stderr, "[t2_hook] Sky views unavailable: no %s\n", name); return 0; } } while (0)
     SKY_FN(IsTexture, "glIsTexture"); SKY_FN(GetTexLevelParameteriv, "glGetTexLevelParameteriv");
     SKY_FN(GetTexImage, "glGetTexImage"); SKY_FN(Uniform3f, "glUniform3f"); SKY_FN(Uniform4f, "glUniform4f");
-    SKY_FN(BlendFunc, "glBlendFunc");
+    SKY_FN(BlendFunc, "glBlendFunc"); SKY_FN(TexSubImage2D, "glTexSubImage2D");
 #undef SKY_FN
     const char *sources[2] = {sky_vertex_shader, sky_fragment_shader};
     unsigned types[2] = {RS_VERTEX_SHADER, RS_FRAGMENT_SHADER};
@@ -322,6 +719,7 @@ static int sky_resolve_gl(void) {
     sky.u_face = rs_gl.GetUniformLocation(sky.program, "face");
     sky.u_color = rs_gl.GetUniformLocation(sky.program, "color");
     sky.u_opacity = rs_gl.GetUniformLocation(sky.program, "opacity");
+    sky.u_tex = rs_gl.GetUniformLocation(sky.program, "tex");
     rs_gl.GenFramebuffers(1, &sky.fbo);
     rs_gl.GenFramebuffers(1, &sky.read_fbo);
     sky.gl_state = 1;
@@ -466,7 +864,8 @@ static void sky_render_face(int index, double seconds) {
     struct sky_view *views[SKY_MAX_VIEWS];
     int count = 0;
     for (int i = 0; i < SKY_MAX_VIEWS; i++)
-        if (sky.views[i].id && sky.views[i].enabled && sky.views[i].face == index) views[count++] = &sky.views[i];
+        if (sky.views[i].id && sky.views[i].enabled && sky.views[i].face == index &&
+            (sky.views[i].source < 0 || sky.sources[sky.views[i].source].texture_ready)) views[count++] = &sky.views[i];
     qsort(views, (size_t)count, sizeof views[0], sky_compare_views);
 
     /* The face texture is the draw target; the backup is the read source for the fallback pixels. */
@@ -491,6 +890,10 @@ static void sky_render_face(int index, double seconds) {
             rs_gl.Uniform1i(sky.u_kind, view->kind);
             gl_gamma.Uniform1f(sky.u_time, (float)seconds);
             rs_gl.Uniform1i(sky.u_face, index);
+            if (view->kind >= SKY_VIDEO) {
+                rs_gl.Uniform1i(sky.u_tex, 0);
+                gl_gamma.BindTexture(RS_TEXTURE_2D, view->source >= 0 ? sky.sources[view->source].texture : 0);
+            }
             sky.Uniform4f(sky.u_color, view->color[0], view->color[1], view->color[2], view->color[3]);
             gl_gamma.Uniform1f(sky.u_opacity, view->opacity);
             /* the rectangle in texture space, and which way its local (0,0)..(1,1) runs */
@@ -555,9 +958,53 @@ static int sky_game_playing(void) {
     return playing;
 }
 
+/* Views whose helper died or never produced a frame are removed, so their faces fall back to the original graphics. */
+static void sky_media_reap(void) {
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) {
+        struct sky_source *source = &sky.sources[i];
+        if (!source->in_use || !(source->failed || source->ended)) continue;
+        if (source->failed && !source->failure_reported) {
+            source->failure_reported = 1;
+            fprintf(stderr, "[t2_hook] Sky views: %s failed: %s\n", source->key, source->error);
+        } else if (!source->failed) {
+            fprintf(stderr, "[t2_hook] Sky views: %s ended\n", source->key);
+        }
+        for (int v = 0; v < SKY_MAX_VIEWS; v++)
+            if (sky.views[v].id && sky.views[v].source == i) sky_view_free(&sky.views[v]);   /* the last release destroys the source */
+        if (sky.sources[i].in_use) sky_source_destroy(&sky.sources[i]);   /* a source nobody uses (cannot normally happen) */
+    }
+}
+
+/* Put each media source's newest frame into its GL texture. */
+static void sky_upload_sources(void) {
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) {
+        struct sky_source *source = &sky.sources[i];
+        unsigned seq = 0;
+        if (!source->in_use) continue;
+        unsigned char *frame = sky_source_take_frame(source, &seq);
+        if (!frame) continue;
+        gl_gamma.ActiveTexture(GL_TEXTURE0_);
+        if (!source->texture) {
+            gl_gamma.GenTextures(1, &source->texture);
+            gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, source->media.kind == SKY_EQUIRECT ? 0x2901 : GL_CLAMP_TO_EDGE_);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+            gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, GL_RGBA8_, source->width, source->height, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, frame);
+        } else {
+            gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
+            sky.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, source->width, source->height, GL_RGBA_, GL_UNSIGNED_BYTE_, frame);
+        }
+        source->texture_ready = 1;
+        sky_source_done_with_frame(source, seq);
+    }
+}
+
 /* Called after each frame on the game thread. */
 static void sky_views_tick(void) {
     sky_options_once();
+    sky_media_reap();
     if (!sky_any_work() || !sky_game_playing()) return;
     sky.frame++;
     if (!sky_resolve_gl()) return;
@@ -585,6 +1032,7 @@ static void sky_views_tick(void) {
     if (!any) return;
 
     post_begin();
+    sky_upload_sources();
     int previous_read = 0, previous_draw = 0;
     rs_gl.GetIntegerv(RS_READ_FRAMEBUFFER_BINDING, &previous_read);
     rs_gl.GetIntegerv(RS_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
@@ -607,6 +1055,10 @@ static void sky_views_context_lost(void) {
     sky.sky = NULL;
     sky.program = sky.fbo = sky.read_fbo = 0;
     sky.full_box_applied = 0;
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) {   /* the texture ids are gone; the next frame uploads again */
+        sky.sources[i].texture = 0;
+        sky.sources[i].texture_ready = 0;
+    }
     if (sky.gl_state > 0) sky.gl_state = 0;
 }
 
@@ -656,31 +1108,31 @@ static const char *sky_set_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     if (argc < 4) return "0";
     struct sky_view *view = sky_find_view(atoi(argv[1]));
-    return view && sky_set_field(view, argv[2], argv[3]) ? "1" : "0";
+    return view && sky_set_field_group(view, argv[2], argv[3]) ? "1" : "0";
 }
 
 static const char *sky_remove_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     struct sky_view *view = argc > 1 ? sky_find_view(atoi(argv[1])) : NULL;
     if (!view) return "0";
-    memset(view, 0, sizeof *view);
+    sky_remove_view(view);
     return "1";
 }
 
 static const char *sky_clear_cb(void *obj, S32 argc, const char **argv) {
     (void)obj; (void)argc; (void)argv;
-    memset(sky.views, 0, sizeof sky.views);
+    sky_views_clear();
     return "1";
 }
 
 static const char *sky_list_cb(void *obj, S32 argc, const char **argv) {
-    static char result[16384];
+    static char result[32768];
     (void)obj; (void)argc; (void)argv;
     size_t used = 0;
     result[0] = 0;
     for (int i = 0; i < SKY_MAX_VIEWS; i++) {
         if (!sky.views[i].id) continue;
-        char line[400];
+        char line[900];
         sky_view_line(&sky.views[i], line, sizeof line);
         int written = snprintf(result + used, sizeof result - used, "%s%d %s", used ? "\n" : "", sky.views[i].id, line);
         if (written < 0 || used + (size_t)written >= sizeof result) break;
@@ -698,7 +1150,7 @@ static const char *sky_layout_save_cb(void *obj, S32 argc, const char **argv) {
     fputs("# t2launch sky layout: one view per line\n", file);
     for (int i = 0; i < SKY_MAX_VIEWS; i++) {
         if (!sky.views[i].id) continue;
-        char line[400];
+        char line[900];
         sky_view_line(&sky.views[i], line, sizeof line);
         fprintf(file, "%s\n", line);
     }
@@ -712,8 +1164,8 @@ static const char *sky_layout_load_cb(void *obj, S32 argc, const char **argv) {
     if (argc < 2 || !sky_layout_path(argv[1], path, sizeof path, 0)) return "0";
     FILE *file = fopen(path, "r");
     if (!file) return "0";
-    memset(sky.views, 0, sizeof sky.views);
-    char line[600];
+    sky_views_clear();
+    char line[1000];
     int loaded = 0;
     while (fgets(line, sizeof line, file)) {
         char *text = line;
