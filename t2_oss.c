@@ -496,8 +496,16 @@ ssize_t read(int fd, void *data, size_t bytes) {
     entry->last_read_ms = now_ms();
     oss_start_thread(entry, 0);
     pthread_cond_broadcast(&entry->cond);
+    /* Bound the wait: the game reads on its main thread, so a stalled capture
+       stream must not freeze it. After 250 ms hand back silence instead. */
+    uint64_t wait_start = now_ms();
     while (!entry->count && !entry->stop) {
         if (nonblocking) { pthread_mutex_unlock(&entry->lock); errno = EAGAIN; return -1; }
+        if (now_ms() - wait_start >= 250) {
+            pthread_mutex_unlock(&entry->lock);
+            memset(output, 0, bytes);
+            return (ssize_t)bytes;
+        }
         struct timespec until;
         clock_gettime(CLOCK_REALTIME, &until);
         until.tv_nsec += 100000000;
