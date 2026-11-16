@@ -6485,12 +6485,15 @@ static void scale_mouse_event(unsigned char *event, struct render_rect rect, int
     memcpy(event + 6, &y, sizeof(y));
 }
 
+static void sky_key_event(const unsigned char *event);   /* t2_sky.h */
+
 int SDL_PollEvent(void *event) {
     static int (*real_poll_event)(void *);
     if (!real_poll_event) real_poll_event = (int (*)(void *))next_symbol("SDL_PollEvent");
     if (!real_poll_event) return 0;
     int pending = real_poll_event(event);
     if (pending && event) reshade_key_event((const unsigned char *)event);
+    if (pending && event) sky_key_event((const unsigned char *)event);
     if (pending && event && rt.active && rt.scaling)
         scale_mouse_event((unsigned char *)event, rt.rect, rt.real_h, rt.game_w, rt.game_h);
     return pending;
@@ -10972,6 +10975,7 @@ static int register_hook_commands(void) {
         if (hook_option_bool("video.reshade")) reshade_register_commands();
         sky_register_commands();
         Con__evaluate("$T2Launch::SkyViews = 1;", 0, NULL, 0);
+        if (hook_option_bool("hook.console_commands")) sky_install_panel();
     }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot_command_labels")) {
         Con__addMethodS(NULL, "shazbot_command_label", shazbot_command_label_cb,

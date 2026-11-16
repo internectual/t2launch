@@ -15,6 +15,13 @@ With the hook, loading the map turns on `t2launch_skyFullBox(1)` (the engine nor
 four sky walls at the camera's height because terrain hides it) and adds a few default views; leaving the map turns
 both off again.
 
+## The in-game panel
+
+**Ctrl+End** opens and closes the Sky Views panel: pick a view (or ADD one with the face and source dropdowns and the
+file/URL/`#color` field; face `all` with `video360` covers the whole sky), UPDATE or REMOVE it, drag the X / Y /
+WIDTH / HEIGHT / OPACITY sliders to move it live, toggle VISIBLE, save or load a layout by name, CLEAR everything, or
+switch the full sky box. Everything it does is also a console command (below).
+
 ## Sky view commands (hook consoles, client)
 
 | Command | |
@@ -25,6 +32,7 @@ both off again.
 | `t2launch_skyViewList()` | one view per line |
 | `t2launch_skyLayoutSave(name)` / `t2launch_skyLayoutLoad(name)` | `~/.local/share/t2launch/skyviews/<name>.cfg` |
 | `t2launch_skyFullBox(on)` | draw the whole sky box |
+| `t2launch_skyViews()` / `t2launch_skyLayouts()` / `t2launch_skyStatus()` | tab/line records the panel reads |
 
 `face` is `fr`, `rt`, `bk`, `lf`, `up`, `dn` (the order of the DML), `0`-`5`, or `front`/`right`/`back`/`left`/`top`/
 `bottom`. A view's rectangle is in displayed coordinates: `0,0` is the top left of the face as you see it from inside

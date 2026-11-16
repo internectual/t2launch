@@ -1057,8 +1057,8 @@ options bring the parts of it that fit the Linux client:
   `video:<file/URL>`, `image:<file>` and `video360:<file/URL>` (face `all`, with audio). `sky.full_box` (or
   `t2launch_skyFullBox(1)`) draws the lower half of the sky walls the engine normally clips, for maps without
   terrain. `scripts/Matrix` is such a map (`zMatrix.vl2`, Deathmatch, no `TerrainBlock`); its README lists the
-  commands, the face geometry and the install steps. The terminal and the game console as sources, and an in-game
-  editor, are the next phases.
+  commands, the face geometry and the install steps. Ctrl+End opens an in-game panel to add, move, fade and remove views and
+  to save or load layouts. The terminal and the game console as sources are the next phase.
 - **Anti-aliasing** (`video.msaa`, 0/2/4/8). The game draws into a
   multisampled framebuffer that is resolved each frame (window-system MSAA
   would break the copy-based gamma pass and the game's `glReadPixels`

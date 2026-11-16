@@ -14,6 +14,7 @@
  * Runs on the game thread from the SDL_GL_SwapBuffers hook, with the game's GL context current.
  */
 #include <ctype.h>
+#include <dirent.h>
 #include <signal.h>
 #include <sys/prctl.h>
 
@@ -1184,6 +1185,316 @@ static const char *sky_full_box_cb(void *obj, S32 argc, const char **argv) {
     return sky_set_full_box(on) ? (on ? "1" : "0") : "";
 }
 
+/* One record per view for the panel: id, face, spec, x, y, w, h, opacity, enabled, group (tab separated). */
+static const char *sky_views_cb(void *obj, S32 argc, const char **argv) {
+    static char result[32768];
+    (void)obj; (void)argc; (void)argv;
+    size_t used = 0;
+    result[0] = 0;
+    for (int i = 0; i < SKY_MAX_VIEWS; i++) {
+        const struct sky_view *view = &sky.views[i];
+        if (!view->id) continue;
+        int written = snprintf(result + used, sizeof result - used, "%s%d\t%s\t%s\t%.4f\t%.4f\t%.4f\t%.4f\t%.3f\t%d\t%d",
+                               used ? "\n" : "", view->id, sky_face_names[view->face], view->spec, (double)view->x,
+                               (double)view->y, (double)view->w, (double)view->h, (double)view->opacity,
+                               view->enabled, view->group);
+        if (written < 0 || used + (size_t)written >= sizeof result) break;
+        used += (size_t)written;
+    }
+    return result;
+}
+
+static int sky_compare_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
+
+/* The saved layouts, one name per line. */
+static const char *sky_layouts_cb(void *obj, S32 argc, const char **argv) {
+    static char result[8192];
+    (void)obj; (void)argc; (void)argv;
+    char probe[900];
+    result[0] = 0;
+    if (!sky_layout_path("x", probe, sizeof probe, 0)) return result;
+    char *slash = strrchr(probe, '/');
+    if (!slash) return result;
+    *slash = 0;
+    DIR *directory = opendir(probe);
+    if (!directory) return result;
+    char *names[128];
+    int count = 0;
+    struct dirent *entry;
+    while (count < 128 && (entry = readdir(directory)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length < 5 || strcmp(entry->d_name + length - 4, ".cfg") != 0) continue;
+        char name[80];
+        if (length - 4 >= sizeof name) continue;
+        memcpy(name, entry->d_name, length - 4);
+        name[length - 4] = 0;
+        if (sky_layout_name_ok(name)) names[count++] = strdup(name);
+    }
+    closedir(directory);
+    qsort(names, (size_t)count, sizeof names[0], sky_compare_names);
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        int written = snprintf(result + used, sizeof result - used, "%s%s", used ? "\n" : "", names[i]);
+        free(names[i]);
+        if (written > 0 && used + (size_t)written < sizeof result) used += (size_t)written;
+    }
+    return result;
+}
+
+static const char *sky_status_cb(void *obj, S32 argc, const char **argv) {
+    static char result[64];
+    (void)obj; (void)argc; (void)argv;
+    int sources = 0;
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) sources += sky.sources[i].in_use;
+    snprintf(result, sizeof result, "%d\t%d\t%d", sky.full_box_applied, sky_view_count(), sources);
+    return result;
+}
+
+/* Ctrl+End opens and closes the panel (an SDL 1.2 key event as in reshade_key_event: sym at 8, mod at 12). */
+#define SKY_KEY_PANEL 279   /* SDLK_END */
+static int sky_panel_installed;
+
+static void sky_key_event(const unsigned char *event) {
+    if (!sky_panel_installed || event[0] != 2 || !Con__evaluate) return;   /* SDL_KEYDOWN */
+    unsigned sym, mod;
+    memcpy(&sym, event + 8, sizeof sym);
+    memcpy(&mod, event + 12, sizeof mod);
+    if (sym == SKY_KEY_PANEL && (mod & 0x00C0)) (void)Con__evaluate("t2launch_skyHotkey();", 0, "t2launch/sky_key.cs", 0);
+}
+
+/* The in-game panel, built on first use from stock Shell controls (the technique of the ReShade panel). */
+static const char sky_panel_script[] =
+    "$T2LSV::Rows = 5;\n"
+    "function t2launch_svText(%name, %text, %x, %y, %w) {\n"
+    " return new GuiTextCtrl(%name) {\n"
+    "  profile = \"ShellTextProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = %x SPC %y; extent = %w SPC 22; minExtent = \"8 8\"; visible = \"1\"; text = %text;\n"
+    " };\n"
+    "}\n"
+    "function t2launch_svButton(%name, %text, %x, %y, %command) {\n"
+    " return new ShellBitmapButton(%name) {\n"
+    "  profile = \"ShellButtonProfile\"; horizSizing = \"right\"; vertSizing = \"top\";\n"
+    "  position = %x SPC %y; extent = \"100 38\"; minExtent = \"32 38\"; visible = \"1\";\n"
+    "  command = %command; text = %text; simpleStyle = \"0\";\n"
+    " };\n"
+    "}\n"
+    "function t2launch_svPopup(%name, %x, %y, %w, %text) {\n"
+    " return new ShellPopupMenu(%name) {\n"
+    "  profile = \"ShellPopupProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = %x SPC %y; extent = %w SPC 36; minExtent = \"49 36\"; visible = \"1\"; text = %text;\n"
+    "  maxLength = \"255\"; maxPopupHeight = \"220\"; buttonBitmap = \"gui/shll_pulldown\";\n"
+    "  rolloverBarBitmap = \"gui/shll_pulldownbar_rol\"; selectedBarBitmap = \"gui/shll_pulldownbar_act\"; noButtonStyle = \"0\";\n"
+    " };\n"
+    "}\n"
+    "function t2launch_svEdit(%name, %x, %y, %w, %max) {\n"
+    " return new ShellTextEditCtrl(%name) {\n"
+    "  profile = \"NewTextEditProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = %x SPC %y; extent = %w SPC 38; minExtent = \"32 38\"; visible = \"1\";\n"
+    "  hideCursor = \"0\"; bypassHideCursor = \"0\"; helpTag = \"0\"; maxLength = %max; historySize = \"0\";\n"
+    "  password = \"0\"; tabComplete = \"0\"; deniedSound = \"InputDeniedSound\"; sinkAllKeyEvents = \"0\";\n"
+    " };\n"
+    "}\n"
+    "function t2launch_svBuild() {\n"
+    " if (isObject(T2LSkyDlg)) return;\n"
+    " new GuiControl(T2LSkyDlg) {\n"
+    "  profile = \"DlgBackProfile\"; horizSizing = \"width\"; vertSizing = \"height\";\n"
+    "  position = \"0 0\"; extent = \"640 480\"; minExtent = \"8 8\"; visible = \"1\";\n"
+    " };\n"
+    " %pane = new ShellPaneCtrl() {\n"
+    "  profile = \"ShellDlgPaneProfile\"; horizSizing = \"center\"; vertSizing = \"center\";\n"
+    "  position = \"10 10\"; extent = \"620 460\"; minExtent = \"48 92\"; visible = \"1\"; text = \"SKY VIEWS\"; noTitleBar = \"0\";\n"
+    " };\n"
+    " T2LSkyDlg.add(%pane);\n"
+    " %pane.add(t2launch_svPopup(\"T2LSV_ViewMenu\", 24, 40, 360, \"Views\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_AddBtn\", \"ADD\", 394, 38, \"t2launch_svAdd();\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_RemoveBtn\", \"REMOVE\", 496, 38, \"t2launch_svRemove();\"));\n"
+    " %pane.add(t2launch_svPopup(\"T2LSV_FaceMenu\", 24, 84, 120, \"Face\"));\n"
+    " %pane.add(t2launch_svPopup(\"T2LSV_SourceMenu\", 154, 84, 200, \"Source\"));\n"
+    " %t = new ShellToggleButton(T2LSV_OnTgl) {\n"
+    "  profile = \"ShellRadioProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"364 88\"; extent = \"120 30\"; minExtent = \"26 27\"; visible = \"1\"; text = \"VISIBLE\";\n"
+    "  command = \"t2launch_svEnabled();\";\n"
+    " };\n"
+    " %pane.add(%t);\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_UpdateBtn\", \"UPDATE\", 496, 82, \"t2launch_svUpdate();\"));\n"
+    " %pane.add(t2launch_svText(\"T2LSV_SrcLabel\", \"File, URL or #color\", 24, 126, 200));\n"
+    " %pane.add(t2launch_svEdit(\"T2LSV_Source\", 24, 146, 570, 500));\n"
+    " %names = \"X Y WIDTH HEIGHT OPACITY\";\n"
+    " for (%r = 0; %r < $T2LSV::Rows; %r++) {\n"
+    "  %y = 196 + %r * 30;\n"
+    "  %pane.add(t2launch_svText(\"T2LSV_Label\" @ %r, getWord(%names, %r), 24, %y, 90));\n"
+    "  %s = new ShellSliderCtrl(\"T2LSV_Slider\" @ %r) {\n"
+    "   profile = \"ShellSliderProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "   position = \"120 \" @ (%y - 2); extent = \"380 24\"; minExtent = \"12 24\"; visible = \"1\";\n"
+    "   variable = \"value\"; altCommand = \"t2launch_svSlider(\" @ %r @ \");\"; range = \"0.000000 1.000000\";\n"
+    "   ticks = \"1000\"; value = \"0\"; usePlusMinus = \"1\";\n"
+    "  };\n"
+    "  %pane.add(%s);\n"
+    "  %pane.add(t2launch_svText(\"T2LSV_Value\" @ %r, \"\", 510, %y, 80));\n"
+    " }\n"
+    " %pane.add(t2launch_svPopup(\"T2LSV_LayoutMenu\", 24, 350, 190, \"Layout\"));\n"
+    " %pane.add(t2launch_svEdit(\"T2LSV_LayoutName\", 224, 349, 150, 40));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_SaveBtn\", \"SAVE\", 384, 348, \"t2launch_svSave();\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_LoadBtn\", \"LOAD\", 494, 348, \"t2launch_svLoad();\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_DoneBtn\", \"DONE\", 24, 400, \"t2launch_skyClose();\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_ClearBtn\", \"CLEAR\", 130, 400, \"t2launch_svClear();\"));\n"
+    " %b = new ShellToggleButton(T2LSV_BoxTgl) {\n"
+    "  profile = \"ShellRadioProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
+    "  position = \"244 404\"; extent = \"150 30\"; minExtent = \"26 27\"; visible = \"1\"; text = \"FULL SKY BOX\";\n"
+    "  command = \"t2launch_svBox();\";\n"
+    " };\n"
+    " %pane.add(%b);\n"
+    " %pane.add(t2launch_svText(\"T2LSV_Status\", \"\", 404, 408, 200));\n"
+    " T2LSV_FaceMenu.add(\"fr\", 1); T2LSV_FaceMenu.add(\"rt\", 2); T2LSV_FaceMenu.add(\"bk\", 3);\n"
+    " T2LSV_FaceMenu.add(\"lf\", 4); T2LSV_FaceMenu.add(\"up\", 5); T2LSV_FaceMenu.add(\"dn\", 6); T2LSV_FaceMenu.add(\"all\", 7);\n"
+    " $T2LSV::Kinds = \"plasma stars aurora gradient solid calibrate video image video360\";\n"
+    " for (%i = 0; %i < 9; %i++) T2LSV_SourceMenu.add(getWord($T2LSV::Kinds, %i), %i + 1);\n"
+    "}\n"
+    "function T2LSV_ViewMenu::onSelect(%this, %id, %text) {\n"
+    " if ($T2LSV::Filling) return;\n"
+    " $T2LSV::Sel = %id;\n"
+    " t2launch_svLoadFields();\n"
+    "}\n"
+    "function T2LSV_LayoutMenu::onSelect(%this, %id, %text) {\n"
+    " if ($T2LSV::Filling) return;\n"
+    " T2LSV_LayoutName.setValue(%text);\n"
+    "}\n"
+    "function t2launch_svRecord(%id) {\n"
+    " %list = t2launch_skyViews();\n"
+    " for (%i = 0; %i < getRecordCount(%list); %i++) { %rec = getRecord(%list, %i); if (getField(%rec, 0) == %id) return %rec; }\n"
+    " return \"\";\n"
+    "}\n"
+    "function t2launch_svFaceId(%name) {\n"
+    " %names = \"fr rt bk lf up dn all\";\n"
+    " for (%i = 0; %i < 7; %i++) if (getWord(%names, %i) $= %name) return %i + 1;\n"
+    " return 1;\n"
+    "}\n"
+    "function t2launch_svSpec() {\n"
+    " %kind = getWord($T2LSV::Kinds, T2LSV_SourceMenu.getSelected() - 1);\n"
+    " %text = T2LSV_Source.getValue();\n"
+    " if (%kind $= \"video\" || %kind $= \"image\" || %kind $= \"video360\") return %kind @ \":\" @ %text;\n"
+    " if ((%kind $= \"solid\" || %kind $= \"gradient\") && getSubStr(%text, 0, 1) $= \"#\") return \"builtin:\" @ %kind @ \":\" @ %text;\n"
+    " return \"builtin:\" @ %kind;\n"
+    "}\n"
+    "function t2launch_svLoadFields() {\n"
+    " %rec = t2launch_svRecord($T2LSV::Sel);\n"
+    " if (%rec $= \"\") return;\n"
+    " $T2LSV::Filling = 1;\n"
+    " T2LSV_FaceMenu.setSelected(t2launch_svFaceId(getField(%rec, 1)));\n"
+    " %spec = getField(%rec, 2);\n"
+    " %colon = strpos(%spec, \":\");\n"
+    " %kind = getSubStr(%spec, 0, %colon);\n"
+    " %rest = getSubStr(%spec, %colon + 1, 1000);\n"
+    " if (%kind $= \"builtin\") { %c2 = strpos(%rest, \":\"); if (%c2 >= 0) { %kind = getSubStr(%rest, 0, %c2); %rest = getSubStr(%rest, %c2 + 1, 1000); } else { %kind = %rest; %rest = \"\"; } }\n"
+    " for (%i = 0; %i < 9; %i++) if (getWord($T2LSV::Kinds, %i) $= %kind) T2LSV_SourceMenu.setSelected(%i + 1);\n"
+    " T2LSV_Source.setValue(%rest);\n"
+    " T2LSV_OnTgl.setValue(getField(%rec, 8));\n"
+    " for (%r = 0; %r < $T2LSV::Rows; %r++) {\n"
+    "  %o = \"T2LSV_Slider\" @ %r; %v = \"T2LSV_Value\" @ %r;\n"
+    "  %val = getField(%rec, 3 + %r);\n"
+    "  %o.setValue(%val); %v.setText(mFloatLength(%val, 2));\n"
+    " }\n"
+    " $T2LSV::Filling = 0;\n"
+    "}\n"
+    "function t2launch_svRefresh() {\n"
+    " if (!isObject(T2LSkyDlg)) return;\n"
+    " $T2LSV::Filling = 1;\n"
+    " T2LSV_ViewMenu.clear();\n"
+    " %list = t2launch_skyViews();\n"
+    " %count = getRecordCount(%list);\n"
+    " %selected = 0;\n"
+    " for (%i = 0; %i < %count; %i++) {\n"
+    "  %rec = getRecord(%list, %i);\n"
+    "  %spec = getField(%rec, 2);\n"
+    "  if (strlen(%spec) > 40) %spec = \"...\" @ getSubStr(%spec, strlen(%spec) - 37, 40);\n"
+    "  T2LSV_ViewMenu.add(getField(%rec, 0) @ \"  \" @ getField(%rec, 1) @ \"  \" @ %spec, getField(%rec, 0));\n"
+    "  if (getField(%rec, 0) == $T2LSV::Sel) %selected = $T2LSV::Sel;\n"
+    " }\n"
+    " if (!%selected && %count) %selected = getField(getRecord(%list, 0), 0);\n"
+    " $T2LSV::Sel = %selected;\n"
+    " if (%selected) T2LSV_ViewMenu.setSelected(%selected);\n"
+    " T2LSV_LayoutMenu.clear();\n"
+    " %names = t2launch_skyLayouts();\n"
+    " for (%i = 0; %i < getRecordCount(%names); %i++) T2LSV_LayoutMenu.add(getRecord(%names, %i), %i + 1);\n"
+    " %status = t2launch_skyStatus();\n"
+    " T2LSV_BoxTgl.setValue(getField(%status, 0));\n"
+    " T2LSV_Status.setText(getField(%status, 1) @ \" view(s), \" @ getField(%status, 2) @ \" media\");\n"
+    " $T2LSV::Filling = 0;\n"
+    " if (%selected) t2launch_svLoadFields();\n"
+    "}\n"
+    "function t2launch_svAdd() {\n"
+    " %face = getWord(\"fr rt bk lf up dn all\", T2LSV_FaceMenu.getSelected() - 1);\n"
+    " %id = t2launch_skyViewAdd(%face, t2launch_svSpec(), 0, 0, 1, 1, 1);\n"
+    " if (%id) $T2LSV::Sel = %id;\n"
+    " else T2LSV_Status.setText(\"could not add (check face/source)\");\n"
+    " if (%id) t2launch_svRefresh();\n"
+    "}\n"
+    "function t2launch_svUpdate() {\n"
+    " if (!$T2LSV::Sel) return;\n"
+    " %face = getWord(\"fr rt bk lf up dn all\", T2LSV_FaceMenu.getSelected() - 1);\n"
+    " if (%face !$= \"all\") t2launch_skyViewSet($T2LSV::Sel, \"face\", %face);\n"
+    " t2launch_skyViewSet($T2LSV::Sel, \"spec\", t2launch_svSpec());\n"
+    " t2launch_svRefresh();\n"
+    "}\n"
+    "function t2launch_svRemove() {\n"
+    " if (!$T2LSV::Sel) return;\n"
+    " t2launch_skyViewRemove($T2LSV::Sel);\n"
+    " $T2LSV::Sel = 0;\n"
+    " t2launch_svRefresh();\n"
+    "}\n"
+    "function t2launch_svClear() {\n"
+    " t2launch_skyViewClear();\n"
+    " $T2LSV::Sel = 0;\n"
+    " t2launch_svRefresh();\n"
+    "}\n"
+    "function t2launch_svEnabled() {\n"
+    " if ($T2LSV::Filling || !$T2LSV::Sel) return;\n"
+    " t2launch_skyViewSet($T2LSV::Sel, \"enabled\", T2LSV_OnTgl.getValue() ? 1 : 0);\n"
+    "}\n"
+    "function t2launch_svSlider(%r) {\n"
+    " if ($T2LSV::Filling || !$T2LSV::Sel) return;\n"
+    " %o = \"T2LSV_Slider\" @ %r; %v = \"T2LSV_Value\" @ %r;\n"
+    " %val = %o.getValue();\n"
+    " t2launch_skyViewSet($T2LSV::Sel, getWord(\"x y w h opacity\", %r), %val);\n"
+    " %v.setText(mFloatLength(%val, 2));\n"
+    "}\n"
+    "function t2launch_svBox() {\n"
+    " if ($T2LSV::Filling) return;\n"
+    " t2launch_skyFullBox(T2LSV_BoxTgl.getValue() ? 1 : 0);\n"
+    "}\n"
+    "function t2launch_svSave() {\n"
+    " %name = T2LSV_LayoutName.getValue();\n"
+    " if (%name $= \"\") return;\n"
+    " T2LSV_Status.setText(t2launch_skyLayoutSave(%name) ? \"saved \" @ %name : \"save failed\");\n"
+    " schedule(1200, 0, \"t2launch_svRefresh\");\n"
+    "}\n"
+    "function t2launch_svLoad() {\n"
+    " %name = T2LSV_LayoutName.getValue();\n"
+    " if (%name $= \"\") return;\n"
+    " %n = t2launch_skyLayoutLoad(%name);\n"
+    " $T2LSV::Sel = 0;\n"
+    " t2launch_svRefresh();\n"
+    " T2LSV_Status.setText(%n $= \"0\" ? \"no such layout\" : %n @ \" view(s) loaded\");\n"
+    "}\n"
+    "function t2launch_skyOpen() {\n"
+    " t2launch_svBuild();\n"
+    " t2launch_svRefresh();\n"
+    " Canvas.pushDialog(T2LSkyDlg);\n"
+    "}\n"
+    "function t2launch_skyClose() {\n"
+    " if (isObject(T2LSkyDlg)) Canvas.popDialog(T2LSkyDlg);\n"
+    "}\n"
+    "function t2launch_skyHotkey() {\n"
+    " if (isObject(T2LSkyDlg) && T2LSkyDlg.isAwake()) t2launch_skyClose();\n"
+    " else t2launch_skyOpen();\n"
+    "}\n";
+
+static void sky_install_panel(void) {
+    if (sky_panel_installed || !Con__evaluate) return;
+    Con__evaluate(sky_panel_script, 0, "t2launch/sky_panel.cs", 0);
+    sky_panel_installed = 1;
+}
+
 static void sky_register_commands(void) {
     Con__addMethodS(NULL, "t2launch_skyViewAdd", sky_add_cb,
         "t2launch_skyViewAdd(face, spec[, x, y, w, h, opacity]) - add a view to a sky face, returns its id", 3, 8);
@@ -1194,6 +1505,9 @@ static void sky_register_commands(void) {
     Con__addMethodS(NULL, "t2launch_skyViewList", sky_list_cb, "t2launch_skyViewList() - one view per line", 1, 1);
     Con__addMethodS(NULL, "t2launch_skyLayoutSave", sky_layout_save_cb, "t2launch_skyLayoutSave(name)", 2, 2);
     Con__addMethodS(NULL, "t2launch_skyLayoutLoad", sky_layout_load_cb, "t2launch_skyLayoutLoad(name) - replace the views", 2, 2);
+    Con__addMethodS(NULL, "t2launch_skyViews", sky_views_cb, "t2launch_skyViews() - id, face, spec, x, y, w, h, opacity, enabled, group records", 1, 1);
+    Con__addMethodS(NULL, "t2launch_skyLayouts", sky_layouts_cb, "t2launch_skyLayouts() - saved layout names", 1, 1);
+    Con__addMethodS(NULL, "t2launch_skyStatus", sky_status_cb, "t2launch_skyStatus() - full box, views, media sources", 1, 1);
     Con__addMethodS(NULL, "t2launch_skyFullBox", sky_full_box_cb,
         "t2launch_skyFullBox(on) - draw the lower half of the sky walls too (maps without terrain)", 2, 2);
 }

@@ -7,6 +7,13 @@
 #include <assert.h>
 #include <sys/wait.h>
 
+static const char *evaluated;
+static const char *hotkey_probe(const char *code, unsigned char flag, const char *file, unsigned char other) {
+    (void)flag; (void)file; (void)other;
+    evaluated = code;
+    return "";
+}
+
 static unsigned char *map_site(uintptr_t address, const unsigned char *bytes, size_t length, size_t *size_out) {
     size_t size = (size_t)sysconf(_SC_PAGESIZE);
     uintptr_t page = address & ~((uintptr_t)size - 1);
@@ -203,6 +210,51 @@ int main(void) {
     assert(sky_view_count() == 2);
     for (int i = 1; i < SKY_MAX_VIEWS; i++) assert(sky_add_view(0, "builtin:solid", 0, 0, 1, 1, 1) != 0 || sky_view_count() == SKY_MAX_VIEWS);
     assert(sky_add_view(0, "builtin:solid", 0, 0, 1, 1, 1) == 0);       /* the table is full */
+
+    /* the panel's data: views, layouts, status, and the Ctrl+End hotkey */
+    sky_views_clear();
+    int panel_view = sky_add_view(4, "builtin:aurora", 0.1f, 0.2f, 0.5f, 0.6f, 0.75f);
+    const char *records = sky_views_cb(NULL, 1, NULL);
+    char expected[200];
+    snprintf(expected, sizeof expected, "%d\tup\tbuiltin:aurora\t0.1000\t0.2000\t0.5000\t0.6000\t0.750\t1\t0", panel_view);
+    assert(!strcmp(records, expected));
+    assert(sky_add_view(1, "builtin:stars", 0, 0, 1, 1, 1) != 0 && strchr(sky_views_cb(NULL, 1, NULL), '\n'));
+    assert(!strncmp(sky_status_cb(NULL, 1, NULL), "0\t2\t0", 5));
+    char layout_root[] = "/tmp/sky_layouts_XXXXXX";
+    assert(mkdtemp(layout_root));
+    setenv("XDG_DATA_HOME", layout_root, 1);
+    const char *save_b[2] = {"t2launch_skyLayoutSave", "bravo"}, *save_a[2] = {"t2launch_skyLayoutSave", "alpha"};
+    assert(!strcmp(sky_layout_save_cb(NULL, 2, save_b), "1") && !strcmp(sky_layout_save_cb(NULL, 2, save_a), "1"));
+    assert(!strcmp(sky_layouts_cb(NULL, 1, NULL), "alpha\nbravo"));
+    const char *load_a[2] = {"t2launch_skyLayoutLoad", "alpha"};
+    assert(!strcmp(sky_layout_load_cb(NULL, 2, load_a), "2") && sky_view_count() == 2);
+    char cleanup[200];
+    snprintf(cleanup, sizeof cleanup, "rm -rf %s", layout_root);
+    assert(system(cleanup) == 0);
+    unsetenv("XDG_DATA_HOME");
+    sky_views_clear();
+
+    evaluated = NULL;
+    Con__evaluate = hotkey_probe;
+    unsigned char key[16] = {2};
+    unsigned sym = SKY_KEY_PANEL, mod = 0x40;
+    memcpy(key + 8, &sym, 4); memcpy(key + 12, &mod, 4);
+    sky_key_event(key);
+    assert(!evaluated);                                   /* not installed yet */
+    sky_panel_installed = 1;
+    sky_key_event(key);
+    assert(evaluated && !strcmp(evaluated, "t2launch_skyHotkey();"));
+    evaluated = NULL;
+    mod = 0; memcpy(key + 12, &mod, 4);
+    sky_key_event(key);
+    assert(!evaluated);                                   /* End without Ctrl */
+    mod = 0x40; sym = 278; memcpy(key + 8, &sym, 4); memcpy(key + 12, &mod, 4);
+    sky_key_event(key);
+    assert(!evaluated);                                   /* Ctrl+Home belongs to ReShade */
+    key[0] = 3; sym = SKY_KEY_PANEL; memcpy(key + 8, &sym, 4);
+    sky_key_event(key);
+    assert(!evaluated);                                   /* key up */
+    assert(strstr(sky_panel_script, "t2launch_skyHotkey") && strstr(sky_panel_script, "T2LSkyDlg"));
 
     /* layout names stay inside the folder */
     assert(sky_layout_name_ok("matrix") && sky_layout_name_ok("a-b_1"));
