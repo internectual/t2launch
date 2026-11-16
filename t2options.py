@@ -167,6 +167,16 @@ OPTIONS = (
                 "keeps the aspect ratio (bars where it differs), stretch fills the screen. The game "
                 "keeps rendering at its own resolution, so the HUD stays large, and windowed mode is "
                 "unchanged. Works on Wayland, where a real mode switch is impossible."),
+    Option("sky.layout", "Sky views", "Sky layout to load", "text", "",
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Name of a saved sky-view layout (~/.local/share/t2launch/skyviews/<name>.cfg) to load "
+                "when the game starts; views draw animations, video or other sources over the faces of the "
+                "sky. t2launch_skyViewAdd() and the Matrix map add views at runtime."),
+    Option("sky.full_box", "Sky views", "Draw the whole sky box", "bool", False,
+           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           help="Draw the lower half of the four sky walls too. The engine clips them at the camera's height "
+                "because terrain normally hides them; maps without terrain (like Matrix, which turns this on "
+                "itself) need it. Affects every sky while on."),
     Option("video.reshade", "Video", "ReShade effects", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
@@ -512,7 +522,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",

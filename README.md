@@ -1049,6 +1049,15 @@ options bring the parts of it that fit the Linux client:
   you run it. Needs `g++` with
   32-bit support at build time (`runtime/build` prints a note when it is
   missing). Shaders are not bundled.
+- **Sky views and the Matrix map** (`sky.layout`, `sky.full_box`; `scripts/Matrix`). The hook renders into the
+  Sky's six face textures, so any face can host "views" (rectangles with a source, opacity and blend mode) while the
+  engine keeps drawing the sky itself: fog, camera and depth stay right, and a face with no view shows its original
+  graphics. Views are added at runtime with `t2launch_skyViewAdd(face, spec, ...)` and saved as layouts; sources so
+  far are built-in GPU animations (`builtin:plasma|stars|aurora|gradient|solid|calibrate`). `sky.full_box` (or
+  `t2launch_skyFullBox(1)`) draws the lower half of the sky walls the engine normally clips, for maps without
+  terrain. `scripts/Matrix` is such a map (`zMatrix.vl2`, Deathmatch, no `TerrainBlock`); its README lists the
+  commands, the face geometry and the install steps. Video, 360 video, the terminal and the game console as sources,
+  and an in-game editor, are the next phases.
 - **Anti-aliasing** (`video.msaa`, 0/2/4/8). The game draws into a
   multisampled framebuffer that is resolved each frame (window-system MSAA
   would break the copy-based gamma pass and the game's `glReadPixels`

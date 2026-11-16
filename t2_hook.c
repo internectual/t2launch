@@ -180,6 +180,8 @@ static struct hook_option hook_options[] = {
     {"video.gamma", "1", NULL, 0, "", 0},
     {"video.render_scale", "off", NULL, 0, "", 0},
     {"video.sharpen", "0.0", NULL, 0, "", 0},
+    {"sky.layout", "", NULL, 0, "", 0},
+    {"sky.full_box", "0", NULL, 0, "", 0},
     {"video.reshade", "0", "T2LAUNCH_RESHADE", 0, "", 0},
     {"video.reshade_preset", "", "T2LAUNCH_RESHADE_PRESET", 0, "", 0},
     {"video.reshade_shaders", "", "T2LAUNCH_RESHADE_SHADERS", 0, "", 0},
@@ -8606,6 +8608,8 @@ static int install_sky_rotation_hook(void) {
     return 1;
 }
 
+#include "t2_sky.h"
+
 /* Run deferred TorqueScript changes after a rendered frame on the game thread. */
 void SDL_GL_SwapBuffers(void) {
     if (!real_sdl_gl_swap_buffers)
@@ -8632,6 +8636,7 @@ void SDL_GL_SwapBuffers(void) {
     if (!registered)
         register_hook_commands();
     if (on_game_thread) render_modifiers_tick();
+    if (on_game_thread) sky_views_tick();
     if (!registered || !Con__evaluate ||
         !game_main_thread_known ||
         !pthread_equal(pthread_self(), game_main_thread)) {
@@ -9043,6 +9048,7 @@ void *SDL_SetVideoMode(int width, int height, int bpp, uint32_t flags) {
         if (gl_gamma.state > 0) gl_gamma.state = 0;
         if (gl_rt.state > 0) gl_rt.state = 0;
         reshade_context_lost();
+        sky_views_context_lost();
         if ((flags & SDL_OPENGL_FLAG) && render_target_wanted())
             rt_setup(width, height, real_w, real_h, scale, msaa_samples());
     }
@@ -10956,6 +10962,8 @@ static int register_hook_commands(void) {
         Con__addMethodS(NULL, "t2launch_setAudioDevice", hook_set_audio_device_cb,
             "t2launch_setAudioDevice(sinks|sources, name) - switch audio device", 3, 3);
         if (hook_option_bool("video.reshade")) reshade_register_commands();
+        sky_register_commands();
+        Con__evaluate("$T2Launch::SkyViews = 1;", 0, NULL, 0);
     }
     if (!target->dedicated && hook_option_bool("telemetry.shazbot_command_labels")) {
         Con__addMethodS(NULL, "shazbot_command_label", shazbot_command_label_cb,

@@ -130,6 +130,9 @@ class NativeReviewTests(unittest.TestCase):
     def test_console_constructor_dump_walk_and_head_pointers(self):
         self.run_fixture("console_constructor_dump_test.c", "ConsoleConstructor dump order, callbacks, loop guards")
 
+    def test_sky_views_parsing_layouts_and_full_box_patch(self):
+        self.run_fixture("sky_views_test.c", "sky views: specs, views, layouts, face flips, full-box patch")
+
     def test_mem_patch_checksum_modes_and_page_restoration(self):
         self.run_fixture("mem_patch_test.c", "memPatch modes, startup compatibility, SHA-256 identity, legacy warning, and page restoration passed")
 
