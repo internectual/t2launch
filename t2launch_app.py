@@ -1282,6 +1282,7 @@ class Launcher(QApplication):
             screen_index = next((i for i, screen in enumerate(QApplication.screens())
                                  if screen.name() == monitor), 0)
             launch["T2LAUNCH_MONITOR_INDEX"] = str(screen_index)
+        launch.setdefault("T2LAUNCH_SKY_PYTHON", sys.executable)   # PySide6 lives in the launcher's Python
         for key, value in launch.items():
             env.insert(key, value)
         process.setProcessEnvironment(env)

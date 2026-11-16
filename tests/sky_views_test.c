@@ -7,6 +7,8 @@
 #include <assert.h>
 #include <sys/wait.h>
 
+static int log_mode_seen = -1;
+static void log_mode_stub(int mode) { log_mode_seen = mode; }
 static const char *evaluated;
 static const char *hotkey_probe(const char *code, unsigned char flag, const char *file, unsigned char other) {
     (void)flag; (void)file; (void)other;
@@ -256,6 +258,135 @@ int main(void) {
     assert(!evaluated);                                   /* key up */
     assert(strstr(sky_panel_script, "t2launch_skyHotkey") && strstr(sky_panel_script, "T2LSkyDlg"));
 
+    /* terminal and console specs: only a profile name, never a command */
+    struct sky_media text;
+    assert(sky_parse_media("terminal", &text) && text.term == 1 && !strcmp(text.layout, "default"));
+    assert(sky_parse_media("terminal:htop-2", &text) && text.term == 1 && !strcmp(text.layout, "htop-2"));
+    assert(sky_parse_media("console", &text) && text.term == 2);
+    assert(!sky_parse_media("terminal:", &text) && !sky_parse_media("terminal:rm -rf ~", &text) &&
+           !sky_parse_media("terminal:../x", &text) && !sky_parse_media("terminal:a;b", &text) &&
+           !sky_parse_media("terminal:waytoolongprofilename", &text) && !sky_parse_media("terminals", &text));
+    assert(sky_parse_spec("terminal", color) == SKY_VIDEO && sky_parse_spec("console", color) == SKY_VIDEO);
+
+    /* spaces in a spec survive a layout line */
+    char escaped[200], plain[200];
+    sky_escape_spec("video:/tmp/my 100% clip.mp4", escaped, sizeof escaped);
+    assert(!strcmp(escaped, "video:/tmp/my%20100%25%20clip.mp4"));
+    sky_unescape_spec(escaped, plain, sizeof plain);
+    assert(!strcmp(plain, "video:/tmp/my 100% clip.mp4"));
+    sky_unescape_spec("a%zzb%2", plain, sizeof plain);
+    assert(!strcmp(plain, "a%zzb%2"));                                   /* not an escape: kept as is */
+
+    /* key_sym translation */
+    unsigned char bytes[16];
+    assert(sky_translate_key('a', 0, 0, bytes) == 1 && bytes[0] == 'a');
+    assert(sky_translate_key('a', 1, 0, bytes) == 1 && bytes[0] == 'A');
+    assert(sky_translate_key('1', 1, 0, bytes) == 1 && bytes[0] == '!');
+    assert(sky_translate_key('-', 1, 0, bytes) == 1 && bytes[0] == '_');
+    assert(sky_translate_key('c', 0x40, 0, bytes) == 1 && bytes[0] == 3);
+    assert(sky_translate_key('[', 0x40, 0, bytes) == 1 && bytes[0] == 0x1b);
+    assert(sky_translate_key('x', 0x100, 0, bytes) == 2 && bytes[0] == 0x1b && bytes[1] == 'x');
+    assert(sky_translate_key(13, 0, 13, bytes) == 1 && bytes[0] == '\r');
+    assert(sky_translate_key(8, 0, 8, bytes) == 1 && bytes[0] == 0x7f);
+    assert(sky_translate_key(9, 0, 9, bytes) == 1 && bytes[0] == '\t');
+    assert(sky_translate_key(9, 1, 9, bytes) == 3 && !memcmp(bytes, "\x1b[Z", 3));
+    assert(sky_translate_key(273, 0, 0, bytes) == 3 && !memcmp(bytes, "\x1b[A", 3));
+    assert(sky_translate_key(282, 0, 0, bytes) == 3 && !memcmp(bytes, "\x1bOP", 3));
+    assert(sky_translate_key(127, 0, 127, bytes) == 4 && !memcmp(bytes, "\x1b[3~", 4));
+    assert(sky_translate_key('e', 0, 0xE9, bytes) == 2 && bytes[0] == 0xC3 && bytes[1] == 0xA9);
+    assert(sky_translate_key(304, 0, 0, bytes) == 0);                      /* a modifier alone */
+
+    /* a text helper: fake "python" (sh) running a fake helper that records its arguments and keystrokes */
+    char tdir[] = "/tmp/sky_text_test_XXXXXX";
+    assert(mkdtemp(tdir));
+    char helper[300];
+    snprintf(helper, sizeof helper, "%s/helper.py", tdir);
+    FILE *fake_helper = fopen(helper, "w");
+    assert(fake_helper);
+    fprintf(fake_helper, "printf '%%s\n' \"$@\" > %s/argv.rec\nhead -c 3145728 /dev/zero\ncat >> %s/keys.rec\n", tdir, tdir);
+    fclose(fake_helper);
+    setenv("T2LAUNCH_SKY_TERMINAL_HELPER", helper, 1);
+    setenv("T2LAUNCH_SKY_PYTHON", "/bin/sh", 1);
+    memset(&sky, 0, sizeof sky);
+    for (int i = 0; i < SKY_MAX_SOURCES; i++) sky.sources[i].fd = sky.sources[i].input_fd = -1;
+    registered = 1;
+    sky_log_mode_fn = log_mode_stub;
+    Con__evaluate = hotkey_probe;
+    evaluated = NULL;
+    int shell_view = sky_add_view(0, "terminal:work", 0, 0, 1, 1, 1);
+    assert(shell_view);
+    struct sky_view *shell = sky_find_view(shell_view);
+    struct sky_source *terminal = &sky.sources[shell->source];
+    assert(terminal->media.term == 1 && terminal->width == 1024 && terminal->height == 768 && terminal->input_fd >= 0);
+    assert(terminal->audio_pid <= 0);
+    for (int i = 0; i < 100 && terminal->seq < 1; i++) usleep(50000);
+    assert(terminal->seq >= 1);
+    assert(sky_first_terminal_source() == shell->source);
+    sky_set_capture(shell->source);
+    assert(sky.capture_source == shell->source + 1);
+    unsigned char press[24] = {2};
+    unsigned key_sym = 'h', no_mod = 0;
+    memcpy(press + 8, &key_sym, 4); memcpy(press + 12, &no_mod, 4);
+    assert(sky_key_event(press) == 1);                                      /* consumed by the terminal */
+    press[0] = 3;
+    assert(sky_key_event(press) == 1);                                      /* key_sym up too */
+    press[0] = 2; key_sym = 280; no_mod = 0x40;
+    memcpy(press + 8, &key_sym, 4); memcpy(press + 12, &no_mod, 4);
+    assert(sky_key_event(press) == 1 && sky.capture_source == 0);           /* Ctrl+PageUp releases */
+    press[0] = 2; key_sym = 'q'; no_mod = 0;
+    memcpy(press + 8, &key_sym, 4); memcpy(press + 12, &no_mod, 4);
+    assert(sky_key_event(press) == 0);                                      /* the game gets keys again */
+    key_sym = 280; no_mod = 0x40;
+    memcpy(press + 8, &key_sym, 4); memcpy(press + 12, &no_mod, 4);
+    assert(sky_key_event(press) == 1 && sky.capture_source == shell->source + 1);   /* and it takes them back */
+    usleep(300000);
+    sky_remove_view(shell);
+    assert(sky.capture_source == 0 && !terminal->in_use);                   /* removing the view ends the capture */
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+    char rec_path[400], content[600];
+    snprintf(rec_path, sizeof rec_path, "%s/keys.rec", tdir);
+    FILE *record_file = fopen(rec_path, "rb");
+    assert(record_file);
+    size_t got = fread(content, 1, sizeof content, record_file);
+    fclose(record_file);
+    static const char expected_keys[] = "f\x01" "1" "k\x01" "h" "f\x01" "0" "f\x01" "1";
+    assert(got == sizeof expected_keys - 1 && !memcmp(content, expected_keys, got));
+    snprintf(rec_path, sizeof rec_path, "%s/argv.rec", tdir);
+    record_file = fopen(rec_path, "r");
+    assert(record_file);
+    got = fread(content, 1, sizeof content - 1, record_file);
+    fclose(record_file);
+    content[got] = 0;
+    assert(strstr(content, "--mode\nshell\n--profile\nwork\n") && strstr(content, "--width\n1024\n--height\n768\n"));
+
+    /* the console view tails <cwd>/console.log and switches the engine's logging on and off with the view */
+    int console_view = sky_add_view(5, "console", 0, 0, 1, 1, 1);
+    assert(console_view && log_mode_seen == 1 && !evaluated);          /* logging on, and no script was run for it */
+    for (int i = 0; i < 100 && sky.sources[sky_find_view(console_view)->source].seq < 1; i++) usleep(50000);
+    snprintf(rec_path, sizeof rec_path, "%s/argv.rec", tdir);
+    record_file = fopen(rec_path, "r");
+    got = fread(content, 1, sizeof content - 1, record_file);
+    fclose(record_file);
+    content[got] = 0;
+    assert(strstr(content, "--mode\nconsole\n--tail\n") && strstr(content, "/console.log\n"));
+    assert(sky_view_count() == 1);
+    int console_source = sky_find_view(console_view)->source;
+    sky_set_capture(console_source);
+    assert(sky.capture_source == 0);                                        /* a console is read only */
+    sky_remove_view(sky_find_view(console_view));
+    assert(log_mode_seen == 0 && !evaluated);
+    assert(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+
+    /* no helper: the add fails cleanly */
+    unsetenv("T2LAUNCH_SKY_TERMINAL_HELPER");
+    assert(sky_add_view(0, "terminal", 0, 0, 1, 1, 1) == 0);
+    registered = 0;
+    sky_log_mode_fn = sky_log_mode_native;
+    char remove_text[400];
+    snprintf(remove_text, sizeof remove_text, "rm -rf %s", tdir);
+    assert(system(remove_text) == 0);
+    unsetenv("T2LAUNCH_SKY_PYTHON");
+
     /* layout names stay inside the folder */
     assert(sky_layout_name_ok("matrix") && sky_layout_name_ok("a-b_1"));
     assert(!sky_layout_name_ok("../x") && !sky_layout_name_ok("a b") && !sky_layout_name_ok("") && !sky_layout_name_ok("a/b"));
@@ -299,6 +430,8 @@ int main(void) {
         assert(memcmp(found, sky_full_box_a_original, 10) == 0);
         assert(fseek(client, (long)(SKY_FULL_BOX_ADDRESS_B - 0x08048000), SEEK_SET) == 0 && fread(found, 1, 12, client) == 12);
         assert(memcmp(found, sky_full_box_b_original, 12) == 0);
+        assert(fseek(client, (long)(SKY_SET_LOG_MODE_CALLBACK - 0x08048000), SEEK_SET) == 0 && fread(found, 1, sizeof sky_set_log_mode_prologue, client) == sizeof sky_set_log_mode_prologue);
+        assert(memcmp(found, sky_set_log_mode_prologue, sizeof sky_set_log_mode_prologue) == 0);
         fclose(client);
         checked = 1;
     }

@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/un.h>
 #include <sys/socket.h>
 #include <errno.h>
@@ -189,6 +190,9 @@ static struct hook_option hook_options[] = {
     {"sky.stream_volume", "50", NULL, 0, "", 0},
     {"sky.stream_fps", "24", NULL, 0, "", 0},
     {"sky.video_width", "1280", NULL, 0, "", 0},
+    {"sky.terminal_width", "1024", NULL, 0, "", 0},
+    {"sky.terminal_height", "768", NULL, 0, "", 0},
+    {"sky.terminal_font", "16", NULL, 0, "", 0},
     {"sky.sphere_width", "2048", NULL, 0, "", 0},
     {"video.reshade", "0", "T2LAUNCH_RESHADE", 0, "", 0},
     {"video.reshade_preset", "", "T2LAUNCH_RESHADE_PRESET", 0, "", 0},
@@ -6485,15 +6489,15 @@ static void scale_mouse_event(unsigned char *event, struct render_rect rect, int
     memcpy(event + 6, &y, sizeof(y));
 }
 
-static void sky_key_event(const unsigned char *event);   /* t2_sky.h */
+static int sky_key_event(const unsigned char *event);   /* t2_sky.h: 1 = the event was consumed */
 
 int SDL_PollEvent(void *event) {
     static int (*real_poll_event)(void *);
     if (!real_poll_event) real_poll_event = (int (*)(void *))next_symbol("SDL_PollEvent");
     if (!real_poll_event) return 0;
     int pending = real_poll_event(event);
+    while (pending && event && sky_key_event((const unsigned char *)event)) pending = real_poll_event(event);
     if (pending && event) reshade_key_event((const unsigned char *)event);
-    if (pending && event) sky_key_event((const unsigned char *)event);
     if (pending && event && rt.active && rt.scaling)
         scale_mouse_event((unsigned char *)event, rt.rect, rt.real_h, rt.game_w, rt.game_h);
     return pending;
@@ -11098,6 +11102,8 @@ sdl_rect_t **SDL_ListModes(void *format, uint32_t flags) {
 }
 
 static void __attribute__((constructor)) init(void) {
+    /* Debugging aid: let a debugger started from another shell attach (Yama normally allows only ancestors). */
+    if (getenv("T2LAUNCH_DEBUG_PTRACE")) prctl(PR_SET_PTRACER, (unsigned long)-1, 0, 0, 0);
     if (!is_game_process()) return;
     game_main_thread = pthread_self();
     hook_started_at = time(NULL);

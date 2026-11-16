@@ -22,6 +22,21 @@ file/URL/`#color` field; face `all` with `video360` covers the whole sky), UPDAT
 WIDTH / HEIGHT / OPACITY sliders to move it live, toggle VISIBLE, save or load a layout by name, CLEAR everything, or
 switch the full sky box. Everything it does is also a console command (below).
 
+### Terminal and console views
+
+| Spec | |
+|---|---|
+| `terminal` | a real shell (`$SHELL`) on a pseudo-terminal, drawn as text on the face |
+| `terminal:<profile>` | the command named `<profile>` in `~/.config/t2launch/sky_terminals.cfg` (`name=command` lines, e.g. `monitor=htop`) |
+| `console` | the Tribes 2 console, live (read from `~/.loki/tribes2/console.log`, which the engine writes while logging is on; the view switches logging on, natively, and off again when it goes) |
+
+Terminals are interactive: **Ctrl+PageUp** (or the panel's TYPE button) gives the keyboard to the first terminal. Every
+key then goes to the shell and not to the game, and a cyan frame shows the focus; Ctrl+PageUp gives the keyboard back.
+The text is drawn by `sky_terminal.py` (PySide6 offscreen, so it needs the launcher's Python, which the launcher passes
+as `T2LAUNCH_SKY_PYTHON`) at `sky.terminal_width` x `sky.terminal_height` pixels (1024x768), so give the view a rectangle
+with the same aspect, for example `w=1 h=0.75`. Profiles come only from that config file, never from the game or a
+map's scripts: a spec can name a profile but cannot make the hook run a command of its own.
+
 ## Sky view commands (hook consoles, client)
 
 | Command | |
@@ -32,6 +47,7 @@ switch the full sky box. Everything it does is also a console command (below).
 | `t2launch_skyViewList()` | one view per line |
 | `t2launch_skyLayoutSave(name)` / `t2launch_skyLayoutLoad(name)` | `~/.local/share/t2launch/skyviews/<name>.cfg` |
 | `t2launch_skyFullBox(on)` | draw the whole sky box |
+| `t2launch_skyKeyCapture(id)` | give the keyboard to a terminal view (0 releases) |
 | `t2launch_skyViews()` / `t2launch_skyLayouts()` / `t2launch_skyStatus()` | tab/line records the panel reads |
 
 `face` is `fr`, `rt`, `bk`, `lf`, `up`, `dn` (the order of the DML), `0`-`5`, or `front`/`right`/`back`/`left`/`top`/
@@ -55,7 +71,7 @@ when its last view is removed, when it fails or ends (the faces then show the re
 exits. Sound comes from a second `ffmpeg` to PulseAudio/PipeWire (`Tribes 2 sky`, honours the audio output device;
 approximately in sync). Paths are used as given, so no `file:`/`concat:`/pipe tricks: only plain paths and
 http/https/rtsp URLs. Options: `sky.media`, `sky.ffmpeg`, `sky.stream_audio`, `sky.stream_volume`, `sky.stream_loop`,
-`sky.stream_fps`, `sky.video_width`, `sky.sphere_width`. Spaces in a path do not survive a saved layout.
+`sky.stream_fps`, `sky.video_width`, `sky.sphere_width`. Spaces in a path are saved in layouts as `%20`.
 
 Geometry (from the engine): FR = south wall, RT = east, BK = north, LF = west, UP = top, DN = bottom.
 

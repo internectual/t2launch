@@ -72,6 +72,7 @@ struct sky_face {
 struct sky_media {
     int kind;                 /* SKY_VIDEO or SKY_EQUIRECT */
     int still;                /* image: (a picture or GIF), played slowly */
+    int term;                 /* 1 = a terminal (layout = profile name), 2 = the game console log */
     char source[480];         /* a local path or an http/https/rtsp URL */
     char layout[16];          /* 360 input layout for v360 (default "e", equirect) */
 };
@@ -82,7 +83,7 @@ struct sky_source {
     struct sky_media media;
     int width, height, fps;
     pid_t video_pid, audio_pid;
-    int fd, error_fd;
+    int fd, error_fd, input_fd;     /* frames in, helper errors in, keystrokes out (terminals) */
     pthread_t thread;
     int thread_running;
     volatile int stop, ended, failed;
@@ -115,6 +116,7 @@ static struct {
     int gl_name_offset;                 /* where TextureObject keeps its GL name (found by probing) */
     struct sky_source sources[SKY_MAX_SOURCES];
     int u_tex;
+    int capture_source;                 /* 1 + the index of the source whose terminal has the keyboard; 0 = none */
     uint64_t start_ms;
 } sky;
 
@@ -151,6 +153,18 @@ static int sky_parse_media(const char *spec, struct sky_media *media) {
     memset(media, 0, sizeof *media);
     if (!spec) return 0;
     const char *rest;
+    if (!strcmp(spec, "console")) { media->kind = SKY_VIDEO; media->term = 2; snprintf(media->source, sizeof media->source, "-"); return 1; }
+    if (!strncmp(spec, "terminal", 8) && (spec[8] == 0 || spec[8] == ':')) {
+        /* only a profile NAME: its command lives in the user's own config file, never in the game's scripts */
+        const char *name = spec[8] ? spec + 9 : "default";
+        size_t length = strlen(name);
+        if (length == 0 || length >= sizeof media->layout) return 0;
+        for (size_t i = 0; i < length; i++) if (!isalnum((unsigned char)name[i]) && name[i] != '_' && name[i] != '-') return 0;
+        media->kind = SKY_VIDEO; media->term = 1;
+        snprintf(media->source, sizeof media->source, "-");
+        snprintf(media->layout, sizeof media->layout, "%s", name);
+        return 1;
+    }
     if (!strncmp(spec, "video360:", 9)) { media->kind = SKY_EQUIRECT; rest = spec + 9; }
     else if (!strncmp(spec, "video:", 6)) { media->kind = SKY_VIDEO; rest = spec + 6; }
     else if (!strncmp(spec, "image:", 6)) { media->kind = SKY_VIDEO; media->still = 1; rest = spec + 6; }
@@ -248,14 +262,14 @@ static int sky_build_audio_argv(const struct sky_media *media, int loop, double 
 static void sky_free_argv(char **argv) { for (int i = 0; argv[i]; i++) free(argv[i]); }
 
 /* Start a helper with stdout (and optionally stderr) on pipes the hook reads; returns its pid or -1. */
-static pid_t sky_spawn(char **argv, int stdout_fd, int stderr_fd) {
+static pid_t sky_spawn(char **argv, int stdin_fd, int stdout_fd, int stderr_fd) {
     char **env = helper_environment();
     if (!env) return -1;
     pid_t child = fork();
     if (child == 0) {
         prctl(PR_SET_PDEATHSIG, SIGKILL);   /* never outlive the game */
         int null = open("/dev/null", O_RDWR);
-        dup2(null, STDIN_FILENO);
+        dup2(stdin_fd >= 0 ? stdin_fd : null, STDIN_FILENO);
         dup2(stdout_fd >= 0 ? stdout_fd : null, STDOUT_FILENO);
         dup2(stderr_fd >= 0 ? stderr_fd : null, STDERR_FILENO);
         execvpe(argv[0], argv, env);
@@ -297,6 +311,65 @@ static void *sky_reader_thread(void *argument) {
     return NULL;
 }
 
+/* The console log is a file the engine writes when logging is on: mode 1 opens, appends and closes per line, so
+   the helper always sees whole lines. The switch is the engine's own setLogMode() callback, called natively:
+   running script from inside a console callback (nested Con::evaluate) corrupted the engine's evaluator and froze
+   the game. 0x080EF170 is what ConsoleFunction(setLogMode) registers on the client (Windows: dumpConsoleConstructor
+   lists it); it reads argv[1] and calls Con::setLogMode(). */
+#define SKY_SET_LOG_MODE_CALLBACK 0x080EF170
+static const unsigned char sky_set_log_mode_prologue[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x10, 0x83, 0xc4, 0xf4};
+
+static void sky_log_mode_native(int mode) {
+    struct rv_memory memory;
+    if (!rv_memory_snapshot(&memory) || !rv_memory_range(&memory, (void *)SKY_SET_LOG_MODE_CALLBACK, sizeof sky_set_log_mode_prologue, PROT_READ) ||
+        memcmp((void *)SKY_SET_LOG_MODE_CALLBACK, sky_set_log_mode_prologue, sizeof sky_set_log_mode_prologue) != 0) return;
+    const char *argv[2] = {"setLogMode", mode ? "1" : "0"};
+    ((void (*)(void *, int, const char **))SKY_SET_LOG_MODE_CALLBACK)(NULL, 2, argv);
+}
+
+static void (*sky_log_mode_fn)(int) = sky_log_mode_native;
+
+static void sky_set_log_mode(int mode) {
+    if (!registered || target->dedicated) return;
+    sky_log_mode_fn(mode);
+}
+
+/* The text helper's command line: python, the helper script, and its options. */
+static int sky_build_terminal_argv(const struct sky_media *media, int width, int height, int fps, char **argv, int max) {
+    const char *helper = getenv("T2LAUNCH_SKY_TERMINAL_HELPER");
+    const char *python = getenv("T2LAUNCH_SKY_PYTHON");
+    if (max < 20 || !helper || !*helper || access(helper, R_OK) != 0) return 0;
+    char text[32], tail[PATH_MAX + 16];
+    int n = 0;
+    argv[n++] = sky_dup(python && *python ? python : "python3");
+    argv[n++] = sky_dup(helper);
+    argv[n++] = sky_dup("--width"); snprintf(text, sizeof text, "%d", width); argv[n++] = sky_dup(text);
+    argv[n++] = sky_dup("--height"); snprintf(text, sizeof text, "%d", height); argv[n++] = sky_dup(text);
+    argv[n++] = sky_dup("--font"); snprintf(text, sizeof text, "%d", (int)sky_option_number("sky.terminal_font", 16, 8, 48)); argv[n++] = sky_dup(text);
+    argv[n++] = sky_dup("--fps"); snprintf(text, sizeof text, "%d", fps); argv[n++] = sky_dup(text);
+    if (media->term == 2) {
+        /* The engine writes console.log through Loki's user-directory layer: ~/.loki/tribes2/ rather than the
+           game's working directory. T2LAUNCH_SKY_CONSOLE_LOG overrides both. */
+        const char *override = getenv("T2LAUNCH_SKY_CONSOLE_LOG"), *home = getenv("HOME");
+        char user_directory[PATH_MAX], cwd[PATH_MAX];
+        struct stat info;
+        snprintf(user_directory, sizeof user_directory, "%s/.loki/tribes2", home ? home : "");
+        if (override && *override) snprintf(tail, sizeof tail, "%s", override);
+        else if (home && stat(user_directory, &info) == 0 && S_ISDIR(info.st_mode)) snprintf(tail, sizeof tail, "%s/console.log", user_directory);
+        else {
+            if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+            snprintf(tail, sizeof tail, "%s/console.log", cwd);
+        }
+        argv[n++] = sky_dup("--mode"); argv[n++] = sky_dup("console");
+        argv[n++] = sky_dup("--tail"); argv[n++] = sky_dup(tail);
+    } else {
+        argv[n++] = sky_dup("--mode"); argv[n++] = sky_dup("shell");
+        argv[n++] = sky_dup("--profile"); argv[n++] = sky_dup(media->layout);
+    }
+    argv[n] = NULL;
+    return n;
+}
+
 static void sky_source_destroy(struct sky_source *source) {
     source->stop = 1;
     /* killing the helper closes the pipe's write end, which ends the reader thread's read() */
@@ -305,6 +378,9 @@ static void sky_source_destroy(struct sky_source *source) {
     if (source->thread_running) pthread_join(source->thread, NULL);
     if (source->fd >= 0) close(source->fd);
     if (source->error_fd >= 0) close(source->error_fd);
+    if (source->input_fd >= 0) close(source->input_fd);
+    if (sky.capture_source == (int)(source - sky.sources) + 1) sky.capture_source = 0;
+    if (source->media.term == 2) sky_set_log_mode(0);
     if (source->video_pid > 0) waitpid(source->video_pid, NULL, 0);
     if (source->audio_pid > 0) waitpid(source->audio_pid, NULL, 0);
     for (int i = 0; i < 3; i++) free(source->slots[i]);
@@ -330,9 +406,13 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     memset(source, 0, sizeof *source);
     snprintf(source->key, sizeof source->key, "%s", spec);
     source->media = *media;
-    source->fd = source->error_fd = -1;
+    source->fd = source->error_fd = source->input_fd = -1;
     int fps = media->still ? 5 : (int)sky_option_number("sky.stream_fps", 24, 1, 60);
-    if (media->kind == SKY_EQUIRECT) {
+    if (media->term) {
+        fps = 12;
+        source->width = (int)sky_option_number("sky.terminal_width", 1024, 256, 2048) & ~1;
+        source->height = (int)sky_option_number("sky.terminal_height", 768, 192, 2048) & ~1;
+    } else if (media->kind == SKY_EQUIRECT) {
         source->width = (int)sky_option_number("sky.sphere_width", 2048, 256, 4096) & ~1;
         source->height = source->width / 2;
     } else {
@@ -342,18 +422,28 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     source->fps = fps;
     int loop = hook_option_bool("sky.stream_loop");
     char *argv[40];
-    int argc = sky_build_video_argv(media, source->width, source->height, fps, loop, argv, 40);
-    if (!argc) return -1;
-    int out[2], err[2];
+    int argc = media->term ? sky_build_terminal_argv(media, source->width, source->height, fps, argv, 40)
+                           : sky_build_video_argv(media, source->width, source->height, fps, loop, argv, 40);
+    if (!argc) {
+        if (media->term) fprintf(stderr, "[t2_hook] Sky views: no text helper (T2LAUNCH_SKY_TERMINAL_HELPER)\n");
+        return -1;
+    }
+    int out[2], err[2], input[2] = {-1, -1};
     if (pipe2(out, O_CLOEXEC) != 0) { sky_free_argv(argv); return -1; }
     if (pipe2(err, O_CLOEXEC) != 0) { close(out[0]); close(out[1]); sky_free_argv(argv); return -1; }
+    /* keystrokes go through a socket so that a dead helper makes send() fail instead of raising SIGPIPE */
+    if (media->term && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, input) != 0) {
+        close(out[0]); close(out[1]); close(err[0]); close(err[1]); sky_free_argv(argv); return -1;
+    }
     pthread_mutex_init(&source->lock, NULL);
     size_t frame_bytes = (size_t)source->width * (size_t)source->height * 4;
     for (int i = 0; i < 3; i++) source->slots[i] = malloc(frame_bytes);
     source->latest = -1; source->reading = -1; source->writing = 0;
-    source->video_pid = sky_spawn(argv, out[1], err[1]);
+    source->video_pid = sky_spawn(argv, input[1], out[1], err[1]);
     sky_free_argv(argv);
     close(out[1]); close(err[1]);
+    if (input[1] >= 0) close(input[1]);
+    source->input_fd = input[0];
     source->fd = out[0];
     source->error_fd = err[0];
     fcntl(source->error_fd, F_SETFL, O_NONBLOCK);
@@ -365,12 +455,13 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     source->in_use = 1;
     source->refs = 1;
     if (pthread_create(&source->thread, NULL, sky_reader_thread, source) == 0) source->thread_running = 1;
-    if (media->kind != SKY_VIDEO || !media->still) {
+    if (media->term == 2) sky_set_log_mode(1);
+    if (!media->term && (media->kind != SKY_VIDEO || !media->still)) {
         if (hook_option_bool("sky.stream_audio")) {
             char *audio[40];
             const char *device = getenv("T2LAUNCH_AUDIO_OUTPUT");
             if (sky_build_audio_argv(media, loop, sky_option_number("sky.stream_volume", 50, 0, 200) / 100.0, device, audio, 40)) {
-                source->audio_pid = sky_spawn(audio, -1, -1);
+                source->audio_pid = sky_spawn(audio, -1, -1, -1);
                 sky_free_argv(audio);
             }
         }
@@ -600,16 +691,40 @@ static int sky_layout_path(const char *name, char *path, size_t size, int make_d
     return snprintf(path, size, "%s/%s.cfg", directory, name) < (int)size;
 }
 
+/* Layout lines are space separated, so a space (and the escape character) inside a spec is written as %20 / %25. */
+static void sky_escape_spec(const char *spec, char *out, size_t size) {
+    size_t used = 0;
+    for (; *spec && used + 4 < size; spec++) {
+        if (*spec == ' ' || *spec == '%') used += (size_t)snprintf(out + used, size - used, "%%%02X", (unsigned char)*spec);
+        else out[used++] = *spec;
+    }
+    out[used] = 0;
+}
+
+static void sky_unescape_spec(const char *in, char *out, size_t size) {
+    size_t used = 0;
+    for (; *in && used + 1 < size; in++) {
+        if (in[0] == '%' && isxdigit((unsigned char)in[1]) && isxdigit((unsigned char)in[2])) {
+            char hex[3] = {in[1], in[2], 0};
+            out[used++] = (char)strtol(hex, NULL, 16);
+            in += 2;
+        } else out[used++] = *in;
+    }
+    out[used] = 0;
+}
+
 /* Text of one view: "face=up spec=builtin:plasma x=0 y=0 w=1 h=1 opacity=1 blend=alpha z=0 enabled=1". */
 static void sky_view_line(const struct sky_view *view, char *out, size_t size) {
+    char spec[SKY_SPEC_SIZE * 3];
+    sky_escape_spec(view->spec, spec, sizeof spec);
     snprintf(out, size, "face=%s spec=%s x=%.4f y=%.4f w=%.4f h=%.4f opacity=%.3f blend=%s z=%d enabled=%d",
-             sky_face_names[view->face], view->spec, (double)view->x, (double)view->y, (double)view->w,
+             sky_face_names[view->face], spec, (double)view->x, (double)view->y, (double)view->w,
              (double)view->h, (double)view->opacity, view->blend ? "add" : "alpha", view->z, view->enabled);
 }
 
 /* Parse "key=value key=value ..." (values have no spaces) into a new view; returns its id or 0. */
 static int sky_view_from_line(const char *line) {
-    char copy[1000];
+    char copy[2600];
     snprintf(copy, sizeof copy, "%s", line);
     int face = -1;
     char spec[SKY_SPEC_SIZE] = "";
@@ -623,7 +738,7 @@ static int sky_view_from_line(const char *line) {
     }
     for (int i = 0; i < count; i++) {
         if (!strcmp(tokens[i][0], "face")) face = sky_parse_face(tokens[i][1]);
-        else if (!strcmp(tokens[i][0], "spec")) snprintf(spec, sizeof spec, "%s", tokens[i][1]);
+        else if (!strcmp(tokens[i][0], "spec")) sky_unescape_spec(tokens[i][1], spec, sizeof spec);
     }
     int id = sky_add_view(face, spec, 0, 0, 1, 1, 1);
     if (!id) return 0;
@@ -988,7 +1103,7 @@ static void sky_upload_sources(void) {
         if (!source->texture) {
             gl_gamma.GenTextures(1, &source->texture);
             gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
-            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, source->media.kind == SKY_EQUIRECT ? GL_LINEAR_ : 0x2703 /* LINEAR_MIPMAP_LINEAR */);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, source->media.kind == SKY_EQUIRECT ? 0x2901 : GL_CLAMP_TO_EDGE_);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
@@ -997,6 +1112,7 @@ static void sky_upload_sources(void) {
             gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
             sky.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, source->width, source->height, GL_RGBA_, GL_UNSIGNED_BYTE_, frame);
         }
+        if (source->media.kind != SKY_EQUIRECT) rs_gl.GenerateMipmap(RS_TEXTURE_2D);   /* flat media is shown smaller than it is decoded */
         source->texture_ready = 1;
         sky_source_done_with_frame(source, seq);
     }
@@ -1100,7 +1216,9 @@ static const char *sky_add_cb(void *obj, S32 argc, const char **argv) {
     float x = argc > 3 ? (float)atof(argv[3]) : 0, y = argc > 4 ? (float)atof(argv[4]) : 0;
     float w = argc > 5 ? (float)atof(argv[5]) : 1, h = argc > 6 ? (float)atof(argv[6]) : 1;
     float opacity = argc > 7 ? (float)atof(argv[7]) : 1;
-    int id = argc > 2 ? sky_add_view(face, argv[2], x, y, w, h, opacity) : 0;
+    char spec[SKY_SPEC_SIZE];                     /* argv lives on the engine's string stack: keep our own copy */
+    if (argc > 2) snprintf(spec, sizeof spec, "%s", argv[2]);
+    int id = argc > 2 ? sky_add_view(face, spec, x, y, w, h, opacity) : 0;
     snprintf(result, sizeof result, "%d", id);
     return result;
 }
@@ -1133,7 +1251,7 @@ static const char *sky_list_cb(void *obj, S32 argc, const char **argv) {
     result[0] = 0;
     for (int i = 0; i < SKY_MAX_VIEWS; i++) {
         if (!sky.views[i].id) continue;
-        char line[900];
+        char line[2400];
         sky_view_line(&sky.views[i], line, sizeof line);
         int written = snprintf(result + used, sizeof result - used, "%s%d %s", used ? "\n" : "", sky.views[i].id, line);
         if (written < 0 || used + (size_t)written >= sizeof result) break;
@@ -1151,7 +1269,7 @@ static const char *sky_layout_save_cb(void *obj, S32 argc, const char **argv) {
     fputs("# t2launch sky layout: one view per line\n", file);
     for (int i = 0; i < SKY_MAX_VIEWS; i++) {
         if (!sky.views[i].id) continue;
-        char line[900];
+        char line[2400];
         sky_view_line(&sky.views[i], line, sizeof line);
         fprintf(file, "%s\n", line);
     }
@@ -1166,7 +1284,7 @@ static const char *sky_layout_load_cb(void *obj, S32 argc, const char **argv) {
     FILE *file = fopen(path, "r");
     if (!file) return "0";
     sky_views_clear();
-    char line[1000];
+    char line[2600];
     int loaded = 0;
     while (fgets(line, sizeof line, file)) {
         char *text = line;
@@ -1250,16 +1368,143 @@ static const char *sky_status_cb(void *obj, S32 argc, const char **argv) {
     return result;
 }
 
+/* ── Keyboard capture for terminal views ───────────────────────────── */
+
+/* SDL 1.2 key symbols and modifiers */
+#define SKY_SDLK_BACKSPACE 8
+#define SKY_SDLK_TAB 9
+#define SKY_SDLK_RETURN 13
+#define SKY_SDLK_ESCAPE 27
+#define SKY_SDLK_DELETE 127
+#define SKY_KMOD_SHIFT 0x0003
+#define SKY_KMOD_CTRL 0x00C0
+#define SKY_KMOD_ALT 0x0300
+
+/* Terminal bytes for one key press; returns the length (0 when the key has no text). The unicode value from SDL
+   is used when the game turned unicode translation on, otherwise a US layout is assumed for printable keys. */
+static size_t sky_translate_key(unsigned sym, unsigned mod, unsigned unicode, unsigned char *out) {
+    static const struct { unsigned sym; const char *bytes; } special[] = {
+        {SKY_SDLK_RETURN, "\r"}, {SKY_SDLK_BACKSPACE, "\x7f"}, {SKY_SDLK_ESCAPE, "\x1b"}, {SKY_SDLK_DELETE, "\x1b[3~"},
+        {273, "\x1b[A"}, {274, "\x1b[B"}, {275, "\x1b[C"}, {276, "\x1b[D"}, {277, "\x1b[2~"}, {278, "\x1b[H"},
+        {279, "\x1b[F"}, {280, "\x1b[5~"}, {281, "\x1b[6~"}, {282, "\x1bOP"}, {283, "\x1bOQ"}, {284, "\x1bOR"},
+        {285, "\x1bOS"}, {286, "\x1b[15~"}, {287, "\x1b[17~"}, {288, "\x1b[18~"}, {289, "\x1b[19~"},
+        {290, "\x1b[20~"}, {291, "\x1b[21~"}, {292, "\x1b[23~"}, {293, "\x1b[24~"},
+    };
+    size_t length = 0;
+    int alt = (mod & SKY_KMOD_ALT) != 0;
+    if (sym == SKY_SDLK_TAB) {
+        const char *bytes = (mod & SKY_KMOD_SHIFT) ? "\x1b[Z" : "\t";
+        length = strlen(bytes);
+        memcpy(out, bytes, length);
+        return length;
+    }
+    for (size_t i = 0; i < sizeof special / sizeof special[0]; i++) {
+        if (special[i].sym != sym) continue;
+        if (alt) out[length++] = 0x1b;
+        size_t n = strlen(special[i].bytes);
+        memcpy(out + length, special[i].bytes, n);
+        return length + n;
+    }
+    unsigned character = 0;
+    if (unicode >= 0x20 && unicode != 0x7f) character = unicode;
+    else if (sym >= 32 && sym <= 126) {                    /* a printable key with no unicode value: US layout */
+        character = sym;
+        if (sym >= 'a' && sym <= 'z' && (mod & SKY_KMOD_SHIFT)) character = sym - 32;
+        else if (mod & SKY_KMOD_SHIFT) {
+            static const char from[] = "1234567890-=[]\\;',./`", to[] = "!@#$%^&*()_+{}|:\"<>?~";
+            const char *at = strchr(from, (int)sym);
+            if (at) character = (unsigned char)to[at - from];
+        }
+    }
+    if (!character) return 0;
+    if (mod & SKY_KMOD_CTRL) {                              /* Ctrl+letter and the classic punctuation controls */
+        unsigned lower = character >= 'A' && character <= 'Z' ? character + 32 : character;
+        if (lower >= 'a' && lower <= 'z') character = lower - 'a' + 1;
+        else if (character == '[') character = 0x1b;
+        else if (character == '\\') character = 0x1c;
+        else if (character == ']') character = 0x1d;
+        else if (character == ' ' || character == '2') character = 0;
+        else if (character == '/') character = 0x1f;
+    }
+    if (alt) out[length++] = 0x1b;
+    if (character < 0x80) out[length++] = (unsigned char)character;
+    else if (character < 0x800) { out[length++] = (unsigned char)(0xC0 | (character >> 6)); out[length++] = (unsigned char)(0x80 | (character & 0x3F)); }
+    else { out[length++] = (unsigned char)(0xE0 | (character >> 12)); out[length++] = (unsigned char)(0x80 | ((character >> 6) & 0x3F)); out[length++] = (unsigned char)(0x80 | (character & 0x3F)); }
+    return length;
+}
+
+/* One packet for the text helper: type, length, payload. A full socket just drops the key. */
+static void sky_send_packet(struct sky_source *source, char type, const unsigned char *payload, size_t length) {
+    unsigned char packet[2 + 255];
+    if (source->input_fd < 0 || length > 255) return;
+    packet[0] = (unsigned char)type;
+    packet[1] = (unsigned char)length;
+    memcpy(packet + 2, payload, length);
+    (void)send(source->input_fd, packet, 2 + length, MSG_NOSIGNAL | MSG_DONTWAIT);
+}
+
+static void sky_set_capture(int source_index) {          /* -1 releases */
+    if (sky.capture_source) {
+        struct sky_source *old = &sky.sources[sky.capture_source - 1];
+        if (old->in_use) sky_send_packet(old, 'f', (const unsigned char *)"0", 1);
+    }
+    sky.capture_source = 0;
+    if (source_index < 0 || source_index >= SKY_MAX_SOURCES || !sky.sources[source_index].in_use ||
+        sky.sources[source_index].media.term != 1) return;
+    sky.capture_source = source_index + 1;
+    sky_send_packet(&sky.sources[source_index], 'f', (const unsigned char *)"1", 1);
+}
+
+/* The first terminal on a visible view, for the hotkey. */
+static int sky_first_terminal_source(void) {
+    for (int i = 0; i < SKY_MAX_VIEWS; i++)
+        if (sky.views[i].id && sky.views[i].enabled && sky.views[i].source >= 0 && sky.sources[sky.views[i].source].media.term == 1)
+            return sky.views[i].source;
+    return -1;
+}
+
+static const char *sky_capture_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    int id = argc > 1 ? atoi(argv[1]) : 0;
+    if (id <= 0) { sky_set_capture(-1); return "0"; }
+    struct sky_view *view = sky_find_view(id);
+    if (!view || view->source < 0) return "0";
+    sky_set_capture(view->source);
+    return sky.capture_source ? "1" : "0";
+}
+
 /* Ctrl+End opens and closes the panel (an SDL 1.2 key event as in reshade_key_event: sym at 8, mod at 12). */
 #define SKY_KEY_PANEL 279   /* SDLK_END */
 static int sky_panel_installed;
 
-static void sky_key_event(const unsigned char *event) {
-    if (!sky_panel_installed || event[0] != 2 || !Con__evaluate) return;   /* SDL_KEYDOWN */
-    unsigned sym, mod;
+#define SKY_KEY_CAPTURE 280   /* SDLK_PAGEUP: Ctrl+PageUp gives the keyboard to a terminal view and takes it back */
+
+/* Called for every SDL event the game is about to see; returns 1 when the event is consumed here (every key
+   while a terminal has the keyboard, except the hotkey that releases it). */
+static int sky_key_event(const unsigned char *event) {
+    if ((event[0] != 2 && event[0] != 3) || (!sky_panel_installed && !sky.capture_source)) return 0;   /* SDL_KEYDOWN / UP */
+    unsigned sym, mod, unicode = 0;
     memcpy(&sym, event + 8, sizeof sym);
     memcpy(&mod, event + 12, sizeof mod);
-    if (sym == SKY_KEY_PANEL && (mod & 0x00C0)) (void)Con__evaluate("t2launch_skyHotkey();", 0, "t2launch/sky_key.cs", 0);
+    unicode = (unsigned)event[16] | ((unsigned)event[17] << 8);
+    int down = event[0] == 2;
+    if (sym == SKY_KEY_CAPTURE && (mod & SKY_KMOD_CTRL)) {
+        if (down && Con__evaluate) {
+            if (sky.capture_source) sky_set_capture(-1);
+            else sky_set_capture(sky_first_terminal_source());
+        }
+        return 1;
+    }
+    if (sky.capture_source) {
+        struct sky_source *source = &sky.sources[sky.capture_source - 1];
+        unsigned char bytes[16];
+        size_t length = down ? sky_translate_key(sym, mod, unicode, bytes) : 0;
+        if (length) sky_send_packet(source, 'k', bytes, length);
+        return 1;
+    }
+    if (down && sym == SKY_KEY_PANEL && (mod & SKY_KMOD_CTRL) && Con__evaluate)
+        (void)Con__evaluate("t2launch_skyHotkey();", 0, "t2launch/sky_key.cs", 0);
+    return 0;
 }
 
 /* The in-game panel, built on first use from stock Shell controls (the technique of the ReShade panel). */
@@ -1317,7 +1562,7 @@ static const char sky_panel_script[] =
     " };\n"
     " %pane.add(%t);\n"
     " %pane.add(t2launch_svButton(\"T2LSV_UpdateBtn\", \"UPDATE\", 496, 82, \"t2launch_svUpdate();\"));\n"
-    " %pane.add(t2launch_svText(\"T2LSV_SrcLabel\", \"File, URL or #color\", 24, 126, 200));\n"
+    " %pane.add(t2launch_svText(\"T2LSV_SrcLabel\", \"File, URL, #color or terminal profile\", 24, 126, 300));\n"
     " %pane.add(t2launch_svEdit(\"T2LSV_Source\", 24, 146, 570, 500));\n"
     " %names = \"X Y WIDTH HEIGHT OPACITY\";\n"
     " for (%r = 0; %r < $T2LSV::Rows; %r++) {\n"
@@ -1338,17 +1583,18 @@ static const char sky_panel_script[] =
     " %pane.add(t2launch_svButton(\"T2LSV_LoadBtn\", \"LOAD\", 494, 348, \"t2launch_svLoad();\"));\n"
     " %pane.add(t2launch_svButton(\"T2LSV_DoneBtn\", \"DONE\", 24, 400, \"t2launch_skyClose();\"));\n"
     " %pane.add(t2launch_svButton(\"T2LSV_ClearBtn\", \"CLEAR\", 130, 400, \"t2launch_svClear();\"));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_TypeBtn\", \"TYPE\", 236, 400, \"t2launch_svType();\"));\n"
     " %b = new ShellToggleButton(T2LSV_BoxTgl) {\n"
     "  profile = \"ShellRadioProfile\"; horizSizing = \"right\"; vertSizing = \"bottom\";\n"
-    "  position = \"244 404\"; extent = \"150 30\"; minExtent = \"26 27\"; visible = \"1\"; text = \"FULL SKY BOX\";\n"
+    "  position = \"346 404\"; extent = \"150 30\"; minExtent = \"26 27\"; visible = \"1\"; text = \"FULL SKY BOX\";\n"
     "  command = \"t2launch_svBox();\";\n"
     " };\n"
     " %pane.add(%b);\n"
-    " %pane.add(t2launch_svText(\"T2LSV_Status\", \"\", 404, 408, 200));\n"
+    " %pane.add(t2launch_svText(\"T2LSV_Status\", \"\", 24, 434, 560));\n"
     " T2LSV_FaceMenu.add(\"fr\", 1); T2LSV_FaceMenu.add(\"rt\", 2); T2LSV_FaceMenu.add(\"bk\", 3);\n"
     " T2LSV_FaceMenu.add(\"lf\", 4); T2LSV_FaceMenu.add(\"up\", 5); T2LSV_FaceMenu.add(\"dn\", 6); T2LSV_FaceMenu.add(\"all\", 7);\n"
-    " $T2LSV::Kinds = \"plasma stars aurora gradient solid calibrate video image video360\";\n"
-    " for (%i = 0; %i < 9; %i++) T2LSV_SourceMenu.add(getWord($T2LSV::Kinds, %i), %i + 1);\n"
+    " $T2LSV::Kinds = \"plasma stars aurora gradient solid calibrate video image video360 terminal console\";\n"
+    " for (%i = 0; %i < 11; %i++) T2LSV_SourceMenu.add(getWord($T2LSV::Kinds, %i), %i + 1);\n"
     "}\n"
     "function T2LSV_ViewMenu::onSelect(%this, %id, %text) {\n"
     " if ($T2LSV::Filling) return;\n"
@@ -1373,6 +1619,8 @@ static const char sky_panel_script[] =
     " %kind = getWord($T2LSV::Kinds, T2LSV_SourceMenu.getSelected() - 1);\n"
     " %text = T2LSV_Source.getValue();\n"
     " if (%kind $= \"video\" || %kind $= \"image\" || %kind $= \"video360\") return %kind @ \":\" @ %text;\n"
+    " if (%kind $= \"console\") return \"console\";\n"
+    " if (%kind $= \"terminal\") return %text $= \"\" ? \"terminal\" : \"terminal:\" @ %text;\n"
     " if ((%kind $= \"solid\" || %kind $= \"gradient\") && getSubStr(%text, 0, 1) $= \"#\") return \"builtin:\" @ %kind @ \":\" @ %text;\n"
     " return \"builtin:\" @ %kind;\n"
     "}\n"
@@ -1383,10 +1631,9 @@ static const char sky_panel_script[] =
     " T2LSV_FaceMenu.setSelected(t2launch_svFaceId(getField(%rec, 1)));\n"
     " %spec = getField(%rec, 2);\n"
     " %colon = strpos(%spec, \":\");\n"
-    " %kind = getSubStr(%spec, 0, %colon);\n"
-    " %rest = getSubStr(%spec, %colon + 1, 1000);\n"
+    " if (%colon < 0) { %kind = %spec; %rest = \"\"; } else { %kind = getSubStr(%spec, 0, %colon); %rest = getSubStr(%spec, %colon + 1, 1000); }\n"
     " if (%kind $= \"builtin\") { %c2 = strpos(%rest, \":\"); if (%c2 >= 0) { %kind = getSubStr(%rest, 0, %c2); %rest = getSubStr(%rest, %c2 + 1, 1000); } else { %kind = %rest; %rest = \"\"; } }\n"
-    " for (%i = 0; %i < 9; %i++) if (getWord($T2LSV::Kinds, %i) $= %kind) T2LSV_SourceMenu.setSelected(%i + 1);\n"
+    " for (%i = 0; %i < 11; %i++) if (getWord($T2LSV::Kinds, %i) $= %kind) T2LSV_SourceMenu.setSelected(%i + 1);\n"
     " T2LSV_Source.setValue(%rest);\n"
     " T2LSV_OnTgl.setValue(getField(%rec, 8));\n"
     " for (%r = 0; %r < $T2LSV::Rows; %r++) {\n"
@@ -1458,6 +1705,13 @@ static const char sky_panel_script[] =
     " t2launch_skyViewSet($T2LSV::Sel, getWord(\"x y w h opacity\", %r), %val);\n"
     " %v.setText(mFloatLength(%val, 2));\n"
     "}\n"
+    "function t2launch_svType() {\n"
+    " %rec = t2launch_svRecord($T2LSV::Sel);\n"
+    " %spec = getField(%rec, 2);\n"
+    " if (getSubStr(%spec, 0, 8) !$= \"terminal\") { T2LSV_Status.setText(\"select a terminal view first\"); return; }\n"
+    " t2launch_skyClose();\n"
+    " t2launch_skyKeyCapture($T2LSV::Sel);\n"
+    "}\n"
     "function t2launch_svBox() {\n"
     " if ($T2LSV::Filling) return;\n"
     " t2launch_skyFullBox(T2LSV_BoxTgl.getValue() ? 1 : 0);\n"
@@ -1505,6 +1759,7 @@ static void sky_register_commands(void) {
     Con__addMethodS(NULL, "t2launch_skyViewList", sky_list_cb, "t2launch_skyViewList() - one view per line", 1, 1);
     Con__addMethodS(NULL, "t2launch_skyLayoutSave", sky_layout_save_cb, "t2launch_skyLayoutSave(name)", 2, 2);
     Con__addMethodS(NULL, "t2launch_skyLayoutLoad", sky_layout_load_cb, "t2launch_skyLayoutLoad(name) - replace the views", 2, 2);
+    Con__addMethodS(NULL, "t2launch_skyKeyCapture", sky_capture_cb, "t2launch_skyKeyCapture(viewId) - give the keyboard to that terminal view; 0 releases it", 2, 2);
     Con__addMethodS(NULL, "t2launch_skyViews", sky_views_cb, "t2launch_skyViews() - id, face, spec, x, y, w, h, opacity, enabled, group records", 1, 1);
     Con__addMethodS(NULL, "t2launch_skyLayouts", sky_layouts_cb, "t2launch_skyLayouts() - saved layout names", 1, 1);
     Con__addMethodS(NULL, "t2launch_skyStatus", sky_status_cb, "t2launch_skyStatus() - full box, views, media sources", 1, 1);

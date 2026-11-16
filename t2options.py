@@ -205,6 +205,16 @@ OPTIONS = (
     Option("sky.sphere_width", "Sky views", "360 video width", "int", 2048, minimum=256, maximum=4096,
            hook=True, advanced=True, requires=(("sky.media", (True,)),),
            help="Decoded width of 360 video (the height is half); 4096 needs a fast CPU."),
+    Option("sky.terminal_width", "Sky views", "Terminal view width", "int", 1024, minimum=256, maximum=2048,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Pixel size of terminal and console views on the sky; they are drawn by sky_terminal.py "
+                "(needs the launcher's PySide6)."),
+    Option("sky.terminal_height", "Sky views", "Terminal view height", "int", 768, minimum=192, maximum=2048,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Pixel height of terminal and console views."),
+    Option("sky.terminal_font", "Sky views", "Terminal font size (pixels)", "int", 16, minimum=8, maximum=48,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Font size of terminal and console views."),
     Option("video.reshade", "Video", "ReShade effects", "bool", False,
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
@@ -550,7 +560,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "sky.media", "sky.ffmpeg", "sky.stream_audio", "sky.stream_volume", "sky.stream_loop", "sky.stream_fps", "sky.video_width", "sky.sphere_width", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "sky.media", "sky.ffmpeg", "sky.stream_audio", "sky.stream_volume", "sky.stream_loop", "sky.stream_fps", "sky.video_width", "sky.sphere_width", "sky.terminal_width", "sky.terminal_height", "sky.terminal_font", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",
