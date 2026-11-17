@@ -22,6 +22,11 @@ file/URL/`#color` field; face `all` with `video360` covers the whole sky), UPDAT
 WIDTH / HEIGHT / OPACITY sliders to move it live, toggle VISIBLE, save or load a layout by name, CLEAR everything, or
 switch the full sky box. Everything it does is also a console command (below).
 
+**BROWSE** (next to the source field, for the `video`, `image` and `video360` sources) opens the game's own file
+dialog on the media folder: put clips and pictures in the game's `base/media` folder and pick one from the list
+(it filters by file type; the field then holds `media/<file>`, which the hook resolves under `base/`). For files
+anywhere else, type the full path or URL into the field.
+
 ### Terminal and console views
 
 | Spec | |

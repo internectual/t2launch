@@ -200,7 +200,13 @@ static char *sky_dup(const char *text) { return strdup(text ? text : ""); }
 
 static int sky_input_argument(const struct sky_media *media, char *out, size_t size) {
     if (strstr(media->source, "://")) return snprintf(out, size, "%s", media->source) < (int)size;
-    return snprintf(out, size, "file:%s", media->source) < (int)size;   /* "file:" keeps a path from being an option */
+    /* The panel's file picker lists files the way the engine finds them: relative to base/ (media/clip.mp4 is
+       base/media/clip.mp4), while the helper runs in the game directory. */
+    const char *path = media->source;
+    char under_base[560];
+    if (path[0] != '/' && access(path, R_OK) != 0 && snprintf(under_base, sizeof under_base, "base/%s", path) < (int)sizeof under_base &&
+        access(under_base, R_OK) == 0) path = under_base;
+    return snprintf(out, size, "file:%s", path) < (int)size;   /* "file:" keeps a path from being an option */
 }
 
 /* The video helper's command line (strdup'ed strings, NULL-terminated); returns the number of arguments. */
@@ -1580,7 +1586,8 @@ static const char sky_panel_script[] =
     " %pane.add(%t);\n"
     " %pane.add(t2launch_svButton(\"T2LSV_UpdateBtn\", \"UPDATE\", 496, 82, \"t2launch_svUpdate();\"));\n"
     " %pane.add(t2launch_svText(\"T2LSV_SrcLabel\", \"File, URL, #color or terminal profile\", 24, 126, 300));\n"
-    " %pane.add(t2launch_svEdit(\"T2LSV_Source\", 24, 146, 570, 500));\n"
+    " %pane.add(t2launch_svEdit(\"T2LSV_Source\", 24, 146, 460, 500));\n"
+    " %pane.add(t2launch_svButton(\"T2LSV_BrowseBtn\", \"BROWSE\", 494, 144, \"t2launch_svBrowse();\"));\n"
     " %names = \"X Y WIDTH HEIGHT OPACITY\";\n"
     " for (%r = 0; %r < $T2LSV::Rows; %r++) {\n"
     "  %y = 196 + %r * 30;\n"
@@ -1728,6 +1735,27 @@ static const char sky_panel_script[] =
     " if (getSubStr(%spec, 0, 8) !$= \"terminal\") { T2LSV_Status.setText(\"select a terminal view first\"); return; }\n"
     " t2launch_skyClose();\n"
     " t2launch_skyKeyCapture($T2LSV::Sel);\n"
+    "}\n"
+    "function t2launch_svIsMedia(%file) {\n"
+    " %kind = getWord($T2LSV::Kinds, T2LSV_SourceMenu.getSelected() - 1);\n"
+    " %ext = strlwr(fileExt(%file)) @ \" \";\n"
+    " if (strlen(%ext) < 3) return 0;\n"
+    " if (%kind $= \"image\") return strpos(\".png .jpg .jpeg .gif .bmp .webp \", %ext) >= 0;\n"
+    " return strpos(\".mp4 .mkv .webm .avi .mov .m4v .ogv .flv .mpg .mpeg .gif .ts \", %ext) >= 0;\n"
+    "}\n"
+    "function t2launch_svBrowse() {\n"
+    " %kind = getWord($T2LSV::Kinds, T2LSV_SourceMenu.getSelected() - 1);\n"
+    " if (%kind !$= \"video\" && %kind !$= \"image\" && %kind !$= \"video360\") { T2LSV_Status.setText(\"pick a video, image or video360 source first\"); return; }\n"
+    " ShellGetLoadFilename(\"CHOOSE MEDIA\", \"media/*.*\", \"t2launch_svIsMedia\", \"t2launch_svPicked\");\n"
+    "}\n"
+    "function t2launch_svPicked(%name) {\n"
+    " if (%name $= \"\") return;\n"
+    " %file = \"\";\n"
+    " for (%f = findFirstFile(\"media/\" @ %name @ \".*\"); %f !$= \"\"; %f = findNextFile(\"media/\" @ %name @ \".*\"))\n"
+    "  if (%file $= \"\" && t2launch_svIsMedia(%f)) %file = %f;\n"
+    " if (%file $= \"\") { T2LSV_Status.setText(\"could not find \" @ %name); return; }\n"
+    " T2LSV_Source.setValue(%file);\n"
+    " T2LSV_Status.setText(\"chosen: \" @ %file @ \" (press ADD or UPDATE)\");\n"
     "}\n"
     "function t2launch_svBox() {\n"
     " if ($T2LSV::Filling) return;\n"

@@ -79,6 +79,30 @@ int main(void) {
     }
     assert(saw_v360 && !saw_loop);
     sky_free_argv(argv);
+    /* the picker returns paths relative to base/ (media/x.mp4); the helper runs in the game directory */
+    {
+        char here[256], pick[256], old[256];
+        assert(getcwd(old, sizeof old));
+        snprintf(here, sizeof here, "/tmp/sky_pick_XXXXXX");
+        assert(mkdtemp(here));
+        snprintf(pick, sizeof pick, "%s/base/media", here);
+        char make[400]; snprintf(make, sizeof make, "mkdir -p %s && : > %s/x.mp4", pick, pick);
+        assert(system(make) == 0 && chdir(here) == 0);
+        assert(sky_parse_media("video:media/x.mp4", &media));
+        argc = sky_build_video_argv(&media, 1280, 720, 24, 0, argv, 40);
+        int saw_base = 0, saw_plain = 0;
+        for (int i = 0; i < argc; i++) { saw_base |= !strcmp(argv[i], "file:base/media/x.mp4"); }
+        assert(saw_base);
+        sky_free_argv(argv);
+        assert(sky_parse_media("video:media/missing.mp4", &media));        /* not under base/ either: left alone */
+        argc = sky_build_video_argv(&media, 1280, 720, 24, 0, argv, 40);
+        for (int i = 0; i < argc; i++) saw_plain |= !strcmp(argv[i], "file:media/missing.mp4");
+        assert(saw_plain);
+        sky_free_argv(argv);
+        assert(chdir(old) == 0);
+        snprintf(make, sizeof make, "rm -rf %s", here);
+        assert(system(make) == 0);
+    }
     assert(sky_parse_media("video:rtsp://cam/s", &media));
     argc = sky_build_video_argv(&media, 1280, 720, 24, 1, argv, 40);
     saw_re = 0;
