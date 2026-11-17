@@ -403,7 +403,10 @@ static int oss_open(const char *path, int flags) {
     if (!oss_is_device(path, &kind)) return -2;
     oss_init_real();
     if (kind == OSS_DSP && !pulse_ready()) { errno = ENODEV; return -1; }
-    int fd = real_open("/dev/null", O_RDWR);  /* a real descriptor, so fcntl/close/dup behave */
+    /* A real descriptor, so fcntl/close/dup behave. O_NONBLOCK must carry over for capture: the game opens the
+       microphone non-blocking and drains it until EAGAIN, and read() consults this flag. Playback
+       keeps its blocking writes. */
+    int fd = real_open("/dev/null", O_RDWR | ((flags & O_ACCMODE) == O_RDONLY ? (flags & O_NONBLOCK) : 0));
     if (fd < 0 || fd >= OSS_MAX_FDS) { if (fd >= 0) real_close(fd); errno = EMFILE; return -1; }
     struct oss_fd *entry = calloc(1, sizeof *entry);
     if (!entry) { real_close(fd); errno = ENOMEM; return -1; }
@@ -497,14 +500,17 @@ ssize_t read(int fd, void *data, size_t bytes) {
     oss_start_thread(entry, 0);
     pthread_cond_broadcast(&entry->cond);
     /* Bound the wait: the game reads on its main thread, so a stalled capture
-       stream must not freeze it. After 250 ms hand back silence instead. */
+       stream must not freeze it. After 250 ms hand back a short run of silence instead. */
     uint64_t wait_start = now_ms();
     while (!entry->count && !entry->stop) {
         if (nonblocking) { pthread_mutex_unlock(&entry->lock); errno = EAGAIN; return -1; }
         if (now_ms() - wait_start >= 250) {
             pthread_mutex_unlock(&entry->lock);
-            memset(output, 0, bytes);
-            return (ssize_t)bytes;
+            /* A short read: callers that drain until the device runs dry stop
+               on it, and callers that need a full buffer simply ask again. */
+            size_t silence = bytes > 2 ? (bytes / 2) & ~(size_t)1 : bytes;
+            memset(output, 0, silence);
+            return (ssize_t)silence;
         }
         struct timespec until;
         clock_gettime(CLOCK_REALTIME, &until);

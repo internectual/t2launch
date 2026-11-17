@@ -1,6 +1,7 @@
 /* Exercises t2_oss.so through the same libc calls Loki's OpenAL makes.
    Run with LD_PRELOAD=<t2_oss.so>; needs a PulseAudio-compatible server. */
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
@@ -59,6 +60,19 @@ int main(int argc, char **argv) {
         printf("captured %zu bytes of 8 kHz mono in 0.4s (expect ~6400)\n", got);
         CHECK(got > 2000 && got < 12000);
         close(in);
+        /* The game opens the microphone non-blocking and drains it until EAGAIN: reads must never wait. */
+        int nb = open("/dev/dsp", O_RDONLY | O_NONBLOCK); CHECK(nb >= 0);
+        CHECK(fcntl(nb, F_GETFL) & O_NONBLOCK);
+        int would_block = 0; start = now();
+        while (now() - start < 0.5) {
+            double before = now();
+            ssize_t n = read(nb, buf, sizeof buf);
+            CHECK(now() - before < 0.2);
+            if (n < 0) { CHECK(errno == EAGAIN); would_block = 1; }
+            usleep(2000);
+        }
+        CHECK(would_block);
+        close(nb);
     }
     puts("OK");
     return 0;
