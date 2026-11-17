@@ -1778,10 +1778,12 @@ static const char sky_panel_script[] =
     "function t2launch_skyOpen() {\n"
     " t2launch_svBuild();\n"
     " t2launch_svRefresh();\n"
+    " if (!Canvas.isCursorOn()) { CursorOn(); $T2LSV::CursorOwned = 1; }\n"   /* in play the mouse is locked to the view */
     " Canvas.pushDialog(T2LSkyDlg);\n"
     "}\n"
     "function t2launch_skyClose() {\n"
     " if (isObject(T2LSkyDlg)) Canvas.popDialog(T2LSkyDlg);\n"
+    " if ($T2LSV::CursorOwned) { $T2LSV::CursorOwned = 0; CursorOff(); }\n"
     "}\n"
     "function t2launch_skyHotkey() {\n"
     " if (isObject(T2LSkyDlg) && T2LSkyDlg.isAwake()) t2launch_skyClose();\n"
