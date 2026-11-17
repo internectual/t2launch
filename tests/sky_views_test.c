@@ -176,6 +176,27 @@ int main(void) {
     assert(sky_view_count() == 0 && !sky.sources[0].in_use);
     setenv("T2LAUNCH_SKY_FFMPEG", fake, 1);
 
+    /* a helper that writes far more to stderr than a pipe holds must not stall: stderr is drained every frame */
+    char noisy[256];
+    snprintf(noisy, sizeof noisy, "%s/noisy-ffmpeg", directory);
+    script = fopen(noisy, "w");
+    assert(script);
+    fprintf(script, "#!/bin/sh\ncase \" $* \" in *\" -vn \"*) sleep 30; exit 0;; esac\n"
+                    "i=0; while [ $i -lt 4000 ]; do echo \"noise line $i from the helper, padded to take up space xxxxxxxxxxxxxxxx\" >&2; i=$((i+1)); done\n"
+                    "head -c 3686400 /dev/zero\n");
+    fclose(script);
+    chmod(noisy, 0755);
+    setenv("T2LAUNCH_SKY_FFMPEG", noisy, 1);
+    int chatty = sky_add_view(1, "video:/tmp/clip.mp4", 0, 0, 1, 1, 1);
+    assert(chatty);
+    source = &sky.sources[sky_find_view(chatty)->source];
+    for (int i = 0; i < 100 && !source->ended; i++) { sky_drain_helper_errors(source); usleep(50000); }
+    assert(!source->failed && source->seq >= 1);
+    assert(strstr(source->note, "noise line 0"));
+    sky_media_reap();
+    assert(sky_view_count() == 0);
+    setenv("T2LAUNCH_SKY_FFMPEG", fake, 1);
+
     /* sky.media off: no helper starts */
     for (size_t i = 0; i < HOOK_OPTION_COUNT; i++)
         if (!strcmp(hook_options[i].key, "sky.media")) { snprintf(hook_options[i].value, sizeof hook_options[i].value, "0"); hook_options[i].set = 1; }

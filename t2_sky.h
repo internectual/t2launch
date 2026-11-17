@@ -94,6 +94,7 @@ struct sky_source {
     unsigned texture;
     int texture_ready, failure_reported;
     char error[200];
+    char note[200];                 /* first line the helper wrote to stderr (the pipe is drained every frame) */
 };
 
 static struct {
@@ -304,6 +305,7 @@ static void *sky_reader_thread(void *argument) {
             char text[200] = "";
             ssize_t n = source->error_fd >= 0 ? read(source->error_fd, text, sizeof text - 1) : 0;
             if (n > 0) { text[n] = 0; for (char *c = text; *c; c++) if (*c == '\n' || *c == '\r') { *c = 0; break; } }
+            if (!text[0]) snprintf(text, sizeof text, "%s", source->note);
             snprintf(source->error, sizeof source->error, "%s", text[0] ? text : "the helper produced no frames (is ffmpeg installed and the source readable?)");
         }
         source->ended = 1;
@@ -1075,9 +1077,24 @@ static int sky_game_playing(void) {
 }
 
 /* Views whose helper died or never produced a frame are removed, so their faces fall back to the original graphics. */
+static void sky_drain_helper_errors(struct sky_source *source) {
+    char text[4096];
+    if (source->error_fd < 0) return;
+    for (int rounds = 0; rounds < 16; rounds++) {   /* a chatty helper must not fill the pipe and stall */
+        ssize_t n = read(source->error_fd, text, sizeof text - 1);
+        if (n <= 0) break;
+        if (!source->note[0]) {
+            text[n] = 0;
+            for (char *c = text; *c; c++) if (*c == '\n' || *c == '\r') { *c = 0; break; }
+            snprintf(source->note, sizeof source->note, "%s", text);
+        }
+    }
+}
+
 static void sky_media_reap(void) {
     for (int i = 0; i < SKY_MAX_SOURCES; i++) {
         struct sky_source *source = &sky.sources[i];
+        if (source->in_use) sky_drain_helper_errors(source);
         if (!source->in_use || !(source->failed || source->ended)) continue;
         if (source->failed && !source->failure_reported) {
             source->failure_reported = 1;
