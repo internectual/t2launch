@@ -77,7 +77,7 @@ exits. Sound comes from a second `ffmpeg` to PulseAudio/PipeWire (`Tribes 2 sky`
 approximately in sync). Paths are used as given, so no `file:`/`concat:`/pipe tricks: only plain paths and
 http/https/rtsp URLs. YouTube links (`video360:https://www.youtube.com/watch?v=...`) are resolved by `yt-dlp` (`sky.ytdlp`,
 `sky.youtube_height`) and played by ONE ffmpeg that outputs picture and sound from the same clock (tight sync).
-Options: `sky.media`, `sky.ffmpeg`, `sky.stream_audio`, `sky.stream_volume`, `sky.stream_loop`,
+Faces are drawn at `sky.face_size` (default 1024; the engine's are 512, or a 4x4 stub for the bottom). Options: `sky.media`, `sky.ffmpeg`, `sky.stream_audio`, `sky.stream_volume`, `sky.stream_loop`,
 `sky.stream_fps`, `sky.video_width`, `sky.sphere_width`. Spaces in a path are saved in layouts as `%20`.
 
 Geometry (from the engine): FR = south wall, RT = east, BK = north, LF = west, UP = top, DN = bottom.

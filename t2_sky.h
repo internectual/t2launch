@@ -66,7 +66,7 @@ struct sky_view {
 struct sky_face {
     void *texture_object;   /* the TextureObject the name came from */
     unsigned name;          /* GL texture name (engine's) */
-    int width, height;      /* the size views are drawn at (never below SKY_MIN_FACE) */
+    int width, height;      /* the size views are drawn at (never below sky.face_size) */
     int backup_width, backup_height;   /* the size of the engine's own pixels */
     unsigned backup;        /* original pixels */
     int modified;           /* the engine texture currently holds our composite */
@@ -110,8 +110,6 @@ struct sky_source {
     char device[64];
     char note[200];                 /* first line the helper wrote to stderr (the pipe is drained every frame) */
 };
-
-#define SKY_MIN_FACE 512
 
 static struct {
     int gl_state;                       /* 0 unresolved, 1 ready, -1 unavailable */
@@ -212,6 +210,15 @@ static double sky_option_number(const char *key, double fallback, double minimum
     const char *text = hook_option_str(key);
     double value = text && *text ? atof(text) : fallback;
     return value < minimum ? minimum : value > maximum ? maximum : value;
+}
+
+/* faces are drawn at least this large (option sky.face_size): the engine's own sky textures are 512 (or a 4x4 stub),
+   far less than a 1440p video can show */
+static int sky_face_size(void) {
+    int size = (int)sky_option_number("sky.face_size", 1024, 512, 4096);
+    int power = 512;
+    while (power * 2 <= size) power *= 2;
+    return power;
 }
 
 static const char *sky_ffmpeg_path(void) {
@@ -1204,7 +1211,8 @@ static int sky_capture_face(struct sky_face *face) {
     face->backup_width = width; face->backup_height = height;
     /* The engine can hold a face at a tiny size when the stock sky never shows it (the Matrix map's bottom is 4x4):
        a view drawn into that would be a blur, so such a face is re-specified at full size below. */
-    int render_width = width < SKY_MIN_FACE ? SKY_MIN_FACE : width, render_height = height < SKY_MIN_FACE ? SKY_MIN_FACE : height;
+    int minimum = sky_face_size();
+    int render_width = width < minimum ? minimum : width, render_height = height < minimum ? minimum : height;
     face->width = render_width; face->height = render_height;
     /* Copy the original pixels through the CPU: this also decompresses compressed faces. */
     unsigned char *pixels = malloc((size_t)width * (size_t)height * 4);
@@ -1229,8 +1237,10 @@ static int sky_capture_face(struct sky_face *face) {
     else gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, RS_RGBA8, render_width, render_height, 0, RS_RGBA, RS_UNSIGNED_BYTE, NULL);
     free(pixels);
     gl_gamma.BindTexture(RS_TEXTURE_2D, (unsigned)previous);
-    fprintf(stderr, "[t2_hook] Sky view face %d: GL texture %u, %dx%d%s\n", (int)(face - sky.faces), face->name, render_width, render_height,
-            render_width != width || render_height != height ? " (enlarged from the engine's smaller texture)" : "");
+    if (render_width != width || render_height != height)
+        fprintf(stderr, "[t2_hook] Sky view face %d: GL texture %u, %dx%d (enlarged from the engine's %dx%d)\n", (int)(face - sky.faces), face->name,
+                render_width, render_height, width, height);
+    else fprintf(stderr, "[t2_hook] Sky view face %d: GL texture %u, %dx%d\n", (int)(face - sky.faces), face->name, width, height);
     return 1;
 }
 

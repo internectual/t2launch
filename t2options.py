@@ -194,6 +194,10 @@ OPTIONS = (
     Option("sky.youtube_height", "Sky views", "YouTube video height", "int", 1440, minimum=144, maximum=2160,
            hook=True, advanced=True, requires=(("sky.media", (True,)),),
            help="Largest video height to stream from YouTube; Higher is sharper but heavier to decode (1440 and up is VP9, which has no hardware shortcut here)."),
+    Option("sky.face_size", "Sky views", "Sky face size (pixels)", "int", 1024, minimum=512, maximum=4096,
+           hook=True, advanced=True, requires=(("sky.media", (True,)),),
+           help="Size the six sky faces are drawn at (rounded down to a power of two). The engine's own faces are 512 pixels; "
+                "1024 shows the detail of a 1440p video, at some GPU cost."),
     Option("sky.stream_volume", "Sky views", "Video volume (percent)", "int", 50, minimum=0, maximum=200,
            hook=True, advanced=True, requires=(("sky.stream_audio", (True,)),),
            help="Volume of sky video audio, 100 = as recorded."),
@@ -566,7 +570,7 @@ OPTIONS = (
 # sound, server browser or account login.
 CLIENT_ONLY = frozenset((
     "hook.tribesnext", "hook.tribes_tab", "video.full_redraw", "video.fps_limit", "video.borderless",
-    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "sky.media", "sky.ffmpeg", "sky.stream_audio", "sky.stream_volume", "sky.stream_loop", "sky.stream_fps", "sky.ytdlp", "sky.youtube_height", "sky.video_width", "sky.sphere_width", "sky.terminal_width", "sky.terminal_height", "sky.terminal_font", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
+    "video.vsync", "video.gamma", "video.render_scale", "video.sharpen", "sky.layout", "sky.full_box", "sky.media", "sky.ffmpeg", "sky.stream_audio", "sky.stream_volume", "sky.stream_loop", "sky.stream_fps", "sky.ytdlp", "sky.youtube_height", "sky.face_size", "sky.video_width", "sky.sphere_width", "sky.terminal_width", "sky.terminal_height", "sky.terminal_font", "video.reshade", "video.reshade_preset", "video.reshade_shaders", "video.msaa", "video.mangohud", "video.disable_locked_arrays", "video.software_gl",
     "video.xrandr_modes", "browser.many_bots", "browser.web_links", "net.depot_downloads",
     "net.native_auth", "discord.presence", "discord.app_id", "audio.openal_volume_fix",
     "audio.backend", "audio.output_device", "audio.input_device", "audio.mic_gain", "audio.mic_gate",
