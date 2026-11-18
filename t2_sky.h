@@ -243,7 +243,7 @@ static int sky_build_video_argv(const struct sky_media *media, int width, int he
         const char *layout = media->layout;
         if (!strcmp(layout, "e-sbs")) { layout = "e"; stereo = ":in_stereo=sbs:out_stereo=2d"; }
         else if (!strcmp(layout, "e-tb")) { layout = "e"; stereo = ":in_stereo=tb:out_stereo=2d"; }
-        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=lin,fps=%d,format=rgba", layout, stereo, width, height, fps);
+        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=linear,fps=%d,format=rgba", layout, stereo, width, height, fps);
     } else if (media->kind == SKY_EQUIRECT) {
         snprintf(filter, sizeof filter, "scale=%d:%d,fps=%d,format=rgba", width, height, fps);
     } else {
@@ -424,7 +424,7 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
         const char *stereo = "", *layout = media->layout;
         if (!strcmp(layout, "e-sbs")) { layout = "e"; stereo = ":in_stereo=sbs:out_stereo=2d"; }
         else if (!strcmp(layout, "e-tb")) { layout = "e"; stereo = ":in_stereo=tb:out_stereo=2d"; }
-        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=lin,fps=%d,format=rgba", layout, stereo, source->width, source->height, source->fps);
+        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=linear,fps=%d,format=rgba", layout, stereo, source->width, source->height, source->fps);
     } else if (media->kind == SKY_EQUIRECT) {
         snprintf(filter, sizeof filter, "scale=%d:%d,fps=%d,format=rgba", source->width, source->height, source->fps);
     } else {
@@ -1044,7 +1044,7 @@ static const char sky_fragment_shader[] =
     "  vec2 p = uv * 2.0 - 1.0; float u = p.x, w = -p.y; vec3 d;\n"
     "  if (face == 0) d = vec3(-u, -1.0, w); else if (face == 1) d = vec3(1.0, -u, w);\n"
     "  else if (face == 2) d = vec3(u, 1.0, w); else if (face == 3) d = vec3(-1.0, u, w);\n"
-    "  else if (face == 4) d = vec3(u, -w, 1.0); else d = vec3(u, w, -1.0);\n"
+    "  else if (face == 4) d = vec3(-u, w, 1.0); else d = vec3(u, w, -1.0);\n"
     "  d = normalize(d); float lon = atan(d.x, d.y); float lat = asin(clamp(d.z, -1.0, 1.0));\n"
     "  vec2 st = vec2(0.5 + lon / 6.2831853, 0.5 - lat / 3.1415927);\n"
     "  if (usemap != 0) {\n"

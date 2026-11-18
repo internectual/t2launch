@@ -171,6 +171,7 @@ struct ytm_mesh {
     float (*position)[3];      /* direction from the viewer */
     float (*uv)[2];            /* video texture coordinates, origin at the lower left */
     unsigned (*triangle)[3];
+    int stereo;                /* st3d stereo_mode: 0 mono, 1 top-bottom, 2 left-right (the mesh covers one eye) */
 };
 
 struct ytm_bits_reader { const unsigned char *data; size_t length, bit; int error; };
@@ -298,7 +299,11 @@ static int ytm_mesh_from_header(const unsigned char *header, size_t length, stru
             if (ok) {
                 ok = ytm_mesh_decode(raw, raw_length, mesh);
                 free(raw);
-                if (ok) return 1;
+                if (ok) {
+                    for (size_t j = 4; j + 9 <= length; j++)   /* st3d box: size, "st3d", version+flags, stereo_mode */
+                        if (!memcmp(header + j, "st3d", 4) && header[j - 1] == 13 && header[j + 8] <= 3) { mesh->stereo = header[j + 8]; break; }
+                    return 1;
+                }
             }
         }
     }
@@ -397,6 +402,8 @@ static int ytm_render_lookup(const struct ytm_mesh *mesh, int out_width, int out
                 if (total <= 0 || b0 < -1e-6 || b1 < -1e-6 || b2 < -1e-6) continue;
                 double u = (b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0]) / total;
                 double w = (b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1]) / total;
+                if (mesh->stereo == 2) u *= 0.5;                 /* left eye of a side-by-side frame */
+                else if (mesh->stereo == 1) w = w * 0.5 + 0.5;   /* left eye of a top-bottom frame (v runs up) */
                 double v = 1.0 - w;
                 u = u < 0 ? 0 : u > 1 ? 1 : u; v = v < 0 ? 0 : v > 1 ? 1 : v;
                 unsigned uu = (unsigned)(u * 65534.0 + 0.5), vv = (unsigned)(v * 65534.0 + 0.5);
