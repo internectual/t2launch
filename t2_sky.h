@@ -72,6 +72,7 @@ struct sky_face {
 struct sky_media {
     int kind;                 /* SKY_VIDEO or SKY_EQUIRECT */
     int still;                /* image: (a picture or GIF), played slowly */
+    int youtube;              /* a youtube.com / youtu.be page: resolved to stream URLs by yt-dlp when it starts */
     int term;                 /* 1 = a terminal (layout = profile name), 2 = the game console log */
     char source[480];         /* a local path or an http/https/rtsp URL */
     char layout[16];          /* 360 input layout for v360 (default "e", equirect) */
@@ -94,6 +95,10 @@ struct sky_source {
     unsigned texture;
     int texture_ready, failure_reported;
     char error[200];
+    int spawn_out, spawn_err;       /* YouTube: the pipe ends the starter thread hands to ffmpeg once it has resolved the page */
+    int loop, with_audio, yt_height;
+    double volume;
+    char device[64];
     char note[200];                 /* first line the helper wrote to stderr (the pipe is drained every frame) */
 };
 
@@ -149,6 +154,13 @@ static int sky_layout_token_ok(const char *token) {
     return 0;
 }
 
+/* A YouTube watch/short/live page (only these hosts are ever handed to yt-dlp). */
+static int sky_youtube_url(const char *text) {
+    static const char *const hosts[] = {"https://www.youtube.com/", "https://youtube.com/", "https://m.youtube.com/", "https://youtu.be/"};
+    for (size_t i = 0; i < sizeof hosts / sizeof hosts[0]; i++) if (!strncmp(text, hosts[i], strlen(hosts[i]))) return 1;
+    return 0;
+}
+
 /* "video:<src>", "image:<src>" or "video360:<src>[@layout]"; 0 when it is none of those or invalid. */
 static int sky_parse_media(const char *spec, struct sky_media *media) {
     memset(media, 0, sizeof *media);
@@ -180,7 +192,9 @@ static int sky_parse_media(const char *spec, struct sky_media *media) {
         }
         if (!strcmp(media->layout, "equirect")) snprintf(media->layout, sizeof media->layout, "e");
     }
-    return sky_media_source_ok(media->source);
+    if (!sky_media_source_ok(media->source)) return 0;
+    media->youtube = sky_youtube_url(media->source);
+    return 1;
 }
 
 static double sky_option_number(const char *key, double fallback, double minimum, double maximum) {
@@ -378,10 +392,144 @@ static int sky_build_terminal_argv(const struct sky_media *media, int width, int
     return n;
 }
 
+static const char *sky_ytdlp_path(void) {
+    static char home_copy[PATH_MAX];
+    const char *override = getenv("T2LAUNCH_SKY_YTDLP");
+    if (override && *override) return override;
+    const char *configured = hook_option_str("sky.ytdlp"), *home = getenv("HOME");
+    if (configured && *configured) return configured;
+    if (home && snprintf(home_copy, sizeof home_copy, "%s/.local/bin/yt-dlp", home) < (int)sizeof home_copy && access(home_copy, X_OK) == 0) return home_copy;
+    return "yt-dlp";
+}
+
+/* One ffmpeg process for a YouTube video: the picture goes to the pipe and the sound to PulseAudio from the same
+   clock, so they cannot drift apart the way two independently started helpers do. The video and audio streams are
+   separate URLs (DASH); audio_url may be empty when the page offered one combined stream. */
+static int sky_build_youtube_argv(const struct sky_source *source, const char *video_url, const char *audio_url, char **argv, int max) {
+    char filter[400], volume[48];
+    if (max < 48) return 0;
+    const struct sky_media *media = &source->media;
+    if (media->kind == SKY_EQUIRECT && strcmp(media->layout, "e") != 0) {
+        const char *stereo = "", *layout = media->layout;
+        if (!strcmp(layout, "e-sbs")) { layout = "e"; stereo = ":in_stereo=sbs:out_stereo=2d"; }
+        else if (!strcmp(layout, "e-tb")) { layout = "e"; stereo = ":in_stereo=tb:out_stereo=2d"; }
+        snprintf(filter, sizeof filter, "v360=input=%s:output=e%s:w=%d:h=%d:interp=lin,fps=%d,format=rgba", layout, stereo, source->width, source->height, source->fps);
+    } else if (media->kind == SKY_EQUIRECT) {
+        snprintf(filter, sizeof filter, "scale=%d:%d,fps=%d,format=rgba", source->width, source->height, source->fps);
+    } else {
+        snprintf(filter, sizeof filter, "scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,fps=%d,format=rgba",
+                 source->width, source->height, source->width, source->height, source->fps);
+    }
+    int n = 0;
+    argv[n++] = sky_dup(sky_ffmpeg_path());
+    argv[n++] = sky_dup("-hide_banner"); argv[n++] = sky_dup("-loglevel"); argv[n++] = sky_dup("error");
+    argv[n++] = sky_dup("-nostdin"); argv[n++] = sky_dup("-nostats");
+    argv[n++] = sky_dup("-protocol_whitelist"); argv[n++] = sky_dup("file,http,https,tcp,tls,crypto");
+    const char *urls[2] = {video_url, audio_url};
+    for (int i = 0; i < 2; i++) {
+        if (!urls[i][0]) continue;
+        argv[n++] = sky_dup("-reconnect"); argv[n++] = sky_dup("1");
+        argv[n++] = sky_dup("-reconnect_streamed"); argv[n++] = sky_dup("1");
+        argv[n++] = sky_dup("-reconnect_delay_max"); argv[n++] = sky_dup("5");
+        argv[n++] = sky_dup("-re");
+        if (source->loop) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
+        argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(urls[i]);
+    }
+    argv[n++] = sky_dup("-map"); argv[n++] = sky_dup("0:v:0");
+    argv[n++] = sky_dup("-an"); argv[n++] = sky_dup("-sn");
+    argv[n++] = sky_dup("-vf"); argv[n++] = sky_dup(filter);
+    argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("rawvideo");
+    argv[n++] = sky_dup("-pix_fmt"); argv[n++] = sky_dup("rgba");
+    argv[n++] = sky_dup("pipe:1");
+    if (source->with_audio) {
+        argv[n++] = sky_dup("-map"); argv[n++] = sky_dup(audio_url[0] ? "1:a:0" : "0:a:0?");
+        argv[n++] = sky_dup("-vn"); argv[n++] = sky_dup("-sn");
+        snprintf(volume, sizeof volume, "volume=%.2f", source->volume);
+        argv[n++] = sky_dup("-af"); argv[n++] = sky_dup(volume);
+        argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("pulse");
+        if (source->device[0]) { argv[n++] = sky_dup("-device"); argv[n++] = sky_dup(source->device); }
+        argv[n++] = sky_dup("Tribes 2 sky");
+    }
+    argv[n] = NULL;
+    return n;
+}
+
+/* Runs yt-dlp (never on the game thread: it takes seconds), then replaces itself with the frame reader. Every
+   process id is published under the source lock and re-checked against `stop`, so sky_source_destroy can end it
+   at any point. */
+static void *sky_youtube_thread(void *argument) {
+    struct sky_source *source = argument;
+    char text[16384] = "", format[160], height[16];
+    char *argv[40];
+    int pipe_fd[2], resolved = 0;
+    snprintf(height, sizeof height, "%d", source->yt_height);
+    snprintf(format, sizeof format, "bv*[height<=%s][vcodec^=avc1]+ba/bv*[height<=%s]+ba/b[height<=%s]/b", height, height, height);
+    int n = 0;
+    argv[n++] = sky_dup(sky_ytdlp_path());
+    argv[n++] = sky_dup("--ignore-config"); argv[n++] = sky_dup("--no-playlist"); argv[n++] = sky_dup("--no-warnings");
+    argv[n++] = sky_dup("-g"); argv[n++] = sky_dup("-f"); argv[n++] = sky_dup(format);
+    argv[n++] = sky_dup("--"); argv[n++] = sky_dup(source->media.source); argv[n] = NULL;
+    if (pipe2(pipe_fd, O_CLOEXEC) == 0) {
+        pthread_mutex_lock(&source->lock);
+        pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, pipe_fd[1], source->spawn_err);
+        if (pid > 0) source->video_pid = pid;
+        pthread_mutex_unlock(&source->lock);
+        close(pipe_fd[1]);
+        size_t got = 0;
+        while (pid > 0 && got < sizeof text - 1) {
+            ssize_t r = read(pipe_fd[0], text + got, sizeof text - 1 - got);
+            if (r > 0) { got += (size_t)r; continue; }
+            if (r < 0 && errno == EINTR) continue;
+            break;
+        }
+        text[got] = 0;
+        close(pipe_fd[0]);
+        if (pid > 0) {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            resolved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        }
+        pthread_mutex_lock(&source->lock);
+        source->video_pid = 0;   /* reaped: destroy must not signal a recycled pid */
+        pthread_mutex_unlock(&source->lock);
+    }
+    sky_free_argv(argv);
+    char *video_url = text, *audio_url = "";
+    char *newline = strchr(text, '\n');
+    if (newline) { *newline++ = 0; audio_url = newline; char *end = strchr(audio_url, '\n'); if (end) *end = 0; }
+    for (char *c = text; *c; c++) if (*c == '\r') *c = 0;
+    int ok = resolved && !source->stop && !strncmp(video_url, "https://", 8) && (!audio_url[0] || !strncmp(audio_url, "https://", 8));
+    if (ok) {
+        int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 40);
+        if (count) {
+            pthread_mutex_lock(&source->lock);
+            pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, source->spawn_out, source->spawn_err);
+            if (pid > 0) source->video_pid = pid;
+            pthread_mutex_unlock(&source->lock);
+            sky_free_argv(argv);
+            close(source->spawn_out); close(source->spawn_err);
+            source->spawn_out = source->spawn_err = -1;
+            if (pid > 0) return sky_reader_thread(source);
+        }
+    }
+    if (source->spawn_out >= 0) close(source->spawn_out);
+    if (source->spawn_err >= 0) close(source->spawn_err);
+    source->spawn_out = source->spawn_err = -1;
+    if (!source->stop) {
+        if (!source->note[0]) snprintf(source->note, sizeof source->note, "yt-dlp could not resolve this page (is it installed? sky.ytdlp)");
+        snprintf(source->error, sizeof source->error, "%s", source->note);
+        source->failed = 1;
+        source->ended = 1;
+    }
+    return NULL;
+}
+
 static void sky_source_destroy(struct sky_source *source) {
+    pthread_mutex_lock(&source->lock);
     source->stop = 1;
     /* killing the helper closes the pipe's write end, which ends the reader thread's read() */
     if (source->video_pid > 0) kill(source->video_pid, SIGKILL);
+    pthread_mutex_unlock(&source->lock);
     if (source->audio_pid > 0) kill(source->audio_pid, SIGKILL);
     if (source->thread_running) pthread_join(source->thread, NULL);
     if (source->fd >= 0) close(source->fd);
@@ -430,7 +578,15 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     source->fps = fps;
     int loop = hook_option_bool("sky.stream_loop");
     char *argv[40];
-    int argc = media->term ? sky_build_terminal_argv(media, source->width, source->height, fps, argv, 40)
+    int youtube = media->youtube && !media->term && !media->still;
+    argv[0] = NULL;
+    source->loop = loop;
+    source->with_audio = hook_option_bool("sky.stream_audio");
+    source->volume = sky_option_number("sky.stream_volume", 50, 0, 200) / 100.0;
+    source->yt_height = (int)sky_option_number("sky.youtube_height", 1080, 144, 2160);
+    snprintf(source->device, sizeof source->device, "%s", getenv("T2LAUNCH_AUDIO_OUTPUT") && strspn(getenv("T2LAUNCH_AUDIO_OUTPUT"), "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:+@-") == strlen(getenv("T2LAUNCH_AUDIO_OUTPUT")) ? getenv("T2LAUNCH_AUDIO_OUTPUT") : "");
+    source->spawn_out = source->spawn_err = -1;
+    int argc = youtube ? 1 : media->term ? sky_build_terminal_argv(media, source->width, source->height, fps, argv, 40)
                            : sky_build_video_argv(media, source->width, source->height, fps, loop, argv, 40);
     if (!argc) {
         if (media->term) fprintf(stderr, "[t2_hook] Sky views: no text helper (T2LAUNCH_SKY_TERMINAL_HELPER)\n");
@@ -447,9 +603,15 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     size_t frame_bytes = (size_t)source->width * (size_t)source->height * 4;
     for (int i = 0; i < 3; i++) source->slots[i] = malloc(frame_bytes);
     source->latest = -1; source->reading = -1; source->writing = 0;
-    source->video_pid = sky_spawn(argv, input[1], out[1], err[1]);
-    sky_free_argv(argv);
-    close(out[1]); close(err[1]);
+    if (youtube) {
+        /* the starter thread resolves the page, then spawns ffmpeg on these pipe ends and closes them */
+        source->spawn_out = out[1]; source->spawn_err = err[1];
+        source->video_pid = 0;
+    } else {
+        source->video_pid = sky_spawn(argv, input[1], out[1], err[1]);
+        sky_free_argv(argv);
+        close(out[1]); close(err[1]);
+    }
     if (input[1] >= 0) close(input[1]);
     source->input_fd = input[0];
     source->fd = out[0];
@@ -462,9 +624,9 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     }
     source->in_use = 1;
     source->refs = 1;
-    if (pthread_create(&source->thread, NULL, sky_reader_thread, source) == 0) source->thread_running = 1;
+    if (pthread_create(&source->thread, NULL, youtube ? sky_youtube_thread : sky_reader_thread, source) == 0) source->thread_running = 1;
     if (media->term == 2) sky_set_log_mode(1);
-    if (!media->term && (media->kind != SKY_VIDEO || !media->still)) {
+    if (!media->term && !youtube && (media->kind != SKY_VIDEO || !media->still)) {
         if (hook_option_bool("sky.stream_audio")) {
             char *audio[40];
             const char *device = getenv("T2LAUNCH_AUDIO_OUTPUT");
@@ -475,7 +637,7 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
         }
     }
     fprintf(stderr, "[t2_hook] Sky views: started %s (%dx%d at %d fps%s)\n", spec, source->width, source->height, fps,
-            source->audio_pid > 0 ? ", with audio" : "");
+            (source->audio_pid > 0 || (youtube && source->with_audio)) ? ", with audio" : "");
     return index;
 }
 
