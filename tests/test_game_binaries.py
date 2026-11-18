@@ -110,7 +110,7 @@ class NativeReviewTests(unittest.TestCase):
         fixture = Path(__file__).resolve().with_name(name)
         output = self.directory / fixture.stem
         build = subprocess.run([self.compiler, "-m32", "-O2", "-std=c99", "-mstackrealign",
-                                "-fPIE", "-pie", str(fixture), "-o", str(output), "-pthread", "-ldl"],
+                                "-fPIE", "-pie", str(fixture), "-o", str(output), "-pthread", "-ldl", "-lm"],
                                env=self.environment, text=True, capture_output=True, timeout=60)
         self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
         result = subprocess.run([str(output)], env=self.environment, text=True, capture_output=True,

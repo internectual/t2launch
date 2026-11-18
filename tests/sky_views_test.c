@@ -1,6 +1,6 @@
 /* Sky views: spec/face/colour parsing, view and layout round trips, the face flip table, and the full-box patch
  * (applied and reverted on synthetic pages, bytes checked against the real client).
- * gcc -m32 -O2 -std=c99 -mstackrealign -fPIE -pie tests/sky_views_test.c -o sky_views_test -pthread -ldl
+ * gcc -m32 -O2 -std=c99 -mstackrealign -fPIE -pie tests/sky_views_test.c -o sky_views_test -pthread -ldl -lm
  */
 #define T2_HOOK_TEST
 #include "../t2_hook.c"
@@ -480,6 +480,80 @@ int main(void) {
         fclose(client);
         checked = 1;
     }
+
+    /* YouTube mesh projection: raw deflate, the mesh box, and the unwrap */
+    {
+        static const unsigned char deflated[] = {0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x57, 0xc8, 0x40, 0x22, 0x73, 0x53, 0x8b, 0x33, 0x10, 0x04, 0x00};
+        unsigned char *text = NULL;
+        size_t text_length = 0;
+        assert(ytm_inflate_raw(deflated, sizeof deflated, &text, &text_length));
+        assert(text_length == 32 && memcmp(text, "hello hello hello mesh mesh mesh", 32) == 0);
+        free(text);
+        assert(!ytm_inflate_raw(deflated, 5, &text, &text_length));   /* truncated */
+
+        /* one triangle on the plane z = -1 around straight ahead; 7 coordinates (4 bits each), 3 vertices (3 bits each) */
+        unsigned char mesh[128];
+        size_t at = 0;
+        unsigned long long bits = 0;
+        int count = 0;
+        const float coordinate[7] = {-2, 2, -1, 0, 1, 2, 0.5f};
+        memset(mesh, 0, sizeof mesh);
+        #define PUT_BYTE(value) mesh[at++] = (unsigned char)(value)
+        #define PUT_32(value) do { PUT_BYTE((value) >> 24); PUT_BYTE((value) >> 16); PUT_BYTE((value) >> 8); PUT_BYTE(value); } while (0)
+        #define PUT_BITS(value, width) do { for (int b_ = (width) - 1; b_ >= 0; b_--) { bits = bits << 1 | (((value) >> b_) & 1u); if (++count == 8) { PUT_BYTE(bits); bits = 0; count = 0; } } } while (0)
+        #define FLUSH_BITS() do { if (count) { PUT_BYTE(bits << (8 - count)); bits = 0; count = 0; } } while (0)
+        at = 4;
+        memcpy(mesh + at, "mesh", 4); at += 4;
+        PUT_32(7u);
+        for (int i = 0; i < 7; i++) { uint32_t raw; memcpy(&raw, &coordinate[i], 4); PUT_32(raw); }
+        PUT_32(3u);
+        /* vertices as (x,y,z,u,v) coordinate indexes; each is stored as a zig-zag delta from the previous vertex's */
+        static const int vertex[3][5] = {{0, 0, 2, 3, 3}, {1, 0, 2, 4, 3}, {3, 1, 2, 6, 4}};
+        int previous[5] = {0, 0, 0, 0, 0};
+        for (int v = 0; v < 3; v++)
+            for (int k = 0; k < 5; k++) {
+                int delta = vertex[v][k] - previous[k];
+                unsigned zigzag = delta >= 0 ? (unsigned)delta * 2 : (unsigned)(-delta) * 2 - 1;
+                PUT_BITS(zigzag, 4);
+                previous[k] = vertex[v][k];
+            }
+        FLUSH_BITS();
+        PUT_32(1u);
+        PUT_BYTE(0); PUT_BYTE(0);   /* texture 0, triangles */
+        PUT_32(3u);
+        PUT_BITS(0u, 3); PUT_BITS(2u, 3); PUT_BITS(2u, 3);   /* indexes 0, 1, 2 as deltas */
+        FLUSH_BITS();
+        mesh[0] = 0; mesh[1] = 0; mesh[2] = 0; mesh[3] = (unsigned char)at;
+        struct ytm_mesh decoded;
+        assert(ytm_mesh_decode(mesh, at, &decoded));
+        assert(decoded.vertex_count == 3 && decoded.triangle_count == 1);
+        assert(decoded.position[1][0] == 2.0f && decoded.position[2][1] == 2.0f && decoded.position[0][2] == -1.0f);
+        assert(decoded.uv[2][0] == 0.5f && decoded.uv[2][1] == 1.0f);
+        ytm_mesh_free(&decoded);
+
+        /* the same mesh inside an MP4-style header (an "ytmp" box with raw encoding) is found */
+        unsigned char header[256];
+        size_t box = 8 + 4 + 4 + 4 + at;
+        memset(header, 0, sizeof header);
+        header[3] = (unsigned char)box; memcpy(header + 4, "ytmp", 4);
+        memcpy(header + 16, "raw ", 4); memcpy(header + 20, mesh, at);
+        assert(ytm_mesh_from_header(header, box, &decoded) && decoded.triangle_count == 1);
+        unsigned char lookup[64 * 32 * 4];
+        assert(ytm_render_lookup(&decoded, 64, 32, lookup));
+        const unsigned char *ahead = lookup + (16 * 64 + 32) * 4, *behind = lookup + (16 * 64 + 0) * 4;
+        assert(!(ahead[0] == 255 && ahead[1] == 255 && ahead[2] == 255 && ahead[3] == 255));
+        assert(ahead[0] * 256 + ahead[1] > 30000 && ahead[0] * 256 + ahead[1] < 36000);   /* u about 0.5 straight ahead */
+        assert(behind[0] == 255 && behind[1] == 255 && behind[2] == 255 && behind[3] == 255);   /* outside the mesh */
+        ytm_mesh_free(&decoded);
+        assert(!ytm_mesh_from_header(header, 12, &decoded));
+        #undef PUT_BYTE
+        #undef PUT_32
+        #undef PUT_BITS
+        #undef FLUSH_BITS
+    }
+    assert(sky_youtube_url("https://www.youtube.com/watch?v=abc") && sky_youtube_url("https://youtu.be/abc"));
+    assert(!sky_youtube_url("https://evil.example/https://www.youtube.com/") && !sky_youtube_url("https://youtube.com.evil.example/x"));
+
     printf("sky views: specs, views, layouts, face flips, full-box patch and %d real-client check passed\n", checked);
     return 0;
 }

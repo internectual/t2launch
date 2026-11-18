@@ -16,6 +16,11 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <signal.h>
+#include "t2_ytmesh.h"
+
+#ifndef GL_TEXTURE1_
+#define GL_TEXTURE1_ 0x84C1
+#endif
 #include <sys/prctl.h>
 
 #define RS_TEXTURE_BINDING_2D_VALUE 0x8069
@@ -61,7 +66,8 @@ struct sky_view {
 struct sky_face {
     void *texture_object;   /* the TextureObject the name came from */
     unsigned name;          /* GL texture name (engine's) */
-    int width, height;
+    int width, height;      /* the size views are drawn at (never below SKY_MIN_FACE) */
+    int backup_width, backup_height;   /* the size of the engine's own pixels */
     unsigned backup;        /* original pixels */
     int modified;           /* the engine texture currently holds our composite */
     uint64_t last_draw_ms;
@@ -97,10 +103,15 @@ struct sky_source {
     char error[200];
     int spawn_out, spawn_err;       /* YouTube: the pipe ends the starter thread hands to ffmpeg once it has resolved the page */
     int loop, with_audio, yt_height;
+    unsigned char *lookup;          /* YouTube mesh video: the packed direction -> video lookup, until the game thread uploads it */
+    int lookup_width, lookup_height;
+    unsigned map_texture;
     double volume;
     char device[64];
     char note[200];                 /* first line the helper wrote to stderr (the pipe is drained every frame) */
 };
+
+#define SKY_MIN_FACE 512
 
 static struct {
     int gl_state;                       /* 0 unresolved, 1 ready, -1 unavailable */
@@ -121,7 +132,7 @@ static struct {
     int full_box_applied;
     int gl_name_offset;                 /* where TextureObject keeps its GL name (found by probing) */
     struct sky_source sources[SKY_MAX_SOURCES];
-    int u_tex;
+    int u_tex, u_map, u_usemap;
     int capture_source;                 /* 1 + the index of the source whose terminal has the keyboard; 0 = none */
     uint64_t start_ms;
 } sky;
@@ -407,7 +418,7 @@ static const char *sky_ytdlp_path(void) {
    separate URLs (DASH); audio_url may be empty when the page offered one combined stream. */
 static int sky_build_youtube_argv(const struct sky_source *source, const char *video_url, const char *audio_url, char **argv, int max) {
     char filter[400], volume[48];
-    if (max < 56) return 0;
+    if (max < 72) return 0;
     const struct sky_media *media = &source->media;
     if (media->kind == SKY_EQUIRECT && strcmp(media->layout, "e") != 0) {
         const char *stereo = "", *layout = media->layout;
@@ -425,6 +436,7 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
     argv[n++] = sky_dup("-hide_banner"); argv[n++] = sky_dup("-loglevel"); argv[n++] = sky_dup("error");
     argv[n++] = sky_dup("-nostdin"); argv[n++] = sky_dup("-nostats");
     argv[n++] = sky_dup("-protocol_whitelist"); argv[n++] = sky_dup("file,http,https,tcp,tls,crypto");
+    int mesh = source->lookup != NULL;   /* the picture goes out as the raw mesh frame; the sky shader unwraps it */
     const char *urls[2] = {video_url, audio_url};
     for (int i = 0; i < 2; i++) {
         if (!urls[i][0]) continue;
@@ -435,6 +447,7 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
         if (source->loop) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
         argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(urls[i]);
     }
+    if (mesh) snprintf(filter, sizeof filter, "fps=%d,format=rgba", source->fps);
     argv[n++] = sky_dup("-map"); argv[n++] = sky_dup("0:v:0");
     argv[n++] = sky_dup("-an"); argv[n++] = sky_dup("-sn");
     argv[n++] = sky_dup("-vf"); argv[n++] = sky_dup(filter);
@@ -454,55 +467,116 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
     return n;
 }
 
-/* Runs yt-dlp (never on the game thread: it takes seconds), then replaces itself with the frame reader. Every
-   process id is published under the source lock and re-checked against `stop`, so sky_source_destroy can end it
-   at any point. */
-static void *sky_youtube_thread(void *argument) {
-    struct sky_source *source = argument;
-    char text[16384] = "", format[160], height[16];
-    char *argv[64];
+/* Run a helper to completion with its stdout captured (never on the game thread). The pid is published under the
+   source lock and re-checked against `stop`, so sky_source_destroy can end it at any point. 1 when it exited 0. */
+static int sky_capture(struct sky_source *source, char **argv, int stderr_fd, char *buffer, size_t size, size_t *got_out) {
     int pipe_fd[2], resolved = 0;
-    snprintf(height, sizeof height, "%d", source->yt_height);
-    snprintf(format, sizeof format, "bv*[height<=%s][vcodec^=avc1]+ba/bv*[height<=%s]+ba/b[height<=%s]/b", height, height, height);
-    int n = 0;
-    argv[n++] = sky_dup(sky_ytdlp_path());
-    argv[n++] = sky_dup("--ignore-config"); argv[n++] = sky_dup("--no-playlist"); argv[n++] = sky_dup("--no-warnings");
-    argv[n++] = sky_dup("-g"); argv[n++] = sky_dup("-f"); argv[n++] = sky_dup(format);
-    argv[n++] = sky_dup("--"); argv[n++] = sky_dup(source->media.source); argv[n] = NULL;
+    size_t got = 0;
     if (pipe2(pipe_fd, O_CLOEXEC) == 0) {
         pthread_mutex_lock(&source->lock);
-        pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, pipe_fd[1], source->spawn_err);
+        pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, pipe_fd[1], stderr_fd);
         if (pid > 0) source->video_pid = pid;
         pthread_mutex_unlock(&source->lock);
         close(pipe_fd[1]);
-        size_t got = 0;
-        while (pid > 0 && got < sizeof text - 1) {
-            ssize_t r = read(pipe_fd[0], text + got, sizeof text - 1 - got);
+        while (pid > 0 && got < size - 1) {
+            ssize_t r = read(pipe_fd[0], buffer + got, size - 1 - got);
             if (r > 0) { got += (size_t)r; continue; }
             if (r < 0 && errno == EINTR) continue;
             break;
         }
-        text[got] = 0;
         close(pipe_fd[0]);
         if (pid > 0) {
+            if (got >= size - 1) kill(pid, SIGKILL);   /* all we wanted */
             int status = 0;
             waitpid(pid, &status, 0);
-            resolved = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+            resolved = (WIFEXITED(status) && WEXITSTATUS(status) == 0) || got >= size - 1;
         }
         pthread_mutex_lock(&source->lock);
         source->video_pid = 0;   /* reaped: destroy must not signal a recycled pid */
         pthread_mutex_unlock(&source->lock);
     }
+    buffer[got] = 0;
+    if (got_out) *got_out = got;
+    return resolved;
+}
+
+/* YouTube stores 360 video as a mesh projection described in the MP4 header: fetch the header, decode the mesh and
+   unwrap it into the lookup the sky shader uses; the frame buffers are resized to the video's own size. 0 when the
+   stream has no mesh (plain equirect, a webm...). */
+static int sky_youtube_mesh_lookup(struct sky_source *source, const char *video_url, int frame_width, int frame_height) {
+    if (frame_width < 2 || frame_height < 2 || (size_t)frame_width * frame_height > 3840u * 2160u ||
+        source->media.kind != SKY_EQUIRECT || strcmp(source->media.layout, "e") != 0) return 0;
+    static const size_t header_size = 131072;
+    unsigned char *header = malloc(header_size + 1);
+    if (!header) return 0;
+    char *argv[16];
+    int n = 0;
+    argv[n++] = sky_dup("curl"); argv[n++] = sky_dup("-s"); argv[n++] = sky_dup("-L");
+    argv[n++] = sky_dup("--max-time"); argv[n++] = sky_dup("20");
+    argv[n++] = sky_dup("--proto"); argv[n++] = sky_dup("=https");
+    argv[n++] = sky_dup("-r"); argv[n++] = sky_dup("0-131071");
+    argv[n++] = sky_dup(video_url); argv[n] = NULL;
+    size_t got = 0;
+    sky_capture(source, argv, -1, (char *)header, header_size + 1, &got);
     sky_free_argv(argv);
+    struct ytm_mesh mesh;
+    int ok = !source->stop && got > 64 && ytm_mesh_from_header(header, got, &mesh);
+    free(header);
+    if (!ok) return 0;
+    int width = source->width * 2 > 4096 ? 4096 : source->width * 2, height = width / 2;
+    unsigned char *lookup = malloc((size_t)width * height * 4);
+    ok = lookup && ytm_render_lookup(&mesh, width, height, lookup);
+    ytm_mesh_free(&mesh);
+    size_t frame_bytes = (size_t)frame_width * (size_t)frame_height * 4;
+    unsigned char *slots[3] = {NULL, NULL, NULL};
+    for (int i = 0; i < 3 && ok; i++) { slots[i] = malloc(frame_bytes); ok = slots[i] != NULL; }
+    if (ok) {
+        pthread_mutex_lock(&source->lock);   /* no frame has been delivered yet, so the game thread is not looking at the slots */
+        for (int i = 0; i < 3; i++) { free(source->slots[i]); source->slots[i] = slots[i]; }
+        source->width = frame_width; source->height = frame_height;
+        source->lookup = lookup; source->lookup_width = width; source->lookup_height = height;
+        pthread_mutex_unlock(&source->lock);
+    } else {
+        for (int i = 0; i < 3; i++) free(slots[i]);
+        free(lookup);
+    }
+    return ok;
+}
+
+/* Runs yt-dlp, unwraps the mesh if the video has one, then replaces itself with the frame reader. */
+static void *sky_youtube_thread(void *argument) {
+    struct sky_source *source = argument;
+    char text[16384], format[160], height[16];
+    char *argv[80];
+    snprintf(height, sizeof height, "%d", source->yt_height);
+    snprintf(format, sizeof format, "bv*[height<=%s][vcodec^=avc1]+ba/bv*[height<=%s]+ba/b[height<=%s]/b", height, height, height);
+    int n = 0;
+    argv[n++] = sky_dup(sky_ytdlp_path());
+    argv[n++] = sky_dup("--ignore-config"); argv[n++] = sky_dup("--no-playlist"); argv[n++] = sky_dup("--no-warnings");
+    argv[n++] = sky_dup("--print"); argv[n++] = sky_dup("%(width)s %(height)s"); argv[n++] = sky_dup("--print"); argv[n++] = sky_dup("urls");
+    argv[n++] = sky_dup("-f"); argv[n++] = sky_dup(format);
+    argv[n++] = sky_dup("--"); argv[n++] = sky_dup(source->media.source); argv[n] = NULL;
+    size_t got = 0;
+    int resolved = sky_capture(source, argv, source->spawn_err, text, sizeof text, &got);
+    sky_free_argv(argv);
+    /* first line: the picture size; then one or two stream URLs */
+    int frame_width = 0, frame_height = 0;
     char *video_url = text, *audio_url = "";
     char *newline = strchr(text, '\n');
+    if (newline && sscanf(text, "%d %d", &frame_width, &frame_height) == 2) {
+        video_url = newline + 1;
+        newline = strchr(video_url, '\n');
+    } else frame_width = frame_height = 0;
     if (newline) { *newline++ = 0; audio_url = newline; char *end = strchr(audio_url, '\n'); if (end) *end = 0; }
     for (char *c = text; *c; c++) if (*c == '\r') *c = 0;
     int ok = resolved && !source->stop && !strncmp(video_url, "https://", 8) && (!audio_url[0] || !strncmp(audio_url, "https://", 8));
-    if (!ok) fprintf(stderr, "[t2_hook] Sky views: yt-dlp (%s) %s, %zu bytes of output, stop=%d, starts \"%.40s\"\n", sky_ytdlp_path(),
-                     resolved ? "exited ok" : "failed", strlen(text), source->stop, text);
+    if (!ok) fprintf(stderr, "[t2_hook] Sky views: yt-dlp (%s) %s, %zu bytes of output, stop=%d\n", sky_ytdlp_path(),
+                     resolved ? "exited ok" : "failed", got, source->stop);
     if (ok) {
-        int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 64);
+        int mesh = sky_youtube_mesh_lookup(source, video_url, frame_width, frame_height);
+        if (mesh) fprintf(stderr, "[t2_hook] Sky views: YouTube mesh projection decoded (%dx%d frame, %dx%d lookup)\n", frame_width, frame_height, source->lookup_width, source->lookup_height);
+        else if (source->media.kind == SKY_EQUIRECT) fprintf(stderr, "[t2_hook] Sky views: no YouTube mesh found; playing the frame as plain equirect\n");
+        int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 80);
         if (count) {
             pthread_mutex_lock(&source->lock);
             pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, source->spawn_out, source->spawn_err);
@@ -541,6 +615,8 @@ static void sky_source_destroy(struct sky_source *source) {
     if (source->media.term == 2) sky_set_log_mode(0);
     if (source->video_pid > 0) waitpid(source->video_pid, NULL, 0);
     if (source->audio_pid > 0) waitpid(source->audio_pid, NULL, 0);
+    free(source->lookup);
+    if (source->map_texture && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->map_texture);
     for (int i = 0; i < 3; i++) free(source->slots[i]);
     if (source->texture && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->texture);
     pthread_mutex_destroy(&source->lock);
@@ -927,7 +1003,7 @@ static const char sky_vertex_shader[] =
 
 /* One fragment shader for every built-in source; uv is local to the view's rectangle, (0,0) top-left. */
 static const char sky_fragment_shader[] =
-    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity; uniform sampler2D tex;\n"
+    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity; uniform sampler2D tex; uniform sampler2D map; uniform int usemap;\n"
     "float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }\n"
     "float box(vec2 uv, vec2 lo, vec2 hi) { return step(lo.x, uv.x) * step(uv.x, hi.x) * step(lo.y, uv.y) * step(uv.y, hi.y); }\n"
     "vec4 faceColor() {\n"
@@ -968,9 +1044,14 @@ static const char sky_fragment_shader[] =
     "  vec2 p = uv * 2.0 - 1.0; float u = p.x, w = -p.y; vec3 d;\n"
     "  if (face == 0) d = vec3(-u, -1.0, w); else if (face == 1) d = vec3(1.0, -u, w);\n"
     "  else if (face == 2) d = vec3(u, 1.0, w); else if (face == 3) d = vec3(-1.0, u, w);\n"
-    "  else if (face == 4) d = vec3(u, w, 1.0); else d = vec3(u, w, -1.0);\n"
+    "  else if (face == 4) d = vec3(u, -w, 1.0); else d = vec3(u, w, -1.0);\n"
     "  d = normalize(d); float lon = atan(d.x, d.y); float lat = asin(clamp(d.z, -1.0, 1.0));\n"
-    "  c = vec4(texture2D(tex, vec2(0.5 + lon / 6.2831853, 0.5 - lat / 3.1415927)).rgb, 1.0); }\n"
+    "  vec2 st = vec2(0.5 + lon / 6.2831853, 0.5 - lat / 3.1415927);\n"
+    "  if (usemap != 0) {\n"
+    "   vec4 m = floor(texture2D(map, st) * 255.0 + 0.5);\n"
+    "   if (m.r > 254.5 && m.g > 254.5 && m.b > 254.5 && m.a > 254.5) c = vec4(0.0, 0.0, 0.0, 1.0);\n"
+    "   else c = vec4(texture2D(tex, vec2((m.r * 256.0 + m.g) / 65535.0, (m.b * 256.0 + m.a) / 65535.0)).rgb, 1.0);\n"
+    "  } else c = vec4(texture2D(tex, st).rgb, 1.0); }\n"
     " gl_FragColor = vec4(c.rgb, c.a * opacity);\n"
     "}\n";
 
@@ -1008,6 +1089,8 @@ static int sky_resolve_gl(void) {
     sky.u_color = rs_gl.GetUniformLocation(sky.program, "color");
     sky.u_opacity = rs_gl.GetUniformLocation(sky.program, "opacity");
     sky.u_tex = rs_gl.GetUniformLocation(sky.program, "tex");
+    sky.u_map = rs_gl.GetUniformLocation(sky.program, "map");
+    sky.u_usemap = rs_gl.GetUniformLocation(sky.program, "usemap");
     rs_gl.GenFramebuffers(1, &sky.fbo);
     rs_gl.GenFramebuffers(1, &sky.read_fbo);
     sky.gl_state = 1;
@@ -1113,7 +1196,11 @@ static int sky_capture_face(struct sky_face *face) {
         gl_gamma.BindTexture(RS_TEXTURE_2D, (unsigned)previous);
         return 0;
     }
-    face->width = width; face->height = height;
+    face->backup_width = width; face->backup_height = height;
+    /* The engine can hold a face at a tiny size when the stock sky never shows it (the Matrix map's bottom is 4x4):
+       a view drawn into that would be a blur, so such a face is re-specified at full size below. */
+    int render_width = width < SKY_MIN_FACE ? SKY_MIN_FACE : width, render_height = height < SKY_MIN_FACE ? SKY_MIN_FACE : height;
+    face->width = render_width; face->height = render_height;
     /* Copy the original pixels through the CPU: this also decompresses compressed faces. */
     unsigned char *pixels = malloc((size_t)width * (size_t)height * 4);
     if (!pixels) { gl_gamma.BindTexture(RS_TEXTURE_2D, (unsigned)previous); return 0; }
@@ -1133,10 +1220,12 @@ static int sky_capture_face(struct sky_face *face) {
     rs_gl.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, width, height, RS_RGBA, RS_UNSIGNED_BYTE, pixels);
     /* Make the engine texture renderable: re-specify level 0 as plain RGBA8 with the same pixels. */
     gl_gamma.BindTexture(RS_TEXTURE_2D, face->name);
-    gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, RS_RGBA8, width, height, 0, RS_RGBA, RS_UNSIGNED_BYTE, pixels);
+    if (render_width == width && render_height == height) gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, RS_RGBA8, width, height, 0, RS_RGBA, RS_UNSIGNED_BYTE, pixels);
+    else gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, RS_RGBA8, render_width, render_height, 0, RS_RGBA, RS_UNSIGNED_BYTE, NULL);
     free(pixels);
     gl_gamma.BindTexture(RS_TEXTURE_2D, (unsigned)previous);
-    fprintf(stderr, "[t2_hook] Sky view face %d: GL texture %u, %dx%d\n", (int)(face - sky.faces), face->name, width, height);
+    fprintf(stderr, "[t2_hook] Sky view face %d: GL texture %u, %dx%d%s\n", (int)(face - sky.faces), face->name, render_width, render_height,
+            render_width != width || render_height != height ? " (enlarged from the engine's smaller texture)" : "");
     return 1;
 }
 
@@ -1164,8 +1253,8 @@ static void sky_render_face(int index, double seconds) {
     unsigned attachment = RS_COLOR_ATTACHMENT0;
     rs_gl.DrawBuffers(1, &attachment);
     if (rs_gl.CheckFramebufferStatus(RS_DRAW_FRAMEBUFFER) != RS_FRAMEBUFFER_COMPLETE) return;
-    rs_gl.BlitFramebuffer(0, 0, face->width, face->height, 0, 0, face->width, face->height,
-                          RS_COLOR_BUFFER_BIT, RS_NEAREST);   /* the original graphics (the fallback) */
+    rs_gl.BlitFramebuffer(0, 0, face->backup_width, face->backup_height, 0, 0, face->width, face->height, RS_COLOR_BUFFER_BIT,
+                          face->backup_width == face->width && face->backup_height == face->height ? RS_NEAREST : RS_LINEAR);   /* the original graphics (the fallback) */
     face->modified = count > 0;
     if (count) {
         rs_gl.BindFramebuffer(RS_FRAMEBUFFER, sky.fbo);
@@ -1181,6 +1270,14 @@ static void sky_render_face(int index, double seconds) {
             if (view->kind >= SKY_VIDEO) {
                 rs_gl.Uniform1i(sky.u_tex, 0);
                 gl_gamma.BindTexture(RS_TEXTURE_2D, view->source >= 0 ? sky.sources[view->source].texture : 0);
+                unsigned map = view->source >= 0 ? sky.sources[view->source].map_texture : 0;
+                rs_gl.Uniform1i(sky.u_usemap, map != 0);
+                if (map) {
+                    gl_gamma.ActiveTexture(GL_TEXTURE1_);
+                    gl_gamma.BindTexture(RS_TEXTURE_2D, map);
+                    rs_gl.Uniform1i(sky.u_map, 1);
+                    gl_gamma.ActiveTexture(GL_TEXTURE0_);
+                }
             }
             sky.Uniform4f(sky.u_color, view->color[0], view->color[1], view->color[2], view->color[3]);
             gl_gamma.Uniform1f(sky.u_opacity, view->opacity);
@@ -1292,12 +1389,25 @@ static void sky_upload_sources(void) {
             gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, source->media.kind == SKY_EQUIRECT ? GL_LINEAR_ : 0x2703 /* LINEAR_MIPMAP_LINEAR */);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
-            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, source->media.kind == SKY_EQUIRECT ? 0x2901 : GL_CLAMP_TO_EDGE_);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, source->media.kind == SKY_EQUIRECT && !source->lookup ? 0x2901 : GL_CLAMP_TO_EDGE_);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
             gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, GL_RGBA8_, source->width, source->height, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, frame);
         } else {
             gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
             sky.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, source->width, source->height, GL_RGBA_, GL_UNSIGNED_BYTE_, frame);
+        }
+        if (source->lookup && !source->map_texture) {   /* YouTube mesh: the direction lookup, sampled NEAREST by the shader */
+            gl_gamma.ActiveTexture(GL_TEXTURE1_);
+            gl_gamma.GenTextures(1, &source->map_texture);
+            gl_gamma.BindTexture(RS_TEXTURE_2D, source->map_texture);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, 0x2600 /* NEAREST */);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, 0x2600);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, 0x2901 /* REPEAT */);
+            gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+            gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, GL_RGBA8_, source->lookup_width, source->lookup_height, 0, GL_RGBA_, GL_UNSIGNED_BYTE_, source->lookup);
+            gl_gamma.ActiveTexture(GL_TEXTURE0_);
+            free(source->lookup);
+            source->lookup = NULL;   /* the texture has it now (map_texture marks the source as a mesh source) */
         }
         if (source->media.kind != SKY_EQUIRECT) rs_gl.GenerateMipmap(RS_TEXTURE_2D);   /* flat media is shown smaller than it is decoded */
         source->texture_ready = 1;
