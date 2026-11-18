@@ -546,6 +546,20 @@ int main(void) {
         assert(behind[0] == 255 && behind[1] == 255 && behind[2] == 255 && behind[3] == 255);   /* outside the mesh */
         ytm_mesh_free(&decoded);
         assert(!ytm_mesh_from_header(header, 12, &decoded));
+
+        /* and in a WebM header: EBML magic, StereoMode 1 (side by side), then ProjectionPrivate (0x7672) holding the same body */
+        unsigned char webm[256];
+        size_t body = 12 + at, w = 0;
+        memset(webm, 0, sizeof webm);
+        memcpy(webm + w, "\x1a\x45\xdf\xa3\x80", 5); w += 5;
+        memcpy(webm + w, "\x53\xb8\x81\x01", 4); w += 4;
+        webm[w++] = 0x76; webm[w++] = 0x72; webm[w++] = (unsigned char)(0x40 | (body >> 8)); webm[w++] = (unsigned char)(body & 255);
+        memcpy(webm + w + 8, "raw ", 4);
+        memcpy(webm + w + 12, mesh, at);
+        w += body;
+        assert(ytm_mesh_from_header(webm, w, &decoded) && decoded.triangle_count == 1 && decoded.stereo == 2);
+        ytm_mesh_free(&decoded);
+        assert(!ytm_mesh_from_header(webm, 14, &decoded));
         #undef PUT_BYTE
         #undef PUT_32
         #undef PUT_BITS

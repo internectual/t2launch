@@ -277,7 +277,26 @@ static int ytm_mesh_decode(const unsigned char *data, size_t length, struct ytm_
     return 1;
 }
 
-/* Find the mesh projection box (ytmp, or the standard mshp) in an MP4 header and decode it; 0 when there is none. */
+/* Decode one mesh projection body: version+flags, crc, encoding four-cc, then the (compressed) mesh boxes. */
+static int ytm_mesh_from_body(const unsigned char *body, size_t body_length, struct ytm_mesh *mesh) {
+    if (body_length < 12) return 0;
+    const unsigned char *encoding = body + 8, *payload = body + 12;
+    size_t payload_length = body_length - 12;
+    unsigned char *raw = NULL;
+    size_t raw_length = 0;
+    int ok;
+    if (!memcmp(encoding, "dfl8", 4)) ok = ytm_inflate_raw(payload, payload_length, &raw, &raw_length);
+    else if (!memcmp(encoding, "raw ", 4)) { raw = malloc(payload_length ? payload_length : 1); ok = raw != NULL; if (ok) { memcpy(raw, payload, payload_length); raw_length = payload_length; } }
+    else ok = 0;
+    if (!ok) return 0;
+    ok = ytm_mesh_decode(raw, raw_length, mesh);
+    free(raw);
+    return ok;
+}
+
+/* Find the mesh projection in a video header and decode it; 0 when there is none. MP4: an "ytmp" (or standard "mshp")
+   box, with the stereo mode in "st3d". WebM: the ProjectionPrivate element (0x7672) inside Projection (0x7670) when
+   ProjectionType (0x7671) is 3, with StereoMode (0x53B8: 1 side by side, 3 top-bottom, left eye first). */
 static int ytm_mesh_from_header(const unsigned char *header, size_t length, struct ytm_mesh *mesh) {
     static const char *const types[2] = {"ytmp", "mshp"};
     for (int t = 0; t < 2; t++) {
@@ -285,25 +304,32 @@ static int ytm_mesh_from_header(const unsigned char *header, size_t length, stru
             if (memcmp(header + i, types[t], 4) != 0) continue;
             size_t size = (size_t)header[i - 4] << 24 | (size_t)header[i - 3] << 16 | (size_t)header[i - 2] << 8 | header[i - 1];
             if (size < 20 || i - 4 + size > length) continue;
-            const unsigned char *body = header + i + 4;   /* version+flags, crc, encoding, data */
-            size_t body_length = size - 8;
-            if (body_length < 12) continue;
-            const unsigned char *encoding = body + 8, *payload = body + 12;
-            size_t payload_length = body_length - 12;
-            unsigned char *raw = NULL;
-            size_t raw_length = 0;
-            int ok;
-            if (!memcmp(encoding, "dfl8", 4)) ok = ytm_inflate_raw(payload, payload_length, &raw, &raw_length);
-            else if (!memcmp(encoding, "raw ", 4)) { raw = malloc(payload_length ? payload_length : 1); ok = raw != NULL; if (ok) { memcpy(raw, payload, payload_length); raw_length = payload_length; } }
-            else ok = 0;
-            if (ok) {
-                ok = ytm_mesh_decode(raw, raw_length, mesh);
-                free(raw);
-                if (ok) {
-                    for (size_t j = 4; j + 9 <= length; j++)   /* st3d box: size, "st3d", version+flags, stereo_mode */
-                        if (!memcmp(header + j, "st3d", 4) && header[j - 1] == 13 && header[j + 8] <= 3) { mesh->stereo = header[j + 8]; break; }
-                    return 1;
-                }
+            if (ytm_mesh_from_body(header + i + 4, size - 8, mesh)) {
+                for (size_t j = 4; j + 9 <= length; j++)   /* st3d box: size, "st3d", version+flags, stereo_mode */
+                    if (!memcmp(header + j, "st3d", 4) && header[j - 1] == 13 && header[j + 8] <= 3) { mesh->stereo = header[j + 8]; break; }
+                return 1;
+            }
+        }
+    }
+    if (length > 4 && !memcmp(header, "\x1a\x45\xdf\xa3", 4)) {   /* WebM */
+        size_t limit = length;
+        for (size_t i = 0; i + 4 <= length; i++) if (!memcmp(header + i, "\x1f\x43\xb6\x75", 4)) { limit = i; break; }   /* first Cluster */
+        for (size_t i = 0; i + 4 < limit; i++) {
+            if (header[i] != 0x76 || header[i + 1] != 0x72) continue;
+            unsigned lead = header[i + 2], width = 1;
+            while (width <= 4 && !(lead & (0x80u >> (width - 1)))) width++;
+            if (width > 4 || i + 2 + width > limit) continue;
+            size_t size = lead & (0xffu >> width);
+            for (unsigned k = 1; k < width; k++) size = size << 8 | header[i + 2 + k];
+            size_t start = i + 2 + width;
+            if (size < 12 || start + size > length) continue;
+            if (ytm_mesh_from_body(header + start, size, mesh)) {
+                for (size_t j = 0; j + 4 <= limit; j++)
+                    if (header[j] == 0x53 && header[j + 1] == 0xb8 && header[j + 2] == 0x81) {
+                        mesh->stereo = header[j + 3] == 1 ? 2 : header[j + 3] == 3 ? 1 : 0;
+                        break;
+                    }
+                return 1;
             }
         }
     }

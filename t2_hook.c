@@ -190,7 +190,7 @@ static struct hook_option hook_options[] = {
     {"sky.stream_volume", "50", NULL, 0, "", 0},
     {"sky.stream_fps", "24", NULL, 0, "", 0},
     {"sky.ytdlp", "", NULL, 0, "", 0},
-    {"sky.youtube_height", "1080", NULL, 0, "", 0},
+    {"sky.youtube_height", "1440", NULL, 0, "", 0},
     {"sky.video_width", "1280", NULL, 0, "", 0},
     {"sky.terminal_width", "1024", NULL, 0, "", 0},
     {"sky.terminal_height", "768", NULL, 0, "", 0},

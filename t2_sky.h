@@ -552,11 +552,13 @@ static void *sky_youtube_thread(void *argument) {
     char text[16384], format[160], height[16];
     char *argv[80];
     snprintf(height, sizeof height, "%d", source->yt_height);
-    snprintf(format, sizeof format, "bv*[height<=%s][vcodec^=avc1]+ba/bv*[height<=%s]+ba/b[height<=%s]/b", height, height, height);
+    /* the tallest video up to the limit (H.264 when there is a choice, and the lower frame rate: both decode cheaper) */
+    snprintf(format, sizeof format, "bv*[height<=%s]+ba/b[height<=%s]/b", height, height);
     int n = 0;
     argv[n++] = sky_dup(sky_ytdlp_path());
     argv[n++] = sky_dup("--ignore-config"); argv[n++] = sky_dup("--no-playlist"); argv[n++] = sky_dup("--no-warnings");
     argv[n++] = sky_dup("--print"); argv[n++] = sky_dup("%(width)s %(height)s"); argv[n++] = sky_dup("--print"); argv[n++] = sky_dup("urls");
+    argv[n++] = sky_dup("-S"); argv[n++] = sky_dup("res,+fps,vcodec:avc1");
     argv[n++] = sky_dup("-f"); argv[n++] = sky_dup(format);
     argv[n++] = sky_dup("--"); argv[n++] = sky_dup(source->media.source); argv[n] = NULL;
     size_t got = 0;
@@ -664,7 +666,7 @@ static int sky_source_acquire(const char *spec, const struct sky_media *media) {
     source->loop = loop;
     source->with_audio = hook_option_bool("sky.stream_audio");
     source->volume = sky_option_number("sky.stream_volume", 50, 0, 200) / 100.0;
-    source->yt_height = (int)sky_option_number("sky.youtube_height", 1080, 144, 2160);
+    source->yt_height = (int)sky_option_number("sky.youtube_height", 1440, 144, 2160);
     snprintf(source->device, sizeof source->device, "%s", getenv("T2LAUNCH_AUDIO_OUTPUT") && strspn(getenv("T2LAUNCH_AUDIO_OUTPUT"), "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:+@-") == strlen(getenv("T2LAUNCH_AUDIO_OUTPUT")) ? getenv("T2LAUNCH_AUDIO_OUTPUT") : "");
     source->spawn_out = source->spawn_err = -1;
     int argc = youtube ? 1 : media->term ? sky_build_terminal_argv(media, source->width, source->height, fps, argv, 40)
