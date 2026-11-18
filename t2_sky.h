@@ -460,6 +460,9 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
         snprintf(volume, sizeof volume, "volume=%.2f", source->volume);
         argv[n++] = sky_dup("-af"); argv[n++] = sky_dup(volume);
         argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("pulse");
+        /* ffmpeg's default PulseAudio buffer is ~0.5 s while the picture is written at once, so the sound came out half a
+           second late (measured with a flash+beep clip); a 40 ms buffer brings it to ~130 ms and stable */
+        argv[n++] = sky_dup("-buffer_duration"); argv[n++] = sky_dup("40");
         if (source->device[0]) { argv[n++] = sky_dup("-device"); argv[n++] = sky_dup(source->device); }
         argv[n++] = sky_dup("Tribes 2 sky");
     }
