@@ -407,7 +407,7 @@ static const char *sky_ytdlp_path(void) {
    separate URLs (DASH); audio_url may be empty when the page offered one combined stream. */
 static int sky_build_youtube_argv(const struct sky_source *source, const char *video_url, const char *audio_url, char **argv, int max) {
     char filter[400], volume[48];
-    if (max < 48) return 0;
+    if (max < 56) return 0;
     const struct sky_media *media = &source->media;
     if (media->kind == SKY_EQUIRECT && strcmp(media->layout, "e") != 0) {
         const char *stereo = "", *layout = media->layout;
@@ -460,7 +460,7 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
 static void *sky_youtube_thread(void *argument) {
     struct sky_source *source = argument;
     char text[16384] = "", format[160], height[16];
-    char *argv[40];
+    char *argv[64];
     int pipe_fd[2], resolved = 0;
     snprintf(height, sizeof height, "%d", source->yt_height);
     snprintf(format, sizeof format, "bv*[height<=%s][vcodec^=avc1]+ba/bv*[height<=%s]+ba/b[height<=%s]/b", height, height, height);
@@ -499,8 +499,10 @@ static void *sky_youtube_thread(void *argument) {
     if (newline) { *newline++ = 0; audio_url = newline; char *end = strchr(audio_url, '\n'); if (end) *end = 0; }
     for (char *c = text; *c; c++) if (*c == '\r') *c = 0;
     int ok = resolved && !source->stop && !strncmp(video_url, "https://", 8) && (!audio_url[0] || !strncmp(audio_url, "https://", 8));
+    if (!ok) fprintf(stderr, "[t2_hook] Sky views: yt-dlp (%s) %s, %zu bytes of output, stop=%d, starts \"%.40s\"\n", sky_ytdlp_path(),
+                     resolved ? "exited ok" : "failed", strlen(text), source->stop, text);
     if (ok) {
-        int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 40);
+        int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 64);
         if (count) {
             pthread_mutex_lock(&source->lock);
             pid_t pid = source->stop ? -1 : sky_spawn(argv, -1, source->spawn_out, source->spawn_err);
