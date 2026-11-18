@@ -193,7 +193,7 @@ OPTIONS = (
            help="Path of yt-dlp, used for YouTube links in sky views; blank uses ~/.local/bin/yt-dlp or PATH."),
     Option("sky.youtube_height", "Sky views", "YouTube video height", "int", 1440, minimum=144, maximum=2160,
            hook=True, advanced=True, requires=(("sky.media", (True,)),),
-           help="Largest video height to stream from YouTube; Higher is sharper but heavier to decode (1440 and up is VP9, which has no hardware shortcut here)."),
+           help="Largest video height to stream from YouTube; Higher is sharper but heavier to decode (1440 and up is VP9, which has no hardware shortcut here); 360 videos with a mesh are sent to the GPU as YUV, which keeps 2160 smooth."),
     Option("sky.face_size", "Sky views", "Sky face size (pixels)", "int", 1024, minimum=512, maximum=4096,
            hook=True, advanced=True, requires=(("sky.media", (True,)),),
            help="Size the six sky faces are drawn at (rounded down to a power of two). The engine's own faces are 512 pixels; "

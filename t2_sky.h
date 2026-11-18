@@ -21,6 +21,8 @@
 #ifndef GL_TEXTURE1_
 #define GL_TEXTURE1_ 0x84C1
 #endif
+#define GL_TEXTURE2_ 0x84C2
+#define GL_TEXTURE3_ 0x84C3
 #include <sys/prctl.h>
 
 #define RS_TEXTURE_BINDING_2D_VALUE 0x8069
@@ -106,6 +108,8 @@ struct sky_source {
     unsigned char *lookup;          /* YouTube mesh video: the packed direction -> video lookup, until the game thread uploads it */
     int lookup_width, lookup_height;
     unsigned map_texture;
+    int yuv;                        /* frames are planar YUV 4:2:0 (Y, then U, then V): a third of the bytes of RGBA, converted in the shader */
+    unsigned tex_u, tex_v;          /* the chroma planes' textures (texture is the luma plane's) */
     double volume;
     char device[64];
     char note[200];                 /* first line the helper wrote to stderr (the pipe is drained every frame) */
@@ -130,7 +134,7 @@ static struct {
     int full_box_applied;
     int gl_name_offset;                 /* where TextureObject keeps its GL name (found by probing) */
     struct sky_source sources[SKY_MAX_SOURCES];
-    int u_tex, u_map, u_usemap;
+    int u_tex, u_map, u_usemap, u_tex_u, u_tex_v, u_useyuv;
     int capture_source;                 /* 1 + the index of the source whose terminal has the keyboard; 0 = none */
     uint64_t start_ms;
 } sky;
@@ -318,9 +322,14 @@ static pid_t sky_spawn(char **argv, int stdin_fd, int stdout_fd, int stderr_fd) 
     return child;
 }
 
+static size_t sky_frame_bytes(const struct sky_source *source) {
+    size_t pixels = (size_t)source->width * (size_t)source->height;
+    return source->yuv ? pixels * 3 / 2 : pixels * 4;
+}
+
 static void *sky_reader_thread(void *argument) {
     struct sky_source *source = argument;
-    size_t frame_bytes = (size_t)source->width * (size_t)source->height * 4;
+    size_t frame_bytes = sky_frame_bytes(source);
     while (!source->stop) {
         unsigned char *slot = source->slots[source->writing];
         size_t got = 0;
@@ -454,12 +463,12 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
         if (source->loop) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
         argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(urls[i]);
     }
-    if (mesh) snprintf(filter, sizeof filter, "fps=%d,format=rgba", source->fps);
+    if (mesh) snprintf(filter, sizeof filter, source->yuv ? "fps=%d,format=yuv420p" : "fps=%d,format=rgba", source->fps);
     argv[n++] = sky_dup("-map"); argv[n++] = sky_dup("0:v:0");
     argv[n++] = sky_dup("-an"); argv[n++] = sky_dup("-sn");
     argv[n++] = sky_dup("-vf"); argv[n++] = sky_dup(filter);
     argv[n++] = sky_dup("-f"); argv[n++] = sky_dup("rawvideo");
-    argv[n++] = sky_dup("-pix_fmt"); argv[n++] = sky_dup("rgba");
+    argv[n++] = sky_dup("-pix_fmt"); argv[n++] = sky_dup(source->yuv ? "yuv420p" : "rgba");
     argv[n++] = sky_dup("pipe:1");
     if (source->with_audio) {
         argv[n++] = sky_dup("-map"); argv[n++] = sky_dup(audio_url[0] ? "1:a:0" : "0:a:0?");
@@ -537,13 +546,14 @@ static int sky_youtube_mesh_lookup(struct sky_source *source, const char *video_
     unsigned char *lookup = malloc((size_t)width * height * 4);
     ok = lookup && ytm_render_lookup(&mesh, width, height, lookup);
     ytm_mesh_free(&mesh);
-    size_t frame_bytes = (size_t)frame_width * (size_t)frame_height * 4;
+    int planar = !(frame_width & 1) && !(frame_height & 1);   /* 4:2:0 needs even sizes */
+    size_t frame_bytes = (size_t)frame_width * (size_t)frame_height * (planar ? 3 : 4) / (planar ? 2 : 1);
     unsigned char *slots[3] = {NULL, NULL, NULL};
     for (int i = 0; i < 3 && ok; i++) { slots[i] = malloc(frame_bytes); ok = slots[i] != NULL; }
     if (ok) {
         pthread_mutex_lock(&source->lock);   /* no frame has been delivered yet, so the game thread is not looking at the slots */
         for (int i = 0; i < 3; i++) { free(source->slots[i]); source->slots[i] = slots[i]; }
-        source->width = frame_width; source->height = frame_height;
+        source->width = frame_width; source->height = frame_height; source->yuv = planar;
         source->lookup = lookup; source->lookup_width = width; source->lookup_height = height;
         pthread_mutex_unlock(&source->lock);
     } else {
@@ -629,6 +639,8 @@ static void sky_source_destroy(struct sky_source *source) {
     if (source->audio_pid > 0) waitpid(source->audio_pid, NULL, 0);
     free(source->lookup);
     if (source->map_texture && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->map_texture);
+    if (source->tex_u && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->tex_u);
+    if (source->tex_v && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->tex_v);
     for (int i = 0; i < 3; i++) free(source->slots[i]);
     if (source->texture && sky.gl_state > 0) rs_gl.DeleteTextures(1, &source->texture);
     pthread_mutex_destroy(&source->lock);
@@ -1015,7 +1027,15 @@ static const char sky_vertex_shader[] =
 
 /* One fragment shader for every built-in source; uv is local to the view's rectangle, (0,0) top-left. */
 static const char sky_fragment_shader[] =
-    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity; uniform sampler2D tex; uniform sampler2D map; uniform int usemap;\n"
+    "uniform int kind; uniform float time; uniform int face; uniform vec4 color; uniform float opacity; uniform sampler2D tex; uniform sampler2D map; uniform int usemap; uniform sampler2D tex_u; uniform sampler2D tex_v; uniform int useyuv;\n"
+    /* planar YUV 4:2:0 video (BT.709, limited range: what the streams are) or an RGBA texture */
+    "vec3 video(vec2 p) {\n"
+    " if (useyuv == 0) return texture2D(tex, p).rgb;\n"
+    " float y = (texture2D(tex, p).r - 0.0627451) * 1.1643836;\n"
+    " float u = (texture2D(tex_u, p).r - 0.5019608) * 1.1383929;\n"
+    " float v = (texture2D(tex_v, p).r - 0.5019608) * 1.1383929;\n"
+    " return clamp(vec3(y + 1.5748 * v, y - 0.1873 * u - 0.4681 * v, y + 1.8556 * u), 0.0, 1.0);\n"
+    "}\n"
     "float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }\n"
     "float box(vec2 uv, vec2 lo, vec2 hi) { return step(lo.x, uv.x) * step(uv.x, hi.x) * step(lo.y, uv.y) * step(uv.y, hi.y); }\n"
     "vec4 faceColor() {\n"
@@ -1062,7 +1082,7 @@ static const char sky_fragment_shader[] =
     "  if (usemap != 0) {\n"
     "   vec4 m = floor(texture2D(map, st) * 255.0 + 0.5);\n"
     "   if (m.r > 254.5 && m.g > 254.5 && m.b > 254.5 && m.a > 254.5) c = vec4(0.0, 0.0, 0.0, 1.0);\n"
-    "   else c = vec4(texture2D(tex, vec2((m.r * 256.0 + m.g) / 65535.0, (m.b * 256.0 + m.a) / 65535.0)).rgb, 1.0);\n"
+    "   else c = vec4(video(vec2((m.r * 256.0 + m.g) / 65535.0, (m.b * 256.0 + m.a) / 65535.0)), 1.0);\n"
     "  } else c = vec4(texture2D(tex, st).rgb, 1.0); }\n"
     " gl_FragColor = vec4(c.rgb, c.a * opacity);\n"
     "}\n";
@@ -1103,6 +1123,9 @@ static int sky_resolve_gl(void) {
     sky.u_tex = rs_gl.GetUniformLocation(sky.program, "tex");
     sky.u_map = rs_gl.GetUniformLocation(sky.program, "map");
     sky.u_usemap = rs_gl.GetUniformLocation(sky.program, "usemap");
+    sky.u_tex_u = rs_gl.GetUniformLocation(sky.program, "tex_u");
+    sky.u_tex_v = rs_gl.GetUniformLocation(sky.program, "tex_v");
+    sky.u_useyuv = rs_gl.GetUniformLocation(sky.program, "useyuv");
     rs_gl.GenFramebuffers(1, &sky.fbo);
     rs_gl.GenFramebuffers(1, &sky.read_fbo);
     sky.gl_state = 1;
@@ -1293,6 +1316,17 @@ static void sky_render_face(int index, double seconds) {
                     rs_gl.Uniform1i(sky.u_map, 1);
                     gl_gamma.ActiveTexture(GL_TEXTURE0_);
                 }
+                const struct sky_source *video = view->source >= 0 ? &sky.sources[view->source] : NULL;
+                rs_gl.Uniform1i(sky.u_useyuv, video && video->yuv && video->tex_u && video->tex_v);
+                if (video && video->yuv && video->tex_u && video->tex_v) {
+                    gl_gamma.ActiveTexture(GL_TEXTURE2_);
+                    gl_gamma.BindTexture(RS_TEXTURE_2D, video->tex_u);
+                    rs_gl.Uniform1i(sky.u_tex_u, 2);
+                    gl_gamma.ActiveTexture(GL_TEXTURE3_);
+                    gl_gamma.BindTexture(RS_TEXTURE_2D, video->tex_v);
+                    rs_gl.Uniform1i(sky.u_tex_v, 3);
+                    gl_gamma.ActiveTexture(GL_TEXTURE0_);
+                }
             }
             sky.Uniform4f(sky.u_color, view->color[0], view->color[1], view->color[2], view->color[3]);
             gl_gamma.Uniform1f(sky.u_opacity, view->opacity);
@@ -1399,7 +1433,30 @@ static void sky_upload_sources(void) {
         unsigned char *frame = sky_source_take_frame(source, &seq);
         if (!frame) continue;
         gl_gamma.ActiveTexture(GL_TEXTURE0_);
-        if (!source->texture) {
+        if (source->yuv) {
+            /* three single-channel planes: Y at full size, U and V at half size in each direction */
+            const int w = source->width, h = source->height;
+            const unsigned char *planes[3] = {frame, frame + (size_t)w * h, frame + (size_t)w * h + (size_t)(w / 2) * (h / 2)};
+            unsigned *ids[3] = {&source->texture, &source->tex_u, &source->tex_v};
+            const int widths[3] = {w, w / 2, w / 2}, heights[3] = {h, h / 2, h / 2};
+            const int first = source->texture == 0;
+            rs_gl.PixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 1);
+            for (int plane = 0; plane < 3; plane++) {
+                if (first) {
+                    gl_gamma.GenTextures(1, ids[plane]);
+                    gl_gamma.BindTexture(RS_TEXTURE_2D, *ids[plane]);
+                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
+                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+                    gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, 0x8040 /* GL_LUMINANCE8 */, widths[plane], heights[plane], 0, 0x1909 /* GL_LUMINANCE */, GL_UNSIGNED_BYTE_, planes[plane]);
+                } else {
+                    gl_gamma.BindTexture(RS_TEXTURE_2D, *ids[plane]);
+                    sky.TexSubImage2D(RS_TEXTURE_2D, 0, 0, 0, widths[plane], heights[plane], 0x1909, GL_UNSIGNED_BYTE_, planes[plane]);
+                }
+            }
+            rs_gl.PixelStorei(0x0CF5, 4);
+        } else if (!source->texture) {
             gl_gamma.GenTextures(1, &source->texture);
             gl_gamma.BindTexture(RS_TEXTURE_2D, source->texture);
             gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, source->media.kind == SKY_EQUIRECT ? GL_LINEAR_ : 0x2703 /* LINEAR_MIPMAP_LINEAR */);
