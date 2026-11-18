@@ -463,7 +463,7 @@ static int sky_build_youtube_argv(const struct sky_source *source, const char *v
         if (source->loop) { argv[n++] = sky_dup("-stream_loop"); argv[n++] = sky_dup("-1"); }
         argv[n++] = sky_dup("-i"); argv[n++] = sky_dup(urls[i]);
     }
-    if (mesh) snprintf(filter, sizeof filter, source->yuv ? "fps=%d,format=yuv420p" : "fps=%d,format=rgba", source->fps);
+    if (mesh || source->yuv) snprintf(filter, sizeof filter, source->yuv ? "fps=%d,format=yuv420p" : "fps=%d,format=rgba", source->fps);
     argv[n++] = sky_dup("-map"); argv[n++] = sky_dup("0:v:0");
     argv[n++] = sky_dup("-an"); argv[n++] = sky_dup("-sn");
     argv[n++] = sky_dup("-vf"); argv[n++] = sky_dup(filter);
@@ -563,6 +563,23 @@ static int sky_youtube_mesh_lookup(struct sky_source *source, const char *video_
     return ok;
 }
 
+/* A YouTube video that is plain equirect: play it at its own size as YUV instead of scaling it down to sky.sphere_width. */
+static int sky_youtube_native_yuv(struct sky_source *source, int frame_width, int frame_height) {
+    if (frame_width < 256 || frame_width > 4096 || frame_height < 128 || (frame_width & 1) || (frame_height & 1) ||
+        source->media.kind != SKY_EQUIRECT || strcmp(source->media.layout, "e") != 0) return 0;
+    size_t frame_bytes = (size_t)frame_width * (size_t)frame_height * 3 / 2;
+    unsigned char *slots[3] = {NULL, NULL, NULL};
+    int ok = 1;
+    for (int i = 0; i < 3 && ok; i++) { slots[i] = malloc(frame_bytes); ok = slots[i] != NULL; }
+    if (ok) {
+        pthread_mutex_lock(&source->lock);   /* no frame has been delivered yet */
+        for (int i = 0; i < 3; i++) { free(source->slots[i]); source->slots[i] = slots[i]; }
+        source->width = frame_width; source->height = frame_height; source->yuv = 1;
+        pthread_mutex_unlock(&source->lock);
+    } else for (int i = 0; i < 3; i++) free(slots[i]);
+    return ok;
+}
+
 /* Runs yt-dlp, unwraps the mesh if the video has one, then replaces itself with the frame reader. */
 static void *sky_youtube_thread(void *argument) {
     struct sky_source *source = argument;
@@ -597,7 +614,10 @@ static void *sky_youtube_thread(void *argument) {
     if (ok) {
         int mesh = sky_youtube_mesh_lookup(source, video_url, frame_width, frame_height);
         if (mesh) fprintf(stderr, "[t2_hook] Sky views: YouTube mesh projection decoded (%dx%d frame, %dx%d lookup)\n", frame_width, frame_height, source->lookup_width, source->lookup_height);
-        else if (source->media.kind == SKY_EQUIRECT) fprintf(stderr, "[t2_hook] Sky views: no YouTube mesh found; playing the frame as plain equirect\n");
+        else if (source->media.kind == SKY_EQUIRECT) {
+            int native = sky_youtube_native_yuv(source, frame_width, frame_height);
+            fprintf(stderr, "[t2_hook] Sky views: no YouTube mesh found; playing the frame as plain equirect (%dx%d%s)\n", source->width, source->height, native ? ", YUV, unscaled" : "");
+        }
         int count = sky_build_youtube_argv(source, video_url, audio_url, argv, 80);
         if (count) {
             pthread_mutex_lock(&source->lock);
@@ -1083,7 +1103,7 @@ static const char sky_fragment_shader[] =
     "   vec4 m = floor(texture2D(map, st) * 255.0 + 0.5);\n"
     "   if (m.r > 254.5 && m.g > 254.5 && m.b > 254.5 && m.a > 254.5) c = vec4(0.0, 0.0, 0.0, 1.0);\n"
     "   else c = vec4(video(vec2((m.r * 256.0 + m.g) / 65535.0, (m.b * 256.0 + m.a) / 65535.0)), 1.0);\n"
-    "  } else c = vec4(texture2D(tex, st).rgb, 1.0); }\n"
+    "  } else c = vec4(video(st), 1.0); }\n"
     " gl_FragColor = vec4(c.rgb, c.a * opacity);\n"
     "}\n";
 
@@ -1447,7 +1467,7 @@ static void sky_upload_sources(void) {
                     gl_gamma.BindTexture(RS_TEXTURE_2D, *ids[plane]);
                     gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
                     gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
-                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+                    gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_S_, source->media.kind == SKY_EQUIRECT && !source->lookup ? 0x2901 : GL_CLAMP_TO_EDGE_);
                     gl_gamma.TexParameteri(RS_TEXTURE_2D, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
                     gl_gamma.TexImage2D(RS_TEXTURE_2D, 0, 0x8040 /* GL_LUMINANCE8 */, widths[plane], heights[plane], 0, 0x1909 /* GL_LUMINANCE */, GL_UNSIGNED_BYTE_, planes[plane]);
                 } else {
