@@ -1140,7 +1140,7 @@ options bring the parts of it that fit the Linux client:
   TribesNEXT QoL patch; the advanced setting can override it. The application
   art asset should be named `tribes2`.
 
-### Server gametypes (Tron, Tetris, Snake, Pong, Atari 2600)
+### Server gametypes (Tron, Tetris, Snake, Pong, Breakout, Atari 2600)
 
 The dedicated server can run extra rulesets that stock clients play without downloading anything. They are
 TorqueScript files in `scripts/Gametypes/` that the hook evaluates in memory at startup; list them (comma
@@ -1153,11 +1153,14 @@ server's `base/`; the Matrix pack README describes it).
 | `MatrixTron` | `Tron.cs` | Light cycles on an upright wall; the last rider alive wins |
 | `MatrixTetris` | `Tetris.cs` | Guideline Tetris, one board per player, line clears send garbage |
 | `MatrixSnake` | `Snake.cs` | Classic snake, one board per player |
+| `MatrixBreakout` | `Breakout.cs` | Arcade Breakout, one board per player: coloured rows scoring 1/3/5/7, three lives, speed-ups, paddle halves at the ceiling |
 | `MatrixPong` | `Pong.cs` | Pong with big seven-segment scores; one player plays the CPU, two play each other, first to 11 |
 | `MatrixAtari` | `Atari.cs` | An Atari 2600 emulator; the picture is a wall of force-field blocks |
 
 They are ordinary deathmatch missions, so the stock time limit still cycles the server to the next map when it runs out. They all use the same controls. The client's camera is the d-pad: forward, back and strafe are read from how the
-camera moves each tick, so no client changes are needed. The engine clamps camera pitch to about 80 degrees, so
+camera moves each tick, so no client changes are needed. While a gametype is running the server slows the fly
+camera to 1 m/s (`$Camera::movementSpeed`, stock 40), so a key only nudges it by centimetres and the view stays
+fixed; for the same reason spectators in these missions cannot fly around quickly. The engine clamps camera pitch to about 80 degrees, so
 every board stands upright and is seen side-on. The engine also has no view-only camera, so touching the mouse
 turns the view briefly until the server turns it back; keep the mouse still while playing.
 

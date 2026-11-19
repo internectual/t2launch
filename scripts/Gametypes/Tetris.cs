@@ -20,7 +20,12 @@ $Tet::Spacing = 46;                  // between boards
 $Tet::CamDist = 70;                  // camera distance in front of the board plane
 $Tet::CamZShift = -3;                // camera below the board centre, so the board sits above the HUD
 $Tet::TickMs = 32;
-$Tet::InputMin = 0.5;                // camera movement per tick that counts as a key sample
+// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
+// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
+// centimetres, which is still readable as input but leaves the view effectively fixed.
+$Tet::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
+$Tet::Eps = 0.02;                    // the camera is off its anchor by more than this
+$Tet::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Tet::KeyGraceMs = 110;              // a key counts as held this long after its last sample
 $Tet::DasMs = 210;                   // delay before auto-repeat
 $Tet::ArrMs = 40;                    // auto-repeat interval
@@ -29,7 +34,7 @@ $Tet::LockResets = 15;
 $Tet::HardDropGapMs = 220;           // forward must be released this long before it hard-drops again
 $Tet::NextCount = 5;
 $Tet::RespawnMs = 3500;
-$Tet::Drift = 25;
+$Tet::Drift = 0.4;                   // re-anchor when it has crept this far
 $Tet::RecentreMs = 250;           // keys quiet this long: bring the camera back to the board
 $Tet::IgnoreMs = 100;                // ignore camera samples this long after re-centring
 $Tet::Debug = 0;
@@ -803,7 +808,7 @@ function tetInput(%cl, %now)
    %a = tetAnchor(%cl.tetSeat);
    // once the keys have been quiet for a moment, bring the camera back to the board
    if (%now - %cl.tetSampleAt > $Tet::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > 0.3 || mAbs(%py - getWord(%a, 1)) > 0.3 || mAbs(%pz - getWord(%a, 2)) > 0.3))
+      && (mAbs(%px - getWord(%a, 0)) > $Tet::Eps || mAbs(%py - getWord(%a, 1)) > $Tet::Eps || mAbs(%pz - getWord(%a, 2)) > $Tet::Eps))
    {
       %cam.setTransform(%a);
       %cam.setVelocity("0 0 0");
@@ -999,6 +1004,8 @@ function tetWatch()
    {
       activatePackage(T2LaunchTetris);
       $Tet::PkgOn = true;
+      $Tet::SavedSpeed = $Camera::movementSpeed;
+      $Camera::movementSpeed = $Tet::CamSpeed;
       $Tet::LastTick = "";
       tetTick();
       echo("Tetris ruleset on");
@@ -1007,6 +1014,7 @@ function tetWatch()
    {
       deactivatePackage(T2LaunchTetris);
       $Tet::PkgOn = false;
+      $Camera::movementSpeed = $Tet::SavedSpeed;
       cancel($Tet::TickThread);
       echo("Tetris ruleset off");
    }

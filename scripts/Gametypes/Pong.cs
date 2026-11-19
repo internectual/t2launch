@@ -31,11 +31,16 @@ $Png::ServeMs = 1500;
 $Png::MatchEndMs = 5000;
 $Png::CamDist = 46;
 $Png::CamZShift = -1.5;
-$Png::InputMin = 0.5;
+// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
+// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
+// centimetres, which is still readable as input but leaves the view effectively fixed.
+$Png::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
+$Png::Eps = 0.02;                    // the camera is off its anchor by more than this
+$Png::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Png::KeyGraceMs = 110;
 $Png::RecentreMs = 250;
 $Png::IgnoreMs = 100;
-$Png::Drift = 25;
+$Png::Drift = 0.4;                   // re-anchor when it has crept this far
 $Png::TickMs = 32;
 $Png::DigitW = 3;                    // seven-segment digit size
 $Png::DigitH = 5;
@@ -426,7 +431,7 @@ function pngReadPad(%cl, %now)
       %cl.pngSampleAt = %now;
    %a = pngAnchor();
    if (%now - %cl.pngSampleAt > $Png::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > 0.3 || mAbs(%py - getWord(%a, 1)) > 0.3 || mAbs(%pz - getWord(%a, 2)) > 0.3))
+      && (mAbs(%px - getWord(%a, 0)) > $Png::Eps || mAbs(%py - getWord(%a, 1)) > $Png::Eps || mAbs(%pz - getWord(%a, 2)) > $Png::Eps))
    {
       %cam.setTransform(%a);
       %cam.setVelocity("0 0 0");
@@ -527,6 +532,8 @@ function pngWatch()
    {
       activatePackage(T2LaunchPong);
       $Png::PkgOn = true;
+      $Png::SavedSpeed = $Camera::movementSpeed;
+      $Camera::movementSpeed = $Png::CamSpeed;
       $Png::LastTick = "";
       pngInitCourt();
       pngTick();
@@ -536,6 +543,7 @@ function pngWatch()
    {
       deactivatePackage(T2LaunchPong);
       $Png::PkgOn = false;
+      $Camera::movementSpeed = $Png::SavedSpeed;
       cancel($Png::TickThread);
       echo("Pong ruleset off");
    }

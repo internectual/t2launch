@@ -22,10 +22,15 @@ $Snk::MinStepMs = 70;
 $Snk::SpeedUpMs = 4;                 // faster per food eaten
 $Snk::FoodPoints = 10;
 $Snk::TickMs = 32;
-$Snk::InputMin = 0.5;
+// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
+// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
+// centimetres, which is still readable as input but leaves the view effectively fixed.
+$Snk::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
+$Snk::Eps = 0.02;                    // the camera is off its anchor by more than this
+$Snk::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Snk::RecentreMs = 250;
 $Snk::IgnoreMs = 100;
-$Snk::Drift = 25;
+$Snk::Drift = 0.4;                   // re-anchor when it has crept this far
 $Snk::RespawnMs = 3000;
 $Snk::MaxQueue = 3;
 $Snk::Debug = 0;
@@ -383,7 +388,7 @@ function snkInput(%cl, %now)
    %a = snkAnchor(%cl.snkSeat);
    // once the keys have been quiet for a moment, bring the camera back to the board
    if (%now - %cl.snkSampleAt > $Snk::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > 0.3 || mAbs(%py - getWord(%a, 1)) > 0.3 || mAbs(%pz - getWord(%a, 2)) > 0.3))
+      && (mAbs(%px - getWord(%a, 0)) > $Snk::Eps || mAbs(%py - getWord(%a, 1)) > $Snk::Eps || mAbs(%pz - getWord(%a, 2)) > $Snk::Eps))
    {
       %cam.setTransform(%a);
       %cam.setVelocity("0 0 0");
@@ -491,6 +496,8 @@ function snkWatch()
    {
       activatePackage(T2LaunchSnake);
       $Snk::PkgOn = true;
+      $Snk::SavedSpeed = $Camera::movementSpeed;
+      $Camera::movementSpeed = $Snk::CamSpeed;
       $Snk::LastTick = "";
       snkTick();
       echo("Snake ruleset on");
@@ -499,6 +506,7 @@ function snkWatch()
    {
       deactivatePackage(T2LaunchSnake);
       $Snk::PkgOn = false;
+      $Camera::movementSpeed = $Snk::SavedSpeed;
       cancel($Snk::TickThread);
       echo("Snake ruleset off");
    }

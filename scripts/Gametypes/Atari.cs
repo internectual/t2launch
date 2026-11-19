@@ -21,11 +21,16 @@ $Atr::CamDist = 52;
 $Atr::CamZShift = -1;
 $Atr::DisplayMs = 50;                // display refresh interval
 $Atr::MaxChanges = 150;              // cells redrawn per refresh
-$Atr::InputMin = 0.5;                // camera movement per tick that counts as a key sample
+// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
+// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
+// centimetres, which is still readable as input but leaves the view effectively fixed.
+$Atr::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
+$Atr::Eps = 0.02;                    // the camera is off its anchor by more than this
+$Atr::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Atr::KeyGraceMs = 110;              // a key counts as held this long after its last sample
 $Atr::RecentreMs = 250;
 $Atr::IgnoreMs = 100;
-$Atr::Drift = 25;
+$Atr::Drift = 0.4;                   // re-anchor when it has crept this far
 $Atr::TickMs = 32;
 $Atr::Ports = 2;
 $Atr::ParkX = 3000;                  // parked blocks live far outside every client's scope
@@ -330,7 +335,7 @@ function atrReadPad(%cl, %now)
       %cl.atrSampleAt = %now;
    %a = atrAnchor();
    if (%now - %cl.atrSampleAt > $Atr::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > 0.3 || mAbs(%py - getWord(%a, 1)) > 0.3 || mAbs(%pz - getWord(%a, 2)) > 0.3))
+      && (mAbs(%px - getWord(%a, 0)) > $Atr::Eps || mAbs(%py - getWord(%a, 1)) > $Atr::Eps || mAbs(%pz - getWord(%a, 2)) > $Atr::Eps))
    {
       %cam.setTransform(%a);
       %cam.setVelocity("0 0 0");
@@ -476,6 +481,8 @@ function atrWatch()
       }
       activatePackage(T2LaunchAtari);
       $Atr::PkgOn = true;
+      $Atr::SavedSpeed = $Camera::movementSpeed;
+      $Camera::movementSpeed = $Atr::CamSpeed;
       $Atr::Chooser = false;
       $Atr::Toggles = 0;
       $Atr::SentSwitches = "";
@@ -488,6 +495,7 @@ function atrWatch()
    {
       deactivatePackage(T2LaunchAtari);
       $Atr::PkgOn = false;
+      $Camera::movementSpeed = $Atr::SavedSpeed;
       cancel($Atr::TickThread);
       cancel($Atr::DisplayThread);
       t2launch_atariStop();

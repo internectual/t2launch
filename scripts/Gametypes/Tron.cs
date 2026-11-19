@@ -16,10 +16,15 @@ $Tron::Cell = 3;                     // trail cell size
 $Tron::Speed = 10;                   // metres/second
 $Tron::CamDist = 44;                 // camera distance in front of the wall
 $Tron::CamZShift = -2;               // camera a little below the centre, so the arena sits above the HUD
-$Tron::InputMin = 0.5;               // camera movement per tick that counts as a key sample
+// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
+// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
+// centimetres, which is still readable as input but leaves the view effectively fixed.
+$Tron::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
+$Tron::Eps = 0.02;                    // the camera is off its anchor by more than this
+$Tron::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Tron::RecentreMs = 250;             // keys quiet this long: bring the camera back to the arena
 $Tron::IgnoreMs = 100;               // ignore camera samples this long after re-centring
-$Tron::Drift = 25;                   // re-anchor the camera when it has wandered this far
+$Tron::Drift = 0.4;                   // re-anchor when it has crept this far
 $Tron::TickMs = 32;
 $Tron::WallDepth = 3;                // thickness of trail blocks (towards the viewer)
 $Tron::HeadSize = 2;                 // the rider's head block
@@ -298,7 +303,7 @@ function tronInput(%cl, %now)
    }
    %a = tronAnchor();
    if (%now - %cl.trSampleAt > $Tron::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > 0.3 || mAbs(%py - getWord(%a, 1)) > 0.3 || mAbs(%pz - getWord(%a, 2)) > 0.3))
+      && (mAbs(%px - getWord(%a, 0)) > $Tron::Eps || mAbs(%py - getWord(%a, 1)) > $Tron::Eps || mAbs(%pz - getWord(%a, 2)) > $Tron::Eps))
    {
       %cam.setTransform(%a);
       %cam.setVelocity("0 0 0");
@@ -396,6 +401,8 @@ function tronWatch()
    {
       activatePackage(T2LaunchTron);
       $Tron::PkgOn = true;
+      $Tron::SavedSpeed = $Camera::movementSpeed;
+      $Camera::movementSpeed = $Tron::CamSpeed;
       $Tron::LastTick = "";
       $Tron::RoundEnding = false;
       tronTick();
@@ -405,6 +412,7 @@ function tronWatch()
    {
       deactivatePackage(T2LaunchTron);
       $Tron::PkgOn = false;
+      $Camera::movementSpeed = $Tron::SavedSpeed;
       cancel($Tron::TickThread);
       echo("Tron ruleset off");
    }
