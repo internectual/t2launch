@@ -560,6 +560,23 @@ OPTIONS = (
            help="TorqueScript files (comma-separated) the server evaluates in memory at startup "
                 "to add custom rulesets (packages that activate only on their own missions). "
                 "Clients download nothing. Empty loads none."),
+    Option("server.atari_rom_dir", "Dedicated server", "Atari 2600 ROM folder", "text", "",
+           hook=True, advanced=True,
+           requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
+                     ("hook.console_commands", (True,))),
+           help="Folder the Atari 2600 gametype loads ROMs from (plain file names only, 2K to 32K "
+                ".bin files you own). Empty uses base/roms inside the game folder."),
+    Option("server.atari_region", "Dedicated server", "Atari 2600 video standard", "choice", "ntsc",
+           choices=("ntsc", "pal"), hook=True, advanced=True,
+           requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
+                     ("hook.console_commands", (True,))),
+           help="Frame rate and palette of the emulated console: NTSC runs at 60 Hz, PAL at 50 Hz."),
+    Option("server.atari_grid", "Dedicated server", "Atari 2600 screen grid", "text", "40x48",
+           hook=True, advanced=True,
+           requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
+                     ("hook.console_commands", (True,))),
+           help="Columns x rows of force-field blocks that draw the picture. The columns must divide "
+                "160 and the rows 192 (for example 40x48, or 20x24 for fewer blocks)."),
     Option("server.public_address", "Dedicated server", "Public IPv4 address", "text", "",
            hook=True, advanced=True, requires=(("server.tribesnext_auth", (True,)),),
            help="The Internet address players connect to. TribesNext clients name the address "

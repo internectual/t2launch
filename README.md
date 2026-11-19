@@ -1140,6 +1140,47 @@ options bring the parts of it that fit the Linux client:
   TribesNEXT QoL patch; the advanced setting can override it. The application
   art asset should be named `tribes2`.
 
+### Server gametypes (Tron, Tetris, Snake, Atari 2600)
+
+The dedicated server can run extra rulesets that stock clients play without downloading anything. They are
+TorqueScript files in `scripts/Gametypes/` that the hook evaluates in memory at startup; list them (comma
+separated) in the `server.gametype_script` option. Each one switches itself on only while its own mission is
+running, so ordinary maps are untouched. The missions are in `scripts/Matrix/zMatrix.vl2` (copy it into the
+server's `base/`; the Matrix pack README describes it).
+
+| Mission | Script | What it is |
+|---|---|---|
+| `MatrixTron` | `Tron.cs` | Light cycles on an upright wall; the last rider alive wins |
+| `MatrixTetris` | `Tetris.cs` | Guideline Tetris, one board per player, line clears send garbage |
+| `MatrixSnake` | `Snake.cs` | Classic snake, one board per player |
+| `MatrixAtari` | `Atari.cs` | An Atari 2600 emulator; the picture is a wall of force-field blocks |
+
+They all use the same controls. The client's camera is the d-pad: forward, back and strafe are read from how the
+camera moves each tick, so no client changes are needed. The engine clamps camera pitch to about 80 degrees, so
+every board stands upright and is seen side-on. The engine also has no view-only camera, so touching the mouse
+turns the view briefly until the server turns it back; keep the mouse still while playing.
+
+**Atari 2600.** The 6507, TIA and RIOT chips run as native code in the hook (`t2_atari.h`), on their own thread
+at 60 Hz (50 Hz for PAL). The hook turns each frame into a coarse grid of colours and tells the script which cells
+changed; the script moves pooled force-field blocks to match. Every player sees the same wall. The first two
+players to press fire take joystick ports 1 and 2; others watch and can fly around.
+
+- Put the ROMs you own (2K, 4K, 8K, 12K, 16K or 32K `.bin` files; F8, FA, F6 and F4 bank switching) in
+  `base/roms/` inside the game folder, or set `server.atari_rom_dir`. A small test ROM is in
+  `scripts/Atari/t2demo.bin` (built by `make_demo_rom.py`); no commercial ROMs are shipped.
+- Controls: forward/back/strafe = joystick, fire = the button (held while held), jump = Select, jet = Reset,
+  alt-fire = your difficulty switch, throw = the ROM list. In the list, strafe picks a ROM and fire starts it.
+- `server.atari_grid` sets the screen grid (default `40x48`; the columns must divide 160 and the rows 192, for
+  example `20x24`). `server.atari_region` picks NTSC or PAL.
+- What to expect: emulation is exact in timing (WSYNC, HMOVE and so on) but the picture is coarse, and the number
+  of lit blocks decides the client's frame rate (about 500 lit blocks keeps ~75 fps, about 1,800 drops to ~50).
+  Network traffic was not the limit in testing (0% loss at 24,000 block changes per second on localhost).
+  Sparse games (Pong, Combat, Breakout) look best. Audio, paddles and the rarer cartridge schemes are not
+  implemented, and the palette is a generated approximation.
+- Tests: `tests/atari_core_test.c` (CPU cycle counts for every official opcode, RIOT timer, banking, TIA
+  objects, collisions, priority, HMOVE, the server thread) runs without the game; `tests/test_atari.py` builds and
+  runs it.
+
 ## Development
 
 ### Repository layout

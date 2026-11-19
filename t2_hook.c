@@ -232,6 +232,9 @@ static struct hook_option hook_options[] = {
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
     {"server.gametype_script", "", NULL, 0, "", 0},
+    {"server.atari_rom_dir", "", NULL, 0, "", 0},
+    {"server.atari_region", "ntsc", NULL, 0, "", 0},
+    {"server.atari_grid", "40x48", NULL, 0, "", 0},
     {"security.safe_soundpacks", "1", NULL, 0, "", 0},
     {"security.max_soundpack_kbytes", "8192", NULL, 0, "", 0},
 };
@@ -10378,6 +10381,187 @@ static const char *dump_console_constructor_cb(void *obj, S32 argc, const char *
     return result;
 }
 
+/* ------------------------------------------------------------------------------------------------- Atari 2600
+ * The emulator core and its server thread live in t2_atari.h. These are the console functions the gametype
+ * script uses (scripts/Gametypes/Atari.cs); they are registered on the dedicated server only. ROMs are read
+ * from server.atari_rom_dir by plain file name, never from an arbitrary path. */
+#define T2_ATARI_SERVER 1
+#include "t2_atari.h"
+#include <dirent.h>
+
+static atari_server_t *atari_srv;
+static int atari_srv_failed;
+
+static atari_server_t *atari_server_get(void) {
+    if (atari_srv || atari_srv_failed) return atari_srv;
+    int cols = 40, rows = 48;
+    const char *grid = hook_option_str("server.atari_grid");
+    if (grid && *grid && sscanf(grid, "%dx%d", &cols, &rows) != 2) { cols = 40; rows = 48; }
+    atari_server_t *v = calloc(1, sizeof *v);
+    const char *err = v ? atari_server_init(v, cols, rows) : "out of memory";
+    if (err) {
+        fprintf(stderr, "[t2_hook] Atari: %s (server.atari_grid=%s); using 40x48\n", err, grid ? grid : "");
+        if (!v || atari_server_init(v, 40, 48)) { free(v); atari_srv_failed = 1; return NULL; }
+    }
+    const char *region = hook_option_str("server.atari_region");
+    v->core.pal = region && !strcmp(region, "pal");
+    atari_srv = v;
+    return v;
+}
+
+static const char *atari_rom_dir(void) {
+    const char *dir = hook_option_str("server.atari_rom_dir");
+    return dir && *dir ? dir : "base/roms";
+}
+
+static int atari_name_ok(const char *name) {
+    if (!name || !*name || strlen(name) > 60 || name[0] == '.') return 0;
+    for (const char *c = name; *c; c++)
+        if (!isalnum((unsigned char)*c) && *c != '.' && *c != '_' && *c != '-' && *c != ' ') return 0;
+    return 1;
+}
+
+static const char *atari_grid_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    static char result[48];
+    atari_server_t *v = atari_server_get();
+    if (!v) return "";
+    snprintf(result, sizeof result, "%d %d %d", v->cols, v->rows, ATARI_QCOLORS - 1);
+    return result;
+}
+
+static const char *atari_color_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    static char result[32];
+    atari_server_t *v = atari_server_get();
+    int i = argc > 1 && argv[1] ? atoi(argv[1]) : 0;
+    if (!v || i < 1 || i >= ATARI_QCOLORS) return "";
+    snprintf(result, sizeof result, "%d %d %d", v->qrgb[i][0], v->qrgb[i][1], v->qrgb[i][2]);
+    return result;
+}
+
+static int atari_name_cmp(const void *a, const void *b) { return strcmp((const char *)a, (const char *)b); }
+
+static const char *atari_list_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    static char result[1024];
+    char names[64][64];
+    int count = 0;
+    DIR *dir = opendir(atari_rom_dir());
+    result[0] = 0;
+    if (!dir) return result;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) && count < 64) {
+        if (!atari_name_ok(entry->d_name)) continue;
+        char path[512];
+        snprintf(path, sizeof path, "%s/%s", atari_rom_dir(), entry->d_name);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (st.st_size != 2048 && st.st_size != 4096 && st.st_size != 8192 && st.st_size != 12288 &&
+            st.st_size != 16384 && st.st_size != 32768) continue;
+        snprintf(names[count++], 64, "%s", entry->d_name);
+    }
+    closedir(dir);
+    qsort(names, (size_t)count, 64, atari_name_cmp);
+    size_t used = 0;
+    for (int i = 0; i < count; i++) {
+        size_t n = strlen(names[i]);
+        if (used + n + 2 >= sizeof result) break;
+        memcpy(result + used, names[i], n);
+        used += n;
+        result[used++] = '\t';
+    }
+    if (used) used--;
+    result[used] = 0;
+    return result;
+}
+
+static const char *atari_load_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    static char result[160];
+    atari_server_t *v = atari_server_get();
+    const char *name = argc > 1 ? argv[1] : NULL;
+    if (!v) return "error: the emulator could not start";
+    if (!atari_name_ok(name)) return "error: bad ROM name";
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", atari_rom_dir(), name);
+    FILE *file = fopen(path, "rb");
+    if (!file) { snprintf(result, sizeof result, "error: cannot open %s", name); return result; }
+    uint8_t *data = malloc(65537);
+    size_t size = data ? fread(data, 1, 65537, file) : 0;
+    fclose(file);
+    if (!data || size == 0 || size > 65536) { free(data); return "error: ROM too large or empty"; }
+    const char *err = atari_server_load(v, data, size, name);
+    free(data);
+    if (err) { snprintf(result, sizeof result, "error: %s", err); return result; }
+    __atomic_store_n(&v->running, 1, __ATOMIC_RELEASE);
+    atari_server_start_thread(v);
+    fprintf(stderr, "[t2_hook] Atari: loaded %s (%zu bytes)\n", name, size);
+    return "ok";
+}
+
+static const char *atari_run_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc;
+    atari_server_t *v = atari_server_get();
+    if (!v) return "";
+    if (!strcmp(argv[0], "t2launch_atariStart")) __atomic_store_n(&v->running, v->core.cart != ATARI_CART_NONE, __ATOMIC_RELEASE);
+    else if (!strcmp(argv[0], "t2launch_atariStop")) __atomic_store_n(&v->running, 0, __ATOMIC_RELEASE);
+    else if (!strcmp(argv[0], "t2launch_atariReset")) atari_server_reset(v);
+    return "";
+}
+
+static const char *atari_input_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    atari_server_t *v = atari_server_get();
+    if (!v || argc < 3) return "";
+    atari_set_joystick(&v->core, atoi(argv[1]), (uint8_t)(atoi(argv[2]) & 31));
+    return "";
+}
+
+static const char *atari_switch_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    atari_server_t *v = atari_server_get();
+    if (!v || argc < 2) return "";
+    atari_set_switches(&v->core, (uint8_t)(atoi(argv[1]) & 31));
+    return "";
+}
+
+static const char *atari_frame_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj;
+    static char result[600 * 6 + 8];
+    atari_server_t *v = atari_server_get();
+    int max = argc > 1 ? atoi(argv[1]) : 100;
+    if (!v) return "";
+    if (max > 600) max = 600;
+    result[0] = 0;
+    atari_server_diff(v, max, result, sizeof result);
+    return result;
+}
+
+static const char *atari_status_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    static char result[160];
+    atari_server_t *v = atari_server_get();
+    if (!v) return "";
+    snprintf(result, sizeof result, "%s|%d|%llu|%d", v->name, v->running && v->core.cart != ATARI_CART_NONE,
+             (unsigned long long)v->frames, v->core.cart);
+    return result;
+}
+
+static void atari_register_commands(void) {
+    Con__addMethodS(NULL, "t2launch_atariGrid", atari_grid_cb, "t2launch_atariGrid() - 'cols rows colours' of the display grid", 1, 1);
+    Con__addMethodS(NULL, "t2launch_atariColor", atari_color_cb, "t2launch_atariColor(i) - 'r g b' of display colour i (1..32)", 2, 2);
+    Con__addMethodS(NULL, "t2launch_atariList", atari_list_cb, "t2launch_atariList() - ROM file names, tab separated", 1, 1);
+    Con__addMethodS(NULL, "t2launch_atariLoad", atari_load_cb, "t2launch_atariLoad(name) - load a ROM from server.atari_rom_dir and start it", 2, 2);
+    Con__addMethodS(NULL, "t2launch_atariStart", atari_run_cb, "t2launch_atariStart() - run the loaded ROM", 1, 1);
+    Con__addMethodS(NULL, "t2launch_atariStop", atari_run_cb, "t2launch_atariStop() - pause the emulator", 1, 1);
+    Con__addMethodS(NULL, "t2launch_atariReset", atari_run_cb, "t2launch_atariReset() - restart the loaded ROM", 1, 1);
+    Con__addMethodS(NULL, "t2launch_atariInput", atari_input_cb, "t2launch_atariInput(port, mask) - joystick bits: 1 up, 2 down, 4 left, 8 right, 16 fire", 3, 3);
+    Con__addMethodS(NULL, "t2launch_atariSwitch", atari_switch_cb, "t2launch_atariSwitch(mask) - console bits: 1 reset, 2 select, 4 b/w, 8 P0 diff A, 16 P1 diff A", 2, 2);
+    Con__addMethodS(NULL, "t2launch_atariFrame", atari_frame_cb, "t2launch_atariFrame(max) - display cells that changed, six characters each (cell, colour)", 2, 2);
+    Con__addMethodS(NULL, "t2launch_atariStatus", atari_status_cb, "t2launch_atariStatus() - 'name|running|frames|cartType'", 1, 1);
+}
+
 static const char *hook_option_cb(void *obj, S32 argc, const char **argv) {
     (void)obj;
     if (argc < 2 || !argv[1]) return "";
@@ -11001,6 +11185,7 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_test", hook_test_cb, "hook_test - test command", 1, 1);
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
+    if (target->dedicated) atari_register_commands();
     Con__addMethodS(NULL, "dumpConsoleConstructor", dump_console_constructor_cb,
         "dumpConsoleConstructor([file]) - list every registered console function to the log and a file", 1, 2);
     if (!target->dedicated) {

@@ -423,7 +423,7 @@ launch_game() {
     for artifact in t2_hook.so rsa_helper t2_realign.so; do
         [[ -x "$support_dir/$artifact" ]] || rebuild=1
     done
-    for source in t2_hook.c t2_sky.h t2_ytmesh.h t2_reshade.h t2_fx.cpp t2_fx.h rsa_helper.c t2_realign.c t2_oss.c; do
+    for source in t2_hook.c t2_atari.h t2_sky.h t2_ytmesh.h t2_reshade.h t2_fx.cpp t2_fx.h rsa_helper.c t2_realign.c t2_oss.c; do
         for artifact in t2_hook.so rsa_helper t2_realign.so; do
             [[ "$REPO_DIR/$source" -nt "$support_dir/$artifact" ]] && rebuild=1
         done
