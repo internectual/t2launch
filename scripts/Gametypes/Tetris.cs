@@ -863,7 +863,9 @@ function tetStep(%cl, %dt, %now)
    else if (%heldL && !%heldR)
       %dir = -1;
    else if (%heldL && %heldR)
-      %dir = %cl.tetKeyR > %cl.tetKeyL ? 1 : -1;
+      %dir = -1;
+      if (%cl.tetKeyR > %cl.tetKeyL)
+         %dir = 1;
    if (%dir != %cl.tetDir)
    {
       %cl.tetDir = %dir;

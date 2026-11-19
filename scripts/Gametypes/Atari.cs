@@ -385,7 +385,12 @@ function atrTick()
          atrSendInput(%cl, 0);
          if (%cl.atrPort == 0)
          {
-            %dir = (%pad & 8) ? 1 : ((%pad & 4) ? -1 : 0);
+            // plain assignments: a nested ternary that yields -1 misbehaves in arithmetic in this engine
+            %dir = 0;
+            if (%pad & 8)
+               %dir = 1;
+            else if (%pad & 4)
+               %dir = -1;
             if (%dir != 0 && %cl.atrChooseDir != %dir)
                atrChooserMove(%dir);
             %cl.atrChooseDir = %dir;
