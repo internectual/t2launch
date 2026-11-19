@@ -557,9 +557,9 @@ OPTIONS = (
            hook=True, advanced=True,
            requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
                      ("hook.console_commands", (True,))),
-           help="A TorqueScript file the server evaluates in memory at startup to add a custom "
-                "ruleset (a package that activates only on its own missions). Clients download "
-                "nothing. Empty loads none."),
+           help="TorqueScript files (comma-separated) the server evaluates in memory at startup "
+                "to add custom rulesets (packages that activate only on their own missions). "
+                "Clients download nothing. Empty loads none."),
     Option("server.public_address", "Dedicated server", "Public IPv4 address", "text", "",
            hook=True, advanced=True, requires=(("server.tribesnext_auth", (True,)),),
            help="The Internet address players connect to. TribesNext clients name the address "

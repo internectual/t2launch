@@ -6,8 +6,8 @@
 //--- MISSION QUOTE END ---
 
 //--- MISSION STRING BEGIN ---
-//[DM]Free-for-all on a platform in the sky
-//No terrain: every face of the sky can show video, a terminal or animation (t2launch hook)
+//[DM]Light-cycle duel on a platform in the sky
+//Last rider alive wins. Server-side ruleset; no client download
 //--- MISSION STRING END ---
 
 //--- OBJECT WRITE BEGIN ---
