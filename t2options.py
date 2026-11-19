@@ -553,6 +553,13 @@ OPTIONS = (
            help="Accept players without a WON certificate and verify their TribesNext accounts "
                 "with T2CSRI, as TribesNext servers do. Players with a WON certificate from "
                 "wonemu still authenticate through WON."),
+    Option("server.gametype_script", "Dedicated server", "Gametype script", "text", "",
+           hook=True, advanced=True,
+           requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
+                     ("hook.console_commands", (True,))),
+           help="A TorqueScript file the server evaluates in memory at startup to add a custom "
+                "ruleset (a package that activates only on its own missions). Clients download "
+                "nothing. Empty loads none."),
     Option("server.public_address", "Dedicated server", "Public IPv4 address", "text", "",
            hook=True, advanced=True, requires=(("server.tribesnext_auth", (True,)),),
            help="The Internet address players connect to. TribesNext clients name the address "

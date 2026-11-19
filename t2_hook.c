@@ -231,6 +231,7 @@ static struct hook_option hook_options[] = {
     {"ui.client_datablocks", "0", NULL, 0, "", 0},
     {"server.tribesnext_auth", "1", NULL, 0, "", 0},
     {"server.public_address", "", NULL, 0, "", 0},
+    {"server.gametype_script", "", NULL, 0, "", 0},
     {"security.safe_soundpacks", "1", NULL, 0, "", 0},
     {"security.max_soundpack_kbytes", "8192", NULL, 0, "", 0},
 };
@@ -8872,6 +8873,28 @@ void SDL_GL_SwapBuffers(void) {
     update_review_model_diagnostic((review_applied_mask & review_group_mask(REVIEW_CORE)) != 0);
 }
 
+/* Evaluate a server gametype script (server.gametype_script) from disk, in
+   memory only; the package inside gates itself on the mission name, so it is
+   safe to load before the first CreateServer. */
+static void install_server_gametype_script(void) {
+    const char *path = hook_option_str("server.gametype_script");
+    if (!path || !*path) return;
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "[t2_hook] Cannot open server gametype script %s\n", path);
+        return;
+    }
+    char *text = malloc(256 * 1024);
+    size_t length = text ? fread(text, 1, 256 * 1024 - 1, file) : 0;
+    fclose(file);
+    if (text && length) {
+        text[length] = 0;
+        Con__evaluate(text, 0, "t2launch/gametype.cs", 0);
+        fprintf(stderr, "[t2_hook] Installed server gametype script %s\n", path);
+    }
+    free(text);
+}
+
 /* The dedicated server never swaps buffers. Platform::process (0x081CF400)
    ends each main-loop pass with usleep(1000), so the hook's main-thread work
    runs there instead. */
@@ -8885,6 +8908,7 @@ static void server_tick(void) {
     if (!core_installed) {
         Con__evaluate(server_core_script, 0, "t2launch/server.cs", 0);
         core_installed = 1;
+        install_server_gametype_script();
     }
     time_t now = time(NULL);
     if (tribesnext_installed || now == last_ready_check) return;
