@@ -1140,7 +1140,7 @@ options bring the parts of it that fit the Linux client:
   TribesNEXT QoL patch; the advanced setting can override it. The application
   art asset should be named `tribes2`.
 
-### Server gametypes (Tron, Tetris, Snake, Pong, Breakout, Invaders, Galaga, Pac-Man, Frogger, Donkey Kong, Atari 2600)
+### Server gametypes (Tron, Tetris, Snake, Pong, Breakout, Invaders, Galaga, Galaga with real models, Pac-Man, Frogger, Donkey Kong, Atari 2600)
 
 The dedicated server can run extra rulesets that stock clients play without downloading anything. They are
 TorqueScript files in `scripts/Gametypes/` that the hook evaluates in memory at startup; list them (comma
@@ -1157,6 +1157,7 @@ server's `base/`; the Matrix pack README describes it).
 | `MatrixInvaders` | `Invaders.cs` | Space Invaders, one board per player: a marching formation that speeds up, bombs, four erodible shields, a mystery ship, three lives |
 | `MatrixPong` | `Pong.cs` | Pong with big seven-segment scores; one player plays the CPU, two play each other, first to 11 |
 | `MatrixGalaga` | `Galaga.cs` | Galaga, one board per player: enemies swoop in and form up, then dive and shoot; a boss takes two butterflies along; every fourth stage is a challenging stage with a perfect bonus. No tractor beam or dual fighter |
+| `MatrixGalagaReal` | `GalagaReal.cs` | The same Galaga with game models: Bioderm players as the aliens (heavy bosses, medium butterflies, light bees), a Shrike as your ship, grenade and mortar-ammo items as shots and bombs, on a pale backdrop. A script cannot add shape datablocks without getting stock clients dropped, so every moving thing is a stock player, vehicle or item |
 | `MatrixPacman` | `Pacman.cs` | Pac-Man, one maze per player (two at most): 19 x 21 maze of force-field walls, dots and corner pellets, four ghosts with the classic chase / scatter targets, blue ghosts worth 200 to 1600, a side tunnel. Forward / back / strafe steer. No fruit |
 | `MatrixFrogger` | `Frogger.cs` | Frogger, one board per player: five lanes of traffic, a median, five lanes of logs and turtles that carry you, five bays at the top. A key press is one hop. Faster each round; no snakes, crocodiles or diving turtles |
 | `MatrixDonkey` | `Donkey.cs` | Donkey Kong (the first stage) built from game models: cargo-container girders, pole ladders, a heavy Bioderm ape throwing mortar barrel packs (with an orange glow behind each), a tiny human Mario and a lady on top, against a pale backdrop so the dark models show. One board per player (four boards stand side by side): jump or fire jumps a barrel for 100, reach the lady for 1000 plus a shrinking bonus. The scenery is shapes in the mission file, since a shape datablock added by a server script gets stock clients dropped. No hammer or fireballs |
