@@ -565,7 +565,7 @@ static int sky_youtube_mesh_lookup(struct sky_source *source, const char *video_
 
 /* A YouTube video that is plain equirect: play it at its own size as YUV instead of scaling it down to sky.sphere_width. */
 static int sky_youtube_native_yuv(struct sky_source *source, int frame_width, int frame_height) {
-    if (frame_width < 256 || frame_width > 4096 || frame_height < 128 || (frame_width & 1) || (frame_height & 1) ||
+    if (frame_width < 256 || frame_width > 8192 || frame_height < 128 || (frame_width & 1) || (frame_height & 1) ||
         source->media.kind != SKY_EQUIRECT || strcmp(source->media.layout, "e") != 0) return 0;
     size_t frame_bytes = (size_t)frame_width * (size_t)frame_height * 3 / 2;
     unsigned char *slots[3] = {NULL, NULL, NULL};
