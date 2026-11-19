@@ -1140,11 +1140,11 @@ options bring the parts of it that fit the Linux client:
   TribesNEXT QoL patch; the advanced setting can override it. The application
   art asset should be named `tribes2`.
 
-### Server gametypes (Tron, Tetris, Snake, Pong, Breakout, Atari 2600)
+### Server gametypes (Tron, Tetris, Snake, Pong, Breakout, Invaders, Atari 2600)
 
 The dedicated server can run extra rulesets that stock clients play without downloading anything. They are
 TorqueScript files in `scripts/Gametypes/` that the hook evaluates in memory at startup; list them (comma
-separated) in the `server.gametype_script` option. Each one switches itself on only while its own mission is
+separated) in the `server.gametype_script` option, with `Retro.cs` first (the shared input helper the games need). Each one switches itself on only while its own mission is
 running, so ordinary maps are untouched. The missions are in `scripts/Matrix/zMatrix.vl2` (copy it into the
 server's `base/`; the Matrix pack README describes it).
 
@@ -1154,13 +1154,11 @@ server's `base/`; the Matrix pack README describes it).
 | `MatrixTetris` | `Tetris.cs` | Guideline Tetris, one board per player, line clears send garbage |
 | `MatrixSnake` | `Snake.cs` | Classic snake, one board per player |
 | `MatrixBreakout` | `Breakout.cs` | Arcade Breakout, one board per player: coloured rows scoring 1/3/5/7, three lives, speed-ups, paddle halves at the ceiling |
+| `MatrixInvaders` | `Invaders.cs` | Space Invaders, one board per player: a marching formation that speeds up, bombs, four erodible shields, a mystery ship, three lives |
 | `MatrixPong` | `Pong.cs` | Pong with big seven-segment scores; one player plays the CPU, two play each other, first to 11 |
 | `MatrixAtari` | `Atari.cs` | An Atari 2600 emulator; the picture is a wall of force-field blocks |
 
-They are ordinary deathmatch missions, so the stock time limit still cycles the server to the next map when it runs out. They all use the same controls. The client's camera is the d-pad: forward, back and strafe are read from how the
-camera moves each tick, so no client changes are needed. While a gametype is running the server slows the fly
-camera to 1 m/s (`$Camera::movementSpeed`, stock 40), so a key only nudges it by centimetres and the view stays
-fixed; for the same reason spectators in these missions cannot fly around quickly. The engine clamps camera pitch to about 80 degrees, so
+They are ordinary deathmatch missions, so the stock time limit still cycles the server to the next map when it runs out. They all use the same controls: forward, back and strafe are the d-pad, and no client changes are needed. A seated player is a stock Player whose armor (`Retro.cs`, loaded before the games in `server.gametype_script`) is patched to creep at 0.6 m/s with its pitch locked; it is hidden and stands on an invisible floor in front of its board. The server reads the keys from that tiny velocity and resets it every tick, so the view moves by centimetres at most (a camera cannot do this: the client moves it at its own 40 m/s, which the server cannot change). Fire, jump and jet reach the games as trigger presses and releases. Spectators keep the stock free-fly camera. The engine clamps camera pitch to about 80 degrees, so
 every board stands upright and is seen side-on. The engine also has no view-only camera, so touching the mouse
 turns the view briefly until the server turns it back; keep the mouse still while playing.
 

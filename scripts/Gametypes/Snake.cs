@@ -22,15 +22,6 @@ $Snk::MinStepMs = 70;
 $Snk::SpeedUpMs = 4;                 // faster per food eaten
 $Snk::FoodPoints = 10;
 $Snk::TickMs = 32;
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Snk::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Snk::Eps = 0.02;                    // the camera is off its anchor by more than this
-$Snk::InputMin = 0.01;               // camera movement per tick that counts as a key sample
-$Snk::RecentreMs = 250;
-$Snk::IgnoreMs = 100;
-$Snk::Drift = 0.4;                   // re-anchor when it has crept this far
 $Snk::RespawnMs = 3000;
 $Snk::MaxQueue = 3;
 $Snk::Debug = 0;
@@ -339,44 +330,17 @@ function snkStep(%cl)
 
 function snkInput(%cl, %now)
 {
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(snkAnchor(%cl.snkSeat));
-      %cl.snkLastCam = "";
-      return;
-   }
-   // Read the d-pad as how far the camera moved since the last tick. The camera is only written to when its
-   // rotation was disturbed (the mouse) or it needs bringing back to the board; rewriting it every tick would
-   // make the client correct itself constantly.
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.snkLastCam $= "")
-      %cl.snkLastCam = %px SPC %py SPC %pz;
-   %dx = %px - getWord(%cl.snkLastCam, 0);
-   %fwd = %py - getWord(%cl.snkLastCam, 1);     // level camera: forward moves it along +Y, toward the board
-   %cl.snkLastCam = %px SPC %py SPC %pz;
-   if (%now < %cl.snkIgnoreUntil)
-   {
-      // just re-centred: the camera may echo a sample or two
-      %dx = 0;
-      %fwd = 0;
-   }
-   %ax = mAbs(%dx);
-   %af = mAbs(%fwd);
-   if (%ax > $Snk::InputMin || %af > $Snk::InputMin)
+   // the keys are read by Retro.cs from the player's tiny velocity; a held key repeats its direction and only a
+   // change is a new turn
+   %m = retroPad(%cl);
+   %want = "";
+   if (%m & 1) %want = 0;
+   else if (%m & 8) %want = 1;
+   else if (%m & 2) %want = 2;
+   else if (%m & 4) %want = 3;
+   if (%want !$= "")
    {
       %cl.snkSampleAt = %now;
-      if ($Snk::Debug)
-         echo("SNK input t=" @ %now SPC "d=" @ %dx SPC %fwd);
-      if (%af >= %ax)
-         %want = %fwd > 0 ? 0 : 2;
-      else
-         %want = %dx > 0 ? 1 : 3;
-      // a held key repeats the same direction; only a change is a new turn
       if (%want !$= %cl.snkLastWant)
       {
          %cl.snkLastWant = %want;
@@ -385,26 +349,6 @@ function snkInput(%cl, %now)
    }
    else if (%now - %cl.snkSampleAt > 150)
       %cl.snkLastWant = "";
-   %a = snkAnchor(%cl.snkSeat);
-   // once the keys have been quiet for a moment, bring the camera back to the board
-   if (%now - %cl.snkSampleAt > $Snk::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Snk::Eps || mAbs(%py - getWord(%a, 1)) > $Snk::Eps || mAbs(%pz - getWord(%a, 2)) > $Snk::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.snkLastCam = getWords(%a, 0, 2);
-      %cl.snkIgnoreUntil = %now + $Snk::IgnoreMs;
-      return;
-   }
-   if (mAbs(%px - getWord(%a, 0)) > $Snk::Drift || mAbs(%py - getWord(%a, 1)) > $Snk::Drift || mAbs(%pz - getWord(%a, 2)) > $Snk::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.snkLastCam = getWords(%a, 0, 2);
-      return;
-   }
-   // the mouse turned the view: put the rotation back, keeping the position
-   if (mAbs(getWord(%t, 6)) > 0.004)
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
 }
 
 function snkTick()
@@ -422,7 +366,7 @@ function snkTick()
    for (%i = 0; %i < ClientGroup.getCount(); %i++)
    {
       %cl = ClientGroup.getObject(%i);
-      if (%cl.snkSeat $= "" || !isObject(%cl.camera))
+      if (%cl.snkSeat $= "" || !isObject(%cl.player))
          continue;
       snkInput(%cl, %now);
       if (!%cl.snkAlive)
@@ -441,13 +385,6 @@ function snkTick()
             snkStep(%cl);
          }
       }
-      // the stand-in Player never moves
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Snk::TickN % 30 == 0)
-            %cl.player.setTransform("0 -150 300 1 0 0 0");
-      }
    }
 }
 
@@ -461,23 +398,16 @@ function snkInitPlayer(%cl)
       %cl.snkSeat = %seat;
       snkMakeFrame(%cl);
    }
-   %cam = %cl.camera;
-   %cam.setFlyMode();
-   %cam.setTransform(snkAnchor(%cl.snkSeat));
-   %cl.setControlObject(%cam);
-   commandToClient(%cl, 'setHudMode', 'Observer');
-   %cl.schedule(100, "setControlObject", %cam);
-   if (isObject(%cl.player))
-   {
-      %cl.player.setTransform("0 -150 300 1 0 0 0");
-      %cl.player.setVelocity("0 0 0");
-   }
+   %a = snkAnchor(%cl.snkSeat);
+   retroAttach(%cl, getWord(%a, 0), getWord(%a, 1), getWord(%a, 2));
+   commandToClient(%cl, 'setHudMode', 'Standard');
    if (!%cl.snkAlive && !isObject(%cl.snkGroup))
       snkStartBoard(%cl);
 }
 
 function snkFreeClient(%cl)
 {
+   retroDetach(%cl);
    snkFreeBoard(%cl);
    if (isObject(%cl.snkFrame))
       %cl.snkFrame.delete();
@@ -496,8 +426,6 @@ function snkWatch()
    {
       activatePackage(T2LaunchSnake);
       $Snk::PkgOn = true;
-      $Snk::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Snk::CamSpeed;
       $Snk::LastTick = "";
       snkTick();
       echo("Snake ruleset on");
@@ -506,7 +434,6 @@ function snkWatch()
    {
       deactivatePackage(T2LaunchSnake);
       $Snk::PkgOn = false;
-      $Camera::movementSpeed = $Snk::SavedSpeed;
       cancel($Snk::TickThread);
       echo("Snake ruleset off");
    }
@@ -546,6 +473,18 @@ package T2LaunchSnake
       if (%client && %client.snkSeat !$= "")
          return false;   // a playing snake must not leave the locked camera
       return Parent::ObserverOnTrigger(%game, %data, %obj, %trigger, %state);
+   }
+
+   // a seated player is a Player now: its triggers go through the same handler
+   function Armor::onTrigger(%data, %player, %trigger, %val)
+   {
+      %client = %player.getControllingClient();
+      if (%client && %client.snkSeat !$= "")
+      {
+         DMGame::ObserverOnTrigger(Game, %data, %player, %trigger, %val);
+         return;
+      }
+      Parent::onTrigger(%data, %player, %trigger, %val);
    }
 
    function DMGame::onClientLeaveGame(%game, %client)

@@ -31,16 +31,9 @@ $Png::ServeMs = 1500;
 $Png::MatchEndMs = 5000;
 $Png::CamDist = 46;
 $Png::CamZShift = -1.5;
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Png::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Png::Eps = 0.02;                    // the camera is off its anchor by more than this
-$Png::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Png::KeyGraceMs = 110;
 $Png::RecentreMs = 250;
 $Png::IgnoreMs = 100;
-$Png::Drift = 0.4;                   // re-anchor when it has crept this far
 $Png::TickMs = 32;
 $Png::DigitW = 3;                    // seven-segment digit size
 $Png::DigitH = 5;
@@ -393,62 +386,16 @@ function pngStep(%dt, %now)
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// input: the d-pad is the camera's movement each tick (as in Snake.cs)
+// input: the player's keys, read by Retro.cs from its (tiny) velocity; 1 while forward is held, 2 while back is
+
+function pngReadPad(%cl)
+{
+   return retroPad(%cl) & 3;
+}
 
 function pngAnchor()
 {
    return "0" SPC (-$Png::CamDist) SPC ($Png::CenterZ + $Png::CamZShift) SPC "1 0 0 0";
-}
-
-// returns 1 while forward is held and 2 while back is held; the camera is looked after
-function pngReadPad(%cl, %now)
-{
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(pngAnchor());
-      %cl.pngLastCam = "";
-      return 0;
-   }
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.pngLastCam $= "")
-      %cl.pngLastCam = %px SPC %py SPC %pz;
-   %fwd = %py - getWord(%cl.pngLastCam, 1);      // level camera: forward moves it along +Y
-   %dx = %px - getWord(%cl.pngLastCam, 0);
-   %cl.pngLastCam = %px SPC %py SPC %pz;
-   if (%now < %cl.pngIgnoreUntil)
-   {
-      %fwd = 0;
-      %dx = 0;
-   }
-   if (%fwd > $Png::InputMin) { %cl.pngKeyU = %now; %cl.pngSampleAt = %now; }
-   if (%fwd < -$Png::InputMin) { %cl.pngKeyD = %now; %cl.pngSampleAt = %now; }
-   if (mAbs(%dx) > $Png::InputMin)
-      %cl.pngSampleAt = %now;
-   %a = pngAnchor();
-   if (%now - %cl.pngSampleAt > $Png::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Png::Eps || mAbs(%py - getWord(%a, 1)) > $Png::Eps || mAbs(%pz - getWord(%a, 2)) > $Png::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.pngLastCam = getWords(%a, 0, 2);
-      %cl.pngIgnoreUntil = %now + $Png::IgnoreMs;
-   }
-   else if (mAbs(%px - getWord(%a, 0)) > $Png::Drift || mAbs(%py - getWord(%a, 1)) > $Png::Drift || mAbs(%pz - getWord(%a, 2)) > $Png::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.pngLastCam = getWords(%a, 0, 2);
-   }
-   else if (mAbs(getWord(%t, 6)) > 0.004)
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
-   %mask = 0;
-   if (%now - %cl.pngKeyU < $Png::KeyGraceMs) %mask = %mask | 1;
-   if (%now - %cl.pngKeyD < $Png::KeyGraceMs) %mask = %mask | 2;
-   return %mask;
 }
 
 function pngTick()
@@ -467,19 +414,19 @@ function pngTick()
       %cl = ClientGroup.getObject(%i);
       if (!%cl.pngJoined || !isObject(%cl.camera))
          continue;
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Png::TickN % 30 == 0)
-            %cl.player.setTransform("0 -150 300 1 0 0 0");
-      }
       if (%cl.pngSide $= "")
       {
+         if (isObject(%cl.player))
+         {
+            %cl.player.setVelocity("0 0 0");
+            if ($Png::TickN % 30 == 0)
+               %cl.player.setTransform("0 -150 300 1 0 0 0");
+         }
          if (%cl.getControlObject() != %cl.camera)
             %cl.setControlObject(%cl.camera);
          continue;
       }
-      %cl.pngPad = pngReadPad(%cl, %now);
+      %cl.pngPad = pngReadPad(%cl);
    }
    pngStep(%dt, %now);
 }
@@ -497,26 +444,30 @@ function pngInitPlayer(%cl)
    %cl.pngJoined = true;
    if (%cl.pngSide $= "")
       %cl.pngSide = pngFreeSide();
-   %cam = %cl.camera;
-   %cam.setFlyMode();
-   %cam.setTransform(pngAnchor());
-   %cl.setControlObject(%cam);
-   commandToClient(%cl, 'setHudMode', 'Observer');
-   %cl.schedule(100, "setControlObject", %cam);
-   if (isObject(%cl.player))
-   {
-      %cl.player.setTransform("0 -150 300 1 0 0 0");
-      %cl.player.setVelocity("0 0 0");
-   }
-   %cl.pngLastCam = "";
    if (%cl.pngSide $= "")
+   {
+      %cam = %cl.camera;
+      %cam.setFlyMode();
+      %cam.setTransform(pngAnchor());
+      %cl.setControlObject(%cam);
+      commandToClient(%cl, 'setHudMode', 'Observer');
+      %cl.schedule(100, "setControlObject", %cam);
+      if (isObject(%cl.player))
+      {
+         %cl.player.setTransform("0 -150 300 1 0 0 0");
+         %cl.player.setVelocity("0 0 0");
+      }
       bottomPrint(%cl, "Watching. Both paddles are taken; press fire when one frees up, and you can fly around freely.", 8, 1);
-   else
-      pngHud();
+      return;
+   }
+   retroAttach(%cl, 0, -$Png::CamDist, $Png::CenterZ + $Png::CamZShift);
+   commandToClient(%cl, 'setHudMode', 'Standard');
+   pngHud();
 }
 
 function pngFreeClient(%cl)
 {
+   retroDetach(%cl);
    %cl.pngSide = "";
    %cl.pngJoined = false;
    %cl.pngPad = 0;
@@ -532,8 +483,6 @@ function pngWatch()
    {
       activatePackage(T2LaunchPong);
       $Png::PkgOn = true;
-      $Png::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Png::CamSpeed;
       $Png::LastTick = "";
       pngInitCourt();
       pngTick();
@@ -543,7 +492,6 @@ function pngWatch()
    {
       deactivatePackage(T2LaunchPong);
       $Png::PkgOn = false;
-      $Camera::movementSpeed = $Png::SavedSpeed;
       cancel($Png::TickThread);
       echo("Pong ruleset off");
    }
@@ -589,12 +537,20 @@ package T2LaunchPong
             if (%side !$= "")
             {
                %client.pngSide = %side;
-               pngHud();
+               pngInitPlayer(%client);
             }
          }
          return false;
       }
       return Parent::ObserverOnTrigger(%game, %data, %obj, %trigger, %state);
+   }
+
+   function Armor::onTrigger(%data, %player, %trigger, %val)
+   {
+      %client = %player.getControllingClient();
+      if (%client && %client.pngJoined)
+         return;
+      Parent::onTrigger(%data, %player, %trigger, %val);
    }
 
    function DMGame::onClientLeaveGame(%game, %client)

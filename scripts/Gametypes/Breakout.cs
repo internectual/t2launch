@@ -34,16 +34,9 @@ $Brk::AutoServeMs = 4000;
 $Brk::GameOverMs = 4500;
 $Brk::CamDist = 44;
 $Brk::CamZShift = -1.5;
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Brk::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Brk::InputMin = 0.01;               // camera movement per tick that counts as a key sample
-$Brk::Eps = 0.02;                    // the camera is off its anchor by more than this
 $Brk::KeyGraceMs = 110;
 $Brk::RecentreMs = 250;
 $Brk::IgnoreMs = 100;
-$Brk::Drift = 0.4;                   // re-anchor when it has crept this far
 $Brk::TickMs = 32;
 $Brk::ParkX = 3000;                  // destroyed bricks wait far outside every client's scope
 $Brk::ParkY = 3000;
@@ -395,59 +388,17 @@ function brkPhysics(%cl, %dt, %now)
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// input: the d-pad is the camera's movement each tick (as in Snake.cs)
+// input: the player's keys, read by Retro.cs from its (tiny) velocity; 1 while strafe-left is held, 2 for right
 
-// returns 1 while strafe-left is held and 2 while strafe-right is held; the camera is looked after
-function brkReadPad(%cl, %now)
+function brkReadPad(%cl)
 {
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(brkAnchor(%cl.brkSeat));
-      %cl.brkLastCam = "";
-      return 0;
-   }
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.brkLastCam $= "")
-      %cl.brkLastCam = %px SPC %py SPC %pz;
-   %dx = %px - getWord(%cl.brkLastCam, 0);
-   %fwd = %py - getWord(%cl.brkLastCam, 1);
-   %cl.brkLastCam = %px SPC %py SPC %pz;
-   if (%now < %cl.brkIgnoreUntil)
-   {
-      %dx = 0;
-      %fwd = 0;
-   }
-   if ($Brk::Debug && (mAbs(%dx) > 0.0001 || mAbs(%fwd) > 0.0001))
-      echo("BRK input t=" @ %now SPC "d=" @ %dx SPC %fwd);
-   if (%dx < -$Brk::InputMin) { %cl.brkKeyL = %now; %cl.brkSampleAt = %now; }
-   if (%dx > $Brk::InputMin) { %cl.brkKeyR = %now; %cl.brkSampleAt = %now; }
-   if (mAbs(%fwd) > $Brk::InputMin)
-      %cl.brkSampleAt = %now;
-   %a = brkAnchor(%cl.brkSeat);
-   if (%now - %cl.brkSampleAt > $Brk::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Brk::Eps || mAbs(%py - getWord(%a, 1)) > $Brk::Eps || mAbs(%pz - getWord(%a, 2)) > $Brk::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.brkLastCam = getWords(%a, 0, 2);
-      %cl.brkIgnoreUntil = %now + $Brk::IgnoreMs;
-   }
-   else if (mAbs(%px - getWord(%a, 0)) > $Brk::Drift || mAbs(%py - getWord(%a, 1)) > $Brk::Drift || mAbs(%pz - getWord(%a, 2)) > $Brk::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.brkLastCam = getWords(%a, 0, 2);
-   }
-   else if (mAbs(getWord(%t, 6)) > 0.004)
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
-   %mask = 0;
-   if (%now - %cl.brkKeyL < $Brk::KeyGraceMs) %mask = %mask | 1;
-   if (%now - %cl.brkKeyR < $Brk::KeyGraceMs) %mask = %mask | 2;
-   return %mask;
+   %m = retroPad(%cl);
+   %out = 0;
+   if (%m & 4)
+      %out = %out | 1;
+   if (%m & 8)
+      %out = %out | 2;
+   return %out;
 }
 
 function brkTick()
@@ -466,19 +417,20 @@ function brkTick()
       %cl = ClientGroup.getObject(%i);
       if (!%cl.brkJoined || !isObject(%cl.camera))
          continue;
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Brk::TickN % 30 == 0)
-            %cl.player.setTransform("0 -150 300 1 0 0 0");
-      }
       if (%cl.brkSeat $= "")
       {
+         // spectators have the stock free-fly camera; the stand-in Player is parked out of the way
+         if (isObject(%cl.player))
+         {
+            %cl.player.setVelocity("0 0 0");
+            if ($Brk::TickN % 30 == 0)
+               %cl.player.setTransform("0 -150 300 1 0 0 0");
+         }
          if (%cl.getControlObject() != %cl.camera)
             %cl.setControlObject(%cl.camera);
          continue;
       }
-      %cl.brkPadMask = brkReadPad(%cl, %now);
+      %cl.brkPadMask = brkReadPad(%cl);
       brkPhysics(%cl, %dt, %now);
    }
 }
@@ -498,27 +450,32 @@ function brkInitPlayer(%cl)
          %cl.brkBV = 5;
       }
    }
-   %cam = %cl.camera;
-   %cam.setFlyMode();
-   if (%cl.brkSeat !$= "")
-      %cam.setTransform(brkAnchor(%cl.brkSeat));
-   %cl.setControlObject(%cam);
-   commandToClient(%cl, 'setHudMode', 'Observer');
-   %cl.schedule(100, "setControlObject", %cam);
-   if (isObject(%cl.player))
-   {
-      %cl.player.setTransform("0 -150 300 1 0 0 0");
-      %cl.player.setVelocity("0 0 0");
-   }
-   %cl.brkLastCam = "";
    if (%cl.brkSeat $= "")
+   {
+      // a spectator: the free-fly camera, parked player
+      %cam = %cl.camera;
+      %cam.setFlyMode();
+      %cam.setTransform(brkAnchor(0));
+      %cl.setControlObject(%cam);
+      commandToClient(%cl, 'setHudMode', 'Observer');
+      %cl.schedule(100, "setControlObject", %cam);
+      if (isObject(%cl.player))
+      {
+         %cl.player.setTransform("0 -150 300 1 0 0 0");
+         %cl.player.setVelocity("0 0 0");
+      }
       bottomPrint(%cl, "Watching: every board is taken. You can fly around freely.", 8, 1);
-   else
-      brkStartGame(%cl);
+      return;
+   }
+   %a = brkAnchor(%cl.brkSeat);
+   retroAttach(%cl, getWord(%a, 0), getWord(%a, 1), getWord(%a, 2));
+   commandToClient(%cl, 'setHudMode', 'Standard');
+   brkStartGame(%cl);
 }
 
 function brkFreeClient(%cl)
 {
+   retroDetach(%cl);
    if (isObject(%cl.brkGroup))
       %cl.brkGroup.delete();
    %cl.brkGroup = "";
@@ -536,8 +493,6 @@ function brkWatch()
    {
       activatePackage(T2LaunchBreakout);
       $Brk::PkgOn = true;
-      $Brk::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Brk::CamSpeed;
       $Brk::LastTick = "";
       brkTick();
       echo("Breakout ruleset on");
@@ -546,7 +501,6 @@ function brkWatch()
    {
       deactivatePackage(T2LaunchBreakout);
       $Brk::PkgOn = false;
-      $Camera::movementSpeed = $Brk::SavedSpeed;
       cancel($Brk::TickThread);
       echo("Breakout ruleset off");
    }
@@ -590,6 +544,19 @@ package T2LaunchBreakout
          return false;
       }
       return Parent::ObserverOnTrigger(%game, %data, %obj, %trigger, %state);
+   }
+
+   // a seated player is a Player now, so its triggers arrive here: fire serves the ball
+   function Armor::onTrigger(%data, %player, %trigger, %val)
+   {
+      %client = %player.getControllingClient();
+      if (%client && %client.brkJoined)
+      {
+         if (%val && %trigger == 0 && %client.brkSeat !$= "")
+            brkLaunch(%client);
+         return;
+      }
+      Parent::onTrigger(%data, %player, %trigger, %val);
    }
 
    function DMGame::onClientLeaveGame(%game, %client)

@@ -16,15 +16,6 @@ $Tron::Cell = 3;                     // trail cell size
 $Tron::Speed = 10;                   // metres/second
 $Tron::CamDist = 44;                 // camera distance in front of the wall
 $Tron::CamZShift = -2;               // camera a little below the centre, so the arena sits above the HUD
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Tron::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Tron::Eps = 0.02;                    // the camera is off its anchor by more than this
-$Tron::InputMin = 0.01;               // camera movement per tick that counts as a key sample
-$Tron::RecentreMs = 250;             // keys quiet this long: bring the camera back to the arena
-$Tron::IgnoreMs = 100;               // ignore camera samples this long after re-centring
-$Tron::Drift = 0.4;                   // re-anchor when it has crept this far
 $Tron::TickMs = 32;
 $Tron::WallDepth = 3;                // thickness of trail blocks (towards the viewer)
 $Tron::HeadSize = 2;                 // the rider's head block
@@ -135,23 +126,11 @@ function tronInitRider(%client)
    %client.trPrevA = "";
    %client.trPrevB = "";
    %client.trCell = "";
-   // the stand-in Player is parked out of the way; the rider is the head block and the trail
-   %pl = %client.player;
-   if (isObject(%pl))
-   {
-      %pl.setTransform("0 -150 300 1 0 0 0");
-      %pl.setVelocity("0 0 0");
-   }
    tronMakeHead(%client);
-   // the level camera in front of the wall
-   %cam = %client.camera;
-   %cam.setFlyMode();
-   %cam.setTransform(tronAnchor());
-   %client.setControlObject(%cam);
-   %client.trLastCam = "";
-   commandToClient(%client, 'setHudMode', 'Observer');
-   // the stock join code hands control to the player right after spawning; take it back
-   %client.schedule(100, "setControlObject", %cam);
+   // the rider is the head block and the trail; its Player only reads the keys, standing in front of the wall
+   %a = tronAnchor();
+   retroAttach(%client, getWord(%a, 0), getWord(%a, 1), getWord(%a, 2));
+   commandToClient(%client, 'setHudMode', 'Standard');
 }
 
 function tronMakeHead(%client)
@@ -266,60 +245,15 @@ function tronStartRound()
 // Read the d-pad as how far the camera moved since the last tick. The camera is only written to when its
 // rotation was disturbed (the mouse) or it needs bringing back to the wall; rewriting it every tick would
 // make the client correct itself constantly. Returns the wanted heading, or "" for none.
+// the heading the held keys ask for (0 up the wall, 1 right, 2 down, 3 left), or "" when none is held
 function tronInput(%cl, %now)
 {
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(tronAnchor());
-      %cl.trLastCam = "";
-      return "";
-   }
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.trLastCam $= "")
-      %cl.trLastCam = %px SPC %py SPC %pz;
-   %dx = %px - getWord(%cl.trLastCam, 0);
-   %fwd = %py - getWord(%cl.trLastCam, 1);      // level camera: forward moves it along +Y, toward the wall
-   %cl.trLastCam = %px SPC %py SPC %pz;
-   if (%now < %cl.trIgnoreUntil)
-   {
-      %dx = 0;
-      %fwd = 0;
-   }
-   %want = "";
-   if (mAbs(%dx) > $Tron::InputMin || mAbs(%fwd) > $Tron::InputMin)
-   {
-      %cl.trSampleAt = %now;
-      if ($Tron::Debug)
-         echo("TRON input t=" @ %now SPC "d=" @ %dx SPC %fwd SPC "head=" @ %cl.trHeading);
-      if (mAbs(%fwd) >= mAbs(%dx))
-         %want = %fwd > 0 ? 0 : 2;
-      else
-         %want = %dx > 0 ? 1 : 3;
-   }
-   %a = tronAnchor();
-   if (%now - %cl.trSampleAt > $Tron::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Tron::Eps || mAbs(%py - getWord(%a, 1)) > $Tron::Eps || mAbs(%pz - getWord(%a, 2)) > $Tron::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.trLastCam = getWords(%a, 0, 2);
-      %cl.trIgnoreUntil = %now + $Tron::IgnoreMs;
-      return %want;
-   }
-   if (mAbs(%px - getWord(%a, 0)) > $Tron::Drift || mAbs(%py - getWord(%a, 1)) > $Tron::Drift || mAbs(%pz - getWord(%a, 2)) > $Tron::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.trLastCam = getWords(%a, 0, 2);
-      return %want;
-   }
-   if (mAbs(getWord(%t, 6)) > 0.004)
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
-   return %want;
+   %m = retroPad(%cl);
+   if (%m & 1) return 0;
+   if (%m & 8) return 1;
+   if (%m & 2) return 2;
+   if (%m & 4) return 3;
+   return "";
 }
 
 function tronTick()
@@ -339,15 +273,9 @@ function tronTick()
    for (%i = 0; %i < ClientGroup.getCount(); %i++)
    {
       %cl = ClientGroup.getObject(%i);
-      if (%cl.trSeat $= "" || !isObject(%cl.camera))
+      if (%cl.trSeat $= "" || !isObject(%cl.player))
          continue;
       %want = tronInput(%cl, %now);
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Tron::TickN % 30 == 0)
-            %cl.player.setTransform("0 -150 300 1 0 0 0");
-      }
       if (!%cl.trAlive)
          continue;
       // turn: never straight back into the trail
@@ -401,8 +329,6 @@ function tronWatch()
    {
       activatePackage(T2LaunchTron);
       $Tron::PkgOn = true;
-      $Tron::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Tron::CamSpeed;
       $Tron::LastTick = "";
       $Tron::RoundEnding = false;
       tronTick();
@@ -412,7 +338,6 @@ function tronWatch()
    {
       deactivatePackage(T2LaunchTron);
       $Tron::PkgOn = false;
-      $Camera::movementSpeed = $Tron::SavedSpeed;
       cancel($Tron::TickThread);
       echo("Tron ruleset off");
    }
@@ -451,15 +376,6 @@ package T2LaunchTron
       %clVictim.deaths++;
    }
 
-   function DMGame::ObserverOnTrigger(%game, %data, %obj, %trigger, %state)
-   {
-      %client = %obj.getControllingClient();
-      // a rider (alive or waiting for the next round) must not leave the locked camera
-      if (%client && %client.team > 0)
-         return false;
-      return Parent::ObserverOnTrigger(%game, %data, %obj, %trigger, %state);
-   }
-
    function DMGame::clientJoinTeam(%game, %client, %team, %respawn)
    {
       Parent::clientJoinTeam(%game, %client, %team, %respawn);
@@ -468,6 +384,7 @@ package T2LaunchTron
    function DMGame::onClientLeaveGame(%game, %client)
    {
       %client.trAlive = false;
+      retroDetach(%client);
       if (isObject(%client.trHead))
          %client.trHead.delete();
       Parent::onClientLeaveGame(%game, %client);

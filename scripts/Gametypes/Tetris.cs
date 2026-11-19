@@ -20,12 +20,6 @@ $Tet::Spacing = 46;                  // between boards
 $Tet::CamDist = 70;                  // camera distance in front of the board plane
 $Tet::CamZShift = -3;                // camera below the board centre, so the board sits above the HUD
 $Tet::TickMs = 32;
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Tet::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Tet::Eps = 0.02;                    // the camera is off its anchor by more than this
-$Tet::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Tet::KeyGraceMs = 110;              // a key counts as held this long after its last sample
 $Tet::DasMs = 210;                   // delay before auto-repeat
 $Tet::ArrMs = 40;                    // auto-repeat interval
@@ -34,9 +28,6 @@ $Tet::LockResets = 15;
 $Tet::HardDropGapMs = 220;           // forward must be released this long before it hard-drops again
 $Tet::NextCount = 5;
 $Tet::RespawnMs = 3500;
-$Tet::Drift = 0.4;                   // re-anchor when it has crept this far
-$Tet::RecentreMs = 250;           // keys quiet this long: bring the camera back to the board
-$Tet::IgnoreMs = 100;                // ignore camera samples this long after re-centring
 $Tet::Debug = 0;
 
 // piece kinds: 0 I, 1 O, 2 T, 3 S, 4 Z, 5 J, 6 L
@@ -768,65 +759,16 @@ function tetSendGarbage(%cl, %n)
 
 function tetInput(%cl, %now)
 {
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(tetAnchor(%cl.tetSeat));
-      %cl.tetLastCam = "";
-      return;
-   }
-   // Read the d-pad as how far the camera moved since the last tick. Only its rotation is snapped back each
-   // tick (so the mouse cannot turn it); the position is left alone and re-anchored when it drifts.
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.tetLastCam $= "")
-      %cl.tetLastCam = %px SPC %py SPC %pz;
-   %dx = %px - getWord(%cl.tetLastCam, 0);
-   %dy = %py - getWord(%cl.tetLastCam, 1);
-   if (%now < %cl.tetIgnoreUntil)
-   {
-      // just re-centred: the camera may echo a sample or two
-      %dx = 0;
-      %dy = 0;
-   }
-   if (mAbs(%dx) > $Tet::InputMin || mAbs(%dy) > $Tet::InputMin)
-      %cl.tetSampleAt = %now;
-   if (%dx < -$Tet::InputMin) %cl.tetKeyL = %now;
-   if (%dx > $Tet::InputMin) %cl.tetKeyR = %now;
-   if (%dy < -$Tet::InputMin) %cl.tetKeyB = %now;
-   if (%dy > $Tet::InputMin)
+   // the keys are read by Retro.cs from the player's tiny velocity; a held key refreshes its timestamp
+   %m = retroPad(%cl);
+   if (%m & 4) %cl.tetKeyL = %now;
+   if (%m & 8) %cl.tetKeyR = %now;
+   if (%m & 2) %cl.tetKeyB = %now;
+   if (%m & 1)
    {
       if (%now - %cl.tetKeyF > $Tet::HardDropGapMs)
          %cl.tetHardDrop = true;
       %cl.tetKeyF = %now;
-   }
-   if ($Tet::Debug && (mAbs(%dx) > 0.01 || mAbs(%dy) > 0.01))
-      echo("TET input t=" @ %now SPC "d=" @ %dx SPC %dy);
-   %a = tetAnchor(%cl.tetSeat);
-   // once the keys have been quiet for a moment, bring the camera back to the board
-   if (%now - %cl.tetSampleAt > $Tet::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Tet::Eps || mAbs(%py - getWord(%a, 1)) > $Tet::Eps || mAbs(%pz - getWord(%a, 2)) > $Tet::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.tetLastCam = getWords(%a, 0, 2);
-      %cl.tetIgnoreUntil = %now + $Tet::IgnoreMs;
-      return;
-   }
-   if (mAbs(%px - getWord(%a, 0)) > $Tet::Drift || mAbs(%py - getWord(%a, 1)) > $Tet::Drift || mAbs(%pz - getWord(%a, 2)) > $Tet::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.tetLastCam = getWords(%a, 0, 2);
-   }
-   else
-   {
-      %cl.tetLastCam = %px SPC %py SPC %pz;
-      // write to the camera only when the mouse has turned it; rewriting it every tick makes the client jump
-      if (mAbs(getWord(%t, 6)) > 0.004)
-         %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
    }
 }
 
@@ -945,17 +887,10 @@ function tetTick()
    for (%i = 0; %i < ClientGroup.getCount(); %i++)
    {
       %cl = ClientGroup.getObject(%i);
-      if (%cl.tetSeat $= "" || !isObject(%cl.camera))
+      if (%cl.tetSeat $= "" || !isObject(%cl.player))
          continue;
       tetInput(%cl, %now);
       tetStep(%cl, %dt, %now);
-      // the stand-in Player never moves
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Tet::TickN % 30 == 0)
-            %cl.player.setTransform("0 -100 300 1 0 0 0");
-      }
    }
 }
 
@@ -969,23 +904,16 @@ function tetInitPlayer(%cl)
       %cl.tetSeat = %seat;
       tetMakeFrame(%cl);
    }
-   %cam = %cl.camera;
-   %cam.setFlyMode();
-   %cam.setTransform(tetAnchor(%cl.tetSeat));
-   %cl.setControlObject(%cam);
-   commandToClient(%cl, 'setHudMode', 'Observer');
-   %cl.schedule(100, "setControlObject", %cam);
-   if (isObject(%cl.player))
-   {
-      %cl.player.setTransform("0 -100 300 1 0 0 0");
-      %cl.player.setVelocity("0 0 0");
-   }
+   %a = tetAnchor(%cl.tetSeat);
+   retroAttach(%cl, getWord(%a, 0), getWord(%a, 1), getWord(%a, 2));
+   commandToClient(%cl, 'setHudMode', 'Standard');
    if (!%cl.tetAlive && !isObject(%cl.tetGroup))
       tetStartBoard(%cl);
 }
 
 function tetFreeClient(%cl)
 {
+   retroDetach(%cl);
    tetFreeBoard(%cl);
    if (isObject(%cl.tetFrame))
       %cl.tetFrame.delete();
@@ -1004,8 +932,6 @@ function tetWatch()
    {
       activatePackage(T2LaunchTetris);
       $Tet::PkgOn = true;
-      $Tet::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Tet::CamSpeed;
       $Tet::LastTick = "";
       tetTick();
       echo("Tetris ruleset on");
@@ -1014,7 +940,6 @@ function tetWatch()
    {
       deactivatePackage(T2LaunchTetris);
       $Tet::PkgOn = false;
-      $Camera::movementSpeed = $Tet::SavedSpeed;
       cancel($Tet::TickThread);
       echo("Tetris ruleset off");
    }
@@ -1067,6 +992,18 @@ package T2LaunchTetris
          return false;
       }
       return Parent::ObserverOnTrigger(%game, %data, %obj, %trigger, %state);
+   }
+
+   // a seated player is a Player now: its triggers go through the same handler
+   function Armor::onTrigger(%data, %player, %trigger, %val)
+   {
+      %client = %player.getControllingClient();
+      if (%client && %client.tetSeat !$= "")
+      {
+         DMGame::ObserverOnTrigger(Game, %data, %player, %trigger, %val);
+         return;
+      }
+      Parent::onTrigger(%data, %player, %trigger, %val);
    }
 
    function DMGame::onClientLeaveGame(%game, %client)

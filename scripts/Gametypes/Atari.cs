@@ -21,16 +21,7 @@ $Atr::CamDist = 52;
 $Atr::CamZShift = -1;
 $Atr::DisplayMs = 50;                // display refresh interval
 $Atr::MaxChanges = 150;              // cells redrawn per refresh
-// The camera is the input device and the stock fly speed is 40 m/s, so a key press used to slide the view. The
-// engine reads $Camera::movementSpeed, so while this ruleset is on the camera crawls instead: a key moves it by
-// centimetres, which is still readable as input but leaves the view effectively fixed.
-$Atr::CamSpeed = 1;                  // metres/second while this ruleset is on (stock: 40)
-$Atr::Eps = 0.02;                    // the camera is off its anchor by more than this
-$Atr::InputMin = 0.01;               // camera movement per tick that counts as a key sample
 $Atr::KeyGraceMs = 110;              // a key counts as held this long after its last sample
-$Atr::RecentreMs = 250;
-$Atr::IgnoreMs = 100;
-$Atr::Drift = 0.4;                   // re-anchor when it has crept this far
 $Atr::TickMs = 32;
 $Atr::Ports = 2;
 $Atr::ParkX = 3000;                  // parked blocks live far outside every client's scope
@@ -299,56 +290,16 @@ function atrHudAll(%text)
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// input: the d-pad is the camera's movement each tick (as in Tetris.cs and Snake.cs)
+// input: the d-pad is the player's keys, read by Retro.cs from its (tiny) velocity
 
-// returns the joystick direction bits currently held, and the camera is looked after
+// returns the joystick direction bits currently held
 function atrReadPad(%cl, %now)
 {
-   %cam = %cl.camera;
-   if (%cl.getControlObject() != %cam)
-   {
-      %cl.setControlObject(%cam);
-      %cam.setTransform(atrAnchor());
-      %cl.atrLastCam = "";
-      return 0;
-   }
-   %t = %cam.getTransform();
-   %px = getWord(%t, 0);
-   %py = getWord(%t, 1);
-   %pz = getWord(%t, 2);
-   if (%cl.atrLastCam $= "")
-      %cl.atrLastCam = %px SPC %py SPC %pz;
-   %dx = %px - getWord(%cl.atrLastCam, 0);
-   %fwd = %py - getWord(%cl.atrLastCam, 1);      // level camera: forward moves it along +Y
-   %cl.atrLastCam = %px SPC %py SPC %pz;
-   if (%now < %cl.atrIgnoreUntil)
-   {
-      %dx = 0;
-      %fwd = 0;
-   }
-   %any = false;
-   if (%dx < -$Atr::InputMin) { %cl.atrKeyL = %now; %any = true; }
-   if (%dx > $Atr::InputMin) { %cl.atrKeyR = %now; %any = true; }
-   if (%fwd > $Atr::InputMin) { %cl.atrKeyU = %now; %any = true; }
-   if (%fwd < -$Atr::InputMin) { %cl.atrKeyD = %now; %any = true; }
-   if (%any)
-      %cl.atrSampleAt = %now;
-   %a = atrAnchor();
-   if (%now - %cl.atrSampleAt > $Atr::RecentreMs
-      && (mAbs(%px - getWord(%a, 0)) > $Atr::Eps || mAbs(%py - getWord(%a, 1)) > $Atr::Eps || mAbs(%pz - getWord(%a, 2)) > $Atr::Eps))
-   {
-      %cam.setTransform(%a);
-      %cam.setVelocity("0 0 0");
-      %cl.atrLastCam = getWords(%a, 0, 2);
-      %cl.atrIgnoreUntil = %now + $Atr::IgnoreMs;
-   }
-   else if (mAbs(%px - getWord(%a, 0)) > $Atr::Drift || mAbs(%py - getWord(%a, 1)) > $Atr::Drift || mAbs(%pz - getWord(%a, 2)) > $Atr::Drift)
-   {
-      %cam.setTransform(%a);
-      %cl.atrLastCam = getWords(%a, 0, 2);
-   }
-   else if (mAbs(getWord(%t, 6)) > 0.004)
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
+   %m = retroPad(%cl);
+   if (%m & 1) %cl.atrKeyU = %now;
+   if (%m & 2) %cl.atrKeyD = %now;
+   if (%m & 4) %cl.atrKeyL = %now;
+   if (%m & 8) %cl.atrKeyR = %now;
    %mask = 0;
    if (%now - %cl.atrKeyU < $Atr::KeyGraceMs) %mask = %mask | 1;
    if (%now - %cl.atrKeyD < $Atr::KeyGraceMs) %mask = %mask | 2;
@@ -370,14 +321,14 @@ function atrTick()
       %cl = ClientGroup.getObject(%i);
       if (!%cl.atrJoined || !isObject(%cl.camera))
          continue;
-      if (isObject(%cl.player))
-      {
-         %cl.player.setVelocity("0 0 0");
-         if ($Atr::TickN % 30 == 0)
-            %cl.player.setTransform("0 -150 300 1 0 0 0");
-      }
       if (%cl.atrPort $= "")
       {
+         if (isObject(%cl.player))
+         {
+            %cl.player.setVelocity("0 0 0");
+            if ($Atr::TickN % 30 == 0)
+               %cl.player.setTransform("0 -150 300 1 0 0 0");
+         }
          // spectators keep the stock free-fly camera; make sure they have it
          if (%cl.getControlObject() != %cl.camera)
             %cl.setControlObject(%cl.camera);
@@ -425,16 +376,26 @@ function atrInitPlayer(%cl)
    %cl.atrJoined = true;
    if (%cl.atrPort $= "")
       %cl.atrPort = atrFreePort();
-   %cam = %cl.camera;
-   %cam.setFlyMode();
-   %cam.setTransform(atrAnchor());
-   %cl.setControlObject(%cam);
-   commandToClient(%cl, 'setHudMode', 'Observer');
-   %cl.schedule(100, "setControlObject", %cam);
-   if (isObject(%cl.player))
+   if (%cl.atrPort $= "")
    {
-      %cl.player.setTransform("0 -150 300 1 0 0 0");
-      %cl.player.setVelocity("0 0 0");
+      // a spectator: the stock free-fly camera, parked player
+      %cam = %cl.camera;
+      %cam.setFlyMode();
+      %cam.setTransform(atrAnchor());
+      %cl.setControlObject(%cam);
+      commandToClient(%cl, 'setHudMode', 'Observer');
+      %cl.schedule(100, "setControlObject", %cam);
+      if (isObject(%cl.player))
+      {
+         %cl.player.setTransform("0 -150 300 1 0 0 0");
+         %cl.player.setVelocity("0 0 0");
+      }
+   }
+   else
+   {
+      %a = atrAnchor();
+      retroAttach(%cl, getWord(%a, 0), getWord(%a, 1), getWord(%a, 2));
+      commandToClient(%cl, 'setHudMode', 'Standard');
    }
    %cl.atrLastCam = "";
    %cl.atrSent = "";
@@ -457,6 +418,7 @@ function atrStatusName()
 
 function atrFreeClient(%cl)
 {
+   retroDetach(%cl);
    if (%cl.atrPort !$= "")
       t2launch_atariInput(%cl.atrPort, 0);
    %cl.atrPort = "";
@@ -481,8 +443,6 @@ function atrWatch()
       }
       activatePackage(T2LaunchAtari);
       $Atr::PkgOn = true;
-      $Atr::SavedSpeed = $Camera::movementSpeed;
-      $Camera::movementSpeed = $Atr::CamSpeed;
       $Atr::Chooser = false;
       $Atr::Toggles = 0;
       $Atr::SentSwitches = "";
@@ -495,7 +455,6 @@ function atrWatch()
    {
       deactivatePackage(T2LaunchAtari);
       $Atr::PkgOn = false;
-      $Camera::movementSpeed = $Atr::SavedSpeed;
       cancel($Atr::TickThread);
       cancel($Atr::DisplayThread);
       t2launch_atariStop();
@@ -575,6 +534,18 @@ package T2LaunchAtari
          return;
       }
       Parent::onTrigger(%data, %obj, %trigger, %state);
+   }
+
+   // a seated player is a Player now: its triggers go through the same handler
+   function Armor::onTrigger(%data, %player, %trigger, %val)
+   {
+      %client = %player.getControllingClient();
+      if (%client && %client.atrJoined)
+      {
+         Observer::onTrigger(%data, %player, %trigger, %val);
+         return;
+      }
+      Parent::onTrigger(%data, %player, %trigger, %val);
    }
 
    function DMGame::onClientLeaveGame(%game, %client)
