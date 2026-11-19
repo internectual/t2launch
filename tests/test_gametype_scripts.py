@@ -16,6 +16,7 @@ PACKS = [
     ("Invaders.cs", "MatrixInvaders", "Matrix Invaders"),
     ("Galaga.cs", "MatrixGalaga", "Matrix Galaga"),
     ("Pacman.cs", "MatrixPacman", "Matrix Pacman"),
+    ("Frogger.cs", "MatrixFrogger", "Matrix Frogger"),
     ("Atari.cs", "MatrixAtari", "Matrix Atari"),
 ]
 
@@ -50,7 +51,7 @@ class GametypeScriptTests(unittest.TestCase):
 
     def test_scripts_can_be_loaded_together(self):
         # each script keeps its names under its own prefix, so a comma list of all of them cannot collide
-        prefixes = {"Tron.cs": "tron", "Tetris.cs": "tet", "Snake.cs": "snk", "Pong.cs": "png", "Retro.cs": "retro", "Breakout.cs": "brk", "Invaders.cs": "inv", "Galaga.cs": "gal", "Pacman.cs": "pm", "Atari.cs": "atr"}
+        prefixes = {"Tron.cs": "tron", "Tetris.cs": "tet", "Snake.cs": "snk", "Pong.cs": "png", "Retro.cs": "retro", "Breakout.cs": "brk", "Invaders.cs": "inv", "Galaga.cs": "gal", "Pacman.cs": "pm", "Frogger.cs": "frg", "Atari.cs": "atr"}
         for script, prefix in prefixes.items():
             text = (GAMETYPES / script).read_text()
             for name in re.findall(r"^function (\w+)\(", text, re.M):
