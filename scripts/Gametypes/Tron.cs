@@ -138,6 +138,7 @@ function tronInitRider(%client)
    %cam = %client.camera;
    %cam.setFlyMode();
    %cam.setTransform(%client.trAnchor);
+   %client.trRotRef = getWords(%cam.getTransform(), 3, 6);   // the rotation the engine settled on
    %client.setControlObject(%cam);
    %client.trLastCam = "";
    commandToClient(%client, 'setHudMode', 'Observer');
@@ -329,8 +330,14 @@ function tronTick()
       }
       else
       {
-         %cam.setTransform(%px SPC %py SPC %pz SPC $Tron::CamRot);
+         // write to the camera only when the mouse has turned it; rewriting it every tick makes the client jump
          %cl.trLastCam = %px SPC %py SPC %pz;
+         %turned = false;
+         for (%k = 0; %k < 4; %k++)
+            if (mAbs(getWord(%t, 3 + %k) - getWord(%cl.trRotRef, %k)) > 0.01)
+               %turned = true;
+         if (%turned)
+            %cam.setTransform(%px SPC %py SPC %pz SPC $Tron::CamRot);
       }
       // advance
       %d = $Tron::Dirs[%cl.trHeading];

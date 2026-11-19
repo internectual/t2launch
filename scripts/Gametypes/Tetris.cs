@@ -818,8 +818,10 @@ function tetInput(%cl, %now)
    }
    else
    {
-      %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
       %cl.tetLastCam = %px SPC %py SPC %pz;
+      // write to the camera only when the mouse has turned it; rewriting it every tick makes the client jump
+      if (mAbs(getWord(%t, 6)) > 0.004)
+         %cam.setTransform(%px SPC %py SPC %pz SPC "1 0 0 0");
    }
 }
 
