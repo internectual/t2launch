@@ -1,8 +1,8 @@
 // GalagaReal: server-side ruleset for the MatrixGalagaReal mission, Galaga with real game models. The same rules as Galaga.cs
 // (swooping entries, a swaying formation, dives, challenging stages), but the enemies are Bioderm players (heavy bosses,
 // medium butterflies, light bees), the ship is a Shrike, the shots are grenade items and the bombs are mortar ammo items.
-// No shape datablock is defined (a shape datablock defined by a server script gets stock clients dropped about 12 seconds
-// after they join): everything is a stock datablock, and the only datablock made here is a pale force-field backdrop so
+// No shape datablock is defined (one defined by a script needs retroRefreshCrc() from Retro.cs, or the server's CRC
+// challenge drops the client): everything is a stock datablock, and the only datablock made here is a pale force-field backdrop so
 // the dark models show.
 // Evaluated in memory by the t2launch hook (server.gametype_script, after Retro.cs). The package is active only while
 // $CurrentMission is MatrixGalagaReal.

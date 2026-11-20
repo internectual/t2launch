@@ -10548,6 +10548,36 @@ static const char *atari_status_cb(void *obj, S32 argc, const char **argv) {
     return result;
 }
 
+/* The dedicated server answers a client's CRC challenge by comparing the client's two reply words with two words it
+   computes ONCE, at startup, from a random seed and the datablock shapes that exist then (CRCChallengeResponseEvent::process
+   at 0x08311220; the compute call is at 0x0822e337). A mismatch schedules ServerDropConnectionEvent after a random delay,
+   which is how a client got dropped 12 to 25 seconds after joining as soon as a gametype script defined a shape datablock:
+   the client's reply covers the new shape, the stored words do not. Calling the same routine again, after the script has
+   defined its datablocks, makes the stored words match and keeps the check enforced. Official servers define nothing late,
+   so they never meet this. The routine is cdecl: (object stored at 0x08489024, seed at 0x0848c488, &word0, &word1). */
+#define CRC_CHALLENGE_ROUTINE 0x08105b94u
+#define CRC_CHALLENGE_OBJECT 0x08489024u
+#define CRC_CHALLENGE_SEED 0x0848c488u
+#define CRC_CHALLENGE_WORD0 0x0848c484u
+#define CRC_CHALLENGE_WORD1 0x0848c48cu
+static const unsigned char crc_challenge_prologue[] = {
+    0x55, 0x89, 0xe5, 0x81, 0xec, 0x2c, 0x03, 0x00, 0x00, 0x57, 0x56, 0x53, 0xe8};
+
+static const char *crc_refresh_cb(void *obj, S32 argc, const char **argv) {
+    (void)obj; (void)argc; (void)argv;
+    typedef char (*crc_routine_t)(void *, int, unsigned *, unsigned *);
+    if (memcmp((const void *)(uintptr_t)CRC_CHALLENGE_ROUTINE, crc_challenge_prologue, sizeof crc_challenge_prologue))
+        return "unavailable";
+    void *owner = *(void **)(uintptr_t)CRC_CHALLENGE_OBJECT;
+    if (!owner) return "unavailable";
+    unsigned before0 = *(unsigned *)(uintptr_t)CRC_CHALLENGE_WORD0, before1 = *(unsigned *)(uintptr_t)CRC_CHALLENGE_WORD1;
+    ((crc_routine_t)(uintptr_t)CRC_CHALLENGE_ROUTINE)(owner, *(int *)(uintptr_t)CRC_CHALLENGE_SEED,
+        (unsigned *)(uintptr_t)CRC_CHALLENGE_WORD0, (unsigned *)(uintptr_t)CRC_CHALLENGE_WORD1);
+    fprintf(stderr, "[t2_hook] CRC challenge refreshed: %08x %08x -> %08x %08x\n", before0, before1,
+            *(unsigned *)(uintptr_t)CRC_CHALLENGE_WORD0, *(unsigned *)(uintptr_t)CRC_CHALLENGE_WORD1);
+    return "ok";
+}
+
 static void atari_register_commands(void) {
     Con__addMethodS(NULL, "t2launch_atariGrid", atari_grid_cb, "t2launch_atariGrid() - 'cols rows colours' of the display grid", 1, 1);
     Con__addMethodS(NULL, "t2launch_atariColor", atari_color_cb, "t2launch_atariColor(i) - 'r g b' of display colour i (1..32)", 2, 2);
@@ -11186,6 +11216,9 @@ static int register_hook_commands(void) {
     Con__addMethodS(NULL, "hook_option", hook_option_cb,
         "hook_option <key> - value of a T2Launch hook option", 2, 2);
     if (target->dedicated) atari_register_commands();
+    if (target->dedicated)
+        Con__addMethodS(NULL, "t2launch_refreshCrcChallenge", crc_refresh_cb,
+            "t2launch_refreshCrcChallenge() - recompute the CRC challenge the server expects (after a script defines shape datablocks)", 1, 1);
     Con__addMethodS(NULL, "dumpConsoleConstructor", dump_console_constructor_cb,
         "dumpConsoleConstructor([file]) - list every registered console function to the log and a file", 1, 2);
     if (!target->dedicated) {

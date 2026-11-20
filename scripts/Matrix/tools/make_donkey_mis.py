@@ -1,7 +1,7 @@
 """Write MatrixDonkey.mis: the Matrix mission plus the Donkey Kong boards as real game models.
 
-Models are placed in the mission file (TSStatic) because shape datablocks defined by a server script make stock clients
-drop about 12 seconds after joining; mission-file shapes need no datablock. Rotations here are in degrees.
+Models are placed in the mission file (TSStatic), which needs no datablock at all (shape datablocks defined by a script
+need retroRefreshCrc() from Retro.cs). Rotations here are in degrees.
 """
 
 from pathlib import Path

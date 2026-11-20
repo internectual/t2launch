@@ -1,12 +1,12 @@
 // Donkey: server-side ruleset for the MatrixDonkey mission (a Donkey Kong clone), built from real game models: cargo
 // containers for the girders, poles for the ladders, a heavy Bioderm as the ape, a tiny human as Mario, a human lady, and
 // mortar barrel packs for the barrels. The girders, ladders and oil drum are TSStatic shapes in the mission file
-// (scripts/Matrix/tools/make_donkey_mis.py writes it), because a shape datablock defined by a server script gets stock
-// clients dropped about 12 seconds after they join. The people are standalone players of the stock armors and the barrels
+// (scripts/Matrix/tools/make_donkey_mis.py writes it), (this was chosen while a shape datablock defined here got clients dropped: the server's CRC challenge was computed before
+// the script ran. retroRefreshCrc() in Retro.cs fixes that, so shape datablocks are possible now). The people are standalone players of the stock armors and the barrels
 // are items of the stock mortar barrel pack datablock, so no shape datablock is defined here. The two datablocks that are
 // (a pale backdrop panel and an orange glow behind each barrel) are force fields, which have no shape. Flames and lamps
-// from projectile or image datablocks were tried and crash or drop stock clients.
-// Evaluated in memory by the t2launch hook (server.gametype_script, after Retro.cs); stock clients download nothing.
+// from projectile datablocks crashed the client (their datablock was rejected by the server); image flames and lamps were never retried after the CRC fix.
+// Evaluated in memory by the t2launch hook (server.gametype_script, after Retro.cs); clients download nothing.
 // The package is active only while $CurrentMission is MatrixDonkey.
 //
 // Rules: climb six girders to the top, where Pauline waits, while the ape at the top rolls barrels down at you. Barrels

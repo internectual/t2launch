@@ -13,8 +13,8 @@
 
 $Retro::Speed = 0.6;                 // the patched armors' top speed in every direction, metres/second
 $Retro::Eye = 2.12;                  // eye height above the feet (measured on the light armor)
-$Retro::VelMin = 0.12;               // velocity that counts as a held key
-$Retro::HoldEps = 0.25;              // put the player back when it has crept this far
+$Retro::VelMin = 0.12;              // velocity that counts as a held key
+$Retro::HoldEps = 0.25;             // put the player back when it has crept this far
 $Retro::YawEps = 0.02;               // radians of turn before the view is put back
 $Retro::FloorSize = 8;
 $Retro::Debug = 0;
@@ -131,6 +131,16 @@ function retroPressed(%cl, %mask)
    %new = %mask & ~%cl.retroLastMask;
    %cl.retroLastMask = %mask;
    return %new;
+}
+
+// A gametype that defines SHAPE datablocks must call this after it has defined them (and again after every CreateServer
+// that redefines them). The dedicated server's anti-cheat challenge compares a client's reply with values it computed once
+// at startup over the stock shapes; without a refresh, a client that has received the new shapes answers differently and is
+// dropped 12 to 25 seconds after joining. Official servers never add datablocks late, so they never meet this. The hook
+// recomputes the stored values with the engine's own routine (t2launch_refreshCrcChallenge, dedicated server only).
+function retroRefreshCrc()
+{
+   t2launch_refreshCrcChallenge();
 }
 
 package T2LaunchRetroBoot
