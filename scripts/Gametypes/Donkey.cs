@@ -197,6 +197,8 @@ function dkMakeBoard(%cl)
    %g.add(dkField(DkBack, %bx - 16 * %k, $Dk::BackY, $Dk::Z0 + %vc + (-1 - %vc) * %k, 32 * %k, 0.5, 34 * %k));
    %cl.dkApe = dkActor("HeavyMaleBiodermArmor", $Dk::ApeScale, %bx - 12, 0, $Dk::Z0 + $Dk::PV[5] + 0.05, 1.5708);
    %g.add(%cl.dkApe);
+   // the ape carries a mortar and fires the barrels with it (no ammo, so the weapon never shoots a real shell)
+   %cl.dkApe.mountImage(MortarImage, 0);
    %cl.dkLady = dkActor("MediumFemaleHumanArmor", $Dk::ManScale, %bx - 3, 0, $Dk::Z0 + $Dk::PV[6] + 0.05, 1.5708);
    %g.add(%cl.dkLady);
    %cl.dkMan = dkActor("MediumMaleHumanArmor", $Dk::ManScale, %bx - 5, 0, $Dk::Z0 + $Dk::PV[0] + 0.05, 1.5708);
@@ -300,7 +302,7 @@ function dkRespawn(%cl)
    %cl.dkVX = 0;
    %cl.dkVZ = 0;
    %cl.dkMV = $Dk::PV[0] + $Dk::ManSize / 2;
-   %cl.dkMan.setActionThread("root", true);
+   %cl.dkMan.setActionThread("root", false, false);        // let the engine pick the animation again after a death
    dkPlaceMan(%cl);
    %cl.dkPl = 0;
    %cl.dkMode = "ground";
