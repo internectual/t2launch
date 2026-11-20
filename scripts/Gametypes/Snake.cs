@@ -49,14 +49,14 @@ function snkDatablocks()
       return;
    for (%i = 0; %i < 8; %i++)
    {
-      eval("datablock ForceFieldBareData(SnkBody" @ %i @ ") : defaultForceFieldBare {"
+      eval("datablock ForceFieldBareData(SnkBody" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " color = \"" @ $Snk::Pal[%i] @ "\"; baseTranslucency = 0.5; needsNoPower = true; };");
-      eval("datablock ForceFieldBareData(SnkHead" @ %i @ ") : defaultForceFieldBare {"
+      eval("datablock ForceFieldBareData(SnkHead" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " color = \"" @ $Snk::Pal[%i] @ "\"; baseTranslucency = 0.95; needsNoPower = true; };");
    }
-   eval("datablock ForceFieldBareData(SnkFood) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(SnkFood) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"1.0 0.15 0.15\"; baseTranslucency = 0.9; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(SnkFrame) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(SnkFrame) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.9 0.9 0.9\"; baseTranslucency = 0.3; needsNoPower = true; };");
 }
 

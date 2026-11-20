@@ -111,9 +111,9 @@ function dkDatablocks()
 {
    if (isObject(DkBack))
       return;
-   eval("datablock ForceFieldBareData(DkBack) : defaultForceFieldBare { color = \"0.72 0.8 0.95\"; baseTranslucency = 0.22;"
+   eval("datablock ForceFieldBareData(DkBack) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.72 0.8 0.95\"; baseTranslucency = 0.22;"
       @ " needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(DkGlow) : defaultForceFieldBare { color = \"1.0 0.5 0.12\"; baseTranslucency = 0.65;"
+   eval("datablock ForceFieldBareData(DkGlow) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"1.0 0.5 0.12\"; baseTranslucency = 0.65;"
       @ " needsNoPower = true; };");
 }
 

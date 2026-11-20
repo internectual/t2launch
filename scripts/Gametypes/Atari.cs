@@ -45,10 +45,10 @@ function atrDatablocks()
    {
       %rgb = t2launch_atariColor(%i);
       %c = getWord(%rgb, 0) / 255 SPC getWord(%rgb, 1) / 255 SPC getWord(%rgb, 2) / 255;
-      eval("datablock ForceFieldBareData(AtrCol" @ %i @ ") : defaultForceFieldBare {"
+      eval("datablock ForceFieldBareData(AtrCol" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " color = \"" @ %c @ "\"; baseTranslucency = 0.95; needsNoPower = true; };");
    }
-   eval("datablock ForceFieldBareData(AtrBezel) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(AtrBezel) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.85 0.85 0.9\"; baseTranslucency = 0.3; needsNoPower = true; };");
 }
 

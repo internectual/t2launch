@@ -43,9 +43,9 @@ function tronDatablocks()
    if (isObject(TronField0))
       return;
    for (%i = 0; %i < 8; %i++)
-      eval("datablock ForceFieldBareData(TronField" @ %i @ ") : defaultForceFieldBare {"
+      eval("datablock ForceFieldBareData(TronField" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " color = \"" @ $Tron::Palette[%i] @ "\"; baseTranslucency = 0.45; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(TronBorder) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(TronBorder) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.9 0.9 0.9\"; baseTranslucency = 0.25; needsNoPower = true; };");
 }
 

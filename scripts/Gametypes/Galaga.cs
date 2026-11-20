@@ -94,7 +94,7 @@ function galDatablocks()
       %alpha = 0.9;
       if (%name $= "GalWall")
          %alpha = 0.3;
-      eval("datablock ForceFieldBareData(" @ %name @ ") : defaultForceFieldBare { color = \"" @ %color
+      eval("datablock ForceFieldBareData(" @ %name @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"" @ %color
          @ "\"; baseTranslucency = " @ %alpha @ "; needsNoPower = true; };");
    }
 }

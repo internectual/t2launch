@@ -76,13 +76,13 @@ function tetDatablocks()
    if (isObject(TetCol0))
       return;
    for (%i = 0; %i < 7; %i++)
-      eval("datablock ForceFieldBareData(TetCol" @ %i @ ") : defaultForceFieldBare {"
+      eval("datablock ForceFieldBareData(TetCol" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " color = \"" @ $Tet::Color[%i] @ "\"; baseTranslucency = 0.6; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(TetGhost) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(TetGhost) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.95 0.95 0.95\"; baseTranslucency = 0.3; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(TetGarbage) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(TetGarbage) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.55 0.55 0.60\"; baseTranslucency = 0.6; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(TetFrame) : defaultForceFieldBare {"
+   eval("datablock ForceFieldBareData(TetFrame) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
       @ " color = \"0.9 0.9 0.9\"; baseTranslucency = 0.35; needsNoPower = true; };");
 }
 

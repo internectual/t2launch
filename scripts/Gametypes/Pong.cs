@@ -54,11 +54,11 @@ function pngDatablocks()
 {
    if (isObject(PngLeft))
       return;
-   eval("datablock ForceFieldBareData(PngLeft) : defaultForceFieldBare { color = \"0.10 0.85 0.95\"; baseTranslucency = 0.9; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(PngRight) : defaultForceFieldBare { color = \"1.00 0.55 0.10\"; baseTranslucency = 0.9; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(PngBall) : defaultForceFieldBare { color = \"1.00 1.00 1.00\"; baseTranslucency = 0.95; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(PngNet) : defaultForceFieldBare { color = \"0.75 0.75 0.80\"; baseTranslucency = 0.6; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(PngDigit) : defaultForceFieldBare { color = \"0.95 0.95 1.00\"; baseTranslucency = 0.9; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(PngLeft) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.10 0.85 0.95\"; baseTranslucency = 0.9; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(PngRight) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"1.00 0.55 0.10\"; baseTranslucency = 0.9; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(PngBall) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"1.00 1.00 1.00\"; baseTranslucency = 0.95; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(PngNet) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.75 0.75 0.80\"; baseTranslucency = 0.6; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(PngDigit) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.95 0.95 1.00\"; baseTranslucency = 0.9; needsNoPower = true; };");
 }
 
 function pngField(%db, %x, %z, %sx, %sz)

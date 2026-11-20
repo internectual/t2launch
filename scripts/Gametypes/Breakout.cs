@@ -54,11 +54,11 @@ function brkDatablocks()
       return;
    %colors = "1.0 0.9 0.1 0.2 0.9 0.2 1.0 0.55 0.1 1.0 0.15 0.1";    // yellow, green, orange, red
    for (%i = 0; %i < 4; %i++)
-      eval("datablock ForceFieldBareData(BrkBrick" @ %i @ ") : defaultForceFieldBare { color = \""
+      eval("datablock ForceFieldBareData(BrkBrick" @ %i @ ") : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \""
          @ getWords(%colors, %i * 3, %i * 3 + 2) @ "\"; baseTranslucency = 0.85; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(BrkPaddle) : defaultForceFieldBare { color = \"0.15 0.6 1.0\"; baseTranslucency = 0.9; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(BrkBall) : defaultForceFieldBare { color = \"1.0 1.0 1.0\"; baseTranslucency = 0.95; needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(BrkWall) : defaultForceFieldBare { color = \"0.8 0.8 0.85\"; baseTranslucency = 0.3; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(BrkPaddle) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.15 0.6 1.0\"; baseTranslucency = 0.9; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(BrkBall) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"1.0 1.0 1.0\"; baseTranslucency = 0.95; needsNoPower = true; };");
+   eval("datablock ForceFieldBareData(BrkWall) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.8 0.8 0.85\"; baseTranslucency = 0.3; needsNoPower = true; };");
 }
 
 function brkField(%db, %x, %z, %sx, %sz)

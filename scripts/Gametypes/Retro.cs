@@ -27,7 +27,7 @@ $Retro::Armors = "LightMaleHumanArmor LightFemaleHumanArmor LightMaleBiodermArmo
 function retroDatablocks()
 {
    if (!isObject(RetroFloor))
-      eval("datablock ForceFieldBareData(RetroFloor) : defaultSolidFieldBare {"
+      eval("datablock ForceFieldBareData(RetroFloor) : defaultSolidFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0;"
          @ " baseTranslucency = 0.01; needsNoPower = true; };");
    if ($Retro::Patched)
       return;

@@ -86,7 +86,7 @@ function glrDatablocks()
 {
    if (isObject(GlrBack))
       return;
-   eval("datablock ForceFieldBareData(GlrBack) : defaultForceFieldBare { color = \"0.72 0.8 0.95\"; baseTranslucency = 0.22;"
+   eval("datablock ForceFieldBareData(GlrBack) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.72 0.8 0.95\"; baseTranslucency = 0.22;"
       @ " needsNoPower = true; };");
 }
 
