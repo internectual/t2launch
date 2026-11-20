@@ -44,7 +44,7 @@ $Dk::BarrelFall = 22;                // gravity for a falling barrel
 $Dk::MaxBarrels = 7;
 $Dk::LadyLoopMs = 2400;               // the lady's wave is started again this often
 $Dk::ManSlack = 0.3;                  // metres Mario may drift from where the game says he is before he is put back
-$Dk::GravComp = 0.64;                // gravity (20 m/s/s) over one tick, added to his upward velocity
+$Dk::GravComp = 0;                   // gravity over one tick, added to his upward velocity (none: the board has a no-gravity zone)
 $Dk::MuzzleU = -9.6;                  // where the ape's mortar points out, across from the centre line
 $Dk::MuzzleV = 1.7;                  // and how far above the girder
 $Dk::MuzzleUp = 3;                   // a barrel leaves the muzzle going up a little...
@@ -211,6 +211,18 @@ function dkMakeBoard(%cl)
    %k = $Dk::BackK;
    %vc = $Dk::Height / 2 + $Dk::CamZShift;
    %g.add(dkField(DkBack, %bx - 16 * %k, $Dk::BackY, $Dk::Z0 + %vc + (-1 - %vc) * %k, 32 * %k, 0.5, 34 * %k));
+   // a zone with no gravity over the board: a client simulates a ghost player between server updates, and with nothing under
+   // him Mario would sag and snap back with every update. The zone is a stock object (the force fields make them too).
+   %zone = new PhysicalZone() {
+      position = (%bx - 16) SPC -3 SPC ($Dk::Z0 - 2);
+      rotation = "1 0 0 0";
+      scale = "32 6 40";
+      polyhedron = "0.000000 1.0000000 0.0000000 1.0000000 0.0000000 0.0000000 0.0000000 -1.0000000 0.0000000 0.0000000 0.0000000 1.0000000";
+      velocityMod = 1.0;
+      gravityMod = 0.0;
+      appliedForce = "0 0 0";
+   };
+   %g.add(%zone);
    %cl.dkApe = dkActor("HeavyMaleBiodermArmor", $Dk::ApeScale, %bx - 12, 0, $Dk::Z0 + $Dk::PV[5] + 0.05, 1.5708);
    %g.add(%cl.dkApe);
    // the ape carries a mortar and fires the barrels with it (no ammo, so the weapon never shoots a real shell)

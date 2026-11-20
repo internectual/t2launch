@@ -15,6 +15,7 @@ $Retro::Speed = 0.6;                 // the patched armors' top speed in every d
 $Retro::Eye = 2.12;                  // eye height above the feet (measured on the light armor)
 $Retro::VelMin = 0.12;              // velocity that counts as a held key
 $Retro::HoldEps = 0.25;             // put the player back when it has crept this far
+$Retro::HoldMs = 130;                // a key stays held this long after the last tick it was seen on (readings come and go while a key is down)
 $Retro::YawEps = 0.02;               // radians of turn before the view is put back
 $Retro::FloorSize = 8;
 $Retro::Debug = 0;
@@ -90,6 +91,7 @@ function retroDetach(%cl)
       %cl.retroFloor.delete();
    %cl.retroFloor = "";
    %cl.retroAnchor = "";
+   %cl.retroHeldMask = 0;
 }
 
 // Direction keys held this tick (1 forward, 2 back, 4 left, 8 right). Also keeps the player still and facing the
@@ -110,6 +112,18 @@ function retroPad(%cl)
    if (%vx < -$Retro::VelMin) %mask = %mask | 4;
    if (%vx > $Retro::VelMin) %mask = %mask | 8;
    %pl.setVelocity("0 0 0");
+   // While a key is down the player is not moved on every tick (the client's moves reach the server in bursts), so a held key
+   // reads as on, off, on. Hold the last reading for a few ticks so it reads as held.
+   %now = getSimTime();
+   if (%mask)
+   {
+      %cl.retroHeldMask = %mask;
+      %cl.retroHeldAt = %now;
+   }
+   else if (%cl.retroHeldMask && %now - %cl.retroHeldAt < $Retro::HoldMs)
+      %mask = %cl.retroHeldMask;
+   else
+      %cl.retroHeldMask = 0;
    // put the player back if it has crept off its spot or the mouse has turned it
    %t = %pl.getTransform();
    %dx = getWord(%t, 0) - getWord(%cl.retroAnchor, 0);
