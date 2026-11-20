@@ -42,6 +42,13 @@ $Dk::BarrelDrop = 0;                 // from the shell's origin to its middle
 $Dk::BarrelSpeed = 5.5;
 $Dk::BarrelFall = 22;                // gravity for a falling barrel
 $Dk::MaxBarrels = 7;
+$Dk::LadyLoopMs = 2400;               // the lady's wave is started again this often
+$Dk::ManSlack = 0.3;                  // metres Mario may drift from where the game says he is before he is put back
+$Dk::GravComp = 0.64;                // gravity (20 m/s/s) over one tick, added to his upward velocity
+$Dk::MuzzleU = -9.6;                  // where the ape's mortar points out, across from the centre line
+$Dk::MuzzleV = 1.7;                  // and how far above the girder
+$Dk::MuzzleUp = 3;                   // a barrel leaves the muzzle going up a little...
+$Dk::MuzzleSpeed = 7;                // ...and forward
 $Dk::SparkMs = 40;                    // a new flame puff behind each barrel this often
 $Dk::SparkLifeMs = 60;               // and it burns this long
 $Dk::LadderChance = 0.22;
@@ -286,19 +293,30 @@ function dkPlaceMan(%cl)
       %yaw = -1.5708;
    if (%cl.dkMode $= "climb")
       %yaw = 0;
-   %cl.dkMan.setTransform((dkBoardX(%seat) + %cl.dkU) SPC 0 SPC ($Dk::Z0 + %feet + 0.03) SPC "0 0 1" SPC %yaw);
-   %cl.dkMan.setVelocity(%cl.dkVX SPC 0 SPC %cl.dkVZ);
-   // nothing is solid under a standalone player, so the engine's own pick never chooses a walk cycle; choose it here. The
-   // thread must not be held (a held thread stands still) and must not wait for its end
+   // The engine moves him by his velocity, which a client interpolates smoothly; a teleport every tick would make it snap
+   // instead. So he is only placed when he turns, when he is sent back to the start, or when he has drifted off the spot he
+   // should be at (nothing is solid under him, so gravity is cancelled in the velocity below).
+   %gx = dkBoardX(%seat) + %cl.dkU;
+   %gz = $Dk::Z0 + %feet + 0.03;
+   %t = %cl.dkMan.getTransform();
+   if (%cl.dkYaw !$= %yaw || mAbs(getWord(%t, 0) - %gx) > $Dk::ManSlack || mAbs(getWord(%t, 2) - %gz) > $Dk::ManSlack)
+   {
+      %cl.dkMan.setTransform(%gx SPC 0 SPC %gz SPC "0 0 1" SPC %yaw);
+      %cl.dkYaw = %yaw;
+   }
+   %cl.dkMan.setVelocity(%cl.dkVX SPC 0 SPC (%cl.dkVZ + $Dk::GravComp));
+   // a standalone player has nothing solid under it, so the engine never picks a walk cycle, and its own thread would not
+   // stride even when set by name. A script thread (slot 0) plays the run cycle at full speed whatever the velocity is.
    %anim = "root";
-   if (%cl.dkMode $= "jump")
-      %anim = "fall";
-   else if (%cl.dkVX != 0 || %cl.dkVZ != 0)
+   if (%cl.dkMode $= "jump" || %cl.dkVX != 0 || %cl.dkVZ != 0)
       %anim = "run";
    if (%anim !$= %cl.dkAnim)
    {
       %cl.dkAnim = %anim;
-      %cl.dkMan.setActionThread(%anim, false, false);
+      if (%anim $= "run")
+         %cl.dkMan.playThread(0, "run");
+      else
+         %cl.dkMan.stopThread(0);
    }
 }
 
@@ -336,7 +354,10 @@ function dkRespawn(%cl)
    %cl.dkVX = 0;
    %cl.dkVZ = 0;
    %cl.dkMV = $Dk::PV[0] + $Dk::ManSize / 2;
-   %cl.dkAnim = "";                    // dkPlaceMan picks the animation again after a death
+   %cl.dkAnim = "";
+   %cl.dkYaw = "";
+   %cl.dkMan.stopThread(0);
+   %cl.dkMan.setActionThread("root", false, false);        // lets go of the held death pose
    dkPlaceMan(%cl);
    %cl.dkPl = 0;
    %cl.dkMode = "ground";
@@ -410,6 +431,8 @@ function dkMan(%cl, %dt, %now)
       %x1 = $Dk::PX1[%k] - 0.7;
       if (%cl.dkU < %x0) %cl.dkU = %x0;
       if (%cl.dkU > %x1) %cl.dkU = %x1;
+      if (%cl.dkU == %x0 || %cl.dkU == %x1)
+         %cl.dkVX = 0;                              // at the end of the girder he stands, so he does not run on the spot
       if (%cl.dkJump)
       {
          %cl.dkMode = "jump";
@@ -514,16 +537,18 @@ function dkMan(%cl, %dt, %now)
 function dkThrow(%cl)
 {
    %seat = %cl.dkSeat;
-   %cl.dkApe.setActionThread("cel2");
-   %cl.dkApeReset = getSimTime() + 1200;
+   // the mortar stays level, and fires: a flash of flame at its muzzle as the barrel leaves
+   dkSpark(dkBoardX(%seat) + $Dk::MuzzleU, $Dk::Z0 + $Dk::PV[5] + $Dk::MuzzleV);
    for (%i = 0; %i < $Dk::MaxBarrels; %i++)
       if ($Dk::BOn[%seat, %i] == 0)
       {
-         $Dk::BOn[%seat, %i] = 1;
-         $Dk::BU[%seat, %i] = -9.3;
+         // out of the mortar's muzzle in a short arc, landing on the girder and rolling from there (state 4)
+         $Dk::BOn[%seat, %i] = 4;
+         $Dk::BU[%seat, %i] = $Dk::MuzzleU;
          $Dk::BPl[%seat, %i] = 5;
          $Dk::BD[%seat, %i] = 1;
-         $Dk::BV[%seat, %i] = $Dk::PV[5] + $Dk::BarrelSize / 2;
+         $Dk::BV[%seat, %i] = $Dk::PV[5] + $Dk::MuzzleV;
+         $Dk::BVy[%seat, %i] = -$Dk::MuzzleUp;
          $Dk::BLast[%seat, %i] = -1;
          $Dk::BScored[%seat, %i] = false;
          return;
@@ -576,6 +601,18 @@ function dkBarrels(%cl, %dt, %now)
             }
          }
       }
+      else if (%st == 4)
+      {
+         $Dk::BVy[%seat, %i] += $Dk::BarrelFall * %dt;
+         $Dk::BV[%seat, %i] -= $Dk::BVy[%seat, %i] * %dt;
+         $Dk::BU[%seat, %i] += $Dk::MuzzleSpeed * %dt;
+         %land = $Dk::PV[5] + $Dk::BarrelSize / 2;
+         if ($Dk::BV[%seat, %i] <= %land)
+         {
+            $Dk::BV[%seat, %i] = %land;
+            $Dk::BOn[%seat, %i] = 1;
+         }
+      }
       else if (%st == 2)
       {
          $Dk::BVy[%seat, %i] += $Dk::BarrelFall * %dt;
@@ -617,7 +654,7 @@ function dkBarrels(%cl, %dt, %now)
             dkHud(%cl);
          }
       }
-      dkPlaceBarrel(%seat, %i, $Dk::BU[%seat, %i], $Dk::BV[%seat, %i], $Dk::BD[%seat, %i], $Dk::BOn[%seat, %i] != 1);
+      dkPlaceBarrel(%seat, %i, $Dk::BU[%seat, %i], $Dk::BV[%seat, %i], $Dk::BD[%seat, %i], $Dk::BOn[%seat, %i] == 2 || $Dk::BOn[%seat, %i] == 3);
    }
 }
 
@@ -626,8 +663,8 @@ function dkApeLife(%cl, %now)
 {
    if (%now >= %cl.dkLadyAt)
    {
-      %cl.dkLadyAt = %now + 3500;
-      %cl.dkLady.setActionThread("cel2");
+      %cl.dkLadyAt = %now + $Dk::LadyLoopMs;
+      %cl.dkLady.setActionThread("cel2");         // a wave, started again as it ends so she waves all the time
    }
    if (%cl.dkApeReset > 0 && %now >= %cl.dkApeReset)
    {
