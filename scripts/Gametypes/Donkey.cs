@@ -1,11 +1,13 @@
 // Donkey: server-side ruleset for the MatrixDonkey mission (a Donkey Kong clone), built from real game models: cargo
-// containers for the girders, poles for the ladders, a heavy Bioderm as the ape, a tiny human as Mario, a human lady, and
-// mortar barrel packs for the barrels. The girders, ladders and oil drum are TSStatic shapes in the mission file
-// (scripts/Matrix/tools/make_donkey_mis.py writes it), (this was chosen while a shape datablock defined here got clients dropped: the server's CRC challenge was computed before
-// the script ran. retroRefreshCrc() in Retro.cs fixes that, so shape datablocks are possible now). The people are standalone players of the stock armors and the barrels
-// are items of the stock mortar barrel pack datablock, so no shape datablock is defined here. The two datablocks that are
-// (a pale backdrop panel and an orange glow behind each barrel) are force fields, which have no shape. Flames and lamps
-// from projectile datablocks crashed the client (their datablock was rejected by the server); image flames and lamps were never retried after the CRC fix.
+// containers for the girders, poles for the ladders, a heavy Bioderm carrying a mortar as the ape, a tiny human as Mario, a
+// human lady, and round grenade shells with a fire on them for the barrels. The girders, ladders and oil drum are TSStatic
+// shapes in the mission file (scripts/Matrix/tools/make_donkey_mis.py writes it). The people are standalone players of the
+// stock armors. The barrels are static shapes of a shape datablock defined here (DkBomb, the stock grenade shell), which
+// needs retroRefreshCrc() from Retro.cs: the server's CRC challenge is computed before the script runs, so without the
+// refresh every client is dropped a few seconds after joining. A particle emitter cannot be moved once a client has it, so
+// each barrel's fire is a short-lived emitter created on the barrel every few tens of milliseconds. A pale force-field
+// backdrop makes the dark models stand out. Mario's walk cycle is chosen here, because nothing is solid under a standalone
+// player and the engine would never pick one.
 // Evaluated in memory by the t2launch hook (server.gametype_script, after Retro.cs); clients download nothing.
 // The package is active only while $CurrentMission is MatrixDonkey.
 //
@@ -35,11 +37,13 @@ $Dk::ClimbSpeed = 4;
 $Dk::JumpSecs = 0.7;
 $Dk::JumpHeight = 2.6;
 $Dk::BarrelSize = 1.2;
-$Dk::BarrelScale = 2.2;               // the pack is 0.44 x 1.1 x 0.59 and lies along its length
-$Dk::BarrelDrop = 0.65;              // from the pack's origin (its bottom) to its middle
+$Dk::BarrelScale = 5;                   // the grenade shell is a few centimetres across
+$Dk::BarrelDrop = 0;                 // from the shell's origin to its middle
 $Dk::BarrelSpeed = 5.5;
 $Dk::BarrelFall = 22;                // gravity for a falling barrel
 $Dk::MaxBarrels = 7;
+$Dk::SparkMs = 40;                    // a new flame puff behind each barrel this often
+$Dk::SparkLifeMs = 60;               // and it burns this long
 $Dk::LadderChance = 0.22;
 $Dk::Lives = 3;
 $Dk::RespawnMs = 1500;
@@ -111,9 +115,14 @@ function dkDatablocks()
 {
    if (isObject(DkBack))
       return;
+   // the barrels are the grenade shell, a round dot from any side (an item cannot be tipped over, a static shape can); a new shape datablock needs
+   // the server's CRC challenge recomputed or every client is dropped a few seconds later
+   eval("datablock StaticShapeData(DkBomb) { shapeFile = \"grenade_projectile.dts\"; };");
+   retroRefreshCrc();
+   // a short, dense flame: the stock debris fire, living a third as long and ejecting twice as often
+   eval("datablock ParticleData(DkFlame) : DebrisFireParticle { lifetimeMS = 100; sizes[0] = 0.6; sizes[1] = 1.1; sizes[2] = 0.6; };");
+   eval("datablock ParticleEmitterData(DkFlameEmitter) : DebrisFireEmitter { ejectionPeriodMS = 8; particles = \"DkFlame\"; };");
    eval("datablock ForceFieldBareData(DkBack) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"0.72 0.8 0.95\"; baseTranslucency = 0.22;"
-      @ " needsNoPower = true; };");
-   eval("datablock ForceFieldBareData(DkGlow) : defaultForceFieldBare { framesPerSec = 1; numFrames = 1; scrollSpeed = 0; color = \"1.0 0.5 0.12\"; baseTranslucency = 0.65;"
       @ " needsNoPower = true; };");
 }
 
@@ -207,12 +216,10 @@ function dkMakeBoard(%cl)
    // it, and a script cannot add a shape datablock; an item of a stock datablock can do both)
    for (%i = 0; %i < $Dk::MaxBarrels; %i++)
    {
-      %o = new Item() {
-         dataBlock = "MortarBarrelPack";
+      %o = new StaticShape() {
+         dataBlock = "DkBomb";
          position = "0 -300 316";
          rotation = "1 0 0 0";
-         static = true;
-         rotate = false;
       };
       %o.dkBarrel = true;
       %o.setScale($Dk::BarrelScale SPC $Dk::BarrelScale SPC $Dk::BarrelScale);
@@ -220,10 +227,6 @@ function dkMakeBoard(%cl)
       $Dk::BObj[%seat, %i] = %o;
       $Dk::BOn[%seat, %i] = 0;
       dkPark(%o);
-      %f = dkField(DkGlow, 0, -1.4, 0, 1.3, 0.6, 1.3);
-      %g.add(%f);
-      $Dk::BGlow[%seat, %i] = %f;
-      dkPark(%f);
    }
    dkPurgeZones();
 }
@@ -234,24 +237,43 @@ function dkPlaceBarrel(%seat, %i, %u, %v, %dir, %falling)
    %x = dkBoardX(%seat) + %u;
    %z = $Dk::Z0 + %v - $Dk::BarrelDrop;
    %o = $Dk::BObj[%seat, %i];
-   // this engine's angles turn the other way round: +90 degrees about z faces right, about x it points the nose down
+   // the shell's nose is its +y: rolling it points the way it travels, falling it points down (this engine's angles turn the
+   // other way round: +90 degrees about z faces right, about x it points the nose down)
    if (%falling)
       %o.setTransform(%x SPC 0 SPC %z SPC "1 0 0 1.5708");
    else if (%dir > 0)
       %o.setTransform(%x SPC 0 SPC %z SPC "0 0 1 1.5708");
    else
       %o.setTransform(%x SPC 0 SPC %z SPC "0 0 1 -1.5708");
-   // the glow: at the tail of a rolling barrel, on top of a falling one (a force field's corner is its position)
-   if (%falling)
-      $Dk::BGlow[%seat, %i].setTransform((%x - 0.65) SPC -1.4 SPC ($Dk::Z0 + %v + 0.4));
-   else
-      $Dk::BGlow[%seat, %i].setTransform((%x - %dir * 1.0 - 0.65) SPC -1.4 SPC ($Dk::Z0 + %v - 0.35));
+   // the flame, on the bomb itself: a particle emitter cannot be moved once a client has it, so a short-lived one is created at
+   // the bomb every so often (a little ahead of it, as the bomb moves while the emitter lives) and deletes itself
+   %now = getSimTime();
+   if (%now >= $Dk::BSpark[%seat, %i])
+   {
+      $Dk::BSpark[%seat, %i] = %now + $Dk::SparkMs;
+      if (%falling)
+         dkSpark(%x, $Dk::Z0 + %v - 0.3);
+      else
+         dkSpark(%x + %dir * 0.3, $Dk::Z0 + %v);
+   }
+}
+
+function dkSpark(%x, %z)
+{
+   %e = new ParticleEmissionDummy() {
+      dataBlock = "defaultEmissionDummy";
+      emitter = "DkFlameEmitter";
+      position = %x SPC -0.3 SPC %z;
+      rotation = "1 0 0 0";
+      scale = "1 1 1";
+   };
+   MissionCleanup.add(%e);
+   %e.schedule($Dk::SparkLifeMs, "delete");
 }
 
 function dkParkBarrel(%seat, %i)
 {
    dkPark($Dk::BObj[%seat, %i]);
-   dkPark($Dk::BGlow[%seat, %i]);
 }
 
 // Mario's model at his position, moving at the velocity that makes it run, climb or fly
@@ -266,6 +288,18 @@ function dkPlaceMan(%cl)
       %yaw = 0;
    %cl.dkMan.setTransform((dkBoardX(%seat) + %cl.dkU) SPC 0 SPC ($Dk::Z0 + %feet + 0.03) SPC "0 0 1" SPC %yaw);
    %cl.dkMan.setVelocity(%cl.dkVX SPC 0 SPC %cl.dkVZ);
+   // nothing is solid under a standalone player, so the engine's own pick never chooses a walk cycle; choose it here. The
+   // thread must not be held (a held thread stands still) and must not wait for its end
+   %anim = "root";
+   if (%cl.dkMode $= "jump")
+      %anim = "fall";
+   else if (%cl.dkVX != 0 || %cl.dkVZ != 0)
+      %anim = "run";
+   if (%anim !$= %cl.dkAnim)
+   {
+      %cl.dkAnim = %anim;
+      %cl.dkMan.setActionThread(%anim, false, false);
+   }
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -302,7 +336,7 @@ function dkRespawn(%cl)
    %cl.dkVX = 0;
    %cl.dkVZ = 0;
    %cl.dkMV = $Dk::PV[0] + $Dk::ManSize / 2;
-   %cl.dkMan.setActionThread("root", false, false);        // let the engine pick the animation again after a death
+   %cl.dkAnim = "";                    // dkPlaceMan picks the animation again after a death
    dkPlaceMan(%cl);
    %cl.dkPl = 0;
    %cl.dkMode = "ground";
@@ -480,13 +514,13 @@ function dkMan(%cl, %dt, %now)
 function dkThrow(%cl)
 {
    %seat = %cl.dkSeat;
-   %cl.dkApe.setActionThread("cel1", true);
+   %cl.dkApe.setActionThread("cel2");
    %cl.dkApeReset = getSimTime() + 1200;
    for (%i = 0; %i < $Dk::MaxBarrels; %i++)
       if ($Dk::BOn[%seat, %i] == 0)
       {
          $Dk::BOn[%seat, %i] = 1;
-         $Dk::BU[%seat, %i] = -7.5;
+         $Dk::BU[%seat, %i] = -9.3;
          $Dk::BPl[%seat, %i] = 5;
          $Dk::BD[%seat, %i] = 1;
          $Dk::BV[%seat, %i] = $Dk::PV[5] + $Dk::BarrelSize / 2;
@@ -593,12 +627,12 @@ function dkApeLife(%cl, %now)
    if (%now >= %cl.dkLadyAt)
    {
       %cl.dkLadyAt = %now + 3500;
-      %cl.dkLady.setActionThread("cel2", true);
+      %cl.dkLady.setActionThread("cel2");
    }
    if (%cl.dkApeReset > 0 && %now >= %cl.dkApeReset)
    {
       %cl.dkApeReset = 0;
-      %cl.dkApe.setActionThread("root", true);
+      %cl.dkApe.setActionThread("root", false, false);
    }
 }
 
