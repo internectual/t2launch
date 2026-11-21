@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 try:
-    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Signal  # noqa: I001 (grid-wrapped names)
+    from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, Qt, Signal  # noqa: I001 (grid-wrapped names)
     from PySide6.QtGui import QAction
     from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import (
@@ -325,6 +325,62 @@ class DeviceCombo(QComboBox):
             self.setEditText(value)
 
 
+class NumericOptionLink(QLabel):
+    """A non-scrollable value link that opens a direct-entry/spin dialog."""
+    valueChanged = Signal()
+
+    def __init__(self, option, value):
+        super().__init__()
+        self.option = option
+        self._value = value
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.setOpenExternalLinks(False)
+        self.linkActivated.connect(self.edit_value)
+        self.setMinimumWidth(72)
+        self.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._refresh_text()
+
+    def _refresh_text(self):
+        display = f"{self._value:.3f}" if self.option.kind == "float" else str(self._value)
+        self.setText(f'<a href="edit">{display}</a>')
+
+    def value(self):
+        return self._value
+
+    def setValue(self, value):
+        value = float(value) if self.option.kind == "float" else int(value)
+        if value != self._value:
+            self._value = value
+            self._refresh_text()
+            self.valueChanged.emit()
+
+    def edit_value(self, *_args):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Edit {self.option.label}")
+        form = QFormLayout(dialog)
+        if self.option.kind == "float":
+            editor = QDoubleSpinBox()
+            editor.setRange(self.option.minimum if self.option.minimum is not None else -1e9,
+                            self.option.maximum if self.option.maximum is not None else 1e9)
+            editor.setDecimals(3)
+            editor.setSingleStep(0.1)
+        else:
+            editor = QSpinBox()
+            editor.setRange(int(self.option.minimum if self.option.minimum is not None else -10**9),
+                            int(self.option.maximum if self.option.maximum is not None else 10**9))
+            editor.setSingleStep(1)
+        editor.setKeyboardTracking(False)
+        editor.setValue(self._value)
+        form.addRow(self.option.label, editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                                   QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.setValue(editor.value())
+
+
 class EndpointsEdit(QLineEdit):
     """One line of host:port entries for the hook's WON bootstrap slots."""
     changed = Signal()
@@ -483,6 +539,13 @@ class ProfileEditor(QWidget):
         self.option_rows = {}
         self.option_default_buttons = {}
         self.section_headings = []  # (heading, keys of its options)
+        self.category_tabs = []  # (Hook tabs widget, index, keys in category)
+        for option in t2options.OPTIONS:
+            if option.hidden:
+                checkbox = QCheckBox(option.label)
+                checkbox.setChecked(bool(saved_options[option.key]))
+                checkbox.setToolTip(option.help)
+                self.option_widgets[option.key] = checkbox
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
@@ -532,6 +595,35 @@ class ProfileEditor(QWidget):
         tabs.addTab(scroll, "Game")
 
         for tab, title in (("won", "WON emulator"), ("hook", "Hook")):
+            if tab == "hook":
+                categories = {}
+                for option in t2options.OPTIONS:
+                    if option.tab != tab or option.hidden:
+                        continue
+                    category = t2options.hook_category(option)
+                    categories.setdefault(category, {}).setdefault(option.section, []).append(option)
+                hook_tabs = QTabWidget()
+                for category, sections in categories.items():
+                    scroll = QScrollArea()
+                    scroll.setWidgetResizable(True)
+                    body = QWidget()
+                    column = QVBoxLayout(body)
+                    category_keys = []
+                    for section, options in sections.items():
+                        heading = QLabel(f"<b>{section}</b>")
+                        column.addWidget(heading)
+                        section_keys = []
+                        self.section_headings.append((heading, section_keys))
+                        for option in options:
+                            section_keys.append(option.key)
+                            category_keys.append(option.key)
+                            column.addWidget(self._option_row(option, saved_options[option.key]))
+                    column.addStretch()
+                    scroll.setWidget(body)
+                    category_index = hook_tabs.addTab(scroll, category)
+                    self.category_tabs.append((hook_tabs, category_index, category_keys))
+                tabs.addTab(hook_tabs, title)
+                continue
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             body = QWidget()
@@ -539,6 +631,8 @@ class ProfileEditor(QWidget):
             section = None
             for option in t2options.OPTIONS:
                 if option.tab != tab:
+                    continue
+                if option.hidden:
                     continue
                 if option.section != section:
                     section = option.section
@@ -591,14 +685,29 @@ class ProfileEditor(QWidget):
         row = QWidget()
         row_layout = QVBoxLayout(row)
         row_layout.setContentsMargins(12, 0, 0, 4)
-        widget = self._option_widget(option, value)
+        if option.key == "render.object_rules" and not value:
+            value = str(ROOT / "runtime/render-modifiers.objects.example.cfg")
+        if option.tab == "hook" and option.kind in ("int", "float"):
+            widget = NumericOptionLink(option, value)
+        else:
+            widget = self._option_widget(option, value)
         widget.setToolTip(option.help)
         line = QHBoxLayout()
-        if option.kind == "bool":
+        if option.enabled_key:
+            enabled = self.option_widgets[option.enabled_key]
+            enabled.setToolTip(option.help)
+            line.addWidget(enabled)
+            line.addWidget(widget, 1)
+        elif option.kind == "bool":
             line.addWidget(widget, 1)
         else:
             line.addWidget(QLabel(option.label))
             line.addWidget(widget, 1)
+        if option.file_dialog:
+            browse = QPushButton("Open…")
+            browse.setToolTip(f"Choose a file or folder for {option.label}")
+            browse.clicked.connect(lambda _checked=False, key=option.key: self.pick_option_file(key))
+            line.addWidget(browse)
         reset = QPushButton("Default")
         reset.setFixedWidth(70)
         reset.setToolTip(f"Reset {option.label} to its declared default")
@@ -616,6 +725,29 @@ class ProfileEditor(QWidget):
         self.option_default_buttons[option.key] = reset
         self.option_rows[option.key] = (row, note)
         return row
+
+    def pick_option_file(self, key):
+        """Choose a path for a text option annotated with file-dialog metadata."""
+        option = t2options.BY_KEY[key]
+        widget = self.option_widgets[key]
+        current_text = widget.text()
+        current = Path(current_text).expanduser() if current_text else Path.home()
+        if key == "video.reshade_preset":
+            shader_root = (self.option_widgets["video.reshade_shaders"].text()
+                           or str(Path.home() / ".local/share/t2launch/reshade"))
+            current = Path(shader_root).expanduser() / "Presets"
+        elif current.exists() and current.is_file():
+            current = current.parent
+        elif current_text and not current.exists():
+            current = current.parent if current.parent != Path(".") else Path.home()
+        if option.file_dialog == "directory":
+            selected = QFileDialog.getExistingDirectory(self, f"Select {option.label}", str(current))
+        else:
+            selected, _ = QFileDialog.getOpenFileName(
+                self, f"Select {option.label}", str(current), option.file_filter
+            )
+        if selected:
+            widget.setText(selected)
 
     @staticmethod
     def _option_widget(option, value):
@@ -653,6 +785,10 @@ class ProfileEditor(QWidget):
         option = t2options.BY_KEY[key]
         widget = self.option_widgets[key]
         value = t2options.reset_option(self.option_values(), key)[key]
+        if option.enabled_key:
+            self.option_widgets[option.enabled_key].setChecked(
+                bool(t2options.BY_KEY[option.enabled_key].default)
+            )
         if option.kind == "bool":
             widget.setChecked(bool(value))
         elif option.kind == "choice":
@@ -690,6 +826,8 @@ class ProfileEditor(QWidget):
         effective = t2options.effective(values, context)
         show_advanced = self.show_advanced.isChecked()
         for option in t2options.OPTIONS:
+            if option.hidden:
+                continue
             row, note = self.option_rows[option.key]
             # Requirements are judged against effective values, so a chain
             # (TribesNext -> console commands -> hook) disables in one step.
@@ -709,6 +847,10 @@ class ProfileEditor(QWidget):
             note.setVisible(bool(missing))
         for heading, keys in self.section_headings:
             heading.setVisible(any(not self.option_rows[key][0].isHidden() for key in keys))
+        for widget, index, keys in self.category_tabs:
+            widget.tabBar().setTabVisible(
+                index, any(not self.option_rows[key][0].isHidden() for key in keys)
+            )
         self.changed()
 
     def save_to(self):

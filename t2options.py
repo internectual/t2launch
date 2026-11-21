@@ -39,6 +39,33 @@ DEFAULT_BACKENDS = (
 WON_ENDPOINT_MAX = 27
 _ENDPOINT = re.compile(r"^([A-Za-z0-9.-]+):(\d{1,5})$")
 
+# Sections remain headings within a category; sections sharing a category get
+# a single page in the Hook options tab.
+HOOK_SECTION_CATEGORIES = {
+    "Hook": "General",
+    "Runtime": "General",
+    "Debugging": "General",
+    "Community": "Community",
+    "Video": "Graphics",
+    "Sky views": "Graphics",
+    "Gamescope": "Graphics",
+    "Server browser": "Interface",
+    "Interface": "Interface",
+    "Render modifiers": "Rendering",
+    "Demo review": "Demo review",
+    "Network": "Network",
+    "Security": "Network",
+    "Telemetry": "Telemetry",
+    "Discord": "Discord",
+    "Audio": "Audio",
+    "Dedicated server": "Dedicated server",
+}
+
+
+def hook_category(option: Option) -> str:
+    """Category tab for a Hook option; section stays as its in-tab heading."""
+    return HOOK_SECTION_CATEGORIES.get(option.section, option.section)
+
 
 @dataclass(frozen=True)
 class Option:
@@ -57,6 +84,10 @@ class Option:
     hook: bool = False  # applied through the hook's config file
     tab: str = field(default="hook")
     devices: str = ""  # "sinks", "sources" or "reshade_presets": the launcher offers a list to pick from
+    file_dialog: str = ""  # "open" or "directory": add a chooser for file-valued options
+    file_filter: str = "All files (*)"
+    hidden: bool = False  # stored option displayed as a control on a related row
+    enabled_key: str = ""  # bool option required to apply this option
 
     @property
     def off_value(self):
@@ -83,6 +114,7 @@ OPTIONS = (
                 f"most {WON_ENDPOINT_MAX} characters. Leave empty in local mode to use the bind "
                 "address and port below (127.0.0.1:15104 by default)."),
     Option("won.verifier", "WON emulator", "Remote verifier file", "text", "", tab="won",
+           file_dialog="open", file_filter="Verifier files (*.der);;All files (*)",
            env="T2LAUNCH_WON_VERIFIER", requires=(("won.mode", ("remote",)),),
            help="verifier.der from ~/.local/state/t2launch/wonemu/ on the machine running "
                 "wonemu; the game checks the emulator's signatures with it."),
@@ -167,7 +199,8 @@ OPTIONS = (
                 "keeps the aspect ratio (bars where it differs), stretch fills the screen. The game "
                 "keeps rendering at its own resolution, so the HUD stays large, and windowed mode is "
                 "unchanged. Works on Wayland, where a real mode switch is impossible."),
-    Option("sky.layout", "Sky views", "Sky layout to load", "text", "",
+    Option("sky.layout", "Sky views", "Sky layout to load", "text", "", file_dialog="open",
+           file_filter="TorqueScript layouts (*.cs *.cfg);;All files (*)",
            hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
            help="Name of a saved sky-view layout (~/.local/share/t2launch/skyviews/<name>.cfg) to load "
                 "when the game starts; views draw animations, video or other sources over the faces of the "
@@ -181,7 +214,7 @@ OPTIONS = (
            hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
            help="Let sky views play video, images, streams and 360 video through ffmpeg (a separate 64-bit "
                 "process per source, started when a view is added and stopped when it is removed)."),
-    Option("sky.ffmpeg", "Sky views", "ffmpeg program", "text", "",
+    Option("sky.ffmpeg", "Sky views", "ffmpeg program", "text", "", file_dialog="open",
            hook=True, advanced=True, requires=(("sky.media", (True,)),),
            help="Path of the ffmpeg to use for sky video; blank uses ffmpeg from PATH."),
     Option("sky.stream_audio", "Sky views", "Play the video's audio", "bool", True,
@@ -189,6 +222,7 @@ OPTIONS = (
            help="Play the sound of sky videos through the audio output (a second ffmpeg; the sync with the "
                 "picture is approximate)."),
     Option("sky.ytdlp", "Sky views", "yt-dlp program", "text", "", hook=True, advanced=True,
+           file_dialog="open",
            requires=(("sky.media", (True,)),),
            help="Path of yt-dlp, used for YouTube links in sky views; blank uses ~/.local/bin/yt-dlp or PATH."),
     Option("sky.youtube_height", "Sky views", "YouTube video height", "int", 2160, minimum=144, maximum=4320,
@@ -229,9 +263,10 @@ OPTIONS = (
            hook=True, requires=(("launcher.load_hook", (True,)),),
            help="Run ReShade .fx shaders and a ReShade preset on the finished frame (needs t2_fx.so)."),
     Option("video.reshade_preset", "Video", "ReShade preset", "text", "", devices="reshade_presets",
+           file_dialog="open", file_filter="ReShade presets (*.ini);;All files (*)",
            hook=True, requires=(("video.reshade", (True,)),),
            help="Preset .ini: a path, or a file name inside <ReShade folder>/Presets."),
-    Option("video.reshade_shaders", "Video", "ReShade folder", "text", "",
+    Option("video.reshade_shaders", "Video", "ReShade folder", "text", "", file_dialog="directory",
            hook=True, requires=(("video.reshade", (True,)),),
            help="Folder with Shaders/ and Textures/ (the reshade-shaders layout). "
                 "Blank uses ~/.local/share/t2launch/reshade."),
@@ -300,12 +335,24 @@ OPTIONS = (
            help="Drop the white flash (concussion grenades and the like) the server sends for your "
                 "player, as HappyMod 2's no-whiteout did."),
     # Render modifiers. Empty paths keep the optional line files inactive.
+    Option("render.datablock_rules_enabled", "Render modifiers", "Use datablock modifier rules", "bool",
+           False, hook=True, advanced=True, hidden=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Enable the datablock modifier rules file selected below."),
     Option("render.datablock_rules", "Render modifiers", "Datablock modifier rules", "text", "",
-           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           hook=True, advanced=True, enabled_key="render.datablock_rules_enabled",
+           file_dialog="open", file_filter="Modifier rules (*.cfg *.cs);;All files (*)",
+           requires=(("launcher.load_hook", (True,)),),
            help="Path to a commented line-based config for datablock field replacements on connect "
                 "or every frame."),
+    Option("render.object_rules_enabled", "Render modifiers", "Use object modifier rules", "bool",
+           False, hook=True, advanced=True, hidden=True,
+           requires=(("launcher.load_hook", (True,)),),
+           help="Enable the per-frame object modifier rules file selected below."),
     Option("render.object_rules", "Render modifiers", "Object modifier rules", "text", "",
-           hook=True, advanced=True, requires=(("launcher.load_hook", (True,)),),
+           hook=True, advanced=True, enabled_key="render.object_rules_enabled",
+           file_dialog="open", file_filter="Modifier rules (*.cfg *.cs);;All files (*)",
+           requires=(("launcher.load_hook", (True,)),),
            help="Path to a commented line-based config for per-frame object field replacements."),
     Option("render.sky_rotation_speed", "Render modifiers", "Sky rotation speed (radians/sec)",
            "float", 0.0, minimum=-20.0, maximum=20.0, hook=True, advanced=True,
@@ -452,6 +499,7 @@ OPTIONS = (
               hook=True, advanced=True, requires=(
                   ("launcher.load_hook", (True,)), ("telemetry.shazbot_auto_weapon_slot_test", (True,)),
               ),
+              file_dialog="open", file_filter="TorqueScript files (*.cs);;All files (*)",
               help="Per-session prefs/ script that calls the hook's bounded weapon-slot test command."),
      Option("net.depot_downloads", "Network", "Download missing map files from the TribesNext depot",
            "bool", False, hook=True,
@@ -554,14 +602,15 @@ OPTIONS = (
                 "with T2CSRI, as TribesNext servers do. Players with a WON certificate from "
                 "wonemu still authenticate through WON."),
     Option("server.gametype_script", "Dedicated server", "Gametype script", "text", "",
-           hook=True, advanced=True,
+           hook=True, advanced=True, file_dialog="open",
+           file_filter="TorqueScript files (*.cs);;All files (*)",
            requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
                      ("hook.console_commands", (True,))),
            help="TorqueScript files (comma-separated) the server evaluates in memory at startup "
                 "to add custom rulesets (packages that activate only on their own missions). "
                 "Clients download nothing. Empty loads none."),
     Option("server.atari_rom_dir", "Dedicated server", "Atari 2600 ROM folder", "text", "",
-           hook=True, advanced=True,
+           hook=True, advanced=True, file_dialog="directory",
            requires=(("game.executable", ("dedicated",)), ("launcher.load_hook", (True,)),
                      ("hook.console_commands", (True,))),
            help="Folder the Atari 2600 gametype loads ROMs from (plain file names only, 2K to 32K "
@@ -735,6 +784,14 @@ def chosen(options):
                 values[key] = coerce(BY_KEY[key], value)
             except (TypeError, ValueError):
                 pass
+    # Existing profiles had paths but no separate enable checkboxes. Preserve
+    # the old behavior for those stored paths when loading their settings.
+    for path_key, enabled_key in (
+        ("render.datablock_rules", "render.datablock_rules_enabled"),
+        ("render.object_rules", "render.object_rules_enabled"),
+    ):
+        if enabled_key not in (options or {}) and values[path_key]:
+            values[enabled_key] = True
     return values
 
 

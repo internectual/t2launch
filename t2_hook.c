@@ -218,6 +218,8 @@ static struct hook_option hook_options[] = {
     {"ui.no_whiteout", "0", NULL, 0, "", 0},
     {"render.datablock_rules", "", NULL, 0, "", 0},
     {"render.object_rules", "", NULL, 0, "", 0},
+    {"render.datablock_rules_enabled", "0", NULL, 0, "", 0},
+    {"render.object_rules_enabled", "0", NULL, 0, "", 0},
     {"render.sky_rotation_speed", "0.0", NULL, 0, "", 0},
     {"review.cheat_view", "0", NULL, 0, "", 0},
     {"review.replace_models", "0", "T2LAUNCH_REVIEW_MODELS", 0, "", 0},
@@ -7681,8 +7683,10 @@ static size_t render_modifiers_apply(enum render_rule_phase phase) {
 static void install_render_modifiers(void) {
     if (render_modifiers_installed || !Con__evaluate || !Con__addMethodS) return;
     render_modifiers_installed = 1;
-    (void)render_load_rules_file(hook_option_str("render.datablock_rules"), 0);
-    (void)render_load_rules_file(hook_option_str("render.object_rules"), 1);
+    if (hook_option_bool("render.datablock_rules_enabled"))
+        (void)render_load_rules_file(hook_option_str("render.datablock_rules"), 0);
+    if (hook_option_bool("render.object_rules_enabled"))
+        (void)render_load_rules_file(hook_option_str("render.object_rules"), 1);
     /* Preserve the legacy environment variable and extra hook-option key. */
     const char *legacy = getenv("T2LAUNCH_DATABLOCK_CONFIG");
     if (!legacy || !*legacy) legacy = hook_option_str("datablock.config");

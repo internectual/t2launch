@@ -136,7 +136,9 @@ default, its type, what it depends on, and how it is applied. An option whose
 requirements are unmet is greyed out with a "Requires: …" note (for example,
 the TribesNext handlers need WON emulation and the hook's console commands);
 its saved choice comes back when the dependency does. **Show advanced options**
-reveals the debugging and compatibility settings.
+reveals the debugging and compatibility settings. The Hook tab groups related
+sections into category tabs, and numeric values open an edit dialog when clicked
+so scrolling through settings cannot change them accidentally.
 
 At launch, options become environment variables for `runtime/run-game`, and the
 hook's options are written to `~/.local/state/t2launch/hook/<profile>.conf`
@@ -896,7 +898,9 @@ options bring the parts of it that fit the Linux client:
   `setTargetId()` ignores them; with this on, client scripts can use all three
   on ghosts, as with the Windows `l33thax` patch.
 - **Render modifier rules** (`render.datablock_rules` and
-  `render.object_rules`, both empty by default, advanced). Set
+  `render.object_rules`, advanced). Each file has its own enable checkbox and
+  **Open…** button. The object-rules field starts with the bundled example
+  config selected; its sample rules are commented out. Set
   `render.sky_rotation_speed` to control the hook's native sky rotation; the
   default is `0` (disabled), with speeds from `-20` to `20` radians/second.
   Point either rules option

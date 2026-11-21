@@ -48,6 +48,33 @@ class OptionTests(unittest.TestCase):
         for key, default in re.findall(r'\{"([a-z_]+\.[a-z_]+)", "([^"]*)"', table):
             self.assertEqual(default, t2options._text(t2options.BY_KEY[key].default), key)
 
+    def test_modifier_enable_options_and_file_picker_metadata(self):
+        for key in ("render.datablock_rules_enabled", "render.object_rules_enabled"):
+            option = t2options.BY_KEY[key]
+            self.assertTrue(option.hidden)
+            self.assertFalse(option.default)
+        for key in ("render.datablock_rules", "render.object_rules"):
+            self.assertEqual(t2options.BY_KEY[key].file_dialog, "open")
+            self.assertTrue(t2options.BY_KEY[key].enabled_key.endswith("_enabled"))
+            enabled_key = t2options.BY_KEY[key].enabled_key
+            self.assertFalse(t2options.chosen({})[enabled_key])
+            self.assertTrue(t2options.chosen({key: "/tmp/rules.cfg"})[enabled_key])
+        self.assertEqual(t2options.BY_KEY["video.reshade_shaders"].file_dialog, "directory")
+        self.assertEqual(t2options.BY_KEY["server.gametype_script"].file_dialog, "open")
+        source = (ROOT / "t2_hook.c").read_text()
+        self.assertIn('if (hook_option_bool("render.datablock_rules_enabled"))', source)
+        self.assertIn('if (hook_option_bool("render.object_rules_enabled"))', source)
+
+    def test_hook_options_are_categorized_with_sections_inside_categories(self):
+        hook_options = [option for option in t2options.OPTIONS if option.tab == "hook" and not option.hidden]
+        sections = {option.section for option in hook_options}
+        categories = {t2options.hook_category(option) for option in hook_options}
+        self.assertTrue(sections.issubset(t2options.HOOK_SECTION_CATEGORIES))
+        self.assertLess(len(categories), len(sections))
+        graphics_sections = {option.section for option in hook_options
+                             if t2options.hook_category(option) == "Graphics"}
+        self.assertGreaterEqual(graphics_sections, {"Video", "Sky views", "Gamescope"})
+
     def test_mem_patch_modes_default_to_warning(self):
         option = t2options.BY_KEY["hook.mem_patch"]
         self.assertEqual(option.kind, "choice")
